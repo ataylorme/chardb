@@ -1,0 +1,5 @@
+[test]
+# Reuse the chardb root preload that stubs `cloudflare:workers` so the
+# example's `worker.ts` (which re-exports the DO classes via
+# `chardb/server`) can be loaded under bun:test.
+preload = ["../../test/preload.ts"]

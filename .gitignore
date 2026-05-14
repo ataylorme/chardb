@@ -1,0 +1,8 @@
+node_modules
+dist
+.chardb
+bun.lockb
+*.log
+.DS_Store
+test/workerd/.test-worker.bundle.mjs
+test/workerd/.test-catalog.bundle.mjs

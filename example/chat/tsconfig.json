@@ -1,0 +1,13 @@
+{
+    "extends": "../../tsconfig.json",
+    "compilerOptions": {
+        "composite": false,
+        "baseUrl": ".",
+        "paths": {
+            "chardb": ["../../src/index.ts"],
+            "chardb/*": ["../../src/*"]
+        }
+    },
+    "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts"],
+    "exclude": ["node_modules", "dist", "vite.config.ts"]
+}

@@ -1,0 +1,454 @@
+/**
+ * `Catalog` DO.
+ *
+ * Single per logical DB. Holds:
+ *   - schema + colocation graph + partition contract digest
+ *   - (vshard_lo, vshard_hi) → ShardDO range table (split-only, never merge)
+ *   - epoch counters: schema_epoch, auth_epoch_global, auth_epoch_tenant, auth_epoch_principal
+ *   - JWKS cache (SWR)
+ *   - reference tables (replicated)
+ *   - barrier records (PITR + tenant snapshot)
+ *
+ * Epoch bumps are CAS-guarded: every bump runs as `UPDATE … SET epoch=epoch+1`
+ * inside `transactionSync`; concurrent admin actions serialize at the DO input
+ * gate. Bootstrap blocks new requests until the schema migration has run via
+ * `state.blockConcurrencyWhile`
+ * (https://developers.cloudflare.com/durable-objects/api/state/#blockconcurrencywhile).
+ */
+
+import { DurableObject } from "cloudflare:workers";
+import { getTableConfig } from "drizzle-orm/sqlite-core";
+import { authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
+import { getAuthRuntime, tableFor } from "../../auth/runtime.ts";
+import type { RawJson } from "../../types.ts";
+import { type PrincipalId, ShardId, type TenantId, type Vshard } from "../../types.ts";
+import { VSHARD_COUNT, VshardMap, type VshardRange } from "../../vshard.ts";
+import { adaptSqlStorage } from "./sql_adapter.ts";
+
+const CATALOG_DDL = `
+CREATE TABLE IF NOT EXISTS catalog_meta (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS catalog_ranges (
+  lo INTEGER NOT NULL,
+  hi INTEGER NOT NULL,
+  shard_id TEXT NOT NULL,
+  PRIMARY KEY (lo)
+);
+CREATE TABLE IF NOT EXISTS catalog_epoch (
+  scope TEXT PRIMARY KEY,
+  scope_id TEXT NOT NULL,
+  epoch INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS catalog_jwks (
+  kid TEXT PRIMARY KEY,
+  jwk_json TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS catalog_barrier (
+  barrier_id TEXT PRIMARY KEY,
+  ts INTEGER NOT NULL,
+  expected_shards TEXT NOT NULL,
+  ack_shards TEXT NOT NULL,
+  bookmarks TEXT NOT NULL,
+  tenant_prefix TEXT
+);
+CREATE TABLE IF NOT EXISTS catalog_policy_digest (
+  digest TEXT PRIMARY KEY,
+  set_at INTEGER NOT NULL
+);
+` as const;
+
+export type CatalogEnv = {};
+
+/**
+ * Render a Drizzle column's SQLite affinity. Mirrors the four type
+ * affinities our auth synthesizer emits (`text`, `integer`, plus the
+ * boolean / timestamp_ms / json *modes* on integer / text). Unknown
+ * column types fall back to `TEXT` — the same conservative choice the
+ * synthesizer makes for forward-compat plugin schemas.
+ */
+function renderColumnType(col: { dataType: string }): string {
+    switch (col.dataType) {
+        case "number":
+        case "boolean":
+        case "bigint":
+        case "date":
+            return "INTEGER";
+        case "buffer":
+            return "BLOB";
+        default:
+            return "TEXT";
+    }
+}
+
+export interface RouteResult {
+    readonly shardId: ShardId;
+    readonly schemaEpoch: number;
+}
+
+export class Catalog extends DurableObject<CatalogEnv> {
+    private bootstrapped = false;
+    private cachedMap: VshardMap | null = null;
+
+    constructor(state: DurableObjectState, env: CatalogEnv) {
+        super(state, env);
+        state.blockConcurrencyWhile(async () => this.bootstrap());
+    }
+
+    private async bootstrap(): Promise<void> {
+        if (this.bootstrapped) return;
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        for (const stmt of CATALOG_DDL.split(";")
+            .map(s => s.trim())
+            .filter(Boolean)) {
+            sql.exec(stmt);
+        }
+        sql.exec(
+            "INSERT OR IGNORE INTO catalog_ranges (lo, hi, shard_id) VALUES (?, ?, ?)",
+            0,
+            VSHARD_COUNT - 1,
+            "ShardDO_0"
+        );
+        sql.exec(
+            "INSERT OR IGNORE INTO catalog_epoch (scope, scope_id, epoch) VALUES (?, ?, ?)",
+            "schema",
+            "global",
+            1
+        );
+        sql.exec(
+            "INSERT OR IGNORE INTO catalog_epoch (scope, scope_id, epoch) VALUES (?, ?, ?)",
+            "auth_global",
+            "global",
+            1
+        );
+        this.ensureReplicatedAuthTables();
+        this.bootstrapped = true;
+    }
+
+    /**
+     * Materialize the SQLite tables for every "replicated" auth model
+     * (`jwks`, `rateLimit`, plus anything else the user's auth profile
+     * marks as such via `PLUGIN_PARTITION_KEY_OVERRIDES`). These tables
+     * live on the Catalog DO instead of on a Cdb shard so every shard
+     * sees a single canonical copy without a fan-out write path. The
+     * DDL is rendered from the synthesized Drizzle schema so column
+     * additions in better-auth plugins flow through automatically.
+     */
+    private ensureReplicatedAuthTables(): void {
+        let runtime;
+        try {
+            runtime = getAuthRuntime();
+        } catch {
+            // Auth runtime not bound — chardb({auth}) wasn't configured.
+            // Catalog still needs to function for non-auth deployments.
+            return;
+        }
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        for (const [model, rule] of runtime.placement) {
+            if (rule.kind !== "replicated") continue;
+            const table = runtime.schema[model as keyof typeof runtime.schema];
+            if (!table) continue;
+            const cfg = getTableConfig(table);
+            const cols = cfg.columns
+                .map(c => {
+                    const sqlType = renderColumnType(c);
+                    const notNull = c.notNull ? " NOT NULL" : "";
+                    const pk = c.primary ? " PRIMARY KEY" : "";
+                    return `"${c.name}" ${sqlType}${pk}${notNull}`;
+                })
+                .join(", ");
+            sql.exec(`CREATE TABLE IF NOT EXISTS "${cfg.name}" (${cols})`);
+        }
+    }
+
+    /** Mirror of `Cdb.mutateAuth` for replicated models pinned to the Catalog DO. */
+    async mutateAuth(args: {
+        readonly model: string;
+        readonly op: "create" | "update" | "delete";
+        readonly where?: { readonly [k: string]: RawJson };
+        readonly payload?: { readonly [k: string]: RawJson };
+    }): Promise<{
+        readonly ok: true;
+        readonly row?: Record<string, RawJson> | null;
+        readonly affected?: number;
+    }> {
+        await this.bootstrap();
+        const table = tableFor(args.model);
+        let row: Record<string, RawJson> | null | undefined;
+        let affected = 0;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            switch (args.op) {
+                case "create":
+                    if (!args.payload) throw new Error("auth: create requires payload");
+                    row = authCreate(sql, table, args.payload);
+                    affected = 1;
+                    break;
+                case "update": {
+                    if (!args.where || !args.payload) {
+                        throw new Error("auth: update requires where and payload");
+                    }
+                    const r = authUpdate(sql, table, args.where, args.payload);
+                    row = r.row;
+                    affected = r.affected;
+                    break;
+                }
+                case "delete":
+                    if (!args.where) throw new Error("auth: delete requires where");
+                    affected = authDelete(sql, table, args.where).affected;
+                    break;
+            }
+        });
+        return { ok: true, row: row ?? null, affected };
+    }
+
+    /** Mirror of `Cdb.queryAuth` for replicated models. */
+    async queryAuth(args: {
+        readonly model: string;
+        readonly where: { readonly [k: string]: RawJson };
+        readonly limit?: number;
+    }): Promise<readonly Record<string, RawJson>[]> {
+        await this.bootstrap();
+        const table = tableFor(args.model);
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        if (args.limit === 1) {
+            const one = authFindOne(sql, table, args.where);
+            return one ? [one] : [];
+        }
+        return authFindMany(sql, table, args.where, args.limit);
+    }
+
+    private map(): VshardMap {
+        if (this.cachedMap) return this.cachedMap;
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        const rows: VshardRange[] = [];
+        const cursor = this.ctx.storage.sql.exec<{ lo: number; hi: number; shard_id: string }>(
+            "SELECT lo, hi, shard_id FROM catalog_ranges ORDER BY lo ASC"
+        );
+        for (const r of cursor) rows.push({ lo: r.lo, hi: r.hi, shardId: ShardId(r.shard_id) });
+        void sql;
+        this.cachedMap = new VshardMap(rows);
+        return this.cachedMap;
+    }
+
+    async route(vshard: number): Promise<RouteResult> {
+        return {
+            shardId: this.map().routeVshard(vshard as Vshard),
+            schemaEpoch: this.readEpoch("schema", "global"),
+        };
+    }
+
+    /**
+     * Atomic cutover for a vshard range. Combines (a) the range-table edit that
+     * reassigns `[lo, hi]` from `fromShard` to `toShard`, (b) a schema-epoch
+     * bump that invalidates every cached client route, and (c) an idempotency
+     * guard keyed by `migId` so a retry after a crash sees `applied=true` and
+     * leaves state unchanged. The whole sequence runs inside a single
+     * `transactionSync` so external observers either see the pre-cutover map at
+     * `epoch=N` or the post-cutover map at `epoch=N+1`, never a half-applied
+     * intermediate. Mirrors the `CatalogCutover` action in `spec/Resharder.tla`.
+     */
+    async cutover(args: {
+        migId: string;
+        lo: number;
+        hi: number;
+        fromShard: string;
+        toShard: string;
+    }): Promise<{ applied: boolean; newEpoch: number }> {
+        let applied = false;
+        let newEpoch = 0;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const guard = sql.one<{ v: string }>("SELECT v FROM catalog_meta WHERE k = ?", `cutover:${args.migId}`);
+            if (guard) {
+                newEpoch = this.readEpoch("schema", "global");
+                return;
+            }
+            const next = this.map().split(args.lo, args.hi, ShardId(args.toShard));
+            sql.exec("DELETE FROM catalog_ranges");
+            for (const r of next.ranges_()) {
+                sql.exec("INSERT INTO catalog_ranges (lo, hi, shard_id) VALUES (?, ?, ?)", r.lo, r.hi, r.shardId);
+            }
+            sql.exec("UPDATE catalog_epoch SET epoch = epoch + 1 WHERE scope = 'schema' AND scope_id = 'global'");
+            sql.exec("INSERT INTO catalog_meta (k, v) VALUES (?, ?)", `cutover:${args.migId}`, args.fromShard);
+            this.cachedMap = next;
+            applied = true;
+            const row = sql.one<{ epoch: number }>(
+                "SELECT epoch FROM catalog_epoch WHERE scope = 'schema' AND scope_id = 'global'"
+            );
+            newEpoch = row?.epoch ?? 0;
+        });
+        return { applied, newEpoch };
+    }
+
+    async splitRange(lo: number, hi: number, toShard: string): Promise<void> {
+        const next = this.map().split(lo, hi, ShardId(toShard));
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            sql.exec("DELETE FROM catalog_ranges");
+            for (const r of next.ranges_()) {
+                sql.exec("INSERT INTO catalog_ranges (lo, hi, shard_id) VALUES (?, ?, ?)", r.lo, r.hi, r.shardId);
+            }
+            sql.exec("UPDATE catalog_epoch SET epoch = epoch + 1 WHERE scope = 'schema' AND scope_id = 'global'");
+        });
+        this.cachedMap = next;
+    }
+
+    bumpAuthEpoch(scope: "global" | "tenant" | "principal", scopeId: string): number {
+        const dbScope = scope === "global" ? "auth_global" : scope === "tenant" ? "auth_tenant" : "auth_principal";
+        let next = 1;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            sql.exec("INSERT OR IGNORE INTO catalog_epoch (scope, scope_id, epoch) VALUES (?, ?, 0)", dbScope, scopeId);
+            sql.exec("UPDATE catalog_epoch SET epoch = epoch + 1 WHERE scope = ? AND scope_id = ?", dbScope, scopeId);
+            const row = sql.one<{ epoch: number }>(
+                "SELECT epoch FROM catalog_epoch WHERE scope = ? AND scope_id = ?",
+                dbScope,
+                scopeId
+            );
+            next = row?.epoch ?? 1;
+        });
+        return next;
+    }
+
+    private readEpoch(scope: string, scopeId: string): number {
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        const row = sql.one<{ epoch: number }>(
+            "SELECT epoch FROM catalog_epoch WHERE scope = ? AND scope_id = ?",
+            scope,
+            scopeId
+        );
+        return row?.epoch ?? 0;
+    }
+
+    authEpoch(args: { tenantId?: TenantId; principalId?: PrincipalId }): {
+        global: number;
+        tenant: number;
+        principal: number;
+    } {
+        return {
+            global: this.readEpoch("auth_global", "global"),
+            tenant: args.tenantId ? this.readEpoch("auth_tenant", args.tenantId) : 0,
+            principal: args.principalId ? this.readEpoch("auth_principal", args.principalId) : 0,
+        };
+    }
+
+    async putJwk(kid: string, jwkJson: string, ttlMs: number): Promise<void> {
+        const now = Date.now();
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        sql.exec(
+            `INSERT INTO catalog_jwks (kid, jwk_json, fetched_at, expires_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(kid) DO UPDATE SET jwk_json = excluded.jwk_json, fetched_at = excluded.fetched_at, expires_at = excluded.expires_at`,
+            kid,
+            jwkJson,
+            now,
+            now + ttlMs
+        );
+    }
+
+    async getJwk(kid: string): Promise<{ jwkJson: string; expiresAt: number } | null> {
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        const row = sql.one<{ jwk_json: string; expires_at: number }>(
+            "SELECT jwk_json, expires_at FROM catalog_jwks WHERE kid = ?",
+            kid
+        );
+        return row ? { jwkJson: row.jwk_json, expiresAt: row.expires_at } : null;
+    }
+
+    async recordBarrier(args: {
+        barrierId: string;
+        ts: number;
+        expectedShards: readonly string[];
+        tenantPrefix?: string;
+    }): Promise<void> {
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        sql.exec(
+            `INSERT OR REPLACE INTO catalog_barrier
+       (barrier_id, ts, expected_shards, ack_shards, bookmarks, tenant_prefix) VALUES (?, ?, ?, '[]', '{}', ?)`,
+            args.barrierId,
+            args.ts,
+            JSON.stringify(args.expectedShards),
+            args.tenantPrefix ?? null
+        );
+    }
+
+    /**
+     * Records a shard ack against an outstanding barrier. The bookmark is the
+     * shard's `_chardb_op_log` row id at the moment it observed the barrier;
+     * a barrier is "complete" once every expected shard has acked, at which
+     * point the (barrierId → bookmarks) map is the durable PITR snapshot
+     * coordinate for the cluster.
+     */
+    async ackBarrier(args: {
+        barrierId: string;
+        shardId: string;
+        bookmark: number;
+    }): Promise<{ complete: boolean }> {
+        let complete = false;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const row = sql.one<{ expected_shards: string; ack_shards: string; bookmarks: string }>(
+                "SELECT expected_shards, ack_shards, bookmarks FROM catalog_barrier WHERE barrier_id = ?",
+                args.barrierId
+            );
+            if (!row) return;
+            const expected = JSON.parse(row.expected_shards) as string[];
+            const acks = new Set<string>(JSON.parse(row.ack_shards) as string[]);
+            const bookmarks = JSON.parse(row.bookmarks) as Record<string, number>;
+            acks.add(args.shardId);
+            bookmarks[args.shardId] = args.bookmark;
+            sql.exec(
+                "UPDATE catalog_barrier SET ack_shards = ?, bookmarks = ? WHERE barrier_id = ?",
+                JSON.stringify([...acks].sort()),
+                JSON.stringify(bookmarks),
+                args.barrierId
+            );
+            complete = expected.every(s => acks.has(s));
+        });
+        return { complete };
+    }
+
+    /**
+     * One barrier tick. Called by the parent Worker's cron at the cadence
+     * controlled by `policy.pitr.barrierIntervalMs` (default 60s). Returns the
+     * created barrier id so the caller can fan out shard-side ack RPCs.
+     */
+    async openBarrier(now: number): Promise<{ barrierId: string; expectedShards: readonly string[] }> {
+        const expectedShards = [
+            ...new Set(
+                this.map()
+                    .ranges_()
+                    .map(r => r.shardId as string)
+            ),
+        ].sort();
+        const barrierId = `b-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        await this.recordBarrier({ barrierId, ts: now, expectedShards });
+        return { barrierId, expectedShards };
+    }
+
+    /**
+     * Lists open (incomplete) barriers — useful for the doctor command and the
+     * Resharder's "wait for last barrier ack" precondition before cutover.
+     */
+    async openBarriers(): Promise<readonly { barrierId: string; ts: number; missing: readonly string[] }[]> {
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        const out: { barrierId: string; ts: number; missing: readonly string[] }[] = [];
+        const cursor = this.ctx.storage.sql.exec<{
+            barrier_id: string;
+            ts: number;
+            expected_shards: string;
+            ack_shards: string;
+        }>("SELECT barrier_id, ts, expected_shards, ack_shards FROM catalog_barrier ORDER BY ts ASC");
+        for (const r of cursor) {
+            const expected = JSON.parse(r.expected_shards) as string[];
+            const acks = new Set<string>(JSON.parse(r.ack_shards) as string[]);
+            const missing = expected.filter(s => !acks.has(s));
+            if (missing.length > 0) out.push({ barrierId: r.barrier_id, ts: r.ts, missing });
+        }
+        void sql;
+        return out;
+    }
+}
