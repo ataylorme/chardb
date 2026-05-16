@@ -75,14 +75,16 @@ type AutoFillKeys<K extends TenantKind, TCols, TConfig> =
  * snapshots in `_.columns` is unchanged, and the proxy fills the value
  * before Drizzle's insert builder runs.
  */
-type CdbBuiltTable<TName extends string, TCols extends CdbColumnsInput, TAutoFill extends string> =
-    BuiltTable<TName, TCols> extends infer T
-        ? T extends { readonly $inferInsert: infer I }
-            ? Omit<T, "$inferInsert"> & {
-                  readonly $inferInsert: Omit<I, TAutoFill & keyof I> & Partial<Pick<I, TAutoFill & keyof I>>;
-              }
-            : T
-        : never;
+type CdbBuiltTable<TName extends string, TCols extends CdbColumnsInput, TAutoFill extends string> = BuiltTable<
+    TName,
+    TCols
+> extends infer T
+    ? T extends { readonly $inferInsert: infer I }
+        ? Omit<T, "$inferInsert"> & {
+              readonly $inferInsert: Omit<I, TAutoFill & keyof I> & Partial<Pick<I, TAutoFill & keyof I>>;
+          }
+        : T
+    : never;
 
 export interface BoundCdbTable<K extends TenantKind> {
     /**

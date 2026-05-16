@@ -46,14 +46,7 @@ export type AuthPartitionRule =
     | { readonly kind: "replicated" };
 
 /** Models that key on `organizationId` for tenant-rooted partitioning. */
-const TENANT_MODELS = new Set([
-    "organization",
-    "member",
-    "invitation",
-    "team",
-    "teamMember",
-    "organizationRole",
-]);
+const TENANT_MODELS = new Set(["organization", "member", "invitation", "team", "teamMember", "organizationRole"]);
 
 /** Models that key on `userId` (or `id` for `user`) for principal-rooted partitioning. */
 const PRINCIPAL_MODELS = new Set([

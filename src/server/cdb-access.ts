@@ -32,11 +32,7 @@ import type { AccessControl, Role, Statements } from "better-auth/plugins/access
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../errors.ts";
 import { collectCdbTables } from "./cdb-table-registry.ts";
-import {
-    type CdbTableMeta,
-    ROW_VERBS,
-    type Verb,
-} from "./cdb-table-types.ts";
+import { type CdbTableMeta, ROW_VERBS, type Verb } from "./cdb-table-types.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
 
 export interface BuiltAccessControl {

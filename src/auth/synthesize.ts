@@ -340,14 +340,7 @@ function pluginById(plugins: readonly BetterAuthPlugin[] | undefined, id: string
 }
 
 /** Tables the bundled `organization()` plugin contributes. Used to widen the synthesized schema's static type. */
-const ORG_PLUGIN_TABLES = [
-    "organization",
-    "member",
-    "invitation",
-    "team",
-    "teamMember",
-    "organizationRole",
-] as const;
+const ORG_PLUGIN_TABLES = ["organization", "member", "invitation", "team", "teamMember", "organizationRole"] as const;
 
 /**
  * Default chardb auth profile: `organization()` and `admin()` are
@@ -370,7 +363,10 @@ export function withChardbDefaults<TPlugins extends readonly BetterAuthPlugin[]>
 export function defineAuth<
     const TPlugins extends readonly BetterAuthPlugin[] = [],
     const TExtra extends readonly string[] = [],
->(options: AuthOptionsInput<TPlugins>, extraTables?: TExtra): ChardbAuth<TPlugins, TExtra[number] | (typeof ORG_PLUGIN_TABLES)[number]> {
+>(
+    options: AuthOptionsInput<TPlugins>,
+    extraTables?: TExtra
+): ChardbAuth<TPlugins, TExtra[number] | (typeof ORG_PLUGIN_TABLES)[number]> {
     const expandedOptions = withChardbDefaults(options);
     const tables = synthesizeAuthSchema(expandedOptions, extraTables);
     // Re-key the result back to TPlugins-shaped (the bundled defaults

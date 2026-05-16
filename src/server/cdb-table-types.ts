@@ -67,10 +67,7 @@ export type VerbValue<TCols, _V extends Verb = Verb> =
  * columns; `["read","create"]` = these verbs, all columns) or a
  * per-verb breakdown.
  */
-export type RoleValue<TCols> =
-    | "*"
-    | readonly Verb[]
-    | { readonly [V in Verb]?: VerbValue<TCols> };
+export type RoleValue<TCols> = "*" | readonly Verb[] | { readonly [V in Verb]?: VerbValue<TCols> };
 
 /** Column-axis CLS spec: one entry per column, listing which roles get each verb. */
 export type ColumnSpec<TCols, R extends string = RoleName> = {
@@ -179,7 +176,10 @@ export interface CdbTableMeta {
      */
     readonly tenantBy: string | undefined;
     /** Resolved partition spec for the colocation algorithm. */
-    readonly partitionBy: { readonly kind: "colocate"; readonly via: readonly string[] } | { readonly kind: "self" } | { readonly kind: "replicated" };
+    readonly partitionBy:
+        | { readonly kind: "colocate"; readonly via: readonly string[] }
+        | { readonly kind: "self" }
+        | { readonly kind: "replicated" };
     /** Whether SELECT is open to anonymous callers. */
     readonly publicRead: boolean;
     /** User-declared roles (raw, unvalidated). */

@@ -72,7 +72,8 @@ export interface ChardbAuthAdapterOptions {
 
 export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactory<BetterAuthOptions> {
     const { env } = opts;
-    const catalog = (): CatalogRpc => env.CDB_CATALOG.get(env.CDB_CATALOG.idFromName("global")) as unknown as CatalogRpc;
+    const catalog = (): CatalogRpc =>
+        env.CDB_CATALOG.get(env.CDB_CATALOG.idFromName("global")) as unknown as CatalogRpc;
     const shardFor = (shardId: string): CdbAuthRpc =>
         env.CDB_SHARD.get(env.CDB_SHARD.idFromName(shardId)) as unknown as CdbAuthRpc;
 
@@ -164,7 +165,10 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
             async findMany({ model, where, limit }) {
                 const flat = where ? whereToFlat(where) : {};
                 const rule = placementFor(model);
-                if (rule.kind === "replicated" || flat[rule.kind === "tenant" ? rule.column : rule.column] !== undefined) {
+                if (
+                    rule.kind === "replicated" ||
+                    flat[rule.kind === "tenant" ? rule.column : rule.column] !== undefined
+                ) {
                     const rpc = await ownerFor(model, flat);
                     const rows = await rpc.queryAuth({ model, where: flat, limit: limit ?? 100 });
                     return rows as never;

@@ -115,9 +115,7 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
                   }
                 : undefined);
         if (!props.endpoint || !getJwt) {
-            throw new Error(
-                "ChardbProvider requires {endpoint} plus either {getJwt} or {auth: createAuthClient(...)}"
-            );
+            throw new Error("ChardbProvider requires {endpoint} plus either {getJwt} or {auth: createAuthClient(...)}");
         }
         return createChardbClient({
             endpoint: props.endpoint,
@@ -140,10 +138,7 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
 
     useEffect(() => () => client.close(), [client]);
 
-    const value = useMemo<ChardbContextValue>(
-        () => ({ client, auth: props.auth ?? null }),
-        [client, props.auth]
-    );
+    const value = useMemo<ChardbContextValue>(() => ({ client, auth: props.auth ?? null }), [client, props.auth]);
 
     return createElement(ChardbCtx.Provider, { value }, props.children);
 }
@@ -180,11 +175,7 @@ export interface QueryHandleStamp<TArgs> {
  * queries (`Promise<readonly Row[]>` / `Promise<Row[]>`) resolve to
  * `Row`; scalar queries resolve to the awaited value.
  */
-type RowOf<F> = F extends (...args: never[]) => Promise<infer R>
-    ? R extends readonly (infer Row)[]
-        ? Row
-        : R
-    : never;
+type RowOf<F> = F extends (...args: never[]) => Promise<infer R> ? (R extends readonly (infer Row)[] ? Row : R) : never;
 
 type ArgsOf<F> = F extends (ctx: never, args: infer A) => unknown ? A : never;
 

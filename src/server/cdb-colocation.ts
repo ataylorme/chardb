@@ -22,9 +22,7 @@ import type { PolicyInput } from "../colocation/types.ts";
 import { collectCdbTables } from "./cdb-table-registry.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
 
-export function buildColocationOverrides(
-    schema: Record<string, unknown>
-): Pick<PolicyInput, "overrides"> {
+export function buildColocationOverrides(schema: Record<string, unknown>): Pick<PolicyInput, "overrides"> {
     const overrides: PolicyInput["overrides"] = {};
     for (const { meta, table } of collectCdbTables(schema)) {
         const resolved = resolveCdbMeta(table);

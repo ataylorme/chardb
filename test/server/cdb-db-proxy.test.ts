@@ -98,9 +98,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         );
 
         const { db, captured } = makeStubDb();
-        wrapDb(db, baseAuth)
-            .insert(messages)
-            .values({ id: "m1", body: "hi" });
+        wrapDb(db, baseAuth).insert(messages).values({ id: "m1", body: "hi" });
 
         expect(captured).toHaveLength(1);
         expect(captured[0]?.rows).toEqual({ id: "m1", body: "hi", authorId: "u-alice" });
@@ -117,9 +115,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         });
 
         const { db, captured } = makeStubDb();
-        wrapDb(db, baseAuth)
-            .insert(channels)
-            .values({ id: "c1", name: "general" });
+        wrapDb(db, baseAuth).insert(channels).values({ id: "c1", name: "general" });
 
         expect(captured[0]?.rows).toEqual({ id: "c1", name: "general", organizationId: "org-acme" });
     });
@@ -140,9 +136,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         );
 
         const { db, captured } = makeStubDb();
-        wrapDb(db, baseAuth)
-            .insert(ledger)
-            .values({ id: "l1", amount: 100 });
+        wrapDb(db, baseAuth).insert(ledger).values({ id: "l1", amount: 100 });
 
         expect(captured[0]?.rows).toEqual({ id: "l1", amount: 100, primaryOrgId: "org-acme" });
     });
@@ -158,9 +152,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         });
 
         const { db, captured } = makeStubDb();
-        wrapDb(db, baseAuth)
-            .insert(notes)
-            .values({ id: "n1", body: "todo" });
+        wrapDb(db, baseAuth).insert(notes).values({ id: "n1", body: "todo" });
 
         expect(captured[0]?.rows).toEqual({ id: "n1", body: "todo", userId: "u-alice" });
     });
@@ -176,9 +168,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         });
 
         const { db, captured } = makeStubDb();
-        wrapDb(db, baseAuth)
-            .insert(channels)
-            .values({ id: "c1", organizationId: "org-other", name: "general" });
+        wrapDb(db, baseAuth).insert(channels).values({ id: "c1", organizationId: "org-other", name: "general" });
 
         expect(captured[0]?.rows).toEqual({
             id: "c1",
@@ -218,9 +208,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         });
 
         const { db, captured } = makeStubDb();
-        wrapDb(db, baseAuth)
-            .insert(raw)
-            .values({ id: "r1", value: "noop" });
+        wrapDb(db, baseAuth).insert(raw).values({ id: "r1", value: "noop" });
 
         expect(captured[0]?.rows).toEqual({ id: "r1", value: "noop" });
     });
@@ -237,9 +225,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
         const anonAuth: AuthCtx = { ...baseAuth, tenantId: undefined };
         const { db, captured } = makeStubDb();
-        wrapDb(db, anonAuth)
-            .insert(channels)
-            .values({ id: "c1", name: "general" });
+        wrapDb(db, anonAuth).insert(channels).values({ id: "c1", name: "general" });
 
         expect(captured[0]?.rows).toEqual({ id: "c1", name: "general" });
     });

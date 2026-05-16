@@ -88,10 +88,7 @@ function projectRow(info: TableInfo, raw: Record<string, unknown>): Record<strin
     return out;
 }
 
-function bindWhere(
-    info: TableInfo,
-    where: { readonly [k: string]: RawJson }
-): { sql: string; params: SqlValue[] } {
+function bindWhere(info: TableInfo, where: { readonly [k: string]: RawJson }): { sql: string; params: SqlValue[] } {
     const keys = Object.keys(where);
     if (keys.length === 0) return { sql: "1=1", params: [] };
     const parts: string[] = [];
@@ -160,11 +157,7 @@ export function authUpdate(
         return { affected: 0, row: authFindOne(sql, table, where) };
     }
     const w = bindWhere(info, where);
-    sql.exec(
-        `UPDATE ${quoteIdent(info.name)} SET ${setCols.join(", ")} WHERE ${w.sql}`,
-        ...params,
-        ...w.params
-    );
+    sql.exec(`UPDATE ${quoteIdent(info.name)} SET ${setCols.join(", ")} WHERE ${w.sql}`, ...params, ...w.params);
     const affected = sql.changes();
     const row = authFindOne(sql, table, where);
     return { affected, row };
@@ -211,11 +204,7 @@ export function authFindMany(
     return rows.map(r => projectRow(info, r));
 }
 
-export function authCount(
-    sql: SyncSql,
-    table: AnySQLiteTable,
-    where: { readonly [k: string]: RawJson }
-): number {
+export function authCount(sql: SyncSql, table: AnySQLiteTable, where: { readonly [k: string]: RawJson }): number {
     const info = infoOf(table);
     const w = bindWhere(info, where);
     const row = sql.one<{ c: number }>(

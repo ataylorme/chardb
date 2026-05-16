@@ -33,12 +33,7 @@ import { eq, type SQL } from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import type { AuthCtx } from "./define.ts";
 import { chardbPolicy, type PolicyDefinition } from "./policy.ts";
-import {
-    type CdbTableMeta,
-    type ColVerb,
-    COL_VERBS,
-    type Verb,
-} from "./cdb-table-types.ts";
+import { type CdbTableMeta, type ColVerb, COL_VERBS, type Verb } from "./cdb-table-types.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
 
 /**
@@ -212,7 +207,10 @@ function callerHasRole(auth: AuthCtx, role: string): boolean {
         if (roles.includes(target)) return true;
         const userRole = (auth.claims as { readonly userRole?: unknown }).userRole;
         if (typeof userRole === "string") {
-            return userRole.split(",").map(s => s.trim()).includes(target);
+            return userRole
+                .split(",")
+                .map(s => s.trim())
+                .includes(target);
         }
         return false;
     }
@@ -221,7 +219,11 @@ function callerHasRole(auth: AuthCtx, role: string): boolean {
 
 function splitCallerRoles(auth: AuthCtx): readonly string[] {
     if (auth.roles && auth.roles.length > 0) return auth.roles;
-    if (auth.role) return auth.role.split(",").map(s => s.trim()).filter(Boolean);
+    if (auth.role)
+        return auth.role
+            .split(",")
+            .map(s => s.trim())
+            .filter(Boolean);
     return [];
 }
 

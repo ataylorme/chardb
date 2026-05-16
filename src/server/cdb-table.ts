@@ -108,11 +108,7 @@ export function createCdbTable<TName extends string, TCols extends CdbColumnsInp
     }
     const tenantByOverride = tenantByJs !== undefined ? toSql(tenantByJs) : undefined;
 
-    const partitionByRaw = cfg.partitionBy as
-        | string
-        | readonly string[]
-        | "replicated"
-        | undefined;
+    const partitionByRaw = cfg.partitionBy as string | readonly string[] | "replicated" | undefined;
     let partitionByResolved: string | readonly string[] | "replicated" | undefined = partitionByRaw;
     if (Array.isArray(partitionByRaw)) {
         const sqlVia: string[] = [];
@@ -158,7 +154,7 @@ export function createCdbTable<TName extends string, TCols extends CdbColumnsInp
             throw new CdbError({
                 code: "CDB_INVALID_SELF",
                 message: `cdbTable("${args.name}"): \`self\` appears in roles/columns but selfBy is missing`,
-                hint: "add `selfBy: \"<userFkColumn>\"` to bind the row's user-FK column",
+                hint: 'add `selfBy: "<userFkColumn>"` to bind the row\'s user-FK column',
             });
         }
     }
@@ -365,13 +361,7 @@ function compileColumnMatrix<TCols extends CdbColumnsInput>(args: {
         if (typeof spec !== "object" || spec === null || Array.isArray(spec)) continue;
         for (const verb of COL_VERBS) {
             const vv = (spec as { readonly [V in Verb]?: VerbValue<CdbColumnsInput> })[verb];
-            if (
-                vv &&
-                typeof vv === "object" &&
-                !Array.isArray(vv) &&
-                vv !== null &&
-                "exclude" in vv
-            ) {
+            if (vv && typeof vv === "object" && !Array.isArray(vv) && vv !== null && "exclude" in vv) {
                 const excluded = (vv as { readonly exclude: readonly string[] }).exclude;
                 for (const colJs of excluded) {
                     const colSpec = args.rawColumns[colJs];
@@ -392,7 +382,7 @@ function compileColumnMatrix<TCols extends CdbColumnsInput>(args: {
     for (const [role, byVerb] of allowed) {
         const v = new Map<ColVerb, ReadonlySet<string> | null>();
         for (const [verb, cols] of byVerb) {
-            v.set(verb, cols === null ? null : Object.freeze(new Set(cols)) as ReadonlySet<string>);
+            v.set(verb, cols === null ? null : (Object.freeze(new Set(cols)) as ReadonlySet<string>));
         }
         allowedFrozen.set(role, v as ReadonlyMap<ColVerb, ReadonlySet<string> | null>);
     }
@@ -445,4 +435,3 @@ function expandVerbValue<TCols extends CdbColumnsInput>(
     }
     return new Set();
 }
-

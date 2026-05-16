@@ -72,7 +72,9 @@ describe("forOrg() / cdbTable", () => {
             "tbl_forOrg_autodiscover",
             {
                 id: text("id").primaryKey(),
-                organizationId: text("organization_id").notNull().references(() => orgTable.id),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
                 name: text("name").notNull(),
             },
             {}
@@ -86,8 +88,12 @@ describe("forOrg() / cdbTable", () => {
             "tbl_forOrg_ambig",
             {
                 id: text("id").primaryKey(),
-                primaryOrgId: text("primary_org_id").notNull().references(() => orgTable.id),
-                secondaryOrgId: text("secondary_org_id").notNull().references(() => orgTable.id),
+                primaryOrgId: text("primary_org_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                secondaryOrgId: text("secondary_org_id")
+                    .notNull()
+                    .references(() => orgTable.id),
             },
             {}
         );
@@ -99,8 +105,12 @@ describe("forOrg() / cdbTable", () => {
             "tbl_forOrg_ambig_resolved",
             {
                 id: text("id").primaryKey(),
-                primaryOrgId: text("primary_org_id").notNull().references(() => orgTable.id),
-                secondaryOrgId: text("secondary_org_id").notNull().references(() => orgTable.id),
+                primaryOrgId: text("primary_org_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                secondaryOrgId: text("secondary_org_id")
+                    .notNull()
+                    .references(() => orgTable.id),
             },
             { tenantBy: "primaryOrgId" }
         );
@@ -109,11 +119,7 @@ describe("forOrg() / cdbTable", () => {
     });
 
     test("missing FK to organization throws CDB_MISSING_TENANT_FK", () => {
-        const t = cdbTable(
-            "tbl_forOrg_missing",
-            { id: text("id").primaryKey(), name: text("name").notNull() },
-            {}
-        );
+        const t = cdbTable("tbl_forOrg_missing", { id: text("id").primaryKey(), name: text("name").notNull() }, {});
         expectCdbError(() => resolveCdbMeta(t), "CDB_MISSING_TENANT_FK");
     });
 
@@ -124,8 +130,12 @@ describe("forOrg() / cdbTable", () => {
                     "tbl_forOrg_selfWithoutSelfBy",
                     {
                         id: text("id").primaryKey(),
-                        organizationId: text("organization_id").notNull().references(() => orgTable.id),
-                        authorId: text("author_id").notNull().references(() => userTable.id),
+                        organizationId: text("organization_id")
+                            .notNull()
+                            .references(() => orgTable.id),
+                        authorId: text("author_id")
+                            .notNull()
+                            .references(() => userTable.id),
                     },
                     { roles: { self: { read: "*" } } }
                 ),
@@ -138,8 +148,12 @@ describe("forOrg() / cdbTable", () => {
             "tbl_forOrg_selfOk",
             {
                 id: text("id").primaryKey(),
-                organizationId: text("organization_id").notNull().references(() => orgTable.id),
-                authorId: text("author_id").notNull().references(() => userTable.id),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                authorId: text("author_id")
+                    .notNull()
+                    .references(() => userTable.id),
                 body: text("body").notNull(),
             },
             { selfBy: "authorId", roles: { self: { read: "*", update: ["body"], delete: true } } }
@@ -157,7 +171,9 @@ describe("forUser() / cdbTable", () => {
             "tbl_forUser_autodiscover",
             {
                 id: text("id").primaryKey(),
-                userId: text("user_id").notNull().references(() => userTable.id),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
                 body: text("body").notNull(),
             },
             { roles: { admin: "*" } }
@@ -174,7 +190,9 @@ describe("forUser() / cdbTable", () => {
                     "tbl_forUser_rejectsSelfBy",
                     {
                         id: text("id").primaryKey(),
-                        userId: text("user_id").notNull().references(() => userTable.id),
+                        userId: text("user_id")
+                            .notNull()
+                            .references(() => userTable.id),
                     },
                     { selfBy: "userId" } as never
                 ),
@@ -218,8 +236,12 @@ describe("compileCdbPolicies — RLS shape parity", () => {
         "messages_for_compile",
         {
             id: text("id").primaryKey(),
-            organizationId: text("organization_id").notNull().references(() => orgTable.id),
-            authorId: text("author_id").notNull().references(() => userTable.id),
+            organizationId: text("organization_id")
+                .notNull()
+                .references(() => orgTable.id),
+            authorId: text("author_id")
+                .notNull()
+                .references(() => userTable.id),
             body: text("body").notNull(),
             flagged: text("flagged"),
         },
@@ -278,8 +300,12 @@ describe("CLS — applyColumnMask + assertColumnsWritable", () => {
         "messages_for_cls",
         {
             id: text("id").primaryKey(),
-            organizationId: text("organization_id").notNull().references(() => orgTable.id),
-            authorId: text("author_id").notNull().references(() => userTable.id),
+            organizationId: text("organization_id")
+                .notNull()
+                .references(() => orgTable.id),
+            authorId: text("author_id")
+                .notNull()
+                .references(() => userTable.id),
             body: text("body").notNull(),
             flaggedReason: text("flagged_reason"),
         },
@@ -359,7 +385,9 @@ describe("buildAccessControl", () => {
         "channels_for_ac",
         {
             id: text("id").primaryKey(),
-            organizationId: text("organization_id").notNull().references(() => orgTable.id),
+            organizationId: text("organization_id")
+                .notNull()
+                .references(() => orgTable.id),
         },
         { roles: { admin: "*", member: { read: "*" } } }
     );
@@ -367,8 +395,12 @@ describe("buildAccessControl", () => {
         "messages_for_ac",
         {
             id: text("id").primaryKey(),
-            organizationId: text("organization_id").notNull().references(() => orgTable.id),
-            authorId: text("author_id").notNull().references(() => userTable.id),
+            organizationId: text("organization_id")
+                .notNull()
+                .references(() => orgTable.id),
+            authorId: text("author_id")
+                .notNull()
+                .references(() => userTable.id),
             body: text("body").notNull(),
         },
         {

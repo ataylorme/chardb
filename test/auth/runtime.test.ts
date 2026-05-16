@@ -93,9 +93,7 @@ describe("auth/sql — render path against bun:sqlite", () => {
         const { sql } = bootstrap();
         const t = tableFor("user");
         const cfg = authTableColumns(t);
-        const colDDL = [...cfg.entries()]
-            .map(([_, sqlName]) => `"${sqlName}" TEXT`)
-            .join(", ");
+        const colDDL = [...cfg.entries()].map(([_, sqlName]) => `"${sqlName}" TEXT`).join(", ");
         sql.exec(`CREATE TABLE "user" (${colDDL})`);
 
         authCreate(sql, t, { id: "u1", email: "a@b.com", name: "A", emailVerified: false });
@@ -150,9 +148,7 @@ describe("auth/sql — render path against bun:sqlite", () => {
         const cfg = authTableColumns(t);
         const colDDL = [...cfg.entries()].map(([_, n]) => `"${n}" TEXT`).join(", ");
         sql.exec(`CREATE TABLE "user" (${colDDL})`);
-        expect(() => authFindOne(sql, t, { notAColumn: "x" } as never)).toThrow(
-            /not a column/
-        );
+        expect(() => authFindOne(sql, t, { notAColumn: "x" } as never)).toThrow(/not a column/);
     });
 });
 

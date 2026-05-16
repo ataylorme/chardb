@@ -406,11 +406,7 @@ export interface MountChardbOptions {
      * it has no `env` at module-init time and must defer construction
      * until the first request lands.
      */
-    readonly authHandler?: (
-        request: Request,
-        env: ChardbEnv,
-        ctx: ExecutionContext
-    ) => Response | Promise<Response>;
+    readonly authHandler?: (request: Request, env: ChardbEnv, ctx: ExecutionContext) => Response | Promise<Response>;
     /** Path prefix the better-auth handler owns. Defaults to `/api/auth`. */
     readonly authBasePath?: string;
 }

@@ -285,10 +285,7 @@ function buildDefaultAuthHandler(
  * those win (we only fill in the chardb defaults when the keys are
  * absent).
  */
-function applyCdbAccessControl(
-    authOptions: BetterAuthOptions,
-    schema: Record<string, unknown>
-): BetterAuthOptions {
+function applyCdbAccessControl(authOptions: BetterAuthOptions, schema: Record<string, unknown>): BetterAuthOptions {
     const built = buildAccessControl(schema);
     const plugins = (authOptions.plugins ?? []) as readonly BetterAuthPlugin[];
     const next: BetterAuthPlugin[] = [];
