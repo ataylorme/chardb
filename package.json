@@ -10,6 +10,7 @@
         "chardb": "./dist/cli/bin.mjs"
     },
     "files": ["dist", "src", "README.md"],
+    "workspaces": ["landing"],
     "scripts": {
         "build": "unbuild",
         "build:stub": "unbuild --stub",
