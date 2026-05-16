@@ -22,7 +22,7 @@ bun test
 ## Package layout
 
 - `chardb` — client, types, error codes
-- `chardb/server` — `defineChardb`, `defineAuth`, `createApi`, `defineMutation` / `defineQuery` / `definePresenceKey`, the access-control DSL (`tenantScope` / `ownerScope` / `requireRole` / `requirePermission` / `publicRead` / `createAccessControl` lifted from better-auth), `manifestFromExports`, `mountChardb`, scatter-gather helpers (`mergeTopK` / `mergePartialAggregates`), and the Durable Object base classes wrangler binds (`Cdb`, `Catalog`, `Gateway`, `BlobMeta`, `Resharder`, `GsiShard`)
+- `chardb/server` — `defineChardb`, `defineAuth`, `createApi`, `defineMutation` / `defineQuery` / `definePresenceKey`, the schema-first cdbTable surface (`forOrg` / `forUser` / `globalScope` factories that return a tenancy-bound `cdbTable(name, columns, config)`; `compileCdbPolicies`, `applyColumnMask`, `assertColumnsWritable`, `buildAccessControl` for runtime enforcement; `createAccessControl` re-exported from better-auth for hand-built lattices), `manifestFromExports`, `mountChardb`, scatter-gather helpers (`mergeTopK` / `mergePartialAggregates`), and the Durable Object base classes wrangler binds (`Cdb`, `Catalog`, `Gateway`, `BlobMeta`, `Resharder`, `GsiShard`)
 - `chardb/drizzle` — async SQLite driver
 - `chardb/files` — `file()` / `fileArray()` Drizzle column types + validator adapters (`chardb/files/{zod,typebox,valibot,arktype}`)
 - `chardb/auth` — `defineAuth` / `synthesizeAuthSchema` for the auth-table namespace; `withChardb` for wrapping an existing better-auth DBAdapter with epoch dispatch

@@ -1,21 +1,20 @@
 import { anonymous } from "better-auth/plugins/anonymous";
 import { jwt } from "better-auth/plugins/jwt";
-import { organization } from "better-auth/plugins/organization";
-import { chardb, defineAuth, defineRoles } from "chardb/server";
+import { chardb, defineAuth } from "chardb/server";
 import * as api from "./api.ts";
 import * as queries from "./queries.ts";
 import * as domain from "./schema.ts";
 
 const DEMO_ORG_ID = "demo-org" as const;
 
+// `defineAuth` bakes `organization()` and `admin()` into the plugin
+// list automatically — schema files reference `auth.organization` /
+// `auth.member` / etc without the user listing the plugin, and
+// cdbTable's role lattice (member.role for org tenants, user.role for
+// user/global tenants) is wired up the same way.
 export const auth = defineAuth({
     appName: "chardb-chat-example",
-    plugins: [organization(), anonymous(), jwt()],
-    // Bootstrap a single shared demo organization on every successful
-    // sign-in (anonymous flow included): create it if missing, add the
-    // signing-in user as a member, set it active. Production apps
-    // typically gate org creation behind a paid tier — this hook is
-    // the example's stand-in for that flow.
+    plugins: [anonymous(), jwt()],
     databaseHooks: {
         session: {
             create: {
@@ -57,17 +56,6 @@ export const auth = defineAuth({
         },
     },
 });
-
-export const chatRoles = defineRoles(
-    {
-        messages: ["create", "update", "delete"],
-        channels: ["create", "rename", "delete"],
-    },
-    {
-        admin: { channels: ["create", "rename"] },
-        member: { messages: ["create"] },
-    }
-);
 
 export const app = chardb({ auth, schema: domain, api: { ...api, ...queries } });
 

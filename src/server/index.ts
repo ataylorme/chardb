@@ -70,20 +70,26 @@ export {
     type PolicyDigestEntry,
     type PolicyOp,
 } from "./policy.ts";
+export { forOrg, forUser, globalScope } from "./cdb-tenant.ts";
+export type { BoundCdbTable } from "./cdb-tenant.ts";
 export {
-    createAccessControl,
-    defineRoles,
-    ownerScope,
-    publicRead,
-    requirePermission,
-    requireRole,
-    role,
-    tenantScope,
-    type AccessControl,
-    type Role,
-    type Statements,
-    type Subset,
-} from "./access.ts";
+    type CdbTableConfig,
+    type CdbTableMeta,
+    type ColumnSpec,
+    type RoleName,
+    type RoleValue,
+    type TenantKind,
+    type Verb,
+    type VerbValue,
+} from "./cdb-table-types.ts";
+export { getCdbMeta, isCdbTable, collectCdbTables, CDB_TABLE_SYMBOL } from "./cdb-table-registry.ts";
+export { resolveCdbMeta } from "./cdb-table.ts";
+export { compileCdbPolicies, TENANT_EPOCH_TABLES, PRINCIPAL_EPOCH_TABLES } from "./cdb-policy.ts";
+export { applyColumnMask, assertColumnsWritable } from "./cdb-cls.ts";
+export { wrapDb } from "./cdb-db-proxy.ts";
+export { buildAccessControl, type BuiltAccessControl } from "./cdb-access.ts";
+export { createAccessControl, role } from "better-auth/plugins/access";
+export type { AccessControl, Role, Statements, Subset } from "better-auth/plugins/access";
 export {
     defineChardb,
     mountChardb,

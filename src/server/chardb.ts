@@ -34,6 +34,8 @@
  */
 
 import { type BetterAuthOptions, type BetterAuthPlugin, betterAuth } from "better-auth";
+import { admin } from "better-auth/plugins/admin";
+import { organization } from "better-auth/plugins/organization";
 import { Hono } from "hono";
 import { type ChardbAuthAdapterEnv, chardbAuthAdapter } from "../auth/chardb_adapter.ts";
 import {
@@ -43,6 +45,7 @@ import {
     type SynthesizedAuthSchema,
     defineAuth,
 } from "../auth/synthesize.ts";
+import { buildAccessControl } from "./cdb-access.ts";
 import { BlobMeta } from "./do/blobmeta.ts";
 import { Catalog } from "./do/catalog.ts";
 import { Cdb } from "./do/cdb.ts";
@@ -188,7 +191,20 @@ export function chardb<
     // env (the DO bindings live there), so we memoize a betterAuth
     // instance per env-identity to avoid re-running the adapter factory
     // on every request.
-    const authHandler = input.authHandler ?? buildDefaultAuthHandler(auth.options as BetterAuthOptions);
+    //
+    // The cdbTable subsystem materializes a single AccessControl from
+    // the user's schema at first-request time (deferred so the
+    // worker.ts ↔ schema.ts ESM cycle has fully evaluated AND so the
+    // `.schema` getter stays lazy). The result is patched into the
+    // `organization()` and `admin()` plugin instances by
+    // re-constructing them with `{ ac, roles }` before handing the
+    // plugin list to betterAuth().
+    const getMergedSchemaForAc = (): Record<string, unknown> => ({
+        ...(auth as unknown as Record<string, unknown>),
+        ...(input.schema as Record<string, unknown>),
+    });
+    const authHandler =
+        input.authHandler ?? buildDefaultAuthHandler(auth.options as BetterAuthOptions, getMergedSchemaForAc);
 
     const mounted = mountChardb(
         Chardb,
@@ -236,15 +252,18 @@ export function chardb<
  * stubs).
  */
 function buildDefaultAuthHandler(
-    authOptions: BetterAuthOptions
+    authOptions: BetterAuthOptions,
+    getSchema: () => Record<string, unknown>
 ): MountChardbOptions["authHandler"] {
     const cache = new WeakMap<object, (request: Request) => Response | Promise<Response>>();
+    let cachedAcOptions: BetterAuthOptions | undefined;
     return (request, env) => {
         const e = env as unknown as object;
         let handler = cache.get(e);
         if (!handler) {
+            if (!cachedAcOptions) cachedAcOptions = applyCdbAccessControl(authOptions, getSchema());
             const instance = betterAuth({
-                ...authOptions,
+                ...cachedAcOptions,
                 database: chardbAuthAdapter({ env: env as unknown as ChardbAuthAdapterEnv }),
             });
             handler = instance.handler.bind(instance);
@@ -252,4 +271,55 @@ function buildDefaultAuthHandler(
         }
         return handler(request);
     };
+}
+
+/**
+ * Patch the `organization()` and `admin()` plugin instances in the
+ * options object with the chardb-built `{ ac, roles }` derived from
+ * the schema. Returns a NEW options object (no mutation) — the
+ * original `auth.options` stays referentially stable so callers
+ * destructuring it elsewhere see the un-patched view.
+ *
+ * The user's plugin instance, if present, has its options preserved
+ * via re-instantiation. If the user already passed `{ ac, roles }`,
+ * those win (we only fill in the chardb defaults when the keys are
+ * absent).
+ */
+function applyCdbAccessControl(
+    authOptions: BetterAuthOptions,
+    schema: Record<string, unknown>
+): BetterAuthOptions {
+    const built = buildAccessControl(schema);
+    const plugins = (authOptions.plugins ?? []) as readonly BetterAuthPlugin[];
+    const next: BetterAuthPlugin[] = [];
+    let patchedOrg = false;
+    let patchedAdmin = false;
+    for (const p of plugins) {
+        const id = (p as { id?: string }).id;
+        if (id === "organization" && !patchedOrg) {
+            const opts = ((p as { options?: Record<string, unknown> }).options ?? {}) as Record<string, unknown>;
+            next.push(
+                organization({
+                    ...opts,
+                    ac: opts.ac ?? built.ac,
+                    roles: (opts.roles as Record<string, unknown> | undefined) ?? built.roles,
+                } as Parameters<typeof organization>[0])
+            );
+            patchedOrg = true;
+            continue;
+        }
+        if (id === "admin" && !patchedAdmin) {
+            const opts = ((p as { options?: Record<string, unknown> }).options ?? {}) as Record<string, unknown>;
+            next.push(
+                admin({
+                    ...opts,
+                    roles: (opts.roles as Record<string, unknown> | undefined) ?? built.userRoles,
+                } as Parameters<typeof admin>[0])
+            );
+            patchedAdmin = true;
+            continue;
+        }
+        next.push(p);
+    }
+    return { ...authOptions, plugins: next };
 }

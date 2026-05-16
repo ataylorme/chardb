@@ -118,13 +118,94 @@ const explainStrict: Rule.RuleModule = {
     },
 };
 
-export const rules = { "explain-strict": explainStrict } as const;
+/**
+ * `chardb/no-raw-sqlite-table` — flag any direct `sqliteTable(...)`
+ * call in app schema files. cdbTable's metadata + RLS/CLS surface only
+ * fires when the user obtains `cdbTable` via one of the tenancy
+ * factories (`forOrg() / forUser() / globalScope()`); a stray
+ * `sqliteTable(...)` call drops every chardb-specific guarantee
+ * silently. The rule fires on the call itself, not the import, so
+ * test fixtures and one-off scripts that opt out can do so locally.
+ */
+const noRawSqliteTable: Rule.RuleModule = {
+    meta: {
+        type: "problem",
+        docs: {
+            description:
+                "Disallow direct `sqliteTable(...)` calls in chardb app schemas; use forOrg() / forUser() / globalScope().cdbTable instead.",
+            recommended: false,
+            url: "https://chardb.dev/eslint/no-raw-sqlite-table",
+        },
+        schema: [],
+        messages: {
+            rawSqliteTable:
+                "Use `forOrg()` / `forUser()` / `globalScope()` to obtain a tenancy-bound `cdbTable` instead of calling `sqliteTable` directly. cdbTable attaches RLS/CLS metadata; raw sqliteTable rows fall through every chardb policy gate.",
+        },
+    },
+    create(context) {
+        return {
+            CallExpression(raw): void {
+                const node = raw as unknown as TSESTree.CallExpression;
+                if (calleeName(node) === "sqliteTable") {
+                    context.report({ node: raw, messageId: "rawSqliteTable" });
+                }
+            },
+        };
+    },
+};
+
+/**
+ * `chardb/no-direct-cdb-table-import` — flag `cdbTable` imported from
+ * `chardb/server`. The cdbTable export does not exist; users must
+ * destructure it from a tenancy factory call. This rule catches the
+ * mistake at editor time before it surfaces as a TypeScript error.
+ */
+const noDirectCdbTableImport: Rule.RuleModule = {
+    meta: {
+        type: "problem",
+        docs: {
+            description: "Disallow importing `cdbTable` directly — obtain via forOrg() / forUser() / globalScope().",
+            recommended: false,
+            url: "https://chardb.dev/eslint/no-direct-cdb-table-import",
+        },
+        schema: [],
+        messages: {
+            directImport:
+                "`cdbTable` is not exported from chardb/server. Obtain a tenancy-bound builder via `const { cdbTable } = forOrg()` (or forUser/globalScope).",
+        },
+    },
+    create(context) {
+        return {
+            ImportDeclaration(raw): void {
+                const node = raw as unknown as { source: { value?: unknown }; specifiers?: readonly unknown[] };
+                const src = node.source.value;
+                if (typeof src !== "string") return;
+                if (!src.startsWith("chardb")) return;
+                for (const spec of node.specifiers ?? []) {
+                    if (!isNode(spec) || spec.type !== "ImportSpecifier") continue;
+                    const imported = (spec as { imported?: { name?: string } }).imported;
+                    if (imported?.name === "cdbTable") {
+                        context.report({ node: raw, messageId: "directImport" });
+                    }
+                }
+            },
+        };
+    },
+};
+
+export const rules = {
+    "explain-strict": explainStrict,
+    "no-raw-sqlite-table": noRawSqliteTable,
+    "no-direct-cdb-table-import": noDirectCdbTableImport,
+} as const;
 
 export const configs = {
     recommended: {
         plugins: ["chardb"],
         rules: {
             "chardb/explain-strict": "warn",
+            "chardb/no-raw-sqlite-table": "error",
+            "chardb/no-direct-cdb-table-import": "error",
         },
     },
 } as const;

@@ -17,6 +17,7 @@ import type { Brand, RawJson } from "../types.ts";
 import type { CdbIntent } from "../wire.ts";
 import { type PolicyDefinition, chardbPolicy } from "./policy.ts";
 import { attachRef } from "./refs.ts";
+import { wrapDb } from "./cdb-db-proxy.ts";
 
 /**
  * Type-level inference helper. `InferArgs<S>` resolves to the output
@@ -257,7 +258,8 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
         : optionsArg;
     const fn = (async (ctx: MutationCtx<TDb>, args: TArgs) => {
         const validated = validator ? await runValidator(validator, args) : args;
-        return handler(ctx, validated);
+        const wrappedCtx = wrapCtxDb(ctx) as MutationCtx<TDb>;
+        return handler(wrappedCtx, validated);
     }) as MutationFn<TDb, TArgs, TResult>;
     // Preserve the handler's identity for `autoRef` (dev/test path before the
     // Vite plugin rewrites refs). Without this every wrapper collapses to
@@ -327,7 +329,8 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
     const intent = isConfig ? configOrHandler.intent : undefined;
     const fn = (async (ctx: QueryCtx<TDb>, args: TArgs) => {
         const validated = validator ? await runValidator(validator, args) : args;
-        return handler(ctx, validated);
+        const wrappedCtx = wrapCtxDb(ctx) as QueryCtx<TDb>;
+        return handler(wrappedCtx, validated);
     }) as QueryFn<TDb, TArgs, TResult>;
     if (handler.name && handler.name !== "fn") {
         Object.defineProperty(fn, "name", { value: handler.name, configurable: true });
@@ -340,6 +343,20 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
         });
     }
     return attachRef(fn, "query") as QueryFn<TDb, TArgs, TResult>;
+}
+
+/**
+ * Replace `ctx.db` with the auto-fill proxy from `cdb-db-proxy.ts`.
+ * Defensive against synthetic ctxs (test stubs, the `chardb` placeholder
+ * ctx in the Convex-style call signature) that pass a non-object `db`
+ * value: in those cases the original ctx flows through unchanged and the
+ * (no-op) handler still typechecks.
+ */
+function wrapCtxDb<TCtx extends { readonly db: unknown; readonly auth?: AuthCtx }>(ctx: TCtx): TCtx {
+    const db = ctx.db;
+    const auth = ctx.auth;
+    if (db === null || typeof db !== "object" || !auth) return ctx;
+    return { ...ctx, db: wrapDb(db as object, auth) } as TCtx;
 }
 
 /**

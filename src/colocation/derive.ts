@@ -291,7 +291,16 @@ export function deriveColocation(schema: SchemaInput, policyIn: Partial<PolicyIn
         if (override) {
             if (override.kind === "self") assignments[t] = { kind: "self", partitionKey: "id" };
             else if (override.kind === "replicated") assignments[t] = { kind: "replicated" };
-            else assignments[t] = { kind: "colocated", root: t, via: [override.via] };
+            else {
+                // `via` accepts a single column name (the common case) OR a
+                // tuple for composite-FK colocation. The assignment shape
+                // always normalizes to a tuple so consumers don't have to
+                // branch on input arity.
+                const viaTuple: readonly string[] = Array.isArray(override.via)
+                    ? (override.via as readonly string[])
+                    : [override.via as string];
+                assignments[t] = { kind: "colocated", root: t, via: viaTuple };
+            }
             continue;
         }
 

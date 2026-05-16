@@ -27,7 +27,7 @@ Landed in this pass (full cutover, no backwards compat):
 ## Status
 
 - TypeScript strict (incl. `exactOptionalPropertyTypes`) clean: `bunx tsc --noEmit` ✓
-- `bun test` (root) — **329 pass / 3 skip / 0 fail across 46 files** (~73k expect calls; includes the original stress / reshard / wire / walker / colocation / dialect / observability suites; `test/auth/synthesize.test.ts` covering the synthesizer and `defineAuth` inference; `test/server/access.test.ts` covering every helper in `chardb/server/access` including the `defineRoles(resources, overrides?)` smart-default form (owner/admin implicit-ALL, member implicit-empty, custom role overrides) and the `RolesMap | (() => RolesMap)` thunk path for cycle-safe role declarations; `test/server/chardb.test.ts` covering the `chardb({…})` mega-factory's route fall-through, lazy `.schema` getter, inline-options auth, and DO-class direct fields; `test/workerd/catalog.harness.test.ts` and `test/workerd/reshard.harness.test.ts` driving real DO SqlStorage via miniflare@4).
+- `bun test` (root) — **323 pass / 3 skip / 0 fail across 42 files** (~72k expect calls; includes the original stress / reshard / wire / walker / colocation / dialect / observability suites; `test/auth/synthesize.test.ts` covering the synthesizer and `defineAuth` inference (now bundling `organization()` and `admin()` by default); `test/server/cdb-table.test.ts` covering the schema-first RLS+CLS surface end-to-end (forOrg/forUser/globalScope factories, tenant column auto-discovery, ambiguity / missing-FK error codes, selfBy + column-matrix compilation, PolicyDefinition emission parity, column mask + writability checks including autoFilled-bypass, AccessControl materialization with `user:` prefix routing); `test/server/chardb.test.ts` covering the `chardb({…})` mega-factory's route fall-through, lazy `.schema` getter (preserved post-cdbTable wiring), inline-options auth, and DO-class direct fields; `test/workerd/catalog.harness.test.ts` and `test/workerd/reshard.harness.test.ts` driving real DO SqlStorage via miniflare@4).
 - `bun test` (example/chat) — **17 pass / 0 fail across 6 files** (≈2k expect calls, deterministic xorshift seeds): chat app exercising op-log idempotency at 1000 mutations × 50 partitions, intent-routing for 100 representative Drizzle queries, scatter-gather merge correctness vs a naive reference, row-level policy isolation across 1500 mixed-tenant rows, full reshard pipeline through bun:sqlite triggers + `renderRowApply` against a destination DB, and the end-to-end custom better-auth plugin (`bot-token`) coverage that validates auth-table inference and FK resolution through `messages.botTokenId` → `auth.botToken.id`.
 - `bun run build` (unbuild) — produces every subpath export under `dist/` (~428 kB), including the `chardb/reshard`, `chardb/eslint-plugin`, and `chardb/observability` entries.
 - All locked decisions reflected in code and types
@@ -208,8 +208,8 @@ also defers past the same cycle. The lower-level primitives
 (`defineAuth`, `defineChardb`, `mountChardb`) remain public exports
 for advanced split-worker setups.
 
-**`chardb/server` Tier-1 DX exports** (`src/server/access.ts`,
-`src/server/define.ts`):
+**`chardb/server` Tier-1 DX exports** (`src/server/cdb-tenant.ts`,
+`src/server/cdb-table.ts`, `src/server/define.ts`):
 - `api` — a default `ChardbApi<Record<string, unknown>>` factory so
   `api.ts` never starts with `const api = createApi<typeof auth &
   typeof domain>()`. Drizzle's `.from(table)` reads the row type from
@@ -217,37 +217,48 @@ for advanced split-worker setups.
   without the bound schema generic. `createApi<T>()` stays exported
   for users who want Drizzle's RQB-typed `db.query.tableName.findMany
   ()` accessor.
-- `tenantScope(table | () => table, options?)` and the rest of the
-  access helpers (`ownerScope`, `requireRole`, `requirePermission`,
-  `publicRead`) — table is now the first **positional** argument, and
-  every helper auto-derives the policy name from `getTableName
-  (table)` (e.g. `messages_tenant`). Both the direct value and a
-  `() => table` thunk are accepted; the thunk is what
-  `example/chat/src/server/api.ts` uses because the api.ts ↔
-  schema.ts ESM cycle puts the table in TDZ at module init. The
-  policy's `.name` field is installed as a lazy getter so the thunk
-  doesn't resolve until first read.
-- `defineRoles(resources, overrides?)` — smart-default RBAC. The
-  two-arg form matches how humans reason about access control:
-  declare `{ messages: ["create", "update", "delete"], … }` (resources
-  × actions), then override per-role deltas. **`owner` and `admin`
-  implicitly grant ALL** permissions on every declared resource (you
-  almost never restrict the owner; admin defaults to universal too).
-  **`member` implicitly grants nothing**; override to opt in. Custom
-  role names get no defaults. Statements are typed via `const S
-  extends Statements`; each role's overrides are typechecked against
-  the statements via `Subset<K, S>`. The returned map is
-  shape-compatible with better-auth's `RolesMap`, so the same value
-  powers chardb's `requirePermission(table, chatRoles, request)`
-  policies AND better-auth's `hasPermission` endpoint check.
-- `requirePermission(table, roles, …)` — `roles` accepts a
-  `RolesMap | (() => RolesMap)` thunk so the chatRoles declaration
-  can live in `worker.ts` alongside `defineAuth` (cycle peer of
-  `api.ts`); the thunk defers reading until the first authorize call,
-  by which point worker.ts has finished evaluating. `chardb/react`
-  adds `InferArgs<typeof handler>` and `InferRow<typeof handler>`
-  type helpers so React-side hooks pull args / row types straight off
-  a mutation/query export without `Parameters<>` / `Awaited<>` hacks.
+- **`forOrg() / forUser() / globalScope()`** — the only sanctioned
+  way to obtain a `cdbTable(name, columns, config)` builder. Each
+  factory binds the schema file's tenancy axis once at the top:
+  `const { cdbTable } = forOrg();` makes every table in the file
+  org-tenanted, auto-discovers the tenant column from
+  `.references(() => auth.organization.id)`, defaults `partitionBy`
+  to that column, defaults the role lattice to `member.role`, and
+  drives INSERT auto-fill from `ctx.auth.tenantId`. `forUser` does
+  the user-FK equivalent (`self` is implicit; `selfBy:` is rejected).
+  `globalScope` requires explicit `partitionBy:` per table.
+  `cdbTable` is **not** exported from `chardb/server` directly — the
+  ESLint rule `chardb/no-direct-cdb-table-import` flags any attempt.
+- **`config` shape** — flat object. Verbs are intrinsic and fixed:
+  row-level `read | create | update | delete`, column-level
+  `read | create | update`. RLS lives in `roles:` (per-role verb
+  grants, with column-granularity per verb) plus `publicRead:` plus
+  the implicit tenant predicate. CLS lives EITHER inside `roles:`
+  (each verb accepts `"*" | string[] | { exclude: string[] } | true |
+  false`) OR in a sibling `columns:` block (per-column,
+  per-verb role allowlists); both axes compile to one role × verb ×
+  column matrix and contradictions throw `CDB_POLICY_CONFLICT` at
+  boot. `self` is reserved as the row-creator role and requires
+  explicit `selfBy: "<userFkColumn>"` in `forOrg`/`globalScope`
+  files. `user:`-prefixed role names match `user.role` (admin plugin)
+  regardless of the file's tenancy lattice.
+- **Runtime helpers** — `compileCdbPolicies(table)` returns a
+  `PolicyDefinition[]` for the existing pipeline
+  (`applyPoliciesToWhere`, `applyRowPolicies`, `policyDigest`).
+  `applyColumnMask({ rows, table, auth })` projects forbidden columns
+  to `null`. `assertColumnsWritable({ values, table, verb, auth })`
+  throws `CDB_FORBIDDEN_COLUMN` when the payload touches a column the
+  caller's roles don't grant. `buildAccessControl(schema)` walks the
+  schema's cdbTables and materializes a single better-auth
+  `AccessControl` + `RolesMap` (org-scope) + `RolesMap` (user-scope)
+  that the `chardb()` factory patches into the `organization()` /
+  `admin()` plugin instances on first request.
+- **Bundled plugins** — `defineAuth` automatically prepends
+  `organization()` and `admin()` to the user's plugin list (skipped
+  if the user supplied their own configured instance). Schema files
+  reference `auth.organization` / `auth.member` / `auth.user` without
+  the user re-declaring the plugin import, and cdbTable's role
+  lattice plumbing is wired without per-app boilerplate.
 `api.ts` uses the schema-bound `createApi<typeof auth & typeof domain>()`
 factory: `TDb` is bound once, `TArgs` is inferred from each mutation's
 `args: StandardSchemaV1` validator (zod / valibot / arktype / typebox /
@@ -264,27 +275,29 @@ downstream consumers pull the wire shape out of the handler with
 `Parameters<typeof postMessage>[1]` and `Awaited<ReturnType<typeof
 listMessages>>[number]`.
 
-`chardb/server/access` (`src/server/access.ts`) lifts better-auth's
-authorization primitives so row-level policies are one-liners. The
-five exports — `tenantScope`, `ownerScope`, `requireRole`,
-`requirePermission`, `publicRead` — read the better-auth session shape
-(`auth.tenantId = session.activeOrganizationId`, `auth.role =
-member.role`) and accept the **same** `RolesMap` the user already
-hands to better-auth's `hasPermission` route. No parallel
-authorization model. Each helper takes the Drizzle table as a
-positional argument (or a `() => table` thunk for ESM-cycle safety,
-same idiom as Drizzle's `.references(() => …)`); the policy name
-auto-derives from the table identifier via `getTableName`.
-`requirePermission` also accepts a `() => roles` thunk so the
-`chatRoles` declaration lives inline in `worker.ts` next to
-`defineAuth` instead of in a separate `roles.ts` file. The example's
-12-line manual `orgIsolation` collapsed to `tenantScope(() =>
-messages)`; the entire `roles.ts` file went away. `defineRoles
-(resources, overrides?)` cut the role declaration from 23 lines to 11
-by implicitly assigning ALL to owner/admin and empty to member.
-`test/server/access.test.ts` exercises every primitive (21 cases
-including the smart-default and thunked-roles paths) against an
-in-memory row set with real Drizzle fixtures.
+**Schema-first RLS + CLS** (`src/server/cdb-tenant.ts`,
+`src/server/cdb-table.ts`, `src/server/cdb-policy.ts`,
+`src/server/cdb-cls.ts`, `src/server/cdb-access.ts`) — every row- and
+column-level policy is declared inline on the cdbTable definition.
+The schema author writes one `forOrg() / forUser() / globalScope()`
+factory per file and one config object per table; chardb compiles to
+the existing `PolicyDefinition[]` pipeline (no wire format change),
+materializes a single better-auth `AccessControl` from every
+table's `roles:`, patches the `organization()` / `admin()` plugin
+instances at first request, and exposes `applyColumnMask` /
+`assertColumnsWritable` for runtime CLS enforcement. The example's
+21-line `api.ts` (with five separate `tenantScope` / `ownerScope` /
+`requirePermission` exports referencing a `chatRoles` thunk in
+`worker.ts`) collapsed to one `cdbTable(... { roles, selfBy })` call
+per table; `chatRoles`, `defineRoles`, `roles.ts`, and the `import {
+organization } from "better-auth/plugins/organization"` line all went
+away. `test/server/cdb-table.test.ts` covers factory binding (org /
+user / global), tenant-column auto-discovery, ambiguity / missing-FK
+error codes, selfBy compile-required when `self` appears, role-axis
++ column-axis matrix compilation, contradiction detection,
+`PolicyDefinition` shape parity, column mask + writability checks
+(including the autoFilled-bypass), and AccessControl materialization
+with `user:` prefix routing — 23 cases in total, all green.
 
 **Just-makes-sense defaults** (`src/colocation/types.ts:DEFAULT_POLICY`,
 `src/server/define.ts`, `src/server/entrypoint.ts`) — chardb ships

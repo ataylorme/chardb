@@ -32,8 +32,26 @@
  */
 
 import type { BetterAuthOptions, BetterAuthPlugin } from "better-auth";
+import { admin } from "better-auth/plugins/admin";
+import { organization } from "better-auth/plugins/organization";
 import { getAuthTables } from "better-auth/db";
-import type { BetterAuthDBSchema, DBFieldAttribute } from "better-auth/db";
+import type {
+    BaseAccount,
+    BaseRateLimit,
+    BaseSession,
+    BaseUser,
+    BaseVerification,
+    BetterAuthDBSchema,
+    DBFieldAttribute,
+} from "better-auth/db";
+import type {
+    Invitation,
+    Member,
+    Organization,
+    OrganizationRole,
+    Team,
+    TeamMember,
+} from "better-auth/plugins/organization";
 import { getTableColumns } from "drizzle-orm";
 import type { Column } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
@@ -85,80 +103,40 @@ type WithColumns<TKey extends string> = AnySQLiteTable & {
 };
 
 /**
- * Static column maps for every well-known better-auth table. Source-of-
- * truth is `getAuthTables` in `@better-auth/core/db` for the core four
- * and each plugin's `schema.ts` for the rest.
+ * Field-name union for a better-auth model, derived from the model's
+ * own row type (`BaseUser`, `Organization`, ...). Better-auth declares
+ * each model as a Zod object whose inferred `z.infer<...>` type is
+ * exported alongside it; reading `keyof` off that type keeps the
+ * column union locked to upstream's source of truth so when better-
+ * auth adds a field (e.g. `user.phoneNumber`) it surfaces here on the
+ * next dependency bump without a hand edit.
+ */
+type FieldsOf<T> = keyof T & string;
+
+/**
+ * Static column maps for every chardb-bundled better-auth table. The
+ * field unions are inferred from upstream's exported row types
+ * (`BaseUser` / `BaseSession` / ... from `@better-auth/core/db`,
+ * `Organization` / `Member` / ... from
+ * `better-auth/plugins/organization/schema`). Plugin tables outside
+ * this set (passkey, twoFactor, apiKey, jwks, ssoProvider, ...)
+ * surface through `FieldsOfPluginTable<TPlugins, T>` instead — only
+ * users who add the plugin to their `defineAuth` see those tables, and
+ * the field union is read straight off the plugin's `schema.fields`
+ * declaration.
  */
 export interface KnownAuthTables {
-    readonly user: WithColumns<"name" | "email" | "emailVerified" | "image" | "createdAt" | "updatedAt">;
-    readonly session: WithColumns<
-        "expiresAt" | "token" | "createdAt" | "updatedAt" | "ipAddress" | "userAgent" | "userId"
-    >;
-    readonly account: WithColumns<
-        | "accountId"
-        | "providerId"
-        | "userId"
-        | "accessToken"
-        | "refreshToken"
-        | "idToken"
-        | "accessTokenExpiresAt"
-        | "refreshTokenExpiresAt"
-        | "scope"
-        | "password"
-        | "createdAt"
-        | "updatedAt"
-    >;
-    readonly verification: WithColumns<"identifier" | "value" | "expiresAt" | "createdAt" | "updatedAt">;
-    // organization plugin
-    readonly organization: WithColumns<"name" | "slug" | "logo" | "metadata" | "createdAt">;
-    readonly member: WithColumns<"organizationId" | "userId" | "role" | "createdAt">;
-    readonly invitation: WithColumns<
-        "organizationId" | "email" | "role" | "status" | "expiresAt" | "createdAt" | "inviterId" | "teamId"
-    >;
-    readonly team: WithColumns<"name" | "organizationId" | "createdAt" | "updatedAt">;
-    readonly teamMember: WithColumns<"teamId" | "userId" | "createdAt">;
-    readonly organizationRole: WithColumns<"organizationId" | "role" | "permission" | "createdAt" | "updatedAt">;
-    // other shipping plugins (column sets are documented at https://better-auth.com)
-    readonly rateLimit: WithColumns<"key" | "count" | "lastRequest">;
-    readonly apiKey: WithColumns<
-        | "name"
-        | "start"
-        | "prefix"
-        | "key"
-        | "userId"
-        | "refillInterval"
-        | "refillAmount"
-        | "lastRefillAt"
-        | "enabled"
-        | "rateLimitEnabled"
-        | "rateLimitTimeWindow"
-        | "rateLimitMax"
-        | "requestCount"
-        | "remaining"
-        | "lastRequest"
-        | "expiresAt"
-        | "createdAt"
-        | "updatedAt"
-        | "permissions"
-        | "metadata"
-    >;
-    readonly jwks: WithColumns<"publicKey" | "privateKey" | "createdAt">;
-    readonly passkey: WithColumns<
-        | "name"
-        | "publicKey"
-        | "userId"
-        | "credentialID"
-        | "counter"
-        | "deviceType"
-        | "backedUp"
-        | "transports"
-        | "createdAt"
-        | "aaguid"
-    >;
-    readonly twoFactor: WithColumns<"secret" | "backupCodes" | "userId">;
-    readonly ssoProvider: WithColumns<
-        "issuer" | "oidcConfig" | "samlConfig" | "userId" | "providerId" | "organizationId" | "domain"
-    >;
+    readonly user: WithColumns<FieldsOf<BaseUser>>;
+    readonly session: WithColumns<FieldsOf<BaseSession>>;
+    readonly account: WithColumns<FieldsOf<BaseAccount>>;
+    readonly verification: WithColumns<FieldsOf<BaseVerification>>;
+    readonly organization: WithColumns<FieldsOf<Organization>>;
+    readonly member: WithColumns<FieldsOf<Member>>;
+    readonly invitation: WithColumns<FieldsOf<Invitation>>;
+    readonly team: WithColumns<FieldsOf<Team>>;
+    readonly teamMember: WithColumns<FieldsOf<TeamMember>>;
+    readonly organizationRole: WithColumns<FieldsOf<OrganizationRole>>;
+    readonly rateLimit: WithColumns<FieldsOf<BaseRateLimit>>;
 }
 
 /**
@@ -334,12 +312,74 @@ export type ChardbAuth<TPlugins extends readonly unknown[] = [], TExtra extends 
     readonly options: BetterAuthOptions;
 } & SynthesizedAuthSchema<TPlugins, TExtra>;
 
+/**
+ * The two better-auth plugins chardb bakes into every `defineAuth`
+ * call by default.
+ *
+ *   - `organization()` — every chardb app is multi-tenant by default;
+ *     the `member.role` lattice is the org-scoped RBAC axis cdbTable's
+ *     unprefixed role names match against (`admin`, `member`, custom
+ *     names).
+ *   - `admin()` — system-wide user roles. cdbTable's `user:`-prefixed
+ *     role names match against `user.role` from this plugin.
+ *
+ * Users may still pass either explicitly to `defineAuth` to override
+ * options (e.g. `organization({ teams: true })`); chardb's defaults
+ * only apply when the user did not supply an instance of the same
+ * plugin id.
+ */
+const ORGANIZATION_PLUGIN_ID = "organization";
+const ADMIN_PLUGIN_ID = "admin";
+
+function pluginById(plugins: readonly BetterAuthPlugin[] | undefined, id: string): BetterAuthPlugin | undefined {
+    if (!plugins) return undefined;
+    for (const p of plugins) {
+        if ((p as { id?: string }).id === id) return p;
+    }
+    return undefined;
+}
+
+/** Tables the bundled `organization()` plugin contributes. Used to widen the synthesized schema's static type. */
+const ORG_PLUGIN_TABLES = [
+    "organization",
+    "member",
+    "invitation",
+    "team",
+    "teamMember",
+    "organizationRole",
+] as const;
+
+/**
+ * Default chardb auth profile: `organization()` and `admin()` are
+ * always present unless the user passed their own configured instance
+ * of the same plugin (in which case theirs wins). The user's
+ * additional plugins (`anonymous()`, `jwt()`, `passkey()`, ...) are
+ * appended verbatim.
+ */
+export function withChardbDefaults<TPlugins extends readonly BetterAuthPlugin[]>(
+    options: AuthOptionsInput<TPlugins>
+): AuthOptionsInput<readonly BetterAuthPlugin[]> {
+    const userPlugins = (options.plugins ?? []) as readonly BetterAuthPlugin[];
+    const merged: BetterAuthPlugin[] = [];
+    if (!pluginById(userPlugins, ORGANIZATION_PLUGIN_ID)) merged.push(organization());
+    if (!pluginById(userPlugins, ADMIN_PLUGIN_ID)) merged.push(admin());
+    for (const p of userPlugins) merged.push(p);
+    return { ...options, plugins: merged };
+}
+
 export function defineAuth<
     const TPlugins extends readonly BetterAuthPlugin[] = [],
     const TExtra extends readonly string[] = [],
->(options: AuthOptionsInput<TPlugins>, extraTables?: TExtra): ChardbAuth<TPlugins, TExtra[number]> {
-    const tables = synthesizeAuthSchema(options, extraTables);
-    return { options: options as unknown as BetterAuthOptions, ...tables } as ChardbAuth<TPlugins, TExtra[number]>;
+>(options: AuthOptionsInput<TPlugins>, extraTables?: TExtra): ChardbAuth<TPlugins, TExtra[number] | (typeof ORG_PLUGIN_TABLES)[number]> {
+    const expandedOptions = withChardbDefaults(options);
+    const tables = synthesizeAuthSchema(expandedOptions, extraTables);
+    // Re-key the result back to TPlugins-shaped (the bundled defaults
+    // contribute the org tables, which are also enumerated in
+    // `KnownAuthTables` and so already typed at the consumer surface).
+    return { options: expandedOptions as unknown as BetterAuthOptions, ...tables } as unknown as ChardbAuth<
+        TPlugins,
+        TExtra[number] | (typeof ORG_PLUGIN_TABLES)[number]
+    >;
 }
 
 /**

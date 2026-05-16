@@ -1,28 +1,58 @@
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { integer, text } from "drizzle-orm/sqlite-core";
+import { forOrg } from "chardb/server";
 import { auth } from "./worker.ts";
 
-// Any `organization_id` FK to `auth.organization` auto-colocates the row
-// on the org's shard — chardb walks the FK graph; no `partitionKey` here.
-export const channels = sqliteTable("channels", {
-    id: text("id").primaryKey(),
-    organizationId: text("organization_id")
-        .notNull()
-        .references(() => auth.organization.id, { onDelete: "cascade" }),
-    name: text("name").notNull(),
-    createdAt: integer("created_at").notNull(),
-});
+// Every cdbTable in this file is org-tenanted. The tenant column is
+// auto-discovered from the `.references(() => auth.organization.id)`
+const { cdbTable } = forOrg();
 
-export const messages = sqliteTable("messages", {
-    id: text("id").primaryKey(),
-    channelId: text("channel_id")
-        .notNull()
-        .references(() => channels.id, { onDelete: "cascade" }),
-    organizationId: text("organization_id")
-        .notNull()
-        .references(() => auth.organization.id, { onDelete: "cascade" }),
-    authorId: text("author_id")
-        .notNull()
-        .references(() => auth.user.id, { onDelete: "cascade" }),
-    body: text("body").notNull(),
-    createdAt: integer("created_at").notNull(),
-});
+export const channels = cdbTable(
+    "channels",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => auth.organization.id, { onDelete: "cascade" }),
+        name: text("name").notNull(),
+        createdAt: integer("created_at").notNull(),
+    },
+    {
+        publicRead: true,
+        roles: { admin: "*" },
+    }
+);
+
+export const messages = cdbTable(
+    "messages",
+    {
+        id: text("id").primaryKey(),
+        channelId: text("channel_id")
+            .notNull()
+            .references(() => channels.id, { onDelete: "cascade" }),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => auth.organization.id, { onDelete: "cascade" }),
+        authorId: text("author_id")
+            .notNull()
+            .references(() => auth.user.id, { onDelete: "cascade" }),
+        body: text("body").notNull(),
+        createdAt: integer("created_at").notNull(),
+    },
+    {
+        // `self` appears under `roles:` below, so chardb requires an
+        // explicit binding to the user-FK column. Validated at boot.
+        selfBy: "authorId",
+        roles: {
+            admin: "*",
+            member: {
+                read: "*",
+                create: ["body", "channelId"],
+            },
+            self: {
+                read: "*",
+                update: ["body"],
+                delete: true,
+            },
+        },
+    }
+);

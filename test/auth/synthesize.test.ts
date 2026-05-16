@@ -168,16 +168,20 @@ describe("defineAuth", () => {
         expect(invitationTable.email).toBeDefined();
     });
 
-    test("no plugins → only the four core tables are statically present", () => {
+    test("no plugins → core four + bundled organization/admin tables are present", () => {
+        // chardb's `defineAuth` bakes `organization()` and `admin()` into the
+        // plugin list by default so cdbTable's role-lattice (member.role for
+        // org-tenanted files, user.role for user/global files) is always
+        // available without per-app re-declaration.
         const auth = defineAuth({});
         expect(auth.user.id).toBeDefined();
         expect(auth.session.token).toBeDefined();
         expect(auth.account.providerId).toBeDefined();
         expect(auth.verification.identifier).toBeDefined();
-        // `auth.organization` would be a TS error here — there's no
-        // `organization()` plugin in scope. We confirm the runtime side
-        // doesn't materialize it either.
-        expect((auth as { organization?: unknown }).organization).toBeUndefined();
+        // organization() plugin's tables come along for the ride:
+        expect((auth as { organization?: { id?: unknown } }).organization?.id).toBeDefined();
+        expect((auth as { member?: { id?: unknown } }).member?.id).toBeDefined();
+        expect((auth as { invitation?: { id?: unknown } }).invitation?.id).toBeDefined();
     });
 
     test("extraTables escape hatch raises when a requested table is absent", () => {

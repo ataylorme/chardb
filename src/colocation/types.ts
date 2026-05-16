@@ -22,7 +22,7 @@ export interface SchemaInput {
 export type ColocationOverride =
     | { readonly kind: "self" }
     | { readonly kind: "replicated" }
-    | { readonly kind: "colocate"; readonly via: string };
+    | { readonly kind: "colocate"; readonly via: string | readonly string[] };
 
 export interface PolicyInput {
     /** Default ["organization", "user"]. */

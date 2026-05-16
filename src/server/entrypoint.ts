@@ -31,6 +31,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import type { BetterAuthOptions } from "better-auth";
 import { bindAuthRuntime } from "../auth/runtime.ts";
 import { assertNoReservedTableShadow, type SynthesizedAuthSchema, synthesizeAuthSchema } from "../auth/synthesize.ts";
+import { buildColocationOverrides } from "./cdb-colocation.ts";
 import type { CdbError } from "../errors.ts";
 import type { RawJson } from "../types.ts";
 import { vshardOf } from "../vshard.ts";
@@ -326,12 +327,21 @@ export function defineChardb<TSchema>(input: DefineChardbInput<TSchema>): typeof
         //     `organization` + `user`) via the first matching root in
         //     priority order, instead of forcing the user to write a
         //     `policy.overrides[t] = { … via: "organizationId" }` entry.
+        // cdbTable-derived colocation overrides live alongside any
+        // user-supplied `policy.overrides`. The user's explicit map wins
+        // (it's their escape hatch for outliers); chardb's auto-derived
+        // overrides fill the rest.
+        const schema = getSchema();
+        const fromTables =
+            schema && typeof schema === "object"
+                ? buildColocationOverrides(schema as Record<string, unknown>).overrides
+                : {};
         cachedPolicy = {
             distributionRoots: input.policy?.distributionRoots ?? ["organization", "user"],
             strictMultiRoot: input.policy?.strictMultiRoot ?? false,
             requireRoot: input.policy?.requireRoot ?? false,
             allowMissingRoots: input.policy?.allowMissingRoots ?? false,
-            overrides: input.policy?.overrides ?? {},
+            overrides: { ...fromTables, ...(input.policy?.overrides ?? {}) },
         };
         return cachedPolicy;
     }

@@ -114,3 +114,17 @@ describe("chardb/explain-strict", () => {
         expect(reports.some(r => r.messageId === "rawSqlInQuery")).toBe(false);
     });
 });
+
+describe("chardb/no-raw-sqlite-table", () => {
+    test("flags direct sqliteTable() calls", () => {
+        const code = `export const t = sqliteTable("t", { id: text("id") });`;
+        const { reports } = runRule(rules["no-raw-sqlite-table"], code);
+        expect(reports.some(r => r.messageId === "rawSqliteTable")).toBe(true);
+    });
+
+    test("does not flag cdbTable() calls (those flow through forOrg/forUser/globalScope)", () => {
+        const code = `export const t = cdbTable("t", { id: text("id") }, { roles: { admin: "*" } });`;
+        const { reports } = runRule(rules["no-raw-sqlite-table"], code);
+        expect(reports.some(r => r.messageId === "rawSqliteTable")).toBe(false);
+    });
+});
