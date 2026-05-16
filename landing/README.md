@@ -40,6 +40,18 @@ First-time setup:
 
 Cloudflare Pages reads `landing/wrangler.toml` for project name and `pages_build_output_dir`.
 
+## Social images / favicons
+
+The OG image (`public/og.png`), favicon (`public/favicon-512.png`) and apple-touch-icon (`public/apple-touch-icon.png`) are rendered from real React components (`src/og/OgImage.tsx`, `src/og/Favicon.tsx`) via headless Chrome — so the live WebGL coal shader actually rasterizes into the PNGs.
+
+Re-render after design changes:
+
+```bash
+cd landing && bun run og
+```
+
+Requires Google Chrome installed at `/Applications/Google Chrome.app` (the script uses `playwright-core` against system Chrome — no chromium download).
+
 ## Structure
 
 - `src/components/` — UI components
