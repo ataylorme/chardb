@@ -13,6 +13,7 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
+import { drizzle } from "drizzle-orm/durable-sqlite";
 import { renderSqliteTableDdl } from "../../auth/ddl.ts";
 import { CdbError, isCdbError, isCdbErrorCode } from "../../errors.ts";
 import { type IntervalKey, IntervalMap, type IntervalSet } from "../../intervals.ts";
@@ -22,11 +23,19 @@ import { type JsonText, parseJsonColumn } from "../../oplog/wrapper.ts";
 import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/range.ts";
 import { type TableSpec, renderRowApply, renderTableTriggers } from "../../reshard/triggers.ts";
 import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId } from "../../types.ts";
+import { rawJsonResult } from "../../util/raw_json.ts";
 import { executeAtomicMutation } from "../atomic-mutation.ts";
 import { collectCdbTables } from "../cdb-table-registry.ts";
 import { resolveCdbMeta } from "../cdb-table.ts";
-import { type ChardbManifest, emptyManifest, resolveMutation } from "../manifest.ts";
-import type { CdbMutationRequest, CdbMutationResponse, CdbSubscriptionRequest, LiveSubscriptionId } from "../rpc.ts";
+import { type ChardbManifest, emptyManifest, resolveMutation, resolveQuery } from "../manifest.ts";
+import type {
+    CdbMutationRequest,
+    CdbMutationResponse,
+    CdbQueryRequest,
+    CdbQueryResponse,
+    CdbSubscriptionRequest,
+    LiveSubscriptionId,
+} from "../rpc.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
 export type {
@@ -88,6 +97,23 @@ function domainSchemaMismatch(tableName: string): CdbError {
         code: "CDB_PARTITION_CONTRACT_CHANGED",
         message: `domain table "${tableName}" is unsigned or does not match the configured schema`,
         hint: "add and run an explicit shard schema migration before deploying this schema",
+    });
+}
+
+const QUERY_DB_READ_PROPERTIES = new Set<PropertyKey>(["select", "selectDistinct", "query", "$count"]);
+
+function readOnlyQueryDb<TDb extends object>(db: TDb): TDb {
+    return new Proxy(db, {
+        get(target, property, receiver) {
+            if (!QUERY_DB_READ_PROPERTIES.has(property)) {
+                throw new CdbError({
+                    code: "CDB_UNSUPPORTED_FEATURE",
+                    message: `query database property "${String(property)}" is unavailable in read-only handlers`,
+                });
+            }
+            const value = Reflect.get(target, property, receiver);
+            return typeof value === "function" ? value.bind(target) : value;
+        },
     });
 }
 
@@ -290,7 +316,19 @@ export class Cdb extends DurableObject<CdbEnv> {
             });
             return { ok: true, ...result };
         } catch (error) {
-            return { ok: false, error: mutationError(error).toJSON() };
+            return { ok: false, error: cdbRuntimeError(error).toJSON() };
+        }
+    }
+
+    /** Execute a registered shard-local query without exposing it through Gateway yet. */
+    async query(request: CdbQueryRequest): Promise<CdbQueryResponse> {
+        try {
+            const descriptor = resolveQuery(this.mutationManifest(), request.ref);
+            const database = drizzle(this.ctx.storage, { schema: this.mutationSchema() });
+            const result = await descriptor.invoke({ db: readOnlyQueryDb(database), auth: request.auth }, request.args);
+            return { ok: true, result: rawJsonResult(result, "query result") };
+        } catch (error) {
+            return { ok: false, error: cdbRuntimeError(error).toJSON() };
         }
     }
 
@@ -581,7 +619,7 @@ export function configureCdbRuntime<TSchema extends Record<string, unknown>>(
     };
 }
 
-function mutationError(error: unknown): CdbError {
+function cdbRuntimeError(error: unknown): CdbError {
     if (isCdbError(error)) return error;
     if (error instanceof Error) {
         const match = /^(CDB_[A-Z_]+)(?::\s*)?/.exec(error.message);

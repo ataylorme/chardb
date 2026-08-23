@@ -88,6 +88,21 @@ export interface CdbMutationRpc {
     mutate(request: CdbMutationRequest): Promise<CdbMutationResponse> | CdbMutationResponse;
 }
 
+/** Internal shard query request. Gateway supplies validated args and trusted auth. */
+export interface CdbQueryRequest {
+    readonly ref: ChardbRef;
+    readonly args: RawJson;
+    readonly auth: AuthCtx;
+}
+
+export type CdbQueryResponse =
+    | { readonly ok: true; readonly result: RawJson }
+    | { readonly ok: false; readonly error: CdbErrorWire };
+
+export interface CdbQueryRpc {
+    query(request: CdbQueryRequest): Promise<CdbQueryResponse>;
+}
+
 /** Auth accepted by dispatch only after a verifier has established it. */
 export interface TrustedMutationAuth {
     readonly auth: AuthCtx;

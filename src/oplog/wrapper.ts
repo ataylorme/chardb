@@ -38,6 +38,7 @@ import { CdbError } from "../errors.ts";
 import type { MutId, PrincipalId, RawJson } from "../types.ts";
 import type { Cookie } from "../types.ts";
 import { bytesEq, sha256Hex } from "../util/canonical.ts";
+import { rawJsonResult } from "../util/raw_json.ts";
 import { type MutationReplayEnvelope, decodeEnvelope, encodeEnvelope } from "./envelope.ts";
 
 /**
@@ -224,7 +225,7 @@ export function runWrappedMutation<R>(args: RunWrappedMutationArgs<R>): RunWrapp
                   v: 1,
                   status: "ok",
                   rowsAffected: outcome.rowsAffected,
-                  result: toRawJsonResult(outcome.result),
+                  result: rawJsonResult(outcome.result, "mutation result"),
                   ...(outcome.lastInsertRowid !== undefined ? { lastInsertRowid: outcome.lastInsertRowid } : {}),
                   ...(outcome.returning ? { returning: outcome.returning } : {}),
                   cookie: args.cookie,
@@ -264,60 +265,6 @@ function hexToBytes(hex: string): Uint8Array {
 
 function asBytes(value: Uint8Array | ArrayBuffer): Uint8Array {
     return value instanceof Uint8Array ? value : new Uint8Array(value);
-}
-
-function toRawJsonResult(value: unknown): RawJson {
-    const active = new WeakSet<object>();
-
-    const fail = (path: string, reason: string): never => {
-        throw new CdbError({
-            code: "CDB_INVARIANT",
-            message: `mutation result is not JSON at ${path}: ${reason}`,
-            hint: "return only null, booleans, finite numbers, strings, arrays, and plain objects",
-        });
-    };
-
-    const visit = (current: unknown, path: string): void => {
-        if (current === null || typeof current === "string" || typeof current === "boolean") return;
-        if (typeof current === "number") {
-            if (!Number.isFinite(current) || Object.is(current, -0)) {
-                fail(path, "numbers must be finite and must not be negative zero");
-            }
-            return;
-        }
-        if (typeof current !== "object") fail(path, `${typeof current} is unsupported`);
-        const objectValue = current as object;
-        if (active.has(objectValue)) fail(path, "cyclic references are unsupported");
-        active.add(objectValue);
-
-        if (Array.isArray(objectValue)) {
-            const ownKeys = Reflect.ownKeys(objectValue);
-            if (ownKeys.some(key => typeof key === "symbol")) fail(path, "symbol properties are unsupported");
-            if (ownKeys.length !== objectValue.length + 1)
-                fail(path, "arrays cannot be sparse or have extra properties");
-            for (let i = 0; i < objectValue.length; i++) {
-                if (!Object.hasOwn(objectValue, i)) fail(`${path}[${i}]`, "sparse array entries are unsupported");
-                visit(objectValue[i], `${path}[${i}]`);
-            }
-        } else {
-            const prototype = Object.getPrototypeOf(objectValue);
-            if (prototype !== Object.prototype && prototype !== null) fail(path, "objects must be plain objects");
-            for (const key of Reflect.ownKeys(objectValue)) {
-                if (typeof key !== "string") fail(path, "symbol properties are unsupported");
-                const stringKey = key as string;
-                const descriptor = Object.getOwnPropertyDescriptor(objectValue, stringKey);
-                if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
-                    fail(`${path}.${stringKey}`, "properties must be enumerable data properties");
-                }
-                visit((descriptor as PropertyDescriptor & { value: unknown }).value, `${path}.${stringKey}`);
-            }
-        }
-
-        active.delete(objectValue);
-    };
-
-    visit(value, "$");
-    return value as RawJson;
 }
 
 /** Convenience: build a canonical request string for hashing. */
