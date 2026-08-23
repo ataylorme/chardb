@@ -1,41 +1,108 @@
 # chardb
 
-Cloudflare-native SQL with per-tenant ACID and live Drizzle queries.
+Experimental tenant-sharded SQLite for Cloudflare Durable Objects.
 
-> chardb is the database for Cloudflare-native apps: SQL, files, vectors, search, scheduling, real-time, presence, and auth — one Drizzle schema, one client, one bill.
+Chardb explores one idea: mark an organization boundary in a Drizzle schema, then derive data placement, per-tenant transactions, authorization, and live-query routing from that declaration.
 
-This repository is the technical foundation: a deterministic FK-chain colocation
-algorithm, Vitess-style 16,384-vshard range routing, an op-log-backed at-most-once
-mutation pipeline, and a hibernated WebSocket gateway with cookie-aligned live
-queries. The locked public surface lives under `chardb`, `chardb/server`,
-`chardb/drizzle`, `chardb/files`, `chardb/auth`, `chardb/react`, and
-`chardb/cli`; everything else is implementation that may evolve between minor
-releases.
+The repository is public engineering work, not a database you should deploy yet. The routing, colocation, op-log, policy compilation, and resharding pieces have substantial tests. The domain mutation and query paths are not connected end to end.
 
-## Getting started
+## Current state
 
-```bash
-bun install
-bun test
+Implemented and tested in isolation:
+
+- Deterministic foreign-key colocation
+- 16,384 virtual-shard range routing
+- SQLite mutation deduplication through an operation log
+- Catalog routing, snapshot barriers, and resharding state machines
+- Hibernated WebSocket bookkeeping
+- Better Auth schema synthesis and SQL adapter helpers
+- Schema-first row and column policy compilation
+- TLA+ models for snapshot barriers and resharding
+
+Still missing from the application path:
+
+- Executing a user mutation inside the owning Durable Object transaction
+- Constructing the handler's Drizzle database and verified auth context
+- Applying row and column policies during real reads and writes
+- Executing an initial query for a subscription
+- Sending live results after a committed mutation
+- Applying domain migrations across shards
+- Production JWT verification in the Gateway
+
+Files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding remain experiments. They are not supported product features.
+
+The ordered implementation work lives in [PLAN.md](./PLAN.md). The detailed engineering history lives in [HANDOFF.md](./HANDOFF.md), but parts of that file describe older APIs and test counts.
+
+## The schema idea
+
+```ts
+import { forOrg } from "chardb/server";
+import { integer, text } from "drizzle-orm/sqlite-core";
+import { auth } from "./worker";
+
+const { cdbTable } = forOrg();
+
+export const messages = cdbTable(
+  "messages",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => auth.organization.id),
+    authorId: text("author_id")
+      .notNull()
+      .references(() => auth.user.id),
+    body: text("body").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  {
+    selfBy: "authorId",
+    roles: {
+      admin: "*",
+      member: { read: "*", create: ["body"] },
+      self: { read: "*", update: ["body"], delete: true },
+    },
+  },
+);
 ```
 
-## Package layout
+The organization foreign key identifies the intended transaction and placement boundary. Related rows colocate through their foreign-key chain. The unfinished runtime must enforce that boundary rather than trusting a tenant ID from the client.
 
-- `chardb` — client, types, error codes
-- `chardb/server` — `defineChardb`, `defineAuth`, `createApi`, `defineMutation` / `defineQuery` / `definePresenceKey`, the schema-first cdbTable surface (`forOrg` / `forUser` / `globalScope` factories that return a tenancy-bound `cdbTable(name, columns, config)`; `compileCdbPolicies`, `applyColumnMask`, `assertColumnsWritable`, `buildAccessControl` for runtime enforcement; `createAccessControl` re-exported from better-auth for hand-built lattices), `manifestFromExports`, `mountChardb`, scatter-gather helpers (`mergeTopK` / `mergePartialAggregates`), and the Durable Object base classes wrangler binds (`Cdb`, `Catalog`, `Gateway`, `BlobMeta`, `Resharder`, `GsiShard`)
-- `chardb/drizzle` — async SQLite driver
-- `chardb/files` — `file()` / `fileArray()` Drizzle column types + validator adapters (`chardb/files/{zod,typebox,valibot,arktype}`)
-- `chardb/auth` — `defineAuth` / `synthesizeAuthSchema` for the auth-table namespace; `withChardb` for wrapping an existing better-auth DBAdapter with epoch dispatch
-- `chardb/react` — `ChardbProvider`, `useQuery`, `useMutation`, `usePresence`
-- `chardb/observability` — tail-Worker scaffolding (`defaultChardbTail`, `renderTailWrangler`, sinks)
-- `chardb/reshard` — pure-helper trigger DDL + row-apply renderers (exercised through bun:sqlite)
-- `chardb/cli` — `chardb` binary (`init` / `doctor` / `migrate` / `deploy` are wired; `shards` / `export` / `schedule` print foundation-skeleton output today)
-- `chardb/vite` — Vite plugin (function-ref → wire id mapping; partial schema-HMR via a `chardb:schemaChanged` dev-server event)
-- `chardb/miniflare-plugin` — dev-time Miniflare plugin (cron simulator + Vectorize stub shipped)
-- `chardb/eslint-plugin` — `chardb/explain-strict` rule + recommended config
+## Repository development
 
-## Vocabulary
+Install Bun, then run:
 
-- **partition / partitionKey / `.partitionedBy()` / `CDB_CROSS_PARTITION`** — user contract.
-- **shard / shard DO / vshard** — operator/internals; physical placement.
-- **chardb** — brand and npm package. **`CDB_`** — error-code prefix.
+```bash
+bun install --frozen-lockfile
+bun run typecheck
+bun test
+bun run build
+```
+
+The workerd tests open local ports. Run them separately if the full test runner contends over Miniflare startup:
+
+```bash
+bun test test/workerd/catalog.harness.test.ts
+bun test test/workerd/reshard.harness.test.ts
+```
+
+The landing page is a separate workspace:
+
+```bash
+cd landing
+bun run build
+```
+
+## Repository layout
+
+- `src/server` contains the Worker entrypoint, Durable Objects, schema helpers, policies, and routing code.
+- `src/client` and `src/react` contain the WebSocket client and React hooks.
+- `src/oplog`, `src/colocation`, `src/reshard`, and `src/drizzle` contain the lower-level database experiments.
+- `test/workerd` exercises selected Durable Object behavior through Miniflare.
+- `spec` contains the TLA+ models.
+- `example/chat` is a concept application. It does not yet prove the complete runtime path.
+- `landing` contains the project site.
+
+## License
+
+MIT
