@@ -144,40 +144,49 @@ The database proxy now applies one explicit rule to registered-table inserts, up
 
 ## 7. Implement queries instead of subscription registration
 
-Protocol v3 subscription requests send a query reference and raw arguments. For an explicit organization query with a stable ref, partition key, and server-owned intent, Gateway validates the arguments, requires the partition and intent to resolve to the same exact organization and one virtual shard, derives current authority from Catalog, calls one Cdb read, and sends one snapshot. This path does not register the query or create replay or live-invalidation state.
+Protocol v3 subscription requests send a query reference and raw arguments. For an explicit organization query with a stable ref, partition key, and server-owned intent, Gateway validates the arguments, requires the partition and intent to resolve to the same exact organization and one virtual shard, derives current authority from Catalog, calls one Cdb read, and sends one snapshot. The public path is still one-shot: it does not install the committed durable registration state or create replay or live-update behavior. Cdb now has an internal registered-query RPC, but Gateway does not call it from `onSub` yet.
 
 - [x] Change the wire protocol so `sub` carries the query reference and raw arguments.
 - [x] Increment the protocol version and enforce it during `hello` and `welcome`.
 - [x] Validate query arguments with the query's Standard Schema validator before intent extraction.
 - [x] Resolve the query reference inside the Cdb isolate.
 - [x] Recompute the query intent on the server. Do not trust the client's intent or query hash.
-- [ ] Canonicalize query identity and include the query ref, validated arguments, verified principal, tenant, auth epoch, and policy epoch.
+- [x] Canonicalize the query ref, validated arguments, and server-derived intent into a query hash used by persisted Cdb registrations and deploy-drift checks.
+- [x] Persist principal and organization identity on Cdb registrations and require freshly derived tenant authority when executing the registered-query RPC.
+- [ ] Add a real policy epoch or digest to registered-query identity once that value is derived and enforced.
 - [x] Route explicit organization queries only when the validated partition metadata and server-computed intent resolve to the same exact organization and one virtual shard.
 - [x] Enumerate distinct current Catalog shard ids for scatter routing instead of probing virtual shards.
 - [x] Construct `QueryCtx` with a read-only database and the auth carried by the internal request.
 - [x] Apply row predicates and readable-column masks during full-row single-`cdbTable` query execution. Keep projections and joins blocked.
 - [x] Execute the query handler inside Cdb and reject non-JSON results.
+- [x] Add an internal registered-query RPC that requires an exact active generation, fresh principal and organization authority, and an unchanged ref, partition, and query hash before execution.
 - [x] Add an explicit protocol-v3 snapshot envelope, including empty row arrays, and replace client subscription state when it arrives.
 - [x] Send an explicit initial snapshot, including an empty snapshot, for the exact-partition organization query path.
 - [x] Move the client subscription from `pending` to `live` when a valid snapshot arrives.
 - [ ] Define ordering and stable row keys for collection results.
 - [x] Reject undeclared, mismatched, scatter, and cross-partition queries instead of silently routing them.
 - [ ] Remove the requirement that users manually keep a query handler and intent extractor equivalent, or verify that equivalence during the build.
-- [ ] Persist and register an authorized query before treating the one-shot snapshot as a subscription.
+- [ ] Connect public authorized registration to `onSub` before treating the one-shot snapshot as a subscription.
 
 ## 8. Implement live updates with simple invalidation first
 
 Do not start with incremental row patches. Re-run the affected query after a commit and send a replacement snapshot. Optimize after this is correct.
 
-- [x] Give every shard subscription a composite identity containing Gateway, client, and subscription IDs.
-- [x] Persist the composite identity, principal, query ref, arguments, tables, and intervals for each shard registration.
-- [x] Rebuild the in-memory interval index from SQLite when Cdb starts.
-- [ ] Add verified tenant, auth epoch, policy epoch, and last delivered cookie to the persisted record.
-- [ ] Record touched tables for every committed mutation.
-- [ ] Notify the relevant Gateway after a commit.
+- [x] Give every shard subscription a generation identity containing Gateway, registration, connection, client, and subscription IDs.
+- [x] Persist exact Cdb generation identity, principal, organization, query ref, arguments, query hash, tables, and intervals; retain retired tombstones so stale subscribe replays cannot reactivate a generation.
+- [x] Rebuild active Cdb generation identity and the in-memory interval index from SQLite when Cdb starts.
+- [x] Persist durable Gateway logical heads and generation rows with organization, logical shard, physical Cdb ID, schema epoch, three auth epochs, lifecycle, cookie, retry, and delivery fields.
+- [ ] Derive and persist a policy epoch or digest for Gateway registrations.
+- [x] Collect deterministic registered-table write sets inside successful newly-run atomic mutations without exposing them on the public mutation wire result.
+- [x] Advance the Cdb change clock and coalesce table-matched registrations into the invalidation outbox inside the same transaction as the domain write and op-log.
+- [x] Deliver bounded invalidation batches from Cdb to the physical Gateway ID with durable alarms, retries, conditional acknowledgement deletes, and dead-letter state.
+- [x] Validate production Gateway invalidation requests against the routed Gateway and exact current generation, connection, client, subscription, and physical Cdb source before accepting them.
+- [x] Durably coalesce accepted invalidations by raising `dirty_version` monotonically, including safe retries of the same change sequence.
+- [x] Persist a token-owned `run_target_version` separately from `delivered_version`; beginning a query does not claim delivery, and guarded settlement advances only the stored target while preserving newer dirtiness.
+- [ ] Wire public `onSub`, `onUnsub`, auth replacement, cancellation, and disconnect paths to install, retire, unsubscribe, and clean up exact durable generations.
 - [ ] Re-run subscriptions whose table set intersects the touched tables.
 - [ ] Send replacement snapshots with a new cookie.
-- [ ] Coalesce repeated invalidations while a query is already running.
+- [ ] Add the replacement-query runner that owns run tokens, consumes coalesced dirtiness, and stages or sends a snapshot before settling delivery.
 - [ ] Remove dead `matchSubsForRow` and patch-queue code if replacement snapshots supersede it.
 - [ ] Add a two-client test in which one client posts and the other receives the updated query result.
 - [ ] Restart both Gateway and Cdb during the test and prove subscriptions can recover.
@@ -189,12 +198,14 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [ ] Define what a cookie identifies and where its replay data lives.
 - [ ] Either implement replay from a valid cookie or always issue `mustRefetch` after reconnect.
 - [ ] Do not claim read-your-writes resume until missed updates can actually be recovered.
+- [ ] Connect replacement snapshots to a durable cookie coordinate and prove cookie replay after missed invalidations.
 - [ ] Add mutation timeouts and retry only errors marked retryable.
 - [ ] Reuse the same `mutId` when retrying the same mutation.
 - [x] Preserve the last delivered nonempty cookie on mutation failures and across auth refresh.
 - [x] Return typed errors for malformed messages instead of accepting any object with a known `t` field.
 - [x] Validate every wire message field.
 - [ ] Bound pending mutations, subscriptions, patch queues, and presence state.
+- [ ] Define client snapshot or poke acknowledgement, retention, retry, and duplicate-delivery behavior.
 - [ ] Apply backpressure or disconnect slow consumers.
 - [ ] Make disconnect and shutdown reject or retain pending mutations according to a documented rule.
 - [ ] Add failure tests for Worker RPC errors, Catalog errors, shard eviction, socket loss before acknowledgment, duplicate delivery, stale schema epoch, and protocol mismatch.
