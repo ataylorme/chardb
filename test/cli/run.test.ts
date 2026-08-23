@@ -58,3 +58,26 @@ describe("chardb explain CLI", () => {
         expect(malformed.err.join("")).toContain("intent.tables");
     });
 });
+
+describe("chardb command availability", () => {
+    test("help labels every unavailable command", async () => {
+        const { ctx, out, err } = fakeCtx();
+
+        expect(await runCli(ctx, ["--help"])).toBe(0);
+        expect(err).toEqual([]);
+        for (const command of ["migrate", "deploy", "shards", "snapshot", "restore", "export", "schedule"]) {
+            expect(out.join("")).toContain(`chardb ${command}`);
+        }
+        expect(out.join("").match(/not implemented/g)).toHaveLength(7);
+    });
+
+    test("unavailable commands fail clearly without running placeholder implementations", async () => {
+        for (const command of ["migrate", "deploy", "shards", "snapshot", "restore", "export", "schedule"]) {
+            const { ctx, out, err } = fakeCtx();
+
+            expect(await runCli(ctx, [command])).toBe(1);
+            expect(out).toEqual([]);
+            expect(err).toEqual([`chardb ${command}: not implemented in this release\n`]);
+        }
+    });
+});
