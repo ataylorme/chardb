@@ -2,7 +2,7 @@ import type { CdbError } from "../errors.ts";
 import type { ChardbRef, ClientId, PrincipalId, RawJson, ShardId, SubId } from "../types.ts";
 import type { WireInterval } from "../wire.ts";
 import type { AuthCtx } from "./define.ts";
-import type { RouteResult } from "./do/catalog.ts";
+import type { OrganizationAuthority, OrganizationAuthorityRequest, RouteResult } from "./do/catalog.ts";
 
 /** Structured-cloneable error envelope shared by every mutation RPC hop. */
 export type CdbErrorWire = ReturnType<CdbError["toJSON"]>;
@@ -27,6 +27,11 @@ export interface CatalogMutationRpc {
 /** Catalog routing surface used by subscription placement. */
 export interface CatalogRoutingRpc extends CatalogMutationRpc {
     listShardIds(): Promise<readonly ShardId[]>;
+}
+
+/** Catalog boundary for deriving tenant authority from persisted membership. */
+export interface CatalogOrganizationAuthorityRpc {
+    resolveOrganizationAuthority(request: OrganizationAuthorityRequest): Promise<OrganizationAuthority | null>;
 }
 
 /** Globally unique identity for one live subscription registration. */

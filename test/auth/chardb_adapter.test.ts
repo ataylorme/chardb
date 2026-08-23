@@ -5,6 +5,7 @@ import { bindAuthRuntime, resetAuthRuntime } from "../../src/auth/runtime.ts";
 import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import { chardb } from "../../src/server/chardb.ts";
 import { Catalog } from "../../src/server/do/catalog.ts";
+import { PrincipalId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -519,5 +520,175 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             tenant: 1,
             principal: 2,
         });
+    });
+
+    test("derives canonical organization roles and current epochs from Catalog rows", async () => {
+        const nowMs = Date.parse("2026-08-23T00:00:00Z");
+        await harness.catalog.mutateAuth({
+            model: "user",
+            op: "create",
+            payload: {
+                id: "authority-user",
+                name: "Authority User",
+                email: "authority@example.com",
+                emailVerified: true,
+                createdAt: nowMs,
+                updatedAt: nowMs,
+            },
+        });
+        await harness.catalog.mutateAuth({
+            model: "organization",
+            op: "create",
+            payload: { id: "authority-org", name: "Authority Org", slug: "authority", createdAt: nowMs },
+        });
+        await harness.catalog.mutateAuth({
+            model: "member",
+            op: "create",
+            payload: {
+                id: "authority-member",
+                organizationId: "authority-org",
+                userId: "authority-user",
+                role: " member,admin, member ,owner ",
+                createdAt: nowMs,
+            },
+        });
+
+        expect(
+            await harness.catalog.resolveOrganizationAuthority({
+                principalId: PrincipalId("authority-user"),
+                organizationId: TenantId("authority-org"),
+            })
+        ).toEqual({
+            principalId: PrincipalId("authority-user"),
+            organizationId: TenantId("authority-org"),
+            role: "admin,member,owner",
+            roles: ["admin", "member", "owner"],
+            authEpochs: { global: 1, tenant: 2, principal: 2 },
+        });
+    });
+
+    test("isolates organizations and returns null for missing or revoked membership", async () => {
+        const nowMs = Date.parse("2026-08-23T00:00:00Z");
+        for (const organizationId of ["isolation-org-a", "isolation-org-b"]) {
+            await harness.catalog.mutateAuth({
+                model: "organization",
+                op: "create",
+                payload: { id: organizationId, name: organizationId, slug: organizationId, createdAt: nowMs },
+            });
+        }
+        await harness.catalog.mutateAuth({
+            model: "user",
+            op: "create",
+            payload: {
+                id: "isolation-user",
+                name: "Isolation User",
+                email: "isolation@example.com",
+                emailVerified: true,
+                createdAt: nowMs,
+                updatedAt: nowMs,
+            },
+        });
+
+        const request = {
+            principalId: PrincipalId("isolation-user"),
+            organizationId: TenantId("isolation-org-a"),
+        };
+        expect(await harness.catalog.resolveOrganizationAuthority(request)).toBeNull();
+        await harness.catalog.mutateAuth({
+            model: "member",
+            op: "create",
+            payload: {
+                id: "isolation-member",
+                organizationId: "isolation-org-a",
+                userId: "isolation-user",
+                role: "member",
+                createdAt: nowMs,
+            },
+        });
+        expect(
+            await harness.catalog.resolveOrganizationAuthority({
+                ...request,
+                organizationId: TenantId("isolation-org-b"),
+            })
+        ).toBeNull();
+        await harness.catalog.mutateAuth({
+            model: "member",
+            op: "delete",
+            where: { id: "isolation-member" },
+        });
+        expect(await harness.catalog.resolveOrganizationAuthority(request)).toBeNull();
+    });
+
+    test("reflects membership role changes and their tenant/principal epoch bumps", async () => {
+        const nowMs = Date.parse("2026-08-23T00:00:00Z");
+        await harness.catalog.mutateAuth({
+            model: "user",
+            op: "create",
+            payload: {
+                id: "role-user",
+                name: "Role User",
+                email: "role@example.com",
+                emailVerified: true,
+                createdAt: nowMs,
+                updatedAt: nowMs,
+            },
+        });
+        await harness.catalog.mutateAuth({
+            model: "organization",
+            op: "create",
+            payload: { id: "role-org", name: "Role Org", slug: "role-org", createdAt: nowMs },
+        });
+        await harness.catalog.mutateAuth({
+            model: "member",
+            op: "create",
+            payload: {
+                id: "role-member",
+                organizationId: "role-org",
+                userId: "role-user",
+                role: "member",
+                createdAt: nowMs,
+            },
+        });
+        await harness.catalog.mutateAuth({
+            model: "member",
+            op: "update",
+            where: { id: "role-member" },
+            payload: { role: "owner, admin" },
+        });
+
+        expect(
+            await harness.catalog.resolveOrganizationAuthority({
+                principalId: PrincipalId("role-user"),
+                organizationId: TenantId("role-org"),
+            })
+        ).toMatchObject({
+            role: "admin,owner",
+            roles: ["admin", "owner"],
+            authEpochs: { global: 1, tenant: 3, principal: 3 },
+        });
+    });
+
+    test("fails closed when the organization authority models are unavailable", async () => {
+        const fullSchema = synthesizeAuthSchema(auth.options as never) as Record<string, unknown>;
+        for (const missingModel of ["organization", "member"]) {
+            harness.close();
+            const incompleteSchema = Object.fromEntries(
+                Object.entries(fullSchema).filter(([model]) => model !== missingModel)
+            );
+            resetAuthRuntime();
+            bindAuthRuntime({
+                schema: incompleteSchema as never,
+                options: auth.options as { readonly [key: string]: unknown },
+            });
+            harness = new CatalogHarness();
+            await harness.ready();
+
+            expect(
+                await harness.catalog.resolveOrganizationAuthority({
+                    principalId: PrincipalId("any-user"),
+                    organizationId: TenantId("any-org"),
+                })
+            ).toBeNull();
+        }
     });
 });

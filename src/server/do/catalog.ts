@@ -113,6 +113,27 @@ export interface RouteResult {
     readonly schemaEpoch: number;
 }
 
+export interface OrganizationAuthorityRequest {
+    /** Subject from a successfully signature-verified JWT. */
+    readonly principalId: PrincipalId;
+    /** Organization selected by the operation, not by JWT role claims. */
+    readonly organizationId: TenantId;
+}
+
+export interface OrganizationAuthority {
+    readonly principalId: PrincipalId;
+    readonly organizationId: TenantId;
+    /** Canonical comma-separated Better Auth membership role. */
+    readonly role: string;
+    /** Sorted, deduplicated membership roles. */
+    readonly roles: readonly string[];
+    readonly authEpochs: {
+        readonly global: number;
+        readonly tenant: number;
+        readonly principal: number;
+    };
+}
+
 export class Catalog extends DurableObject<CatalogEnv> {
     private bootstrapped = false;
     private authTablesBootstrapped = false;
@@ -287,6 +308,54 @@ export class Catalog extends DurableObject<CatalogEnv> {
             return one ? [one] : [];
         }
         return authFindMany(sql, table, args.where, args.limit);
+    }
+
+    /**
+     * Resolve organization authority from Catalog-owned Better Auth rows.
+     * JWT tenant and role claims are deliberately absent from this boundary:
+     * the caller supplies only its verified subject and requested organization.
+     */
+    async resolveOrganizationAuthority(args: OrganizationAuthorityRequest): Promise<OrganizationAuthority | null> {
+        await this.bootstrap();
+        if (!args.principalId || !args.organizationId) return null;
+
+        let runtime: ReturnType<typeof getAuthRuntime>;
+        try {
+            runtime = getAuthRuntime();
+        } catch (error) {
+            if (error instanceof CdbError && error.code === "CDB_AUTH_NOT_BOUND") return null;
+            throw error;
+        }
+        const authSchema = runtime.schema as unknown as Record<string, unknown>;
+        if (!authSchema.organization || !authSchema.member) return null;
+
+        this.ensureAuthTables();
+        const organizationTable = tableFor("organization");
+        const memberTable = tableFor("member");
+        let authority: OrganizationAuthority | null = null;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const organization = authFindOne(sql, organizationTable, { id: args.organizationId });
+            if (!organization) return;
+            const membership = authFindOne(sql, memberTable, {
+                organizationId: args.organizationId,
+                userId: args.principalId,
+            });
+            const roles = canonicalMembershipRoles(membership?.role);
+            if (roles.length === 0) return;
+            authority = {
+                principalId: args.principalId,
+                organizationId: args.organizationId,
+                role: roles.join(","),
+                roles,
+                authEpochs: {
+                    global: this.readEpoch("auth_global", "global"),
+                    tenant: this.readEpoch("auth_tenant", args.organizationId),
+                    principal: this.readEpoch("auth_principal", args.principalId),
+                },
+            };
+        });
+        return authority;
     }
 
     private map(): VshardMap {
@@ -521,4 +590,16 @@ export class Catalog extends DurableObject<CatalogEnv> {
         void sql;
         return out;
     }
+}
+
+function canonicalMembershipRoles(value: RawJson | undefined): readonly string[] {
+    if (typeof value !== "string") return [];
+    return [
+        ...new Set(
+            value
+                .split(",")
+                .map(role => role.trim())
+                .filter(Boolean)
+        ),
+    ].sort();
 }

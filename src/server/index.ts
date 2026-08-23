@@ -109,6 +109,7 @@ export { chardb, type ChardbApp, type ChardbFactoryInput } from "./chardb.ts";
 export { Cdb } from "./do/cdb.ts";
 export type {
     CatalogMutationRpc,
+    CatalogOrganizationAuthorityRpc,
     CatalogRoutingRpc,
     CdbErrorWire,
     CdbMutationFailure,
@@ -159,7 +160,11 @@ export {
     type VectorColumnHandle,
     type VectorConfig,
 } from "../vector.ts";
-export { Catalog } from "./do/catalog.ts";
+export {
+    Catalog,
+    type OrganizationAuthority,
+    type OrganizationAuthorityRequest,
+} from "./do/catalog.ts";
 export { Gateway } from "./do/gateway.ts";
 export { BlobMeta } from "./do/blobmeta.ts";
 export { Resharder } from "./do/resharder.ts";
