@@ -113,6 +113,12 @@ const awaitRecords = api.query(async function awaitRecordsHandler(ctx) {
     return await ctx.db.select().from(records).orderBy(records.id);
 });
 let registeredProbeRuns = 0;
+let registeredQueryPause:
+    | {
+          readonly entered: () => void;
+          readonly release: Promise<void>;
+      }
+    | undefined;
 const registeredListRecords = api.query({
     ref: "queries.ts#registeredListRecords",
     authority: "organization",
@@ -128,6 +134,11 @@ const registeredListRecords = api.query({
     }),
     handler: async function registeredListRecordsHandler(ctx, args: { organizationId: string; groupId: string }) {
         registeredProbeRuns++;
+        const pause = registeredQueryPause;
+        if (pause) {
+            pause.entered();
+            await pause.release;
+        }
         return ctx.db.select().from(records).where(eq(records.groupId, args.groupId)).orderBy(records.id).all();
     },
 });
@@ -309,6 +320,7 @@ describe("Cdb registered query execution", () => {
 
     async function setup(): Promise<{ readonly db: Database; readonly cdb: Cdb }> {
         registeredProbeRuns = 0;
+        registeredQueryPause = undefined;
         const db = new Database(":memory:");
         databases.push(db);
         const configured = construct(ConfiguredCdb, db);
@@ -359,6 +371,36 @@ describe("Cdb registered query execution", () => {
             ],
         });
         expect(registeredProbeRuns).toBe(1);
+    });
+
+    test("does not return a result when the generation retires during the handler await", async () => {
+        const { cdb } = await setup();
+        const subscription = liveIdentity({ registrationId: "registration-retired-during-query" });
+        await cdb.subscribe(liveRequest(subscription));
+
+        let signalEntered: (() => void) | undefined;
+        const entered = new Promise<void>(resolve => {
+            signalEntered = resolve;
+        });
+        let releaseHandler: (() => void) | undefined;
+        const release = new Promise<void>(resolve => {
+            releaseHandler = resolve;
+        });
+        registeredQueryPause = {
+            entered: () => signalEntered?.(),
+            release,
+        };
+
+        const pending = cdb.queryRegistered(registeredQuery(subscription));
+        await entered;
+        await cdb.unsubscribe(subscription);
+        releaseHandler?.();
+        const response = await pending;
+
+        expect(response).toMatchObject({ ok: false, error: { code: "CDB_INVARIANT" } });
+        expect(response).not.toHaveProperty("result");
+        expect(registeredProbeRuns).toBe(1);
+        registeredQueryPause = undefined;
     });
 
     test("rejects missing, forged, principal-mismatched, and retired registrations before execution", async () => {

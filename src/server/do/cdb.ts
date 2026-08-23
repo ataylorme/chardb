@@ -1001,6 +1001,28 @@ export class Cdb extends DurableObject<CdbEnv> {
             if (!Array.isArray(result)) {
                 throw subscriptionInvariant("registered query result must be an array");
             }
+
+            const current = sql.one<StoredSubscriptionRow>(
+                `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+                        principal_id, organization_id, ref, args_json, query_hash, tables_json, intervals_json
+                 FROM _chardb_live_subscriptions
+                 WHERE gateway_id = ? AND registration_id = ?`,
+                request.subscription.gatewayId,
+                request.subscription.registrationId
+            );
+            if (
+                !current ||
+                current.state !== "active" ||
+                !sameSubscriptionIdentity(current, request.subscription) ||
+                current.principal_id !== row.principal_id ||
+                current.organization_id !== row.organization_id ||
+                current.payload_hash !== row.payload_hash ||
+                current.query_hash !== row.query_hash
+            ) {
+                throw subscriptionInvariant("registered query changed while its handler was running");
+            }
+            parseStoredSubscription(current);
+            assertSubscriptionTables(sql, request.subscription, [...new Set(subscription.tables)].sort());
             return { ok: true, result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
