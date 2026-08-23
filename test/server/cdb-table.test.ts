@@ -22,8 +22,8 @@ import {
     compileCdbPolicies,
     forOrg,
     forUser,
-    globalScope,
     getCdbMeta,
+    globalScope,
     isCdbTable,
     resolveCdbMeta,
 } from "../../src/server/index.ts";
@@ -425,7 +425,8 @@ describe("buildAccessControl", () => {
     });
 
     test("admin authorizes every verb on every cdbTable", () => {
-        const admin = built.roles.admin!;
+        const admin = built.roles.admin;
+        if (!admin) throw new Error("expected buildAccessControl to create the admin role");
         expect(admin.authorize({ messages_for_ac: ["read", "create", "update", "delete"] }).success).toBe(true);
     });
 });

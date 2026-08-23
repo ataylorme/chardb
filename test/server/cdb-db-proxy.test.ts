@@ -21,10 +21,10 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import type { BaseSQLiteDatabase, SQLiteTable } from "drizzle-orm/sqlite-core";
-import { forOrg, forUser, wrapDb } from "../../src/server/index.ts";
 import type { AuthCtx } from "../../src/server/define.ts";
+import { forOrg, forUser, wrapDb } from "../../src/server/index.ts";
 
 /**
  * The stub satisfies the surface chardb's proxy actually inspects
