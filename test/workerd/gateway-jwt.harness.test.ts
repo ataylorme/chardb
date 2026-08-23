@@ -180,15 +180,22 @@ afterAll(async () => {
 interface OpenedSocket {
     readonly socket: WebSocket;
     readonly first: Promise<Down>;
-    readonly closed: Promise<void>;
+    readonly closed: Promise<CloseEvent>;
 }
 
 async function openSocket(
     jwt: string,
-    options: { readonly clientId?: string; readonly resumeFromCookie?: string } = {}
+    options: {
+        readonly clientId?: string;
+        readonly routedClientId?: string | null;
+        readonly resumeFromCookie?: string;
+    } = {}
 ): Promise<OpenedSocket> {
     if (!workerdUrl) throw new Error("miniflare not initialized");
+    const clientId = options.clientId ?? crypto.randomUUID();
     const url = new URL("/ws", workerdUrl);
+    const routedClientId = options.routedClientId === undefined ? clientId : options.routedClientId;
+    if (routedClientId !== null) url.searchParams.set("clientId", routedClientId);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(url);
     await new Promise<void>((resolve, reject) => {
@@ -211,11 +218,11 @@ async function openSocket(
         );
     });
     const first = nextDown(socket);
-    const closed = new Promise<void>(resolve => socket.addEventListener("close", () => resolve(), { once: true }));
+    const closed = new Promise<CloseEvent>(resolve => socket.addEventListener("close", resolve, { once: true }));
     const hello: Up = {
         t: "hello",
         protocolV: PROTOCOL_V,
-        clientId: ClientId(options.clientId ?? crypto.randomUUID()),
+        clientId: ClientId(clientId),
         ...(options.resumeFromCookie ? { resumeFromCookie: Cookie(options.resumeFromCookie) } : {}),
         jwt,
     };
@@ -309,6 +316,15 @@ async function enqueuePatch(clientId: string, rowKey: string): Promise<void> {
 }
 
 describe("configured Gateway JWT handshake in real workerd", () => {
+    test("rejects a hello client id that differs from the Worker-routed client id", async () => {
+        const { first, closed } = await openSocket(await signed(), {
+            clientId: "hello-client",
+            routedClientId: "routed-client",
+        });
+        await expect(first).resolves.toMatchObject({ t: "error", code: "CDB_FORBIDDEN" });
+        expect(await closed).toMatchObject({ code: 1008, reason: "CDB_FORBIDDEN" });
+    });
+
     test("a seeded Catalog membership permits the declared organization mutation", async () => {
         const clientId = "workerd-authorized-client";
         const { socket, first, closed } = await openSocket(await signed(), { clientId });

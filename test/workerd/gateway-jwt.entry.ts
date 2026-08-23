@@ -355,7 +355,7 @@ export default {
         }
         if (url.pathname === "/patch-poke") {
             const body = (await request.json()) as { readonly clientId: string; readonly rowKey: string };
-            const id = env.CDB_GATEWAY.idFromName("gateway-jwt-probe");
+            const id = env.CDB_GATEWAY.idFromName(body.clientId.slice(0, 12));
             const gateway = env.CDB_GATEWAY.get(id) as unknown as {
                 enqueuePatch(clientId: ReturnType<typeof ClientId>, patch: RowPatch): Promise<void>;
             };
@@ -368,7 +368,8 @@ export default {
             return Response.json({ ok: true });
         }
         if (url.pathname === "/ws") {
-            const id = env.CDB_GATEWAY.idFromName("gateway-jwt-probe");
+            const routedClientId = url.searchParams.get("clientId");
+            const id = env.CDB_GATEWAY.idFromName((routedClientId ?? "missing-client-route").slice(0, 12));
             return env.CDB_GATEWAY.get(id).fetch(request);
         }
         return new Response("not found", { status: 404 });

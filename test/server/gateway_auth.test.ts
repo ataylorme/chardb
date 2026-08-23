@@ -6,6 +6,7 @@ import { gatewayJwtConfigFromAuthOptions } from "../../src/server/chardb.ts";
 import {
     type GatewayJwtConfig,
     isCurrentVerifiedAttachment,
+    routedClientIdFromUrl,
     trustedMutationAuthFromAttachment,
     verifyGatewayJwt,
 } from "../../src/server/do/gateway.ts";
@@ -71,6 +72,20 @@ function config(overrides: Partial<GatewayJwtConfig> = {}): GatewayJwtConfig {
 }
 
 describe("Gateway verified JWT boundary", () => {
+    test("accepts one bounded routed client id and rejects missing or malformed routes", () => {
+        expect(routedClientIdFromUrl("https://app.example/ws?clientId=client-1")).toBe(ClientId("client-1"));
+        for (const url of [
+            "https://app.example/ws",
+            "https://app.example/ws?clientId=",
+            "https://app.example/ws?clientId=%20client-1",
+            "https://app.example/ws?clientId=client%00one",
+            "https://app.example/ws?clientId=client-1&clientId=client-2",
+            `https://app.example/ws?clientId=${"x".repeat(257)}`,
+        ]) {
+            expect(routedClientIdFromUrl(url)).toBeNull();
+        }
+    });
+
     test("attaches only signature-verified identity and expiry", async () => {
         const { catalog, sign } = await signingFixture();
         const attachment = await verifyGatewayJwt({

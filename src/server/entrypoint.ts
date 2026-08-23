@@ -124,8 +124,9 @@ class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
     private async handleWebSocket(request: Request): Promise<Response> {
         const url = new URL(request.url);
         const clientId = url.searchParams.get("clientId") ?? crypto.randomUUID();
+        url.searchParams.set("clientId", clientId);
         const id = this.env.CDB_GATEWAY.idFromName(clientId.slice(0, 12));
-        return this.env.CDB_GATEWAY.get(id).fetch(request);
+        return this.env.CDB_GATEWAY.get(id).fetch(new Request(url, request));
     }
 
     private async handleDashboard(request: Request): Promise<Response> {

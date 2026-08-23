@@ -16,7 +16,7 @@ import { verifyJwt } from "../../auth/jwt.ts";
 import { CdbError, docsUrlFor, isCdbErrorCode, isRetryable } from "../../errors.ts";
 import {
     type ChardbRef,
-    type ClientId,
+    ClientId,
     Cookie,
     CorrelationId,
     type MutId,
@@ -104,6 +104,7 @@ interface PendingGwAttachment {
     readonly kind: "pending";
     readonly connectionId: string;
     readonly authOrigin: string;
+    readonly routedClientId: ClientId | null;
 }
 
 interface RejectedGwAttachment {
@@ -162,6 +163,35 @@ export interface GatewayJwtConfig {
     readonly authBasePath: string;
     readonly jwksPath: string;
     readonly clockToleranceSeconds?: number;
+}
+
+/** Parse the Worker-routed client id without trusting the later hello payload. */
+export function routedClientIdFromUrl(rawUrl: string): ClientId | null {
+    let candidates: string[];
+    try {
+        candidates = new URL(rawUrl).searchParams.getAll("clientId");
+    } catch {
+        return null;
+    }
+    if (candidates.length !== 1) return null;
+    const candidate = candidates[0] as string;
+    if (
+        candidate.length === 0 ||
+        candidate.length > 256 ||
+        candidate.trim() !== candidate ||
+        hasAsciiControlCharacter(candidate)
+    ) {
+        return null;
+    }
+    return ClientId(candidate);
+}
+
+function hasAsciiControlCharacter(value: string): boolean {
+    for (let index = 0; index < value.length; index++) {
+        const code = value.charCodeAt(index);
+        if (code <= 31 || code === 127) return true;
+    }
+    return false;
 }
 
 interface CatalogJwksRpc extends CatalogMutationRpc {
@@ -613,6 +643,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             kind: "pending",
             connectionId: crypto.randomUUID(),
             authOrigin: new URL(request.url).origin,
+            routedClientId: routedClientIdFromUrl(request.url),
         } satisfies PendingGwAttachment);
         return new Response(null, { status: 101, webSocket: pair[0] });
     }
@@ -670,26 +701,26 @@ export class Gateway extends DurableObject<GatewayEnv> {
     }
 
     private async onHello(ws: WebSocket, msg: Extract<Up, { t: "hello" }>): Promise<void> {
+        const pending = ws.deserializeAttachment() as GwAttachment | null;
+        if (pending?.kind !== "pending" || pending.routedClientId === null || msg.clientId !== pending.routedClientId) {
+            this.rejectAuth(ws, "CDB_FORBIDDEN");
+            return;
+        }
         const mismatch = checkProtocolV(msg.protocolV);
         if (mismatch) {
             this.send(ws, mismatch);
             ws.close(1002, `unsupported chardb protocol ${msg.protocolV}`);
             return;
         }
-        const pending = ws.deserializeAttachment() as GwAttachment | null;
-        if (pending?.kind !== "pending") {
-            this.rejectAuth(ws, "CDB_FORBIDDEN");
-            return;
-        }
         const attachment = await this.verifyAttachment(ws, {
             authOrigin: pending.authOrigin,
             connectionId: pending.connectionId,
-            clientId: msg.clientId,
+            clientId: pending.routedClientId,
             jwt: msg.jwt,
             ...(msg.resumeFromCookie ? { lastCookie: msg.resumeFromCookie } : {}),
         });
         if (!attachment) return;
-        const baseCookie = Cookie(`${msg.clientId}:0`);
+        const baseCookie = Cookie(`${pending.routedClientId}:0`);
         ws.serializeAttachment({
             ...attachment,
             lastCookie: msg.resumeFromCookie ?? baseCookie,
