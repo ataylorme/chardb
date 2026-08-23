@@ -143,13 +143,13 @@ Implement it as follows:
 
 ## 7. Implement queries instead of subscription registration
 
-The subscription wire message contains an intent and hash but no query reference or arguments. The server therefore cannot invoke `defineQuery`. `Cdb.subscribe` only registers intervals and never returns rows.
+The subscription protocol now sends a query reference and raw arguments. Gateway validates the arguments, derives routing intent from its local server manifest, and forwards the validated identity to Cdb. Cdb still only registers intervals and never invokes the query or returns rows.
 
-- [ ] Change the wire protocol so `sub` carries the query reference and raw arguments.
-- [ ] Increment the protocol version.
-- [ ] Validate query arguments with the query's Standard Schema validator.
+- [x] Change the wire protocol so `sub` carries the query reference and raw arguments.
+- [x] Increment the protocol version and enforce it during `hello` and `welcome`.
+- [x] Validate query arguments with the query's Standard Schema validator before intent extraction.
 - [ ] Resolve the query reference inside the Cdb isolate.
-- [ ] Recompute the query intent on the server. Do not trust the client's intent or query hash.
+- [x] Recompute the query intent on the server. Do not trust the client's intent or query hash.
 - [ ] Route organization queries using the verified tenant and the server-computed intent.
 - [ ] Construct `QueryCtx` with a read database and verified auth.
 - [ ] Apply row and column policies during query execution.
@@ -187,8 +187,8 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [ ] Add mutation timeouts and retry only errors marked retryable.
 - [ ] Reuse the same `mutId` when retrying the same mutation.
 - [ ] Never store an empty cookie from a failed mutation.
-- [ ] Return typed errors for malformed messages instead of accepting any object with a known `t` field.
-- [ ] Validate every wire message field.
+- [x] Return typed errors for malformed messages instead of accepting any object with a known `t` field.
+- [x] Validate every wire message field.
 - [ ] Bound pending mutations, subscriptions, patch queues, and presence state.
 - [ ] Apply backpressure or disconnect slow consumers.
 - [ ] Make disconnect and shutdown reject or retain pending mutations according to a documented rule.
@@ -218,10 +218,10 @@ The chat directory now consumes the packed package and passes compile-time check
 
 - [x] Rewrite `chardb init` to generate `forOrg`, `cdbTable`, current auth setup, current API helpers, and the actual Wrangler bindings.
 - [ ] Make the generated project install and build without this monorepo.
-- [ ] Make `doctor` report unimplemented checks as failures, not success.
+- [x] Make `doctor` report unimplemented checks as failures, not success.
 - [x] Wire the advertised `explain` command into command dispatch.
 - [x] Keep unfinished commands visible only when help labels them `not implemented`, and make invocation exit nonzero.
-- [ ] Remove reserved HTTP routes that only return 501.
+- [x] Remove reserved HTTP routes that only return 501.
 - [x] Remove placeholder React hooks from public exports until implemented.
 - [x] Remove placeholder file and vector APIs from the main product description.
 - [x] Run each workerd harness in a separate sequential CI process to avoid shared Miniflare ports.
@@ -241,12 +241,12 @@ The chat directory now consumes the packed package and passes compile-time check
 - [x] Stop tracking generated landing `.js`, `.d.ts`, and `.tsbuildinfo` files.
 - [x] Add `prepack` so a clean package build always produces `dist`.
 - [x] Fail the package build on warnings.
-- [ ] Stop publishing all of `src` unless there is a concrete consumer need.
+- [x] Stop publishing all of `src` unless there is a concrete consumer need.
 - [x] Include `LICENSE` and `README.md` in the tarball.
-- [ ] Include `STATUS.md`, `ARCHITECTURE.md`, `SECURITY.md`, and `CONTRIBUTING.md` in the tarball.
-- [ ] Create an empty consumer fixture that installs the tarball and imports every advertised subpath.
+- [x] Include `STATUS.md`, `ARCHITECTURE.md`, `SECURITY.md`, and `CONTRIBUTING.md` in the tarball.
+- [x] Create an empty consumer fixture that installs the tarball and imports every advertised subpath.
 - [x] Test the chat consumer's runtime imports and declarations from the packed package without workspace hoisting.
-- [ ] Fix all Biome errors and warnings, or narrow the lint inputs deliberately and document why.
+- [x] Fix all Biome errors and warnings, or narrow the lint inputs deliberately and document why.
 - [x] Add CI for frozen install, typecheck, lint, unit tests, serialized workerd tests, package build, package consumer test, landing build, and example build.
 - [ ] Run a full-history secret scan before changing repository visibility.
 
