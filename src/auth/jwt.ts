@@ -25,7 +25,7 @@
  * https://datatracker.ietf.org/doc/html/rfc7519#section-4.1
  */
 
-import { errors as joseErrors, importJWK, jwtVerify, type JWK } from "jose";
+import { type JWK, importJWK, errors as joseErrors, jwtVerify } from "jose";
 import { CdbError } from "../errors.ts";
 import { PrincipalId } from "../types.ts";
 

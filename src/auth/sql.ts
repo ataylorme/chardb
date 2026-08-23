@@ -127,7 +127,7 @@ export function authCreate(
     // Re-read the row so we return the canonical post-insert shape (e.g. defaults
     // populated by SQLite). Best-effort PK lookup: the better-auth adapter
     // always supplies an `id` field for create; if not, fall back to the input.
-    const id = payload["id"];
+    const id = payload.id;
     if (id !== undefined) {
         const found = sql.one<Record<string, unknown>>(
             `SELECT * FROM ${quoteIdent(info.name)} WHERE ${quoteIdent(info.columns.get("id") ?? "id")} = ? LIMIT 1`,

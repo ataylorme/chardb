@@ -32,8 +32,6 @@
  */
 
 import type { BetterAuthOptions, BetterAuthPlugin } from "better-auth";
-import { admin } from "better-auth/plugins/admin";
-import { organization } from "better-auth/plugins/organization";
 import { getAuthTables } from "better-auth/db";
 import type {
     BaseAccount,
@@ -44,6 +42,8 @@ import type {
     BetterAuthDBSchema,
     DBFieldAttribute,
 } from "better-auth/db";
+import { admin } from "better-auth/plugins/admin";
+import { organization } from "better-auth/plugins/organization";
 import type {
     Invitation,
     Member,

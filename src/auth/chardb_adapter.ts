@@ -23,13 +23,13 @@
  * support is straightforward to add by extending `whereToFlat`.
  */
 
-import { createAdapterFactory } from "better-auth/adapters";
-import type { BetterAuthOptions } from "better-auth";
 import type { AdapterFactory, CleanedWhere } from "@better-auth/core/db/adapter";
+import type { BetterAuthOptions } from "better-auth";
+import { createAdapterFactory } from "better-auth/adapters";
 import { CdbError } from "../errors.ts";
 import type { RawJson } from "../types.ts";
 import { vshardOf } from "../vshard.ts";
-import { type AuthEpochDispatcher } from "./adapter.ts";
+import type { AuthEpochDispatcher } from "./adapter.ts";
 import { placementFor } from "./runtime.ts";
 
 /**
