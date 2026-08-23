@@ -25,13 +25,14 @@ Do this work before touching the higher-level features:
 - [x] Prove that the failed mutation rolls back both statements and its op-log entry.
 - [x] Decide whether the public mutation handler remains async or becomes synchronous.
 - [x] Make mutation handlers and their argument validators synchronous so they can run inside `transactionSync`.
-- [ ] Put the application manifest and schema in the Cdb isolate through a generated registry, configured subclass, or eagerly bound module runtime.
-- [ ] Remove the runner closure from the Cdb RPC contract.
-- [ ] Make `Cdb.mutate` accept one serializable request containing `ref`, validated `args`, `mutId`, verified auth, and schema epoch.
-- [ ] Resolve the mutation reference inside the owning Cdb isolate.
+- [x] Put the application manifest and schema in the Cdb isolate through a configured subclass.
+- [x] Remove the runner closure from the Cdb RPC contract.
+- [x] Make `Cdb.mutate` accept one serializable request containing `ref`, validated `args`, `mutId`, auth context, and schema epoch.
+- [ ] Only construct that request from verified auth and server-derived tenant membership.
+- [x] Resolve the mutation reference inside the owning Cdb isolate.
 - [x] Construct a real Drizzle database over a Cdb `SqlStorage` inside the atomic executor.
 - [x] Construct `MutationCtx` with that Drizzle database and an auth context inside the atomic executor.
-- [ ] Invoke the handler inside the chosen transaction boundary.
+- [x] Invoke the handler inside the chosen transaction boundary.
 - [x] Return the handler's exact result. Do not reconstruct it from `returning[0]`.
 - [x] Validate that mutation results are JSON before committing them.
 - [x] Store the exact result in the op-log replay envelope.
