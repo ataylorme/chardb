@@ -59,10 +59,10 @@ The package currently has three incompatible ideas about how requests reach user
 
 Stable references also need repair:
 
-- [ ] Teach the Vite transform to recognize `api.mutation` and `api.query`, not only direct `defineMutation` and `defineQuery` calls.
-- [ ] Stamp references from module path and export name.
-- [ ] Fail the build on duplicate references.
-- [ ] Add a test with at least two config-form mutations and two config-form queries in one application.
+- [x] Teach the Vite transform to recognize `api.mutation` and `api.query`, not only direct `defineMutation` and `defineQuery` calls.
+- [x] Stamp references from module path and export name.
+- [x] Fail the build on duplicate references.
+- [x] Add a test with at least two config-form mutations and two config-form queries in one application.
 - [ ] Prove that client references match the server manifest after a production build.
 
 ## 3. Create and migrate domain tables
