@@ -31,7 +31,7 @@ Still missing from the application path:
 
 Files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding remain experiments. They are not supported product features.
 
-The ordered implementation work lives in [PLAN.md](./PLAN.md). The detailed engineering history lives in [HANDOFF.md](./HANDOFF.md), but parts of that file describe older APIs and test counts.
+See [STATUS.md](./STATUS.md) for current capability boundaries, [ARCHITECTURE.md](./ARCHITECTURE.md) for the runtime design, and [PLAN.md](./PLAN.md) for the ordered implementation work.
 
 ## The schema idea
 

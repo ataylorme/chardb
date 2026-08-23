@@ -263,9 +263,9 @@ The current landing page describes a product that does not exist. Fix the code f
 - [ ] Remove the fake `[[chardb]]` binding and nonexistent `client(env.DB)` example.
 - [ ] Remove the npm install command until the package is published.
 - [ ] Replace dead Docs links with real documents.
-- [ ] Replace `HANDOFF.md` with public status documentation, or keep it out of the public repository.
-- [ ] Add an architecture document that explains Worker, Gateway, Catalog, Cdb, transaction ownership, schema migration, auth verification, and subscription invalidation.
-- [ ] Add a status table that distinguishes implemented, tested in isolation, wired end to end, and experimental.
+- [x] Replace internal engineering notes with public status documentation.
+- [x] Add an architecture document that explains Worker, Gateway, Catalog, Cdb, transaction ownership, schema migration, auth verification, and subscription invalidation.
+- [x] Add a status table that distinguishes implemented, tested in isolation, wired end to end, and experimental.
 - [ ] Keep every feature claim tied to a test that exercises the real runtime path.
 
 ## 14. Work that stays deferred
