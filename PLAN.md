@@ -6,13 +6,13 @@ Last reviewed: 2026-08-23
 
 Chardb should do one thing well: a developer marks an organization boundary in a Drizzle schema, and chardb routes that organization's data to a SQLite Durable Object with tenant isolation, atomic mutations, idempotent retries, initial queries, and live updates.
 
-The repository does not do that yet. It can bootstrap domain tables, execute isolated shard-local writes and reads, and enforce insert, update, delete, and full-row select policy rules. The public auth, routing, query-delivery, and live-update path is still disconnected.
+The repository does not do that yet. A declared organization mutation now crosses the public Gateway, Catalog, and Cdb path in a focused workerd test. Full-row policy enforcement and isolated shard-local reads also work. The packed example, initial query delivery, and live-update path are still incomplete.
 
 Finish the organization-tenanted SQL path first. Stop presenting files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding as working product features. Keep that code as experimental work until the database path works.
 
 ## 1. Settle how mutations execute
 
-The trusted mutation dispatcher now resolves the server manifest, routes through Catalog, and sends one serializable request to Cdb. Cdb resolves the handler and commits its SQL with the op-log inside one synchronous transaction. Gateway verifies WebSocket identity, but it cannot construct the trusted mutation request until Catalog-derived membership, role, and policy authority are connected. Client promise settlement also needs failure coverage.
+The public mutation path is open only for definitions with an explicit stable ref and `authority: "organization"`. Gateway verifies the JWT subject, validates and transforms raw arguments once, extracts the organization partition, and asks Catalog to re-derive membership, role, roles, and auth epochs. Cdb treats the resulting RPC as trusted post-validation input, resolves the validated handler, and commits its policy-wrapped SQL with the op-log inside one synchronous transaction.
 
 - [x] Write a small workerd test that runs two domain SQL statements in one Durable Object mutation and throws after the second statement.
 - [x] Prove that the failed mutation rolls back both statements and its op-log entry.
@@ -21,7 +21,7 @@ The trusted mutation dispatcher now resolves the server manifest, routes through
 - [x] Put the application manifest and schema in the Cdb isolate through a configured subclass.
 - [x] Remove the runner closure from the Cdb RPC contract.
 - [x] Make `Cdb.mutate` accept one serializable request containing `ref`, validated `args`, `mutId`, auth context, and schema epoch.
-- [ ] Only construct that request from verified auth and server-derived tenant membership.
+- [x] Construct public organization mutation requests only from a verified JWT subject and current Catalog-derived membership, roles, and auth epochs.
 - [x] Resolve the mutation reference inside the owning Cdb isolate.
 - [x] Construct a real Drizzle database over a Cdb `SqlStorage` inside the atomic executor.
 - [x] Construct `MutationCtx` with that Drizzle database and an auth context inside the atomic executor.
@@ -31,18 +31,18 @@ The trusted mutation dispatcher now resolves the server manifest, routes through
 - [x] Store the exact result in the op-log replay envelope.
 - [x] Return that stored result when the client repeats the same `mutId`.
 - [x] Keep collision detection for a repeated `mutId` with different arguments.
-- [ ] Make every error path settle the client mutation promise.
+- [x] Settle admitted public mutations once across local routing, Catalog authority and routing, Cdb RPC, malformed response, and policy failures.
 
 ## 2. Make runtime registration and routing coherent
 
-The configured Gateway now owns partition extraction and manifest lookup. It routes through Catalog, then sends a serializable request to the configured Cdb. The remaining routing problem is trust. The partition key must come from verified tenant state rather than caller-controlled arguments.
+The configured Gateway owns partition extraction and manifest lookup. For a declared organization mutation, it validates and transforms raw arguments once before extracting the partition key. Catalog must confirm that the verified JWT subject currently belongs to that exact organization before routing continues.
 
 - [x] Make the configured Gateway own partition extraction and manifest lookup.
 - [x] Define typed routing, Catalog, and Cdb mutation interfaces in one shared module.
 - [x] Remove the invalid Worker service self-binding from generated and example Wrangler configuration.
 - [x] Make `chardb doctor` validate the Durable Object bindings without requiring a service self-binding.
 - [x] Remove the Worker `runMutation` RPC that returned only a vshard while dropping `mutId` and auth.
-- [ ] Pass the verified tenant-derived partition key through routing.
+- [x] Route with the organization extracted from validated arguments only after Catalog confirms the verified subject's membership in it.
 - [x] Read the current routing table and schema epoch from Catalog before invoking Cdb.
 - [x] Catch local routing, Catalog, and Cdb failures and translate them to typed mutation responses.
 - [x] Preserve each error code's retryable flag and documentation URL in mutation wire responses.
@@ -53,7 +53,7 @@ Stable references also need repair:
 - [x] Stamp references from module path and export name.
 - [x] Fail the build on duplicate references.
 - [x] Add a test with at least two config-form mutations and two config-form queries in one application.
-- [ ] Prove that client references match the server manifest after a production build.
+- [x] Prove two explicit mutation refs match between a real emitted Vite browser chunk and an independently bundled workerd Worker.
 
 ## 3. Create and migrate domain tables
 
@@ -100,22 +100,23 @@ The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lo
 
 ## 5. Make authentication a real trust boundary
 
-The configured Gateway verifies JWT signatures and registered claims during `hello` and `updateAuth`. Its attachment stores only verified subject and time bounds. Verified identity is not tenant authority, so mutations, subscriptions, and presence remain fail-closed until Catalog-derived membership, role, and policy state are attached.
+The configured Gateway verifies JWT signatures and registered claims during `hello` and `updateAuth`. Its attachment stores only the verified subject and time bounds. For each declared organization mutation, Gateway asks Catalog to derive current membership, role, roles, and auth epochs. Undeclared mutations, public subscriptions, queries, and presence remain fail-closed.
 
 - [x] Verify the JWT signature before storing `principalId`; do not copy tenant, role, or custom claims into the verified attachment.
 - [x] Pin issuer, audience, and accepted algorithms from the configured Better Auth JWT plugin, with a bounded 30-second default clock tolerance.
 - [x] Resolve JWKS through the Catalog-backed resolver contract.
 - [ ] Prove outbound JWKS fetch, key rotation, and cache refresh through the configured Gateway path.
 - [x] Reject missing, malformed, tampered, expired, not-yet-valid, wrong-issuer, wrong-audience, and disallowed-algorithm tokens.
-- [x] Handle `updateAuth`, replace the verified subject only after successful verification, and invalidate existing subscriptions.
+- [x] Serialize `updateAuth` per server connection id, drain admitted mutations, replace the subject only after successful verification, invalidate subscriptions, and store a terminal rejected attachment on failure.
 - [x] Recheck token time bounds before every mutation, subscription, and presence operation.
 - [x] Stop deriving a principal from `clientId` for protected requests.
-- [ ] Derive active organization membership and role from trusted server state. Do not accept a caller-supplied organization argument as authority.
-- [ ] Build `ctx.auth` only after verification and membership resolution.
+- [x] Derive organization membership, role, roles, and auth epochs from Catalog for each declared organization mutation. Treat the caller's validated organization only as the requested partition.
+- [x] Build mutation `ctx.auth` only after JWT verification and Catalog membership resolution.
 - [ ] Define the anonymous query behavior explicitly.
 - [x] Test real signed tokens, tampering, expiry, not-before, issuer, audience, algorithm, subject refresh, and the Catalog resolver contract.
 - [x] Test the configured Gateway WebSocket dispatch under workerd with real Catalog SQLite cache and ES256 tokens.
-- [ ] Add tests for revoked membership, changed role, and a socket that outlives its membership authority.
+- [x] Prove a later revocation blocks the next mutation, while documenting that the Catalog authority read does not cancel an already-authorized in-flight Cdb call.
+- [ ] Add workerd tests for membership deletion, role changes, and a socket that outlives its membership authority.
 
 ## 6. Finish policy enforcement
 
@@ -136,6 +137,7 @@ The database proxy now applies one explicit rule to registered-table inserts, up
 - [x] Apply readable-column masks to full-row select results.
 - [ ] Compile safe readable-column masks for projections and joins. Keep those shapes blocked until then.
 - [x] Block raw SQL, session and client access, relational shortcuts, plain-table CRUD, insert-select, conflict methods, `returning`, and unsupported pre-policy builder paths from application handlers.
+- [x] Prove in workerd that a raw escape after typed SQL rolls back both that SQL and the provisional op-log row.
 - [ ] Remove unused policy-digest and auth-epoch claims, or wire them into actual subscription identity and invalidation.
 - [ ] Add hostile two-tenant tests for every CRUD operation.
 - [ ] Test admin, member, self, public read, no matching role, forbidden columns, explicit tenant override, and membership revocation.
@@ -153,7 +155,7 @@ Protocol v3 subscriptions send a query reference and raw arguments. Gateway vali
 - [ ] Route organization queries using the verified tenant and the server-computed intent.
 - [x] Enumerate distinct current Catalog shard ids for scatter routing instead of probing virtual shards.
 - [x] Construct `QueryCtx` with a read-only database and the auth carried by the internal request.
-- [ ] Apply row and column policies during query execution.
+- [x] Apply row predicates and readable-column masks during full-row single-`cdbTable` query execution. Keep projections and joins blocked.
 - [x] Execute the query handler inside Cdb and reject non-JSON results.
 - [x] Add an explicit protocol-v3 snapshot envelope, including empty row arrays, and replace client subscription state when it arrives.
 - [ ] Send an explicit initial snapshot, including an empty snapshot.
@@ -181,14 +183,14 @@ Do not start with incremental row patches. Re-run the affected query after a com
 
 ## 9. Define reconnect, retry, and failure behavior
 
-The current cookie is a generated string, not a replay coordinate. Resume does not replay missed changes. Mutation RPC exceptions can leave promises pending forever.
+The current cookie is a generated string, not a replay coordinate. Resume does not replay missed changes. Admitted mutation dispatch failures settle as typed results, but socket loss and shutdown behavior still need an explicit rule.
 
 - [ ] Define what a cookie identifies and where its replay data lives.
 - [ ] Either implement replay from a valid cookie or always issue `mustRefetch` after reconnect.
 - [ ] Do not claim read-your-writes resume until missed updates can actually be recovered.
 - [ ] Add mutation timeouts and retry only errors marked retryable.
 - [ ] Reuse the same `mutId` when retrying the same mutation.
-- [ ] Never store an empty cookie from a failed mutation.
+- [x] Preserve the last delivered nonempty cookie on mutation failures and across auth refresh.
 - [x] Return typed errors for malformed messages instead of accepting any object with a known `t` field.
 - [x] Validate every wire message field.
 - [ ] Bound pending mutations, subscriptions, patch queues, and presence state.
@@ -198,7 +200,7 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 
 ## 10. Make one real example
 
-The chat directory now consumes the packed package and passes compile-time checks. It is not runnable end to end because domain migrations, verified auth, initial queries, and live updates remain incomplete.
+The chat directory now consumes the packed package and passes compile-time checks. Its mutation declares the public organization authority contract, but the packed example has not run a Better Auth sign-in, persisted mutation readback, initial query, or live update under workerd. Domain migrations are also incomplete.
 
 - [x] Install the package through npm's packed file-dependency path with a committed consumer lockfile.
 - [x] Declare every dependency used by the example.
@@ -208,7 +210,7 @@ The chat directory now consumes the packed package and passes compile-time check
 - [x] Delete stale `tenantScope`, `ownerScope`, and `requirePermission` documentation.
 - [ ] Generate the example schema through real migrations.
 - [x] Add an idempotent auth hook that reuses the demo organization and user membership, tolerates confirmed concurrent creation, then sets the active organization.
-- [ ] Make posting a message use the real mutation path.
+- [x] Give `postMessage` an explicit stable ref and organization authority, and call it through the public mutation hook.
 - [ ] Make opening a channel return a persisted initial query result.
 - [ ] Make a second browser receive the live replacement result.
 - [ ] Add an organization switch and prove data isolation.

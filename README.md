@@ -4,7 +4,7 @@ Experimental tenant-sharded SQLite for Cloudflare Durable Objects.
 
 Chardb explores one idea: mark an organization boundary in a Drizzle schema, then derive data placement, per-tenant transactions, authorization, and live-query routing from that declaration.
 
-This is engineering work intended for public review, not a database you should deploy yet. The routing, colocation, op-log, policy compilation, and resharding pieces have substantial tests. The domain mutation and query paths are not connected end to end.
+This is engineering work intended for public review, not a database you should deploy yet. A declared organization mutation now crosses the public WebSocket, Gateway, Catalog, and Cdb path in a focused workerd test. The public query and live-update paths remain disconnected, and no packed example has passed a full sign-in-to-read round trip.
 
 ## Current state
 
@@ -21,6 +21,9 @@ Implemented and tested in isolation:
 - Constraint-complete Catalog auth DDL with exact `auth_ddl_v1` compatibility checks
 - Atomic Catalog auth mutations with directly derivable old and new epoch bumps
 - Gateway JWT signature and registered-claim verification
+- Public organization-authorized mutations with explicit stable refs
+- Catalog-derived membership, roles, and auth epochs for each declared organization mutation
+- Single-pass mutation argument validation and transformation before partition routing
 - Schema-first insert, update, delete, and full-row select authorization, including writable-column checks and readable-column masks
 - A fail-closed database wrapper that rejects raw, session, client, plain-table, insert-select, conflict, returning, and unsupported builder paths
 - Read-only shard-local query execution with JSON result validation
@@ -32,8 +35,7 @@ Implemented and tested in isolation:
 
 Still missing from the application path:
 
-- Resolving tenant membership, role, and policy authority after Gateway verifies identity
-- Constructing the handler's auth context from verified identity and server-owned authority
+- A complete Better Auth sign-in through the packed example and a persisted domain readback
 - Routing a public subscription to shard-local query execution
 - Producing the protocol-v3 initial snapshot on the server
 - Sending live results after a committed mutation
@@ -43,9 +45,13 @@ Still missing from the application path:
 
 Files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding remain experiments. They are not supported product features.
 
-The WebSocket protocol does not trust client routing metadata. Protocol v3 subscriptions carry a server-stamped query ref and raw arguments. It also defines a snapshot message that replaces client rows and moves the subscription to `live`, but no server path produces that message yet. Gateway verifies JWT signatures, subject, time bounds, issuer, audience, and allowed algorithms through a Catalog-backed JWK resolver. It stores verified identity but no tenant or role authority. Mutations, subscriptions, and presence therefore fail closed with `CDB_AUTH_NOT_BOUND` until membership and policy resolution exist.
+The WebSocket protocol does not trust client routing or authority metadata. Gateway verifies the JWT signature and registered claims, then keeps only the verified subject and time bounds in the socket attachment. A mutation becomes public only when its server definition declares `authority: "organization"` and an explicit stable `ref`. Gateway validates and transforms the raw arguments once, extracts the organization partition from that exact value, and asks Catalog to re-derive membership, role, roles, and global, tenant, and principal auth epochs. Token tenant, role, and custom claims never become authority. Mutations without the declaration return `CDB_AUTH_NOT_BOUND`; all public query, subscription, and presence operations remain closed with the same code.
 
-The JWT tests use real signatures and the Catalog resolver contract. A Miniflare workerd test drives the configured Gateway Durable Object and WebSocket with ES256 tokens and a real Catalog SQLite cache. It seeds `Catalog.putJwk` through a test-only HTTP route, so outbound JWKS fetch, cache refresh, and key rotation remain untested. Catalog auth DDL preserves constraints and indexes for new storage. Existing tables need exact matching `auth_ddl_v1` signatures; no versioned upgrade path exists.
+Catalog's authority read is the authorization linearization point. A revocation blocks the next dispatch, but it does not cancel a Cdb call that Catalog already authorized. Cdb treats its mutation RPC as a trusted post-validation internal seam. It invokes the validated handler under the database policy wrapper and commits domain SQL with the provisional op-log row in one transaction.
+
+The JWT tests use real signatures and the Catalog resolver contract. A Miniflare workerd test drives the configured Gateway Durable Object and WebSocket with ES256 tokens, a real Catalog SQLite cache, Catalog membership resolution, and a configured Cdb mutation. The test imports refs from a real emitted Vite browser chunk and compares them with the independently bundled workerd Worker. It still seeds the JWK and auth rows through test-only HTTP routes, so Better Auth sign-in, outbound JWKS fetch, cache refresh, and key rotation remain untested. Catalog auth DDL preserves constraints and indexes for new storage. Existing tables need exact matching `auth_ddl_v1` signatures; no versioned upgrade path exists.
+
+Auth refreshes serialize per server-generated connection id. Gateway drains already admitted mutations before replacing the verified attachment, invalidates subscriptions, and gates later mutations behind the refresh result. Failed refreshes serialize a terminal rejected attachment before closing the socket, so queued mutations cannot run against stale identity.
 
 Each auth mutation commits with every directly derivable old and new global, tenant, or principal epoch bump. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. Bulk updates and deletes preload matched rows to derive epoch scopes. Indirect plugin relationships without placement metadata or conventional `organizationId` or `userId` fields may lack a secondary scope. These cases have Bun fake-Durable-Object coverage, not workerd coverage.
 
@@ -53,7 +59,7 @@ Fresh Cdb objects render domain tables and indexes from the configured Drizzle s
 
 Application handlers can use only typed builders against registered `cdbTable` definitions. The wrapper rejects raw SQL, Drizzle session and client access, relational and count shortcuts, plain-table CRUD, insert-select, conflict methods, `returning`, and unsupported properties before or after policy attachment. Direct `Cdb.query` calls can execute a registered handler through this read-only policy wrapper, but Gateway does not route public subscriptions to that RPC.
 
-The chat example's sign-in hook reuses the shared demo organization and an existing membership for the user, then updates the session's active organization. Repeated sessions and concurrent bootstrap attempts do not blindly insert the same rows. This improves the concept example; it does not close the public Gateway authority gap.
+The chat example's sign-in hook reuses the shared demo organization and an existing membership for the user, then updates the session's active organization. Its `postMessage` mutation opts into the public path with an explicit ref and organization authority. Repeated sessions and concurrent bootstrap attempts do not blindly insert the same rows. The example still lacks a workerd run that starts with Better Auth sign-in and reads the persisted message back.
 
 Scatter routing asks Catalog for the distinct physical shards that own current ranges. Cdb persists shard registrations under composite Gateway, client, and subscription ids, then rebuilds its interval map from SQLite on startup. Persisted registrations still lack verified tenant, auth epoch, policy epoch, and delivery-cookie state.
 
@@ -96,7 +102,7 @@ export const messages = cdbTable(
 );
 ```
 
-The organization foreign key identifies the intended transaction and placement boundary. Related rows colocate through their foreign-key chain. The unfinished runtime must enforce that boundary rather than trusting a tenant ID from the client.
+The organization foreign key identifies the intended transaction and placement boundary. Related rows colocate through their foreign-key chain. Declared organization mutations enforce that boundary by checking the extracted organization against Catalog membership. Public queries do not yet cross the same authority path.
 
 ## Repository development
 

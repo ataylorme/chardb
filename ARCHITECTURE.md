@@ -34,7 +34,7 @@ The Durable Objects have separate responsibilities:
 
 | Component | Responsibility |
 | --- | --- |
-| [`Gateway`](src/server/do/gateway.ts) | Owns hibernated WebSockets, resolves refs in the server manifest, derives query routing intent, persists subscription registrations, handles presence messages, and batches outgoing patches. |
+| [`Gateway`](src/server/do/gateway.ts) | Owns hibernated WebSockets, verifies JWT identity, authorizes declared organization mutations through Catalog, resolves refs in the server manifest, and batches outgoing results and patches. Query subscriptions and presence remain closed. |
 | [`Catalog`](src/server/do/catalog.ts) | Owns the global virtual-shard range map, schema and auth epochs, snapshot barriers, cached JWKs, and all synthesized auth models. |
 | [`Cdb`](src/server/do/cdb.ts) | Owns SQLite domain data for one physical shard, the mutation op-log, interval registrations, and source or destination state for range movement. |
 | [`Resharder`](src/server/do/resharder.ts) | Persists and drives the multi-phase range-movement protocol by calling Catalog and Cdb RPCs. |
@@ -56,9 +56,11 @@ tenant key -> canonical encoding -> xxHash64 -> vshard 0..16383
 
 ## Refs and the manifest
 
-API helpers attach a stable `__chardbRef` and a kind marker to mutations, queries, crons, presence keys, and ledgers. The Vite plugin can stamp refs during a build. [`manifestFromExports`](src/server/manifest.ts) walks the marked exports and builds maps for mutations, queries, crons, and ledgers.
+API helpers attach a `__chardbRef` and a kind marker to mutations, queries, crons, presence keys, and ledgers. Public organization mutations require an explicit literal `ref` alongside `authority: "organization"`. The Vite plugin preserves that ref in the browser handle, rejects invalid or duplicate declarations, and uses generated module refs for APIs that do not require an explicit one. [`manifestFromExports`](src/server/manifest.ts) walks the marked server exports and builds maps for mutations, queries, crons, and ledgers.
 
-Mutation descriptors retain the local handler and an optional partition-key extractor. Query descriptors retain argument validation, intent extraction, and the local handler. `chardb()` closes over the same lazily built manifest in configured Gateway and Cdb classes. The Gateway resolves refs, validates query arguments, and derives routing metadata locally. Cdb resolves both mutation and query refs inside the shard isolate. The manifest and its functions never cross RPC.
+Mutation descriptors retain raw argument validation, a validated handler entry point, the partition-key extractor, and the authority declaration. Query descriptors retain argument validation, intent extraction, and the local handler. `chardb()` closes over the same lazily built manifest in configured Gateway and Cdb classes. The Gateway resolves refs and routing metadata locally. Cdb resolves both mutation and query refs inside the shard isolate. The manifest and its functions never cross RPC.
+
+The workerd mutation harness builds a browser module through Vite, imports its emitted refs, and compares two mutation refs with the independently bundled Worker before opening the socket. This proves the client and server builds agree for explicit refs; it is not a general compatibility promise for generated refs.
 
 ## Mutation and transaction design
 
@@ -66,11 +68,14 @@ The intended single-partition write path is:
 
 ```text
 Up.mut
-  -> Gateway verifies auth, then resolves the ref and partition key locally
-  -> Catalog resolves vshard to Cdb shard
-  -> Cdb resolves the handler locally
+  -> Gateway verifies the JWT subject
+  -> Gateway resolves the explicit ref, validates and transforms args once,
+     then extracts the organization partition from those validated args
+  -> Catalog re-derives membership, role, roles, and auth epochs
+  -> Catalog resolves the vshard to a Cdb shard
+  -> Cdb resolves the validated handler locally under the policy wrapper
   -> one transactionSync commits user SQL and the op-log result
-  -> Gateway returns the mutation result and subscription changes
+  -> Gateway returns the mutation result
 ```
 
 The transaction core exists in [`executeAtomicMutation`](src/server/atomic-mutation.ts). It creates a Drizzle Durable Object database, wraps it with the request auth context, and runs a synchronous handler inside `DurableObjectStorage.transactionSync`. [`runWrappedMutation`](src/oplog/wrapper.ts) writes the deduplication record in that same transaction.
@@ -79,7 +84,9 @@ The op-log key is the principal and mutation id. A retry with the same canonical
 
 Durable Object SQLite transactions cannot span `await`. The atomic executor rejects native async handlers and thenables. Input validation and any external I/O must finish before entering the transaction.
 
-The typed Gateway dispatcher performs local routing, reads the shard and schema epoch from Catalog, and calls the configured Cdb with one serializable request. Cdb runs the atomic executor. Gateway now verifies WebSocket identity, but the public mutation path stops before dispatch because verified subject is not tenant authority. It returns `CDB_AUTH_NOT_BOUND` until Catalog-derived membership, role, and policy state can construct `ctx.auth`. See [STATUS.md](STATUS.md).
+The typed Gateway dispatcher opens only mutations that declare `authority: "organization"` and an explicit ref. It passes the verified subject and the organization extracted from validated arguments to Catalog. Catalog re-derives current membership, role, roles, and global, tenant, and principal auth epochs. Gateway rejects missing, revoked, mismatched, or malformed authority before selecting Cdb, then reads the shard and schema epoch and sends one serializable request.
+
+The Catalog membership read is the authorization linearization point. Revocation prevents the next dispatch, but it does not cancel a Cdb call authorized by an earlier read. Cdb does not revalidate membership epochs. Its mutation RPC is therefore a trusted post-validation internal seam, not a public raw-input boundary. Cdb resolves the validated handler entry point and runs it with Catalog-derived auth under the policy wrapper and atomic op-log executor. Mutations without an authority declaration return `CDB_AUTH_NOT_BOUND`. See [STATUS.md](STATUS.md).
 
 ## Auth and policy design
 
@@ -100,17 +107,17 @@ Table role and column rules compile through [`compileCdbPolicies`](src/server/cd
 
 The wrapper exposes typed select, insert, update, delete, and transaction entry points for registered `cdbTable` definitions. It blocks raw execution, Drizzle session and client objects, relational-query and count shortcuts, plain-table CRUD, insert-select, conflict methods, `returning`, and unsupported builder properties before policy attachment. Full-row single-table selects can use filters, ordering, limits, and offsets. Projections, joins, grouping, set operations, prepared queries, and other result shapes that cannot yet be masked fail closed with `CDB_UNSUPPORTED_FEATURE`. Transactions receive the same wrapper recursively.
 
-The configured Gateway derives issuer, audience, allowed algorithms, and JWKS location from the Better Auth JWT plugin. During `hello` and `updateAuth`, it verifies the signature and registered claims through a Catalog-backed JWK resolver. The verified attachment contains the subject and token time bounds. It does not copy tenant, role, or custom claims into authority.
+The configured Gateway derives issuer, audience, allowed algorithms, and JWKS location from the Better Auth JWT plugin. During `hello` and `updateAuth`, it verifies the signature and registered claims through a Catalog-backed JWK resolver. The verified attachment contains the subject and token time bounds. It does not copy tenant, role, or custom claims into authority. Catalog supplies those fields for each declared organization mutation.
 
-Gateway rechecks expiry and not-before before protected operations. A verified refresh replaces the subject only after successful verification and invalidates existing subscriptions. A Miniflare workerd test drives the configured Gateway Durable Object and WebSocket with ES256 tokens and a real Catalog SQLite cache. The test seeds `Catalog.putJwk` through a test-only HTTP route. Outbound JWKS fetch, cache refresh, and key rotation remain untested.
+Gateway rechecks expiry and not-before before protected operations. Each socket receives a server-generated connection id. Auth refresh barriers use that id, serialize multiple refreshes, drain admitted mutations before replacing identity, invalidate subscriptions, and gate later mutations. A failed refresh writes a terminal rejected attachment before closing the socket, so queued work cannot reuse stale verified state.
 
-Tenant membership, role, auth epoch, and policy authority are still absent. Mutation, subscription, and presence handlers therefore return `CDB_AUTH_NOT_BOUND` after identity verification. Anonymous query behavior is also undefined.
+A Miniflare workerd test drives the configured Gateway Durable Object and WebSocket with ES256 tokens, a real Catalog SQLite cache, Catalog-derived organization authority, and a configured Cdb. The test seeds JWKs and auth rows through test-only HTTP routes. Better Auth sign-in, outbound JWKS fetch, cache refresh, and key rotation remain untested. Public queries, subscriptions, and presence do not use the mutation authority path and still return `CDB_AUTH_NOT_BOUND`. Anonymous query behavior is undefined.
 
 ## Subscription design
 
 Wire protocol v3 requires `protocolV` in `hello` and `welcome`. Its decoder rejects unknown fields, missing fields, and incorrect field types. A subscription sends a server-stamped query ref and raw arguments. It does not send intent or a query hash. The protocol also defines a `snapshot` with a subscription id, cookie, and JSON row array. The client replaces its rows, clears optimistic patches, records the cookie, and marks the subscription `live` when that message arrives.
 
-After the remaining membership boundary, the isolated routing path can resolve the ref in its local manifest, validate the arguments, derive the intent, compute the current query hash, persist the registration, and choose shards:
+The isolated query-routing path can resolve the ref in its local manifest, validate the arguments, derive the intent, compute the current query hash, persist the registration, and choose shards:
 
 - explicit partition values route to their owning shards;
 - reference joins route to a canonical shard;
@@ -120,11 +127,11 @@ Catalog reads distinct shard ids directly from `catalog_ranges` and returns them
 
 Each selected Cdb persists the subscription's composite Gateway, client, and subscription id along with its principal, ref, arguments, tables, and intervals. The in-memory [`IntervalMap`](src/intervals.ts) uses that composite identity and rebuilds from SQLite when Cdb starts. Focused reconstruction tests cover colliding numeric subscription ids and targeted unsubscribe. `matchSubsForRow` maps a committed row's indexed keys back to composite registrations. Gateway code exists to coalesce patches before sending a `poke`.
 
-The current query hash serializes the ref, validated arguments, and derived intent. It still needs canonical JSON and verified principal, tenant, auth epoch, and policy epoch inputs. Public subscription registration currently fails closed before this routing path.
+The current query hash serializes the ref, validated arguments, and derived intent. It still needs canonical JSON and verified principal, tenant, auth epoch, and policy epoch inputs. Public subscription registration currently fails closed before this routing path because organization authority has only been connected to mutations.
 
 An isolated `Cdb.query` RPC resolves a query descriptor, constructs a policy-wrapped Drizzle database, invokes the handler with the request auth context, and validates that its result is JSON. Its tests cover persisted rows, empty arrays, handler failures, row predicates, column masks, and rejected write and escape paths. Gateway does not call this RPC for a public subscription or establish its auth authority, and no server component produces the protocol-v3 snapshot. Committed mutations also do not generate live replacement results. React presence, upload, stream, and vector hooks are not exported until their client paths exist.
 
-The chat example's auth hook uses a find-or-create sequence for the shared demo organization and each user's membership. It accepts a concurrent create only after a confirming lookup, then updates the new session's active organization. This bootstrap is idempotent for repeated sessions. It is example setup, not a substitute for Catalog-derived public Gateway authority.
+The chat example's auth hook uses a find-or-create sequence for the shared demo organization and each user's membership. It accepts a concurrent create only after a confirming lookup, then updates the new session's active organization. Its `postMessage` definition opts into the public mutation path with an explicit ref and organization authority. The packed example has not yet run that path through Better Auth sign-in and persisted readback.
 
 ## Package and generated project
 
