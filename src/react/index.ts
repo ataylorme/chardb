@@ -103,11 +103,12 @@ export interface ChardbProviderProps extends Partial<ChardbClientOptions> {
 export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): ReactElement {
     const client = useMemo<ChardbClient>(() => {
         if (props.client) return props.client;
+        const auth = props.auth;
         const getJwt =
             props.getJwt ??
-            (props.auth
+            (auth
                 ? async () => {
-                      const r = await props.auth!.$fetch<{ token: string }>("/token");
+                      const r = await auth.$fetch<{ token: string }>("/token");
                       if (r.error || !r.data?.token) {
                           throw new Error(`chardb: failed to fetch JWT (${r.error?.message ?? "no token"})`);
                       }
