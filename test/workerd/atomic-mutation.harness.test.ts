@@ -51,7 +51,17 @@ afterAll(async () => {
 });
 
 async function execute(body: {
-    readonly mode: "commit" | "throw" | "async" | "forbidden" | "policy" | "updatePolicy" | "deletePolicy";
+    readonly mode:
+        | "commit"
+        | "throw"
+        | "async"
+        | "forbidden"
+        | "policy"
+        | "updatePolicy"
+        | "deletePolicy"
+        | "hookCommit"
+        | "hookEmpty"
+        | "hookThrow";
     readonly mutId: string;
     readonly firstId: string;
     readonly secondId: string;
@@ -66,12 +76,14 @@ async function execute(body: {
 
 async function inspect(): Promise<{
     readonly entries: readonly { id: string; sequence: number }[];
+    readonly hookEvents: readonly { id: string; touched_tables: string }[];
     readonly opLogRows: number;
 }> {
     if (!mf) throw new Error("miniflare not initialized");
     const response = await mf.dispatchFetch("http://example.com/inspect");
     return (await response.json()) as {
         readonly entries: readonly { id: string; sequence: number }[];
+        readonly hookEvents: readonly { id: string; touched_tables: string }[];
         readonly opLogRows: number;
     };
 }
@@ -111,8 +123,66 @@ describe("atomic domain mutation on real Durable Object SqlStorage", () => {
                 { id: "committed-1", sequence: 1 },
                 { id: "committed-2", sequence: 2 },
             ],
+            hookEvents: [],
             opLogRows: 1,
         });
+    });
+
+    test("runs the write-set hook before commit, skips replay and empty sets, and rolls back hook failures", async () => {
+        const before = await inspect();
+        const request = {
+            mode: "hookCommit" as const,
+            mutId: "hook-commit",
+            firstId: "hook-committed-1",
+            secondId: "hook-committed-2",
+        };
+        const committed = await execute(request);
+        expect(committed.status).toBe(200);
+        expect((await committed.json()) as unknown).toMatchObject({
+            ran: true,
+            touchedTables: ["atomic_aux_entries", "atomic_entries"],
+        });
+
+        const afterCommit = await inspect();
+        expect(afterCommit.hookEvents).toEqual([
+            ...before.hookEvents,
+            {
+                id: "hook-commit",
+                touched_tables: '["atomic_aux_entries","atomic_entries"]',
+            },
+        ]);
+        expect(afterCommit.opLogRows).toBe(before.opLogRows + 1);
+
+        const replay = await execute(request);
+        expect((await replay.json()) as unknown).toMatchObject({ ran: false, touchedTables: [] });
+        expect(await inspect()).toEqual(afterCommit);
+
+        const empty = await execute({
+            mode: "hookEmpty",
+            mutId: "hook-empty",
+            firstId: "unused",
+            secondId: "unused",
+        });
+        expect(empty.status).toBe(200);
+        expect((await empty.json()) as unknown).toMatchObject({ ran: true, touchedTables: [] });
+        const afterEmpty = await inspect();
+        expect(afterEmpty.entries).toEqual(afterCommit.entries);
+        expect(afterEmpty.hookEvents).toEqual(afterCommit.hookEvents);
+        expect(afterEmpty.opLogRows).toBe(afterCommit.opLogRows + 1);
+
+        const beforeThrow = await inspect();
+        const failed = await execute({
+            mode: "hookThrow",
+            mutId: "hook-throw",
+            firstId: "hook-rolled-back-1",
+            secondId: "hook-rolled-back-2",
+        });
+        expect(failed.status).toBe(409);
+        expect((await failed.json()) as unknown).toEqual({
+            code: "UNKNOWN",
+            message: "write-set hook failure",
+        });
+        expect(await inspect()).toEqual(beforeThrow);
     });
 
     test("throwing after the second statement rolls back both rows and the provisional op-log row", async () => {

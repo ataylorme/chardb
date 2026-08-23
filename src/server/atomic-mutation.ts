@@ -1,6 +1,6 @@
 import { type DrizzleSqliteDODatabase, drizzle } from "drizzle-orm/durable-sqlite";
 import { CdbError } from "../errors.ts";
-import { type MutationOutcome, canonicalRequest, runWrappedMutation } from "../oplog/wrapper.ts";
+import { type MutationOutcome, type SyncSql, canonicalRequest, runWrappedMutation } from "../oplog/wrapper.ts";
 import { Cookie, MutId, PrincipalId, type RawJson } from "../types.ts";
 import { wrapMutationDb } from "./cdb-db-proxy.ts";
 import type { AuthCtx, MutationCtx } from "./define.ts";
@@ -27,6 +27,15 @@ export type AtomicMutationHandler<TSchema extends Record<string, unknown>, TArgs
     args: TArgs
 ) => TResult;
 
+interface AtomicMutationWriteSet {
+    /** Sorted, de-duplicated registered table names from successful write builders. */
+    readonly touchedTables: readonly string[];
+    /** The same synchronous SQL connection and transaction as the domain writes and op-log row. */
+    readonly sql: SyncSql;
+}
+
+type AtomicMutationWriteSetHook = (writeSet: AtomicMutationWriteSet) => void;
+
 export interface ExecuteAtomicMutationInput<TSchema extends Record<string, unknown>, TArgs extends RawJson, TResult> {
     readonly storage: DurableObjectStorage;
     readonly schema: TSchema;
@@ -34,6 +43,7 @@ export interface ExecuteAtomicMutationInput<TSchema extends Record<string, unkno
     readonly handler: AtomicMutationHandler<TSchema, TArgs, TResult>;
     readonly cookie: string;
     readonly nowMs?: number;
+    readonly onWriteSet?: AtomicMutationWriteSetHook;
 }
 
 export interface AtomicMutationResult {
@@ -59,6 +69,7 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
     input: ExecuteAtomicMutationInput<TSchema, TArgs, TResult>
 ): AtomicMutationResult {
     assertSynchronousHandler(input.handler);
+    if (input.onWriteSet) assertSynchronousWriteSetHook(input.onWriteSet);
 
     const cookie = Cookie(input.cookie);
     const sql = adaptSqlStorage(input.storage.sql);
@@ -66,6 +77,7 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
     const touchedTables = new Set<string>();
     const db = wrapMutationDb(rawDb, input.request.auth, tableName => touchedTables.add(tableName));
     let wrappedResult: ReturnType<typeof runWrappedMutation<TResult>> | undefined;
+    let committedTouchedTables: readonly string[] = [];
 
     input.storage.transactionSync(() => {
         wrappedResult = runWrappedMutation({
@@ -88,6 +100,12 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
                 };
             },
         });
+        if (wrappedResult.ran && wrappedResult.envelope.status === "ok" && touchedTables.size > 0) {
+            const sortedTables = Object.freeze([...touchedTables].sort());
+            const hookResult = input.onWriteSet?.({ touchedTables: sortedTables, sql });
+            if (isThenable(hookResult)) throw asyncWriteSetHookError();
+            committedTouchedTables = sortedTables;
+        }
     });
 
     if (!wrappedResult) {
@@ -104,7 +122,7 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
         ran: wrappedResult.ran,
         result: wrappedResult.envelope.result ?? null,
         rowsAffected: wrappedResult.envelope.rowsAffected,
-        touchedTables: wrappedResult.ran ? [...touchedTables].sort() : [],
+        touchedTables: committedTouchedTables,
     };
 }
 
@@ -125,5 +143,16 @@ function asyncHandlerError(): CdbError {
         code: "CDB_INTERACTIVE_TXN_UNSUPPORTED",
         message: "mutation handlers must be synchronous; Durable Object SQLite transactions cannot span await",
         hint: "remove async/await from the mutation handler; validate and fetch external data before entering the mutation",
+    });
+}
+
+function assertSynchronousWriteSetHook(hook: AtomicMutationWriteSetHook): void {
+    if (hook.constructor?.name === "AsyncFunction") throw asyncWriteSetHookError();
+}
+
+function asyncWriteSetHookError(): CdbError {
+    return new CdbError({
+        code: "CDB_INTERACTIVE_TXN_UNSUPPORTED",
+        message: "atomic write-set hooks must be synchronous; Durable Object SQLite transactions cannot span await",
     });
 }

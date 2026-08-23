@@ -44,7 +44,17 @@ const securedEntries = cdbTable(
 const securedSchema = { entries, securedEntries };
 
 interface ExecuteArgs {
-    readonly mode: "commit" | "throw" | "async" | "forbidden" | "policy" | "updatePolicy" | "deletePolicy";
+    readonly mode:
+        | "commit"
+        | "throw"
+        | "async"
+        | "forbidden"
+        | "policy"
+        | "updatePolicy"
+        | "deletePolicy"
+        | "hookCommit"
+        | "hookEmpty"
+        | "hookThrow";
     readonly mutId: string;
     readonly firstId: string;
     readonly secondId: string;
@@ -64,6 +74,9 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
             }
             sql.exec("CREATE TABLE IF NOT EXISTS atomic_entries (id TEXT PRIMARY KEY, sequence INTEGER NOT NULL)");
             sql.exec("CREATE TABLE IF NOT EXISTS atomic_aux_entries (id TEXT PRIMARY KEY, sequence INTEGER NOT NULL)");
+            sql.exec(
+                "CREATE TABLE IF NOT EXISTS atomic_write_hook_events (id TEXT PRIMARY KEY, touched_tables TEXT NOT NULL)"
+            );
             sql.exec(
                 "CREATE TABLE IF NOT EXISTS atomic_secured_entries (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, secret_note TEXT)"
             );
@@ -121,6 +134,7 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
                         ? securedSchema
                         : schema,
                 handler: ({ db }) => {
+                    if (args.mode === "hookEmpty") return { ids: [] };
                     db.insert(entries).values({ id: args.firstId, sequence: 1 }).run();
                     if (args.mode === "forbidden") {
                         db.insert(securedEntries).values({ id: args.secondId, organizationId: "unverified-org" }).run();
@@ -134,13 +148,28 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
                     if (args.mode === "deletePolicy") {
                         db.delete(securedEntries).run();
                     }
-                    if (args.mode === "commit") {
+                    if (args.mode === "commit" || args.mode === "hookCommit" || args.mode === "hookThrow") {
                         db.insert(auxEntries).values({ id: args.mutId, sequence: 1 }).run();
                     }
                     db.insert(entries).values({ id: args.secondId, sequence: 2 }).run();
                     if (args.mode === "throw") throw new Error("probe failure after second statement");
                     return { ids: [args.firstId, args.secondId] };
                 },
+                ...(args.mode === "hookCommit" || args.mode === "hookEmpty" || args.mode === "hookThrow"
+                    ? {
+                          onWriteSet: ({
+                              touchedTables,
+                              sql,
+                          }: { touchedTables: readonly string[]; sql: ReturnType<typeof adaptSqlStorage> }) => {
+                              sql.exec(
+                                  "INSERT INTO atomic_write_hook_events (id, touched_tables) VALUES (?, ?)",
+                                  args.mutId,
+                                  JSON.stringify(touchedTables)
+                              );
+                              if (args.mode === "hookThrow") throw new Error("write-set hook failure");
+                          },
+                      }
+                    : {}),
             });
         } catch (error) {
             if (!isCdbError(error)) throw error;
@@ -148,13 +177,20 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
         }
     }
 
-    inspect(): { readonly entries: readonly { id: string; sequence: number }[]; readonly opLogRows: number } {
+    inspect(): {
+        readonly entries: readonly { id: string; sequence: number }[];
+        readonly hookEvents: readonly { id: string; touched_tables: string }[];
+        readonly opLogRows: number;
+    } {
         const sql = adaptSqlStorage(this.ctx.storage.sql);
         const rows = sql.all<{ id: string; sequence: number }>(
             "SELECT id, sequence FROM atomic_entries ORDER BY sequence, id"
         );
+        const hookEvents = sql.all<{ id: string; touched_tables: string }>(
+            "SELECT id, touched_tables FROM atomic_write_hook_events ORDER BY id"
+        );
         const count = sql.one<{ count: number }>("SELECT COUNT(*) AS count FROM _chardb_op_log");
-        return { entries: rows, opLogRows: count?.count ?? 0 };
+        return { entries: rows, hookEvents, opLogRows: count?.count ?? 0 };
     }
 }
 
