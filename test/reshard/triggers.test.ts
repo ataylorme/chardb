@@ -14,7 +14,7 @@ let db: Database;
 
 beforeEach(() => {
     db = new Database(":memory:");
-    db.run(`CREATE TABLE orders (id INTEGER PRIMARY KEY, tenant_id TEXT NOT NULL, total INTEGER NOT NULL)`);
+    db.run("CREATE TABLE orders (id INTEGER PRIMARY KEY, tenant_id TEXT NOT NULL, total INTEGER NOT NULL)");
     db.run(`CREATE TABLE _chardb_split_log (
     lsn INTEGER PRIMARY KEY AUTOINCREMENT,
     mig_id TEXT NOT NULL, op TEXT NOT NULL, table_name TEXT NOT NULL,
@@ -53,7 +53,9 @@ describe("renderTableTriggers", () => {
             after: '{"id":1,"tenant_id":"t-A","total":100}',
         });
         expect(rows[1]?.op).toBe("upd");
-        const after = JSON.parse(rows[1]!.after!) as { total: number };
+        const afterJson = rows[1]?.after;
+        if (afterJson == null) throw new Error("expected the update trigger to capture the resulting row");
+        const after = JSON.parse(afterJson) as { total: number };
         expect(after.total).toBe(150);
         expect(rows[2]?.op).toBe("del");
         expect(rows[2]?.after).toBeNull();

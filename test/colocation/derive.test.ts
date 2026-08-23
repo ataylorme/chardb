@@ -24,10 +24,10 @@ const baseSchema: SchemaInput = {
 describe("deriveColocation — basic shapes", () => {
     test("default distributionRoots: organization+user are SELF; child colocates by FK column", () => {
         const r = deriveColocation(baseSchema);
-        expect(r.assignments["organization"]).toEqual({ kind: "self", partitionKey: "id" });
+        expect(r.assignments.organization).toEqual({ kind: "self", partitionKey: "id" });
         // user is also a default root, so it's SELF (not colocated under organization).
-        expect(r.assignments["user"]).toEqual({ kind: "self", partitionKey: "id" });
-        expect(r.assignments["messages"]).toEqual({
+        expect(r.assignments.user).toEqual({ kind: "self", partitionKey: "id" });
+        expect(r.assignments.messages).toEqual({
             kind: "colocated",
             root: "organization",
             via: ["organizationId"],
@@ -40,7 +40,7 @@ describe("deriveColocation — basic shapes", () => {
             edges: [fk("messages", "organization", ["organizationId"])],
         };
         const r = deriveColocation(schema, { distributionRoots: ["organization"] });
-        expect(r.assignments["messages"]).toEqual({
+        expect(r.assignments.messages).toEqual({
             kind: "colocated",
             root: "organization",
             via: ["organizationId"],
@@ -49,7 +49,7 @@ describe("deriveColocation — basic shapes", () => {
 
     test("table with no FK and no requireRoot becomes REPLICATED", () => {
         const r = deriveColocation(baseSchema);
-        expect(r.assignments["tags"]).toEqual({ kind: "replicated" });
+        expect(r.assignments.tags).toEqual({ kind: "replicated" });
     });
 
     test("requireRoot=true raises CDB_AMBIGUOUS_COLOCATION on unrooted table", () => {
@@ -73,7 +73,7 @@ describe("policy.distributionRoots", () => {
             distributionRoots: ["workspaces", "organization"],
             allowMissingRoots: true,
         });
-        expect(r.assignments["organization"]).toBeDefined();
+        expect(r.assignments.organization).toBeDefined();
     });
 });
 
@@ -89,7 +89,7 @@ describe("strictMultiRoot (P5/P6)", () => {
         // and `user` is colocated with the org without forcing the user to
         // write an explicit `policy.overrides[notification]` entry.
         const r = deriveColocation(schema);
-        expect(r.assignments["notification"]).toEqual({
+        expect(r.assignments.notification).toEqual({
             kind: "colocated",
             root: "organization",
             via: ["organizationId"],
@@ -112,7 +112,7 @@ describe("strictMultiRoot (P5/P6)", () => {
             strictMultiRoot: false,
             distributionRoots: ["user", "organization"],
         });
-        expect(r.assignments["notification"]).toEqual({
+        expect(r.assignments.notification).toEqual({
             kind: "colocated",
             root: "user",
             via: ["userId"],
@@ -138,7 +138,7 @@ describe("determinism — P1, P2, P3, P4, P8", () => {
             edges: baseSchema.edges,
         };
         const b = deriveColocation(augmented);
-        for (const t of baseSchema.tables) expect(b.assignments[t]).toEqual(a.assignments[t]!);
+        for (const t of baseSchema.tables) expect(b.assignments[t]).toEqual(a.assignments[t]);
     });
 
     test("P3 — parallel/duplicate edges canonicalized", () => {
@@ -173,14 +173,14 @@ describe("determinism — P1, P2, P3, P4, P8", () => {
 describe("overrides", () => {
     test("explicit replicated override wins", () => {
         const r = deriveColocation(baseSchema, { overrides: { messages: { kind: "replicated" } } });
-        expect(r.assignments["messages"]).toEqual({ kind: "replicated" });
+        expect(r.assignments.messages).toEqual({ kind: "replicated" });
     });
 
     test("explicit colocate override sets via", () => {
         const r = deriveColocation(baseSchema, {
             overrides: { messages: { kind: "colocate", via: "customCol" } },
         });
-        expect(r.assignments["messages"]).toEqual({
+        expect(r.assignments.messages).toEqual({
             kind: "colocated",
             root: "messages",
             via: ["customCol"],
@@ -204,7 +204,7 @@ describe("composite FK", () => {
             ],
         };
         const r = deriveColocation(composite);
-        expect(r.assignments["members"]).toEqual({
+        expect(r.assignments.members).toEqual({
             kind: "colocated",
             root: "organization",
             via: ["orgId", "tenant"],

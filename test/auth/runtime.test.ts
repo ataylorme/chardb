@@ -9,6 +9,13 @@ import { Database as BunSqlite } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { organization } from "better-auth/plugins/organization";
 import {
+    type AuthPartitionRule,
+    bindAuthRuntime,
+    placementFor,
+    resetAuthRuntime,
+    tableFor,
+} from "../../src/auth/runtime.ts";
+import {
     authCount,
     authCreate,
     authDelete,
@@ -19,13 +26,6 @@ import {
     authUpdate,
 } from "../../src/auth/sql.ts";
 import { defineAuth } from "../../src/auth/synthesize.ts";
-import {
-    type AuthPartitionRule,
-    bindAuthRuntime,
-    placementFor,
-    resetAuthRuntime,
-    tableFor,
-} from "../../src/auth/runtime.ts";
 import type { SyncSql } from "../../src/oplog/wrapper.ts";
 
 function bunSyncSql(db: BunSqlite): SyncSql {

@@ -59,8 +59,8 @@ interface TailRow {
 function makeSource() {
     const db = new Database(":memory:");
     db.run(SPLIT_LOG_DDL);
-    db.run(`CREATE TABLE messages (id TEXT PRIMARY KEY, org_id TEXT, channel_id TEXT, body TEXT, created_at INTEGER)`);
-    db.run(`CREATE TABLE channels (id TEXT PRIMARY KEY, org_id TEXT, name TEXT)`);
+    db.run("CREATE TABLE messages (id TEXT PRIMARY KEY, org_id TEXT, channel_id TEXT, body TEXT, created_at INTEGER)");
+    db.run("CREATE TABLE channels (id TEXT PRIMARY KEY, org_id TEXT, name TEXT)");
     for (const stmt of renderTableTriggers(MIG_ID, messagesSpec).install) db.run(stmt);
     for (const stmt of renderTableTriggers(MIG_ID, channelsSpec).install) db.run(stmt);
     return db;
@@ -68,8 +68,8 @@ function makeSource() {
 
 function makeDest() {
     const db = new Database(":memory:");
-    db.run(`CREATE TABLE messages (id TEXT PRIMARY KEY, org_id TEXT, channel_id TEXT, body TEXT, created_at INTEGER)`);
-    db.run(`CREATE TABLE channels (id TEXT PRIMARY KEY, org_id TEXT, name TEXT)`);
+    db.run("CREATE TABLE messages (id TEXT PRIMARY KEY, org_id TEXT, channel_id TEXT, body TEXT, created_at INTEGER)");
+    db.run("CREATE TABLE channels (id TEXT PRIMARY KEY, org_id TEXT, name TEXT)");
     return db;
 }
 
@@ -114,11 +114,11 @@ describe("reshard pipeline — multi-table integration", () => {
     });
 
     test("INSERT → UPDATE → DELETE → INSERT cycles converge on destination for in-range rows", () => {
-        src.run(`INSERT INTO channels VALUES (?, ?, ?)`, ["ch-1", orgA, "general"]);
-        src.run(`INSERT INTO messages VALUES (?, ?, ?, ?, ?)`, ["m-1", orgA, "ch-1", "first", 1]);
-        src.run(`UPDATE messages SET body = ? WHERE id = ?`, ["edited", "m-1"]);
-        src.run(`DELETE FROM messages WHERE id = ?`, ["m-1"]);
-        src.run(`INSERT INTO messages VALUES (?, ?, ?, ?, ?)`, ["m-1", orgA, "ch-1", "reborn", 2]);
+        src.run("INSERT INTO channels VALUES (?, ?, ?)", ["ch-1", orgA, "general"]);
+        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-1", orgA, "ch-1", "first", 1]);
+        src.run("UPDATE messages SET body = ? WHERE id = ?", ["edited", "m-1"]);
+        src.run("DELETE FROM messages WHERE id = ?", ["m-1"]);
+        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-1", orgA, "ch-1", "reborn", 2]);
 
         const aV = rowVshard(orgA);
         applyTail(dest, src, { lo: aV, hi: aV });
@@ -130,10 +130,10 @@ describe("reshard pipeline — multi-table integration", () => {
     });
 
     test("out-of-range rows are filtered before apply and never reach the destination", () => {
-        src.run(`INSERT INTO messages VALUES (?, ?, ?, ?, ?)`, ["m-A", orgA, "ch-1", "in", 1]);
-        src.run(`INSERT INTO messages VALUES (?, ?, ?, ?, ?)`, ["m-Z", orgZ, "ch-9", "out", 1]);
-        src.run(`INSERT INTO channels VALUES (?, ?, ?)`, ["ch-1", orgA, "in"]);
-        src.run(`INSERT INTO channels VALUES (?, ?, ?)`, ["ch-9", orgZ, "out"]);
+        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-A", orgA, "ch-1", "in", 1]);
+        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-Z", orgZ, "ch-9", "out", 1]);
+        src.run("INSERT INTO channels VALUES (?, ?, ?)", ["ch-1", orgA, "in"]);
+        src.run("INSERT INTO channels VALUES (?, ?, ?)", ["ch-9", orgZ, "out"]);
 
         const aV = rowVshard(orgA);
         applyTail(dest, src, { lo: aV, hi: aV });
@@ -145,8 +145,8 @@ describe("reshard pipeline — multi-table integration", () => {
     });
 
     test("re-running the tail replay is idempotent — no row drift", () => {
-        src.run(`INSERT INTO messages VALUES (?, ?, ?, ?, ?)`, ["m-1", orgA, "ch-1", "v1", 1]);
-        src.run(`UPDATE messages SET body = ? WHERE id = ?`, ["v2", "m-1"]);
+        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-1", orgA, "ch-1", "v1", 1]);
+        src.run("UPDATE messages SET body = ? WHERE id = ?", ["v2", "m-1"]);
 
         const aV = rowVshard(orgA);
         applyTail(dest, src, { lo: aV, hi: aV });
@@ -159,8 +159,8 @@ describe("reshard pipeline — multi-table integration", () => {
 
     test("multi-table workload — channels and messages share the log without contamination", () => {
         for (let i = 0; i < 20; i++) {
-            src.run(`INSERT INTO channels VALUES (?, ?, ?)`, [`ch-${i}`, orgA, `c${i}`]);
-            src.run(`INSERT INTO messages VALUES (?, ?, ?, ?, ?)`, [`m-${i}`, orgA, `ch-${i}`, `body-${i}`, i]);
+            src.run("INSERT INTO channels VALUES (?, ?, ?)", [`ch-${i}`, orgA, `c${i}`]);
+            src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", [`m-${i}`, orgA, `ch-${i}`, `body-${i}`, i]);
         }
 
         const aV = rowVshard(orgA);
@@ -185,10 +185,10 @@ describe("reshard pipeline — multi-table integration", () => {
         // Asserts the destination converges and the per-row ops counter
         // confirms no row was applied twice (proxy for "no duplicate work").
         for (let i = 0; i < 50; i++) {
-            src.run(`INSERT INTO messages VALUES (?, ?, ?, ?, ?)`, [`m-${i}`, orgA, "ch-1", `b${i}`, i]);
+            src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", [`m-${i}`, orgA, "ch-1", `b${i}`, i]);
         }
         for (let i = 0; i < 25; i++) {
-            src.run(`UPDATE messages SET body = ? WHERE id = ?`, [`b${i}-edit`, `m-${i}`]);
+            src.run("UPDATE messages SET body = ? WHERE id = ?", [`b${i}-edit`, `m-${i}`]);
         }
 
         const aV = rowVshard(orgA);
@@ -228,8 +228,8 @@ describe("reshard pipeline — multi-table integration", () => {
 
         // Concurrent writes happen during the crash window — they must also
         // be picked up on resume, exercising the cursor-vs-tail contract.
-        src.run(`INSERT INTO messages VALUES (?, ?, ?, ?, ?)`, ["m-100", orgA, "ch-1", "post-crash", 100]);
-        src.run(`UPDATE messages SET body = ? WHERE id = ?`, ["post-crash-edit", "m-100"]);
+        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-100", orgA, "ch-1", "post-crash", 100]);
+        src.run("UPDATE messages SET body = ? WHERE id = ?", ["post-crash-edit", "m-100"]);
 
         // Restart: read everything strictly after the cursor and apply.
         const remaining = src
@@ -238,7 +238,7 @@ describe("reshard pipeline — multi-table integration", () => {
         apply(remaining);
 
         // Final destination matches the source's in-range view.
-        const srcView = src.prepare(`SELECT * FROM messages ORDER BY id`).all();
+        const srcView = src.prepare("SELECT * FROM messages ORDER BY id").all();
         const destView = dump(dest, "messages");
         expect(destView).toEqual(srcView);
         // Every applied lsn was applied exactly once.
