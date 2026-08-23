@@ -377,7 +377,7 @@ export function deriveColocation(schema: SchemaInput, policyIn: Partial<PolicyIn
                     ? `colocated:${a.root}:${a.via.join(",")}`
                     : a.kind === "self"
                       ? `self:${a.partitionKey}`
-                      : `replicated`;
+                      : "replicated";
             seen.add(fp);
         }
         if (seen.size > 1) {

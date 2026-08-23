@@ -75,10 +75,7 @@ export function renderTableTriggers(migId: string, table: TableSpec): TriggerSet
     const newJson = jsonObjectExpr("NEW", table.columns);
     const oldJson = jsonObjectExpr("OLD", table.columns);
     const insertLog = (op: string, prefix: "NEW" | "OLD", payloadExpr: string) =>
-        `INSERT INTO _chardb_split_log (mig_id, op, table_name, pk, before, after, ts) ` +
-        `VALUES ('${migId}', '${op}', '${table.name}', CAST(${prefix}.${pkCol} AS TEXT), ` +
-        `${op === "ins" ? "NULL" : oldJson}, ${op === "del" ? "NULL" : payloadExpr}, ` +
-        `CAST(strftime('%s','now') AS INTEGER) * 1000)`;
+        `INSERT INTO _chardb_split_log (mig_id, op, table_name, pk, before, after, ts) VALUES ('${migId}', '${op}', '${table.name}', CAST(${prefix}.${pkCol} AS TEXT), ${op === "ins" ? "NULL" : oldJson}, ${op === "del" ? "NULL" : payloadExpr}, CAST(strftime('%s','now') AS INTEGER) * 1000)`;
 
     return {
         install: [
