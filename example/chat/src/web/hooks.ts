@@ -19,8 +19,9 @@ export interface ChatMessagesResult {
  * lives with the query in `queries.ts` (`defineQuery({intent: ...})`),
  * so we only pass `(handle, args)` here — no hand-written `CdbIntent`.
  *
- * The organizationId is read from the session's active org by the
- * server-side handler; the client only supplies the channel selection.
+ * This demo explicitly sends its fixed organizationId with the query args.
+ * The server must match it against membership-derived authority; the client
+ * value is routing input, not proof of access.
  */
 export function useChatMessages(channelId: string, limit = 50): ChatMessagesResult {
     const args = { organizationId: "demo-org", channelId, limit };
