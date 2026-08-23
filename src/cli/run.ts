@@ -1,6 +1,7 @@
 import { emptyManifest } from "../server/manifest.ts";
 import { runDeploy } from "./commands/deploy.ts";
 import { runDoctor } from "./commands/doctor.ts";
+import { runExplain } from "./commands/explain.ts";
 import { runExport } from "./commands/export.ts";
 import { runInit } from "./commands/init.ts";
 import { runMigrate } from "./commands/migrate.ts";
@@ -14,7 +15,7 @@ const HELP = `chardb — Cloudflare-native SQL with per-tenant ACID and live Dri
 Commands:
   chardb init <name>            scaffold a new chardb app (writes wrangler.jsonc, schema, worker)
   chardb doctor [which]         enforce wrangler.jsonc / schema / auth contract; which ∈ {wrangler,schema,auth}
-  chardb explain                planner decision + estimated fanout (use --strict for CI)
+  chardb explain <intent-json>  planner decision + estimated fanout (use --strict for CI)
   chardb shards top             live shard heatmap from chardb-tail → AE
   chardb shards split <lo>:<hi> --to <shardId>
   chardb snapshot [--tenant T] [--label L]
@@ -46,6 +47,26 @@ export async function runCli(ctx: CliContext, argv: readonly string[]): Promise<
             const which = (rest[0] as "wrangler" | "schema" | "auth" | undefined) ?? "wrangler";
             const r = await runDoctor(ctx, { which });
             return r.ok ? 0 : 1;
+        }
+        case "explain": {
+            const rawIntent = valueAfterFlag(rest, "--intent") ?? rest.find(v => !v.startsWith("--"));
+            if (!rawIntent) {
+                ctx.stderr("usage: chardb explain '<intent-json>' [--strict] [--prod]\n");
+                return 2;
+            }
+            let intent: import("../wire.ts").CdbIntent;
+            try {
+                intent = parseIntent(rawIntent);
+            } catch (err) {
+                ctx.stderr(`chardb explain: ${err instanceof Error ? err.message : String(err)}\n`);
+                return 2;
+            }
+            const result = await runExplain(ctx, {
+                intent,
+                strict: rest.includes("--strict"),
+                prod: rest.includes("--prod"),
+            });
+            return result.path === "rejected" ? 1 : 0;
         }
         case "shards": {
             const sub = rest[0];
@@ -152,6 +173,36 @@ export async function runCli(ctx: CliContext, argv: readonly string[]): Promise<
             ctx.stdout(HELP);
             return 2;
     }
+}
+
+function valueAfterFlag(argv: readonly string[], flag: string): string | undefined {
+    const index = argv.indexOf(flag);
+    return index >= 0 ? argv[index + 1] : undefined;
+}
+
+function parseIntent(raw: string): import("../wire.ts").CdbIntent {
+    const value = JSON.parse(raw) as unknown;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new TypeError("intent must be a JSON object");
+    }
+    const intent = value as Record<string, unknown>;
+    if (!["select", "insert", "update", "delete", "execute"].includes(String(intent.kind))) {
+        throw new TypeError("intent.kind must be select, insert, update, delete, or execute");
+    }
+    if (!Array.isArray(intent.tables) || !intent.tables.every(table => typeof table === "string")) {
+        throw new TypeError("intent.tables must be an array of table names");
+    }
+    if (intent.partitionKey !== undefined) {
+        const key = intent.partitionKey;
+        if (key === null || typeof key !== "object" || Array.isArray(key)) {
+            throw new TypeError("intent.partitionKey must be an object");
+        }
+        const record = key as Record<string, unknown>;
+        if (typeof record.table !== "string" || typeof record.column !== "string" || !Array.isArray(record.values)) {
+            throw new TypeError("intent.partitionKey requires table, column, and values");
+        }
+    }
+    return value as import("../wire.ts").CdbIntent;
 }
 
 function parseFlags(rest: readonly string[]): { [k: string]: string } {

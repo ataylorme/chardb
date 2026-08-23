@@ -74,6 +74,13 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.has("/tmp/proj/src/worker.ts")).toBe(true);
         // Worker template must be specialised to the app name.
         expect(files.get("/tmp/proj/src/worker.ts")).toContain('appName: "myapp"');
+        expect(files.get("/tmp/proj/src/schema.ts")).toContain("const { cdbTable } = forOrg()");
+        expect(files.get("/tmp/proj/src/schema.ts")).toContain('selfBy: "authorId"');
+        expect(files.get("/tmp/proj/src/api.ts")).toContain('partitionKey: "organizationId"');
+        expect(files.get("/tmp/proj/src/api.ts")).toContain("handler: (ctx, args) =>");
+        expect(files.get("/tmp/proj/src/api.ts")).toContain("}).run()");
+        expect(files.get("/tmp/proj/src/api.ts")).not.toContain("handler: async");
+        expect(files.get("/tmp/proj/src/api.ts")).not.toContain("tenantScope");
 
         const r = await runDoctor(ctx, { which: "wrangler" });
         expect(r.ok).toBe(true);

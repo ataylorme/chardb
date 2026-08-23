@@ -8,23 +8,37 @@ export interface InitOptions {
 
 const DEFAULT_COMPAT_DATE = "2026-05-10";
 
-const SCHEMA_TEMPLATE = `import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+const SCHEMA_TEMPLATE = `import { integer, text } from "drizzle-orm/sqlite-core";
+import { forOrg } from "chardb/server";
 import { auth } from "./worker.ts";
 
-export const messages = sqliteTable("messages", {
-  id: text("id").primaryKey(),
-  organizationId: text("organization_id")
-    .notNull()
-    .references(() => auth.organization.id, { onDelete: "cascade" }),
-  authorId: text("author_id")
-    .notNull()
-    .references(() => auth.user.id, { onDelete: "cascade" }),
-  body: text("body").notNull(),
-  createdAt: integer("created_at").notNull(),
-});
+const { cdbTable } = forOrg();
+
+export const messages = cdbTable(
+  "messages",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => auth.organization.id, { onDelete: "cascade" }),
+    authorId: text("author_id")
+      .notNull()
+      .references(() => auth.user.id, { onDelete: "cascade" }),
+    body: text("body").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  {
+    selfBy: "authorId",
+    roles: {
+      admin: "*",
+      member: { read: "*", create: ["id", "body", "createdAt"] },
+      self: { read: "*", update: ["body"], delete: true },
+    },
+  },
+);
 `;
 
-const API_TEMPLATE = `import { api, tenantScope } from "chardb/server";
+const API_TEMPLATE = `import { api } from "chardb/server";
 import { z } from "zod";
 import { messages } from "./schema.ts";
 
@@ -33,27 +47,25 @@ export const postMessage = api.mutation({
     id: z.string(),
     organizationId: z.string(),
     body: z.string().min(1),
-    authorId: z.string(),
     clientCreatedAt: z.number(),
   }),
   partitionKey: "organizationId",
-  handler: async (ctx, args) => {
-    await ctx.db.insert(messages).values({
+  handler: (ctx, args) => {
+    if (!ctx.auth.userId || !ctx.auth.tenantId || ctx.auth.tenantId !== args.organizationId) {
+      throw new Error("CDB_FORBIDDEN: active organization does not match the routed partition");
+    }
+    ctx.db.insert(messages).values({
       id: args.id,
-      organizationId: args.organizationId,
-      authorId: args.authorId,
       body: args.body,
       createdAt: args.clientCreatedAt,
-    });
+    }).run();
     return { id: args.id };
   },
 });
-
-/** One-line row policy: messages are visible only to the active org's members. */
-export const orgIsolation = tenantScope(() => messages);
 `;
 
-const WORKER_TEMPLATE = `import { organization } from "better-auth/plugins/organization";
+const WORKER_TEMPLATE = `import { anonymous } from "better-auth/plugins/anonymous";
+import { jwt } from "better-auth/plugins/jwt";
 import { chardb, defineAuth } from "chardb/server";
 import * as api from "./api.ts";
 import * as domain from "./schema.ts";
@@ -64,7 +76,7 @@ import * as domain from "./schema.ts";
 // \`schema.ts\` can \`import { auth } from "./worker.ts"\` cleanly.
 export const auth = defineAuth({
   appName: "{{NAME}}",
-  plugins: [organization()],
+  plugins: [anonymous(), jwt()],
 });
 
 // One factory call composes the runtime: merged Drizzle schema, lazy
