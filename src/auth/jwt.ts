@@ -1,11 +1,11 @@
 /**
- * Minimal pure JWT decoding for chardb's `Gateway.hello`.
+ * JWT decoding and verification for chardb's `Gateway.hello` boundary.
  *
  * The Gateway needs a stable `principalId` derived from the inbound JWT so
  * subscription routing and op-log dedup can key on the authenticated user.
- * A full RFC 7519 verifier (signature + JWKS) is out of scope for this
- * helper — that lives one layer up alongside the `catalog_jwks` SWR cache
- * and is invoked by the entrypoint before the websocket upgrade.
+ * `decodeJwtClaims` is intentionally available for diagnostics only.
+ * Authorization paths use `verifyJwt`, which verifies the signature and
+ * registered claims against a pinned deployment configuration.
  *
  * What this module *does* guarantee:
  *
@@ -14,12 +14,9 @@
  *   - `decodeJwtClaims` rejects tokens whose `exp` is at or before `now`.
  *   - Returns a typed claims object — never `unknown`/`any`.
  *
- * Callers MUST treat the returned `principalId` as authentic only after a
- * separate signature verification step succeeds. Until JWKS verification
- * is wired through `Gateway.onHello`, the `Gateway.principalId` derived
- * from this helper is a soft-trust hint used for routing and presence
- * bucket keys; the actual write paths (Gateway mutation dispatch / `crossPartitionMutation`)
- * MUST re-verify before they grant authority.
+ * Callers MUST never treat `decodeJwtClaims` or `principalIdFromJwt` as an
+ * authorization decision. The Gateway stores a principal only after
+ * `verifyJwt` succeeds.
  *
  * RFC 7519 §4.1 defines the registered claims used here:
  * https://datatracker.ietf.org/doc/html/rfc7519#section-4.1
@@ -129,7 +126,9 @@ export interface VerifyJwtOptions {
      */
     readonly issuer?: string;
     /** Expected `aud` claim. Same opt-out semantics as `issuer`. */
-    readonly audience?: string;
+    readonly audience?: string | readonly string[];
+    /** Explicit algorithm allow-list derived from the Better Auth JWT plugin. */
+    readonly algorithms: readonly string[];
     /** Allowed clock skew in seconds. Defaults to 30. */
     readonly clockToleranceSeconds?: number;
 }
@@ -155,13 +154,27 @@ export async function verifyJwt(jwt: string, opts: VerifyJwtOptions): Promise<Jw
             message: `verifyJwt: no JWK for kid ${decoded.kid || "(unset)"}`,
         });
     }
+    if (opts.algorithms.length === 0 || !opts.algorithms.includes(decoded.alg)) {
+        throw new CdbError({ code: "CDB_FORBIDDEN", message: "verifyJwt: disallowed JWT algorithm" });
+    }
     try {
         const key = await importJWK(jwk, decoded.alg);
+        const audience: string | string[] | undefined =
+            typeof opts.audience === "string"
+                ? opts.audience
+                : opts.audience !== undefined
+                  ? [...opts.audience]
+                  : undefined;
         const { payload } = await jwtVerify(jwt, key, {
             ...(opts.issuer ? { issuer: opts.issuer } : {}),
-            ...(opts.audience ? { audience: opts.audience } : {}),
+            ...(audience ? { audience } : {}),
+            algorithms: [...opts.algorithms],
+            requiredClaims: ["sub", "exp"],
             clockTolerance: opts.clockToleranceSeconds ?? 30,
         });
+        if (typeof payload.sub !== "string" || payload.sub.length === 0) {
+            throw new CdbError({ code: "CDB_FORBIDDEN", message: "verifyJwt: missing subject" });
+        }
         return payload as JwtClaims;
     } catch (cause) {
         const message =

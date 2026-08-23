@@ -80,6 +80,11 @@ function fakeWebSocket(index = 0): FakeWS {
     return ws;
 }
 
+async function welcome(ws: FakeWS, cookie = "c-test:0"): Promise<void> {
+    ws.emit({ t: "welcome", protocolV: PROTOCOL_V, baseCookie: Cookie(cookie), region: "test" });
+    await flush();
+}
+
 describe("createChardbClient — wire round-trip", () => {
     test("hello is sent on open with clientId and jwt", async () => {
         client();
@@ -108,10 +113,59 @@ describe("createChardbClient — wire round-trip", () => {
         expect(ws.readyState).toBe(FakeWS.CLOSED);
     });
 
+    test("queues protected operations until the verified welcome arrives", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        c.subscribe("queries.ts#listMessages", { organizationId: "org-1" }, () => {});
+        void c.mutate("src/api.ts#post", { body: "hi" });
+        await flush();
+        expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+
+        await welcome(ws);
+        expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello", "sub", "mut"]);
+        c.close();
+    });
+
+    test("a terminal auth error before welcome closes without entering a reconnect loop", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        let subscriptionNotifications = 0;
+        c.subscribe("queries.ts#listMessages", {}, () => subscriptionNotifications++);
+        const mutation = c.mutate("src/api.ts#post", {});
+        ws.emit({
+            t: "error",
+            code: "CDB_FORBIDDEN",
+            retryable: false,
+            correlationId: "corr-auth" as never,
+            docs: "https://chardb.dev/errors/cdb_forbidden",
+        });
+        await flush();
+        expect(c.state).toBe("closed");
+        expect(ws.readyState).toBe(FakeWS.CLOSED);
+        expect(subscriptionNotifications).toBe(1);
+        await expect(mutation).rejects.toMatchObject({ code: "CDB_FORBIDDEN" });
+        await new Promise(resolve => setTimeout(resolve, 300));
+        expect(FakeWS.instances).toHaveLength(1);
+    });
+
+    test("a protocol mismatch before welcome terminates queued work", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        const mutation = c.mutate("src/api.ts#post", {});
+        ws.emit({ t: "mustRefetch", subIds: [], reason: "protocolMismatch" });
+        await flush();
+        expect(c.state).toBe("closed");
+        await expect(mutation).rejects.toMatchObject({ code: "CDB_UNSUPPORTED_FEATURE" });
+    });
+
     test("subscribe → server poke delivers rows to the listener", async () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
+        await welcome(ws);
         const seen: unknown[][] = [];
         c.subscribe<{ id: string }>("queries.ts#listMessages", { organizationId: "org-1" }, rows =>
             seen.push([...rows])
@@ -138,6 +192,7 @@ describe("createChardbClient — wire round-trip", () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
+        await welcome(ws);
         const promise = c.mutate<{ id: string }>("src/api.ts#post", { body: "hi" });
         await flush();
         const mutSent = ws.sent.map(r => JSON.parse(r) as Up).find(m => m.t === "mut");
@@ -156,6 +211,7 @@ describe("createChardbClient — wire round-trip", () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
+        await welcome(ws);
         const promise = c.mutate("src/api.ts#post", {});
         await flush();
         const mutSent = ws.sent.map(r => JSON.parse(r) as Up).find(m => m.t === "mut");
@@ -190,6 +246,7 @@ describe("createChardbClient — wire round-trip", () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
+        await welcome(ws);
         const seen: unknown[][] = [];
         c.subscribe<{ id: string }>("queries.ts#listMessages", { organizationId: "org-1" }, rows =>
             seen.push([...rows])

@@ -49,7 +49,7 @@ import { buildAccessControl } from "./cdb-access.ts";
 import { BlobMeta } from "./do/blobmeta.ts";
 import { Catalog } from "./do/catalog.ts";
 import { type Cdb, configureCdbRuntime } from "./do/cdb.ts";
-import { type Gateway, configureGatewayRuntime } from "./do/gateway.ts";
+import { type Gateway, type GatewayJwtConfig, configureGatewayRuntime } from "./do/gateway.ts";
 import { GsiShard } from "./do/gsishard.ts";
 import { Resharder } from "./do/resharder.ts";
 import {
@@ -183,8 +183,10 @@ export function chardb<
         schema: () => runtimeEntrypoint.schema,
         manifest: () => runtimeEntrypoint.chardbManifest,
     });
+    const authBasePath = input.authBasePath ?? auth.options.basePath ?? "/api/auth";
     const ConfiguredGateway = configureGatewayRuntime({
         manifest: () => runtimeEntrypoint.chardbManifest,
+        auth: gatewayJwtConfigFromAuthOptions(auth.options, authBasePath),
     });
 
     const hono = new Hono<{ Bindings: ChardbEnv }>();
@@ -222,7 +224,7 @@ export function chardb<
         { fetch: honoFetch as Parameters<typeof mountChardb>[1]["fetch"] },
         {
             ...(authHandler ? { authHandler } : {}),
-            ...(input.authBasePath ? { authBasePath: input.authBasePath } : {}),
+            authBasePath,
         }
     );
 
@@ -250,6 +252,39 @@ export function chardb<
         GsiShard,
     });
     return merged as ChardbApp<TPlugins, TSchema>;
+}
+
+interface BetterAuthJwtPluginOptions {
+    readonly jwt?: {
+        readonly issuer?: string;
+        readonly audience?: string | readonly string[];
+    };
+    readonly jwks?: {
+        readonly remoteUrl?: string;
+        readonly jwksPath?: string;
+        readonly keyPairConfig?: { readonly alg?: string };
+    };
+}
+
+/** Derive the verifier contract from the exact Better Auth JWT plugin instance. */
+export function gatewayJwtConfigFromAuthOptions(
+    authOptions: BetterAuthOptions,
+    authBasePath: string = authOptions.basePath ?? "/api/auth"
+): GatewayJwtConfig | null {
+    const plugin = (authOptions.plugins ?? []).find(candidate => candidate.id === "jwt");
+    if (!plugin) return null;
+    const options = (plugin as BetterAuthPlugin & { readonly options?: BetterAuthJwtPluginOptions }).options;
+    const configuredOrigin = typeof authOptions.baseURL === "string" ? new URL(authOptions.baseURL).origin : undefined;
+    const issuer = options?.jwt?.issuer ?? configuredOrigin;
+    const audience = options?.jwt?.audience ?? configuredOrigin;
+    return {
+        ...(issuer !== undefined ? { issuer } : {}),
+        ...(audience !== undefined ? { audience } : {}),
+        algorithms: [options?.jwks?.keyPairConfig?.alg ?? "EdDSA"],
+        ...(options?.jwks?.remoteUrl ? { jwksUrl: options.jwks.remoteUrl } : {}),
+        authBasePath,
+        jwksPath: options?.jwks?.jwksPath ?? "/jwks",
+    };
 }
 
 /**

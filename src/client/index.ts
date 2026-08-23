@@ -118,7 +118,6 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         ws = new WebSocket(url.toString());
         ws.onopen = () => {
             reconnectBackoff = RECONNECT_INITIAL_BACKOFF_MS;
-            state = "open";
             const hello: Up = {
                 t: "hello",
                 protocolV: PROTOCOL_V,
@@ -127,26 +126,30 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 jwt,
             };
             ws?.send(encodeWire(hello));
-            // Re-register subs and re-send pending mutations.
-            for (const sub of subs.values()) {
-                const upSub: Up = {
-                    t: "sub",
-                    subId: sub.subId,
-                    ref: sub.ref,
-                    args: sub.args,
-                };
-                ws?.send(encodeWire(upSub));
-            }
-            for (const m of pending.values()) {
-                if (m.inFlight) continue;
-                const upMut: Up = { t: "mut", mutId: m.mutId, ref: m.ref, args: m.args };
-                ws?.send(encodeWire(upMut));
-                m.inFlight = true;
-            }
         };
         ws.onmessage = ev => onWire(ev.data as string);
         ws.onclose = () => onClose();
         ws.onerror = () => ws?.close();
+    }
+
+    function sendSessionState(): void {
+        // The Gateway verifies hello asynchronously. Do not send protected
+        // operations until its welcome proves the auth boundary opened.
+        for (const sub of subs.values()) {
+            const upSub: Up = {
+                t: "sub",
+                subId: sub.subId,
+                ref: sub.ref,
+                args: sub.args,
+            };
+            ws?.send(encodeWire(upSub));
+        }
+        for (const m of pending.values()) {
+            if (m.inFlight) continue;
+            const upMut: Up = { t: "mut", mutId: m.mutId, ref: m.ref, args: m.args };
+            ws?.send(encodeWire(upMut));
+            m.inFlight = true;
+        }
     }
 
     function onClose(): void {
@@ -183,6 +186,8 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                     return;
                 }
                 lastCookie = msg.baseCookie;
+                state = "open";
+                sendSessionState();
                 return;
             case "poke":
                 lastCookie = msg.cookie;
@@ -206,6 +211,10 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 }
                 return;
             case "mustRefetch":
+                if (state === "connecting" && msg.reason === "protocolMismatch") {
+                    failSession("CDB_UNSUPPORTED_FEATURE", "server rejected the Chardb protocol version");
+                    return;
+                }
                 for (const subId of msg.subIds) {
                     const sub = subs.get(subId);
                     if (!sub) continue;
@@ -224,6 +233,9 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 return;
             case "error":
                 applyError(msg.code, msg.subId, msg.correlationId);
+                if (state === "connecting" && !msg.retryable) {
+                    failSession(msg.code, `authentication failed: ${msg.code}`);
+                }
                 return;
             case "presence":
             case "streamChunk":
@@ -261,6 +273,19 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         }
         void correlationId;
         void code;
+    }
+
+    function failSession(code: CdbErrorCode, message: string): void {
+        state = "closed";
+        for (const sub of subs.values()) {
+            sub.state = "error";
+            notify(sub);
+        }
+        for (const mutation of pending.values()) {
+            mutation.reject(new CdbError({ code, message }));
+        }
+        pending.clear();
+        ws?.close();
     }
 
     function notify(sub: SubRecord): void {

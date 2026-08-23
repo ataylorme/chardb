@@ -5,23 +5,24 @@
  *
  * Sharded by `clientId` prefix (12-bit prefix → 4096 Gateway DOs default).
  * Hibernated state is rebuilt from `_gw_subs` and `_gw_presence_subs` on wake;
- * the per-conn 2 KiB `serializeAttachment` payload carries
- * `{clientId, lastCookie, jwtKid}` so a wake-up can reconstitute the routing
- * decision without a fresh handshake.
+ * the per-conn 2 KiB `serializeAttachment` payload carries verified subject,
+ * expiry, client id, and resume state so a wake-up can recheck authentication
+ * without trusting decode-only JWT claims.
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { decodeJwtClaims, principalIdFromJwt } from "../../auth/jwt.ts";
-import { CdbError, docsUrlFor, isCdbErrorCode, isRetryable } from "../../errors.ts";
+import { createCatalogJwksResolver } from "../../auth/jwks_cache.ts";
+import { verifyJwt } from "../../auth/jwt.ts";
+import { CdbError, docsUrlFor, isRetryable } from "../../errors.ts";
 import {
     type ChardbRef,
     type ClientId,
     Cookie,
     CorrelationId,
     type MutId,
-    type PrincipalId,
+    PrincipalId,
     type RawJson,
-    type SubId,
+    SubId,
 } from "../../types.ts";
 import type { Vshard } from "../../types.ts";
 import { vshardOf } from "../../vshard.ts";
@@ -88,46 +89,25 @@ export const PRESENCE_FANOUT_CAP = 1024 as const;
 
 export const PRESENCE_TTL_DEFAULT_MS = 30_000 as const;
 
-interface GwAttachment {
-    readonly clientId: ClientId;
-    readonly lastCookie?: Cookie;
-    readonly jwtKid: string;
-    readonly presenceKeys?: readonly string[];
-    /** Unverified `sub` hint decoded from the hello JWT. Never grants write authority. */
-    readonly principalId?: PrincipalId;
-    /**
-     * Active tenant from the JWT (`activeOrganizationId` claim issued
-     * by the better-auth `organization` plugin). Threaded into every
-     * mutation/query envelope so handlers can read it from `ctx.auth.tenantId`.
-     */
-    readonly tenantId?: string;
-    /** Comma-separated role string from the active org membership. */
-    readonly role?: string;
-    /** JWT expiry in epoch seconds. The Gateway uses this to schedule a re-auth. */
-    readonly jwtExp?: number;
-    /**
-     * Remaining JWT claims as a stringified JSON blob. Kept stringified
-     * so the per-conn 2 KiB attachment budget isn't blown by sprawling
-     * custom-session payloads.
-     */
-    readonly claimsJson?: string;
+interface PendingGwAttachment {
+    readonly kind: "pending";
+    readonly authOrigin: string;
 }
 
-/**
- * Extract a `CdbErrorCode` from an unknown thrown value. Prefers a real
- * `CdbError`; otherwise inspects an `Error.message` for a `CDB_…` prefix
- * (legacy paths still throw bare `Error`s); otherwise returns the safe
- * shard-unavailable retry code so transient errors get retried by the
- * client without leaking handler internals.
- */
-function errorCodeFrom(e: unknown): import("../../errors.ts").CdbErrorCode {
-    if (e instanceof CdbError) return e.code;
-    if (e instanceof Error) {
-        const m = /^(CDB_[A-Z_]+)/.exec(e.message);
-        if (m && isCdbErrorCode(m[1])) return m[1];
-    }
-    return "CDB_SHARD_UNAVAILABLE";
+export interface VerifiedGwAttachment {
+    readonly kind: "verified";
+    readonly authOrigin: string;
+    readonly clientId: ClientId;
+    readonly lastCookie?: Cookie;
+    readonly presenceKeys?: readonly string[];
+    /** Subject from a signature-verified token. */
+    readonly principalId: PrincipalId;
+    /** Required JWT expiry in epoch seconds. */
+    readonly jwtExp: number;
+    readonly jwtNbf?: number;
 }
+
+type GwAttachment = PendingGwAttachment | VerifiedGwAttachment;
 
 export interface GatewayEnv {
     readonly CDB_CATALOG: DurableObjectNamespace;
@@ -161,6 +141,22 @@ export interface TrustedMutationDispatchDeps {
 
 export interface GatewayRuntimeConfig {
     readonly manifest: () => ChardbManifest;
+    readonly auth: GatewayJwtConfig | null;
+}
+
+export interface GatewayJwtConfig {
+    readonly issuer?: string;
+    readonly audience?: string | readonly string[];
+    readonly algorithms: readonly string[];
+    readonly jwksUrl?: string;
+    readonly authBasePath: string;
+    readonly jwksPath: string;
+    readonly clockToleranceSeconds?: number;
+}
+
+interface CatalogJwksRpc extends CatalogMutationRpc {
+    getJwk(kid: string): Promise<{ jwkJson: string; expiresAt: number } | null>;
+    putJwk(kid: string, jwkJson: string, ttlMs: number): Promise<void>;
 }
 
 function mutationFailure(code: import("../../errors.ts").CdbErrorCode, message: string): CdbMutationResponse {
@@ -205,6 +201,73 @@ export function cdbSubscriptionRequest(input: {
     };
 }
 
+export interface GatewayJwtVerificationRequest {
+    readonly config: GatewayJwtConfig;
+    readonly authOrigin: string;
+    readonly catalog: CatalogJwksRpc;
+    readonly jwt: string;
+    readonly clientId: ClientId;
+    readonly lastCookie?: Cookie;
+    readonly presenceKeys?: readonly string[];
+}
+
+/** Verify and project a JWT into the only attachment shape trusted by Gateway handlers. */
+export async function verifyGatewayJwt(request: GatewayJwtVerificationRequest): Promise<VerifiedGwAttachment> {
+    const issuer = request.config.issuer ?? request.authOrigin;
+    const audience = request.config.audience ?? request.authOrigin;
+    const jwksUrl =
+        request.config.jwksUrl ??
+        new URL(
+            `${request.config.authBasePath.replace(/\/$/, "")}${request.config.jwksPath}`,
+            `${request.authOrigin}/`
+        ).toString();
+    const claims = await verifyJwt(request.jwt, {
+        resolver: createCatalogJwksResolver({ catalog: request.catalog, jwksUrl }),
+        issuer,
+        audience,
+        algorithms: request.config.algorithms,
+        ...(request.config.clockToleranceSeconds !== undefined
+            ? { clockToleranceSeconds: request.config.clockToleranceSeconds }
+            : {}),
+    });
+    if (typeof claims.sub !== "string" || typeof claims.exp !== "number") {
+        throw new CdbError({ code: "CDB_FORBIDDEN", message: "verified JWT is missing subject or expiry" });
+    }
+    return {
+        kind: "verified",
+        authOrigin: request.authOrigin,
+        clientId: request.clientId,
+        ...(request.lastCookie !== undefined ? { lastCookie: request.lastCookie } : {}),
+        ...(request.presenceKeys !== undefined ? { presenceKeys: request.presenceKeys } : {}),
+        principalId: PrincipalId(claims.sub),
+        jwtExp: claims.exp,
+        ...(typeof claims.nbf === "number" ? { jwtNbf: claims.nbf } : {}),
+    };
+}
+
+function isVerifiedAttachment(attachment: GwAttachment | null): attachment is VerifiedGwAttachment {
+    return attachment?.kind === "verified";
+}
+
+/** Recheck time validity before every protected operation. */
+export function isCurrentVerifiedAttachment(
+    attachment: VerifiedGwAttachment,
+    nowSeconds: number = Math.floor(Date.now() / 1000)
+): boolean {
+    if (attachment.jwtExp <= nowSeconds) return false;
+    if (attachment.jwtNbf !== undefined && attachment.jwtNbf > nowSeconds) return false;
+    return true;
+}
+
+/**
+ * A verified subject is identity, not tenant authority. Mutation dispatch
+ * remains closed until Catalog-derived membership and policy enforcement can
+ * construct the full trusted AuthCtx.
+ */
+export function trustedMutationAuthFromAttachment(_attachment: VerifiedGwAttachment): TrustedMutationAuth | null {
+    return null;
+}
+
 /**
  * Complete mutation dispatch from an already-verified auth boundary. Ref
  * routing stays local to the configured Gateway isolate; Catalog and Cdb are
@@ -244,11 +307,6 @@ export async function dispatchTrustedMutation(
     }
 }
 
-/** JWT decoding is not verification. This remains closed until a verifier stamps auth. */
-function trustedMutationAuthFromAttachment(_attachment: GwAttachment): TrustedMutationAuth | null {
-    return null;
-}
-
 export class Gateway extends DurableObject<GatewayEnv> {
     private bootstrapped = false;
     private coalesceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -261,6 +319,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     protected runtimeManifest(): ChardbManifest {
         return emptyManifest();
+    }
+
+    protected jwtConfig(): GatewayJwtConfig | null {
+        return null;
     }
 
     /** Resolve the registered mutation inside this Gateway isolate. */
@@ -294,6 +356,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const pair = new WebSocketPair();
         const server = pair[1];
         this.ctx.acceptWebSocket(server);
+        server.serializeAttachment({
+            kind: "pending",
+            authOrigin: new URL(request.url).origin,
+        } satisfies PendingGwAttachment);
         return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -308,7 +374,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
         }
         switch ((msg as Up).t) {
             case "hello":
-                this.onHello(ws, msg as Extract<Up, { t: "hello" }>);
+                void this.onHello(ws, msg as Extract<Up, { t: "hello" }>);
+                break;
+            case "updateAuth":
+                void this.onUpdateAuth(ws, msg as Extract<Up, { t: "updateAuth" }>);
                 break;
             case "sub":
                 void this.onSub(ws, msg as Extract<Up, { t: "sub" }>);
@@ -339,36 +408,25 @@ export class Gateway extends DurableObject<GatewayEnv> {
         // last cookie after a wake-up without re-running the user's `useQuery`.
     }
 
-    private onHello(ws: WebSocket, msg: Extract<Up, { t: "hello" }>): void {
+    private async onHello(ws: WebSocket, msg: Extract<Up, { t: "hello" }>): Promise<void> {
         const mismatch = checkProtocolV(msg.protocolV);
         if (mismatch) {
             this.send(ws, mismatch);
             ws.close(1002, `unsupported chardb protocol ${msg.protocolV}`);
             return;
         }
-        const decoded = decodeJwtClaims(msg.jwt);
-        const principalId = principalIdFromJwt(msg.jwt);
-        const tenantId =
-            decoded?.claims.activeOrganizationId !== undefined &&
-            typeof decoded.claims.activeOrganizationId === "string"
-                ? decoded.claims.activeOrganizationId
-                : undefined;
-        const role =
-            decoded?.claims.role !== undefined && typeof decoded.claims.role === "string"
-                ? decoded.claims.role
-                : undefined;
-        const exp = typeof decoded?.claims.exp === "number" ? decoded.claims.exp : undefined;
-        const claimsJson = decoded ? JSON.stringify(decoded.claims) : undefined;
-        const attachment: GwAttachment = {
+        const pending = ws.deserializeAttachment() as GwAttachment | null;
+        if (pending?.kind !== "pending") {
+            this.rejectAuth(ws, "CDB_FORBIDDEN");
+            return;
+        }
+        const attachment = await this.verifyAttachment(ws, {
+            authOrigin: pending.authOrigin,
             clientId: msg.clientId,
+            jwt: msg.jwt,
             ...(msg.resumeFromCookie ? { lastCookie: msg.resumeFromCookie } : {}),
-            jwtKid: decoded?.kid ?? "",
-            ...(principalId !== null ? { principalId } : {}),
-            ...(tenantId !== undefined ? { tenantId } : {}),
-            ...(role !== undefined ? { role } : {}),
-            ...(exp !== undefined ? { jwtExp: exp } : {}),
-            ...(claimsJson !== undefined ? { claimsJson } : {}),
-        };
+        });
+        if (!attachment) return;
         ws.serializeAttachment(attachment);
         const welcome: Down = {
             t: "welcome",
@@ -380,46 +438,92 @@ export class Gateway extends DurableObject<GatewayEnv> {
         this.send(ws, welcome);
     }
 
-    private async onSub(ws: WebSocket, msg: Extract<Up, { t: "sub" }>): Promise<void> {
-        const att = ws.deserializeAttachment() as GwAttachment | null;
-        if (!att) return;
-        // `att.principalId` is the JWT-derived `sub` claim from `hello`. When
-        // the inbound token is missing/expired/malformed we fall back to a
-        // deterministic projection of `clientId` so cross-shard subs still
-        // share a stable bucket key — write paths re-validate authority.
-        const principalId = att.principalId ?? (att.clientId as unknown as PrincipalId);
-        const routed = await this.routeQuery({ ref: msg.ref, args: msg.args });
-        if (!routed.ok) {
-            this.sendError(ws, routed.error.code, msg.subId);
+    private async onUpdateAuth(ws: WebSocket, msg: Extract<Up, { t: "updateAuth" }>): Promise<void> {
+        const current = ws.deserializeAttachment() as GwAttachment | null;
+        if (!isVerifiedAttachment(current)) {
+            this.rejectAuth(ws, "CDB_FORBIDDEN");
             return;
         }
-        void this.subscribeAcrossShards(
-            att.clientId,
-            msg.subId,
-            msg.ref,
-            routed.args,
-            routed.queryHash,
-            routed.intent,
-            principalId
-        ).catch((e: unknown) => {
-            const code = errorCodeFrom(e);
-            this.sendError(ws, code, msg.subId);
+        const attachment = await this.verifyAttachment(ws, {
+            authOrigin: current.authOrigin,
+            clientId: current.clientId,
+            jwt: msg.jwt,
+            ...(current.lastCookie !== undefined ? { lastCookie: current.lastCookie } : {}),
+            ...(current.presenceKeys !== undefined ? { presenceKeys: current.presenceKeys } : {}),
         });
+        if (!attachment) return;
+        ws.serializeAttachment(attachment);
+        this.pendingPatches.delete(current.clientId);
+        try {
+            const { subIds, rpcFailed } = await this.invalidateClientSubscriptions(current.clientId);
+            if (rpcFailed) {
+                this.sendError(ws, "CDB_SHARD_UNAVAILABLE");
+                ws.close(1011, "subscription invalidation failed");
+                return;
+            }
+            this.send(ws, { t: "mustRefetch", subIds, reason: "authChanged" });
+        } catch {
+            this.sendError(ws, "CDB_SHARD_UNAVAILABLE");
+            ws.close(1011, "subscription invalidation failed");
+        }
+    }
+
+    private async verifyAttachment(
+        ws: WebSocket,
+        request: Omit<GatewayJwtVerificationRequest, "config" | "catalog">
+    ): Promise<VerifiedGwAttachment | null> {
+        const config = this.jwtConfig();
+        if (!config) {
+            this.rejectAuth(ws, "CDB_AUTH_NOT_BOUND");
+            return null;
+        }
+        try {
+            return await verifyGatewayJwt({ ...request, config, catalog: this.catalog() as CatalogJwksRpc });
+        } catch (error) {
+            this.rejectAuth(ws, error instanceof CdbError ? error.code : "CDB_CATALOG_UNAVAILABLE");
+            return null;
+        }
+    }
+
+    private rejectAuth(ws: WebSocket, code: import("../../errors.ts").CdbErrorCode): void {
+        this.sendError(ws, code);
+        ws.close(1008, code);
+    }
+
+    private async onSub(ws: WebSocket, msg: Extract<Up, { t: "sub" }>): Promise<void> {
+        const att = ws.deserializeAttachment() as GwAttachment | null;
+        if (!isVerifiedAttachment(att) || !isCurrentVerifiedAttachment(att)) {
+            this.sendError(ws, "CDB_FORBIDDEN", msg.subId);
+            return;
+        }
+        // The client args may name a tenant, but verified identity alone does
+        // not establish membership in it. Registration remains closed until
+        // Catalog-derived membership is part of the attachment.
+        this.sendError(ws, "CDB_AUTH_NOT_BOUND", msg.subId);
     }
 
     private onUnsub(ws: WebSocket, msg: Extract<Up, { t: "unsub" }>): void {
         const att = ws.deserializeAttachment() as GwAttachment | null;
-        if (!att) return;
+        if (!isVerifiedAttachment(att)) return;
         void this.unsubscribeAcrossShards(att.clientId, msg.subId);
     }
 
     private onMut(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): void {
         const att = ws.deserializeAttachment() as GwAttachment | null;
-        if (!att) {
+        if (!isVerifiedAttachment(att)) {
             this.sendMutFailure(
                 ws,
                 msg.mutId,
-                new CdbError({ code: "CDB_AUTH_NOT_BOUND", message: "verified mutation auth is not bound" }).toJSON()
+                new CdbError({ code: "CDB_FORBIDDEN", message: "verified mutation auth is not bound" }).toJSON()
+            );
+            return;
+        }
+        if (!isCurrentVerifiedAttachment(att)) {
+            this.sendMutFailure(
+                ws,
+                msg.mutId,
+                new CdbError({ code: "CDB_FORBIDDEN", message: "verified mutation auth is expired" }).toJSON(),
+                att.lastCookie
             );
             return;
         }
@@ -428,7 +532,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
             this.sendMutFailure(
                 ws,
                 msg.mutId,
-                new CdbError({ code: "CDB_AUTH_NOT_BOUND", message: "verified mutation auth is not bound" }).toJSON(),
+                new CdbError({
+                    code: "CDB_AUTH_NOT_BOUND",
+                    message: "tenant membership and policy authority are not bound",
+                }).toJSON(),
                 att.lastCookie
             );
             return;
@@ -445,7 +552,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
      */
     private async routeMut(
         ws: WebSocket,
-        att: GwAttachment,
+        att: VerifiedGwAttachment,
         msg: Extract<Up, { t: "mut" }>,
         trusted: TrustedMutationAuth
     ): Promise<void> {
@@ -493,33 +600,20 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     private onPresencePub(ws: WebSocket, msg: Extract<Up, { t: "presencePub" }>): void {
         const sender = ws.deserializeAttachment() as GwAttachment | null;
-        if (!sender) return;
-        const ttl = msg.ttlMs ?? PRESENCE_TTL_DEFAULT_MS;
-        const expires = Date.now() + ttl;
-        let fanout = 0;
-        for (const peer of this.ctx.getWebSockets()) {
-            if (peer === ws) continue;
-            if (fanout >= PRESENCE_FANOUT_CAP) break;
-            const att = peer.deserializeAttachment() as GwAttachment | null;
-            if (!att) continue;
-            if (!att.presenceKeys?.includes(msg.key)) continue;
-            this.send(peer, {
-                t: "presence",
-                key: msg.key,
-                version: 1,
-                states: [{ clientId: sender.clientId, state: msg.state, ts: expires }],
-            });
-            fanout++;
-        }
+        void msg;
+        this.sendError(
+            ws,
+            isVerifiedAttachment(sender) && isCurrentVerifiedAttachment(sender) ? "CDB_AUTH_NOT_BOUND" : "CDB_FORBIDDEN"
+        );
     }
 
     private onPresenceSub(ws: WebSocket, msg: Extract<Up, { t: "presenceSub" }>): void {
         const att = ws.deserializeAttachment() as GwAttachment | null;
-        if (!att) return;
-        const keys = new Set([...(att.presenceKeys ?? []), msg.key]);
-        ws.serializeAttachment({ ...att, presenceKeys: [...keys] });
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        sql.exec("INSERT OR IGNORE INTO _gw_presence_subs (client_id, key) VALUES (?, ?)", att.clientId, msg.key);
+        void msg;
+        this.sendError(
+            ws,
+            isVerifiedAttachment(att) && isCurrentVerifiedAttachment(att) ? "CDB_AUTH_NOT_BOUND" : "CDB_FORBIDDEN"
+        );
     }
 
     /**
@@ -589,6 +683,19 @@ export class Gateway extends DurableObject<GatewayEnv> {
         );
     }
 
+    private async invalidateClientSubscriptions(
+        clientId: ClientId
+    ): Promise<{ readonly subIds: readonly SubId[]; readonly rpcFailed: boolean }> {
+        const subIds: SubId[] = [];
+        const cursor = this.ctx.storage.sql.exec<{ sub_id: number }>(
+            "SELECT sub_id FROM _gw_subs WHERE client_id = ? ORDER BY sub_id",
+            clientId
+        );
+        for (const row of cursor) subIds.push(SubId(row.sub_id));
+        const results = await Promise.allSettled(subIds.map(subId => this.unsubscribeAcrossShards(clientId, subId)));
+        return { subIds, rpcFailed: results.some(result => result.status === "rejected") };
+    }
+
     /**
      * Resolve which shards own a given intent. Single-partition queries hit
      * exactly one vshard via `xxhash64(canonical_concat(values))`; reference
@@ -652,7 +759,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         this.coalesceTimer = null;
         for (const ws of this.ctx.getWebSockets()) {
             const att = ws.deserializeAttachment() as GwAttachment | null;
-            if (!att) continue;
+            if (!isVerifiedAttachment(att) || !isCurrentVerifiedAttachment(att)) continue;
             const patches = this.pendingPatches.get(att.clientId);
             if (!patches || patches.length === 0) continue;
             const cookie = Cookie(`${att.clientId}:${Date.now()}`);
@@ -701,6 +808,10 @@ export function configureGatewayRuntime(config: GatewayRuntimeConfig): typeof Ga
     return class ConfiguredGateway extends Gateway {
         protected override runtimeManifest(): ChardbManifest {
             return config.manifest();
+        }
+
+        protected override jwtConfig(): GatewayJwtConfig | null {
+            return config.auth;
         }
     };
 }
