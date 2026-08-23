@@ -198,71 +198,73 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 
 ## 10. Make one real example
 
-The current chat directory is not a runnable example. It imports unsupported package subpaths, omits dependencies, uses a partition extractor that always returns `undefined`, and documents APIs that were deleted.
+The chat directory now consumes the packed package and passes compile-time checks. It is not runnable end to end because domain migrations, verified auth, initial queries, and live updates remain incomplete.
 
-- [ ] Add `example/chat` to the workspace or make it install the packed tarball.
-- [ ] Declare every dependency used by the example.
-- [ ] Replace `chardb/react/index.ts` with `chardb/react`.
-- [ ] Replace `chardb/vite/index.ts` with `chardb/vite`.
-- [ ] Fix the mutation partition key. Derive routing from verified organization tenancy rather than `() => undefined`.
-- [ ] Delete stale `tenantScope`, `ownerScope`, and `requirePermission` documentation.
+- [x] Install the package through npm's packed file-dependency path with a committed consumer lockfile.
+- [x] Declare every dependency used by the example.
+- [x] Replace `chardb/react/index.ts` with `chardb/react`.
+- [x] Replace `chardb/vite/index.ts` with `chardb/vite`.
+- [x] Give `postMessage` a concrete organization partition key and reject an auth tenant mismatch.
+- [x] Delete stale `tenantScope`, `ownerScope`, and `requirePermission` documentation.
 - [ ] Generate the example schema through real migrations.
-- [ ] Make sign-in establish an active organization and membership.
+- [x] Add an auth hook that provisions the demo organization and membership, then sets the active organization.
 - [ ] Make posting a message use the real mutation path.
 - [ ] Make opening a channel return a persisted initial query result.
 - [ ] Make a second browser receive the live replacement result.
 - [ ] Add an organization switch and prove data isolation.
-- [ ] Build and run the example against the packed package, not TypeScript path aliases or source imports.
+- [x] Install, typecheck, and build the example against the packed package instead of TypeScript aliases or source imports.
 - [ ] Add one workerd test that crosses the real WebSocket, Gateway, Worker, Catalog, Cdb, auth, policy, mutation, query, and live-update paths.
 - [ ] Do not use test-only raw SQL RPCs or fabricated `poke` messages in that test.
 
 ## 11. Repair the CLI and local setup
 
-- [ ] Rewrite `chardb init` to generate `forOrg`, `cdbTable`, current auth setup, current API helpers, and the actual Wrangler bindings.
+- [x] Rewrite `chardb init` to generate `forOrg`, `cdbTable`, current auth setup, current API helpers, and the actual Wrangler bindings.
 - [ ] Make the generated project install and build without this monorepo.
 - [ ] Make `doctor` report unimplemented checks as failures, not success.
-- [ ] Wire the advertised `explain` command into command dispatch.
-- [ ] Remove `shards`, `export`, `schedule`, `snapshot`, `restore`, and `deploy` from help until they perform their advertised work.
+- [x] Wire the advertised `explain` command into command dispatch.
+- [x] Keep unfinished commands visible only when help labels them `not implemented`, and make invocation exit nonzero.
 - [ ] Remove reserved HTTP routes that only return 501.
 - [ ] Remove placeholder React hooks from public exports until implemented.
-- [ ] Remove placeholder file and vector APIs from the main product description.
-- [ ] Make local Miniflare tests run deterministically in the full suite without port conflicts or hanging processes.
+- [x] Remove placeholder file and vector APIs from the main product description.
+- [x] Run each workerd harness in a separate sequential CI process to avoid shared Miniflare ports.
 - [ ] Add one command that starts the example locally with migrations applied.
 
 ## 12. Fix package and repository hygiene
 
-- [ ] Add the MIT `LICENSE` file.
-- [ ] Correct the repository URL to `zpg6/chardb`.
-- [ ] Add `bugs` and correct homepage metadata.
-- [ ] Move `hono` to runtime dependencies or an explicit required peer.
-- [ ] Add direct metadata for `@standard-schema/spec` and every package referenced by emitted declarations.
-- [ ] Remove unused dependencies such as `ulid` if the source does not import them.
-- [ ] Declare the supported Bun and Node versions.
-- [ ] Choose one lockfile policy.
-- [ ] Stop tracking generated landing `.js`, `.d.ts`, and `.tsbuildinfo` files.
-- [ ] Add `prepack` so a clean package build always produces `dist`.
+- [x] Add the MIT `LICENSE` file.
+- [x] Correct the repository URL to `zpg6/chardb`.
+- [x] Add `bugs` and correct homepage metadata.
+- [x] Move `hono` to runtime dependencies.
+- [x] Add direct metadata for `@standard-schema/spec` and packages referenced by emitted validator, auth, and React declarations.
+- [x] Remove the unused `ulid` dependency.
+- [x] Declare Bun 1.2.22 as the package-manager baseline.
+- [ ] Decide whether Node is supported and declare its version if so.
+- [x] Use `bun.lock` at the root and keep `package-lock.json` only for the npm consumer fixture.
+- [x] Stop tracking generated landing `.js`, `.d.ts`, and `.tsbuildinfo` files.
+- [x] Add `prepack` so a clean package build always produces `dist`.
 - [ ] Fail the package build on warnings.
 - [ ] Stop publishing all of `src` unless there is a concrete consumer need.
-- [ ] Include the license and public documentation in the tarball.
+- [x] Include `LICENSE` and `README.md` in the tarball.
+- [ ] Include `STATUS.md`, `ARCHITECTURE.md`, `SECURITY.md`, and `CONTRIBUTING.md` in the tarball.
 - [ ] Create an empty consumer fixture that installs the tarball and imports every advertised subpath.
-- [ ] Test runtime imports and declarations without workspace hoisting.
+- [x] Test the chat consumer's runtime imports and declarations from the packed package without workspace hoisting.
 - [ ] Fix all Biome errors and warnings, or narrow the lint inputs deliberately and document why.
-- [ ] Add CI for frozen install, typecheck, lint, unit tests, serialized workerd tests, package build, package consumer test, landing build, and example build.
+- [x] Add CI for frozen install, typecheck, lint, unit tests, serialized workerd tests, package build, package consumer test, landing build, and example build.
 - [ ] Run a full-history secret scan before changing repository visibility.
 
 ## 13. Rewrite the public story
 
-The current landing page describes a product that does not exist. Fix the code first, but do not leave the current claims live while doing it.
+The README and landing page now describe the repository as an experiment. Keep each claim within the boundaries recorded in the public status documents.
 
-- [ ] Change the README and landing page to call chardb an experimental prototype.
-- [ ] Lead with schema-derived organization tenancy and per-tenant transactions.
-- [ ] Remove "Unlimited SQL."
-- [ ] Remove the 160 TB claim.
-- [ ] Remove automatic online-resharding claims until the runtime performs and tests the whole flow.
-- [ ] Remove working files, vectors, search, presence, scheduling, and migration claims.
-- [ ] Remove the fake `[[chardb]]` binding and nonexistent `client(env.DB)` example.
-- [ ] Remove the npm install command until the package is published.
-- [ ] Replace dead Docs links with real documents.
+- [x] Change the README and landing page to call chardb an experimental prototype.
+- [x] Lead with schema-derived organization tenancy and per-tenant transactions.
+- [x] Remove "Unlimited SQL."
+- [x] Remove the 160 TB claim.
+- [x] Stop presenting automatic online resharding as supported and label it unfinished.
+- [x] Label files, vectors, search, presence, scheduling, and migrations as unsupported or experimental.
+- [x] Remove the fake `[[chardb]]` binding and nonexistent `client(env.DB)` example.
+- [x] Remove unpublished-package install commands from the README and landing page.
+- [x] Replace dead Docs links with links to repository documents.
 - [x] Replace internal engineering notes with public status documentation.
 - [x] Add an architecture document that explains Worker, Gateway, Catalog, Cdb, transaction ownership, schema migration, auth verification, and subscription invalidation.
 - [x] Add a status table that distinguishes implemented, tested in isolation, wired end to end, and experimental.
