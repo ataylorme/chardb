@@ -152,6 +152,11 @@ export const PRESENCE_FANOUT_CAP = 1024 as const;
 export const PRESENCE_TTL_DEFAULT_MS = 30_000 as const;
 export const MAX_INITIAL_SNAPSHOTS_PER_CONNECTION = 64 as const;
 export const MAX_GATEWAY_INVALIDATIONS_PER_REQUEST = 64 as const;
+export const GATEWAY_CLEANUP_BATCH_SIZE = 32 as const;
+export const GATEWAY_CLEANUP_BASE_RETRY_MS = 1_000 as const;
+export const GATEWAY_CLEANUP_MAX_RETRY_MS = 60_000 as const;
+export const GATEWAY_CLEANUP_MAX_RETRY_COUNT = 30 as const;
+export const GATEWAY_CLEANUP_MAX_ERROR_LENGTH = 512 as const;
 
 interface PendingGwAttachment {
     readonly kind: "pending";
@@ -574,6 +579,16 @@ export interface GatewayCurrentRegistrationRetire extends GatewayRegistrationKey
     readonly nowMs: number;
 }
 
+interface StoredGatewayCleanupRow {
+    readonly principal_id: string;
+    readonly client_id: string;
+    readonly sub_id: number;
+    readonly registration_id: string;
+    readonly connection_id: string;
+    readonly source_cdb_id: string | null;
+    readonly retry_count: number;
+}
+
 /**
  * Install a new durable generation. The caller must wrap this helper in the
  * Gateway storage transaction so the old generation and head move atomically.
@@ -623,8 +638,9 @@ export function installGatewayRegistration(
         sql.exec(
             `UPDATE _gw_registration_generations
              SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
-                 run_version = run_version + 1, updated_at = ?
+                 run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
              WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
+            input.nowMs,
             input.nowMs,
             previous.registration_id,
             input.principalId,
@@ -879,9 +895,10 @@ export function retireCurrentGatewayRegistration(
     sql.exec(
         `UPDATE _gw_registration_generations
          SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
-             run_version = run_version + 1, updated_at = ?
+             run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
            AND connection_id = ?`,
+        input.nowMs,
         input.nowMs,
         current.registration_id,
         input.principalId,
@@ -958,8 +975,9 @@ export function retireGatewayRegistration(
     sql.exec(
         `UPDATE _gw_registration_generations
          SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
-             run_version = run_version + 1, updated_at = ?
+             run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
+        nowMs,
         nowMs,
         registrationId,
         key.principalId,
@@ -1281,6 +1299,7 @@ export async function shardsForIntent(catalog: CatalogRoutingRpc, intent: CdbInt
 
 export class Gateway extends DurableObject<GatewayEnv> {
     private bootstrapped = false;
+    private alarmScheduler: Promise<void> = Promise.resolve();
     private coalesceTimer: ReturnType<typeof setTimeout> | null = null;
     private readonly pendingPatches = new Map<ClientId, RowPatch[]>();
     private readonly authRefreshBarriers = new Map<string, Promise<boolean>>();
@@ -1310,7 +1329,153 @@ export class Gateway extends DurableObject<GatewayEnv> {
         return resolveQueryRoute(this.runtimeManifest(), request);
     }
 
-    private bootstrap(): void {
+    protected gatewayNowMs(): number {
+        return Date.now();
+    }
+
+    /** Serialize every Gateway alarm write and preserve any earlier durable deadline. */
+    protected scheduleGatewayAlarm(requestedAt: number): Promise<void> {
+        assertNonnegativeSafeInteger(requestedAt, "requestedAt");
+        const scheduled = this.alarmScheduler.then(async () => {
+            const current = await this.ctx.storage.getAlarm();
+            if (current === null || requestedAt < current) {
+                await this.ctx.storage.setAlarm(requestedAt);
+            }
+        });
+        this.alarmScheduler = scheduled.catch(() => {});
+        return scheduled;
+    }
+
+    private cleanupRetryDelayMs(attempts: number): number {
+        const exponent = Math.max(0, Math.min(attempts - 1, GATEWAY_CLEANUP_MAX_RETRY_COUNT - 1));
+        return Math.min(GATEWAY_CLEANUP_MAX_RETRY_MS, GATEWAY_CLEANUP_BASE_RETRY_MS * 2 ** exponent);
+    }
+
+    private dueGatewayCleanupRows(nowMs: number): readonly StoredGatewayCleanupRow[] {
+        return adaptSqlStorage(this.ctx.storage.sql).all<StoredGatewayCleanupRow>(
+            `SELECT g.principal_id, g.client_id, g.sub_id, g.registration_id,
+                    g.connection_id, g.source_cdb_id, g.retry_count
+             FROM _gw_registration_generations g
+             WHERE g.lifecycle = 'retiring' AND g.cdb_state = 'retiring'
+               AND g.retry_at IS NOT NULL AND g.retry_at <= ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM _gw_registration_heads h WHERE h.registration_id = g.registration_id
+               )
+             ORDER BY g.retry_at, g.registration_id
+             LIMIT ?`,
+            nowMs,
+            GATEWAY_CLEANUP_BATCH_SIZE
+        );
+    }
+
+    private completeGatewayCleanup(row: StoredGatewayCleanupRow): void {
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            sql.exec(
+                `DELETE FROM _gw_registration_generations
+                 WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+                   AND connection_id = ? AND source_cdb_id = ?
+                   AND lifecycle = 'retiring' AND cdb_state = 'retiring'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM _gw_registration_heads h
+                     WHERE h.registration_id = _gw_registration_generations.registration_id
+                   )`,
+                row.registration_id,
+                row.principal_id,
+                row.client_id,
+                row.sub_id,
+                row.connection_id,
+                row.source_cdb_id
+            );
+            if (sql.changes() === 1) return;
+            if (
+                sql.one<{ registration_id: string }>(
+                    "SELECT registration_id FROM _gw_registration_generations WHERE registration_id = ?",
+                    row.registration_id
+                )
+            ) {
+                throw gatewayInvalidationInvariant("retired Gateway generation changed before cleanup could complete");
+            }
+        });
+    }
+
+    private recordGatewayCleanupFailure(row: StoredGatewayCleanupRow, nowMs: number, error: unknown): void {
+        const attempts = Math.min(row.retry_count + 1, GATEWAY_CLEANUP_MAX_RETRY_COUNT);
+        const message = (error instanceof Error ? error.message : String(error)).slice(
+            0,
+            GATEWAY_CLEANUP_MAX_ERROR_LENGTH
+        );
+        const retryAt = nowMs + this.cleanupRetryDelayMs(attempts);
+        this.ctx.storage.transactionSync(() => {
+            adaptSqlStorage(this.ctx.storage.sql).exec(
+                `UPDATE _gw_registration_generations
+                 SET retry_count = ?, retry_at = ?, retry_error = ?, updated_at = ?
+                 WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+                   AND connection_id = ?
+                   AND lifecycle = 'retiring' AND cdb_state = 'retiring'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM _gw_registration_heads h
+                     WHERE h.registration_id = _gw_registration_generations.registration_id
+                   )`,
+                attempts,
+                retryAt,
+                message,
+                nowMs,
+                row.registration_id,
+                row.principal_id,
+                row.client_id,
+                row.sub_id,
+                row.connection_id
+            );
+        });
+    }
+
+    private async cleanupGatewayGeneration(row: StoredGatewayCleanupRow, nowMs: number): Promise<void> {
+        try {
+            if (!row.source_cdb_id) throw new Error("retired Gateway generation has no physical Cdb object ID");
+            const id = this.env.CDB_SHARD.idFromString(row.source_cdb_id);
+            const cdb = this.env.CDB_SHARD.get(id) as unknown as CdbSubscriptionRpc;
+            const outcome: unknown = await cdb.unsubscribe({
+                gatewayId: this.ctx.id.toString(),
+                registrationId: row.registration_id,
+                connectionId: row.connection_id,
+                clientId: ClientId(row.client_id),
+                subId: SubId(row.sub_id),
+            });
+            if (outcome !== undefined) throw new Error("Cdb returned a malformed unsubscribe outcome");
+            this.completeGatewayCleanup(row);
+        } catch (error) {
+            this.recordGatewayCleanupFailure(row, nowMs, error);
+        }
+    }
+
+    private earliestGatewayCleanupAt(): number | null {
+        return (
+            adaptSqlStorage(this.ctx.storage.sql).one<{ retry_at: number | null }>(
+                `SELECT MIN(retry_at) AS retry_at
+                 FROM _gw_registration_generations g
+                 WHERE lifecycle = 'retiring' AND cdb_state = 'retiring' AND retry_at IS NOT NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM _gw_registration_heads h WHERE h.registration_id = g.registration_id
+                   )`
+            )?.retry_at ?? null
+        );
+    }
+
+    private async scheduleGatewayCleanup(nowMs: number): Promise<void> {
+        const retryAt = this.earliestGatewayCleanupAt();
+        if (retryAt === null) return;
+        await this.scheduleGatewayAlarm(Math.max(nowMs + 1, retryAt));
+    }
+
+    private async maintainGatewayCleanup(): Promise<void> {
+        const nowMs = this.gatewayNowMs();
+        const rows = this.dueGatewayCleanupRows(nowMs);
+        await Promise.all(rows.map(row => this.cleanupGatewayGeneration(row, nowMs)));
+        await this.scheduleGatewayCleanup(nowMs);
+    }
+
+    private async bootstrap(): Promise<void> {
         if (this.bootstrapped) return;
         const sql = adaptSqlStorage(this.ctx.storage.sql);
         sql.exec("PRAGMA foreign_keys = ON");
@@ -1319,7 +1484,17 @@ export class Gateway extends DurableObject<GatewayEnv> {
             .filter(Boolean))
             sql.exec(stmt);
         ensureGatewayRegistrationColumns(sql);
+        sql.exec(
+            `UPDATE _gw_registration_generations
+             SET retry_at = updated_at
+             WHERE lifecycle = 'retiring' AND cdb_state = 'retiring' AND retry_at IS NULL`
+        );
+        await this.scheduleGatewayCleanup(this.gatewayNowMs());
         this.bootstrapped = true;
+    }
+
+    override async alarm(): Promise<void> {
+        await this.maintainGatewayCleanup();
     }
 
     /**
@@ -1329,7 +1504,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
     async invalidateSubscriptions(request: GatewayInvalidationRequest): Promise<GatewayInvalidationResponse> {
         const gatewayId = this.ctx.id.toString();
         const validated = validateGatewayInvalidationRequest(request, gatewayId);
-        const updatedAt = Date.now();
+        const updatedAt = this.gatewayNowMs();
         const acknowledgements = this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             return validated.invalidations.map(({ subscription, changeSeq }): GatewayInvalidationAck => {
@@ -1412,7 +1587,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
         if (acknowledgements.some(acknowledgement => acknowledgement.status === "accepted")) {
             try {
-                await this.ctx.storage.setAlarm(updatedAt + 1);
+                await this.scheduleGatewayAlarm(updatedAt + 1);
             } catch (error) {
                 throw new CdbError({
                     code: "CDB_SHARD_UNAVAILABLE",

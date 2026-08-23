@@ -107,21 +107,25 @@ describe("Gateway invalidation receiver", () => {
     let ready: Promise<unknown>;
     let sql: SyncSql;
     let alarms: number[];
+    let currentAlarm: number | null;
     let alarmFails: boolean;
 
     beforeEach(async () => {
         db = new Database(":memory:");
         ready = Promise.resolve();
         alarms = [];
+        currentAlarm = null;
         alarmFails = false;
         const state = {
             id: { toString: () => "gateway-do-1" },
             storage: {
                 sql: sqlStorage(db),
                 transactionSync: <T>(callback: () => T): T => db.transaction(callback)(),
+                getAlarm: async (): Promise<number | null> => currentAlarm,
                 setAlarm: async (scheduledTime: number | Date): Promise<void> => {
                     if (alarmFails) throw new Error("alarm unavailable");
-                    alarms.push(scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime);
+                    currentAlarm = scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime;
+                    alarms.push(currentAlarm);
                 },
             },
             blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
@@ -323,7 +327,7 @@ describe("Gateway invalidation receiver", () => {
             acknowledgements: [{ changeSeq: 9, status: "accepted" }],
         });
         expect(dirtyVersion(current.registrationId)).toBe(9);
-        expect(alarms).toHaveLength(3);
+        expect(alarms).toHaveLength(1);
     });
 
     test("retains dirty state when alarm scheduling fails and safely retries", async () => {
