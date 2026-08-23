@@ -10,7 +10,7 @@ The repository uses Bun 1.2.22 or newer and treats `bun.lock` as the canonical l
 bun install --frozen-lockfile
 ```
 
-Do not add an npm lockfile. If a dependency changes, update `package.json` and `bun.lock` together.
+Do not add an npm lockfile at the repository root. If a root dependency changes, update `package.json` and `bun.lock` together. The chat consumer fixture keeps its own `package-lock.json` because it verifies installation of the packed package through npm.
 
 ## Verification
 
