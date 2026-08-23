@@ -7,9 +7,9 @@ export default defineConfig({
     build: {
         rollupOptions: {
             input: {
-                main: resolve(__dirname, "index.html"),
-                og: resolve(__dirname, "og.html"),
-                favicon: resolve(__dirname, "favicon.html"),
+                main: resolve(import.meta.dirname, "index.html"),
+                og: resolve(import.meta.dirname, "og.html"),
+                favicon: resolve(import.meta.dirname, "favicon.html"),
             },
         },
     },
