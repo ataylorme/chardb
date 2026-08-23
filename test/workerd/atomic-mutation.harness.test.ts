@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { rm } from "node:fs/promises";
 import * as path from "node:path";
 import { Miniflare } from "miniflare";
 
@@ -9,25 +10,29 @@ const BUNDLE = path.join(HERE, ".test-atomic-mutation.bundle.mjs");
 let mf: Miniflare | undefined;
 
 async function buildWorker(): Promise<string> {
-    const proc = Bun.spawn(
-        [
-            "bun",
-            "build",
-            ENTRY,
-            "--target=browser",
-            "--format=esm",
-            "--external=cloudflare:workers",
-            "--outfile",
-            BUNDLE,
-        ],
-        { stdout: "pipe", stderr: "pipe" }
-    );
-    const exitCode = await proc.exited;
-    if (exitCode !== 0) {
-        const stderr = await new Response(proc.stderr).text();
-        throw new Error(`bundle failed (exit ${exitCode}):\n${stderr}`);
+    try {
+        const proc = Bun.spawn(
+            [
+                "bun",
+                "build",
+                ENTRY,
+                "--target=browser",
+                "--format=esm",
+                "--external=cloudflare:workers",
+                "--outfile",
+                BUNDLE,
+            ],
+            { stdout: "pipe", stderr: "pipe" }
+        );
+        const exitCode = await proc.exited;
+        if (exitCode !== 0) {
+            const stderr = await new Response(proc.stderr).text();
+            throw new Error(`bundle failed (exit ${exitCode}):\n${stderr}`);
+        }
+        return await Bun.file(BUNDLE).text();
+    } finally {
+        await rm(BUNDLE, { force: true });
     }
-    return Bun.file(BUNDLE).text();
 }
 
 beforeAll(async () => {

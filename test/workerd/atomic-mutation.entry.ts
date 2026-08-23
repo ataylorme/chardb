@@ -3,13 +3,18 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { isCdbError } from "../../src/errors.ts";
 import { SHARD_BOOTSTRAP_DDL } from "../../src/oplog/schema.ts";
 import { executeAtomicMutation } from "../../src/server/atomic-mutation.ts";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
+import { forOrg, globalScope } from "../../src/server/cdb-tenant.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 
-const entries = sqliteTable("atomic_entries", {
-    id: text("id").primaryKey(),
-    sequence: integer("sequence").notNull(),
-});
+const { cdbTable: globalTable } = globalScope();
+const entries = globalTable(
+    "atomic_entries",
+    {
+        id: text("id").primaryKey(),
+        sequence: integer("sequence").notNull(),
+    },
+    { partitionBy: "id", roles: { member: { create: "*" } } }
+);
 
 const schema = { entries };
 
