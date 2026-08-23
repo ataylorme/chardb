@@ -16,28 +16,27 @@ The current design cannot work as written:
 
 - [`Gateway.routeMut`](src/server/do/gateway.ts) calls `Cdb.mutate` over RPC with one serializable argument.
 - [`Cdb.mutate`](src/server/do/cdb.ts) requires a second argument containing a local runner closure. RPC cannot transport that closure.
-- [`defineMutation`](src/server/define.ts) produces async handlers.
-- [`runWrappedMutation`](src/oplog/wrapper.ts) requires a synchronous result inside `transactionSync`.
-- No code constructs the Drizzle database that a domain handler expects in `ctx.db`.
+- [`defineMutation`](src/server/define.ts) now requires synchronous handlers, but the public RPC path does not invoke them.
+- [`executeAtomicMutation`](src/server/atomic-mutation.ts) constructs the Drizzle database and commits handler SQL with the op-log, but Gateway and Cdb are not connected to it.
 
 Do this work before touching the higher-level features:
 
-- [ ] Write a small workerd test that runs two domain SQL statements in one Durable Object mutation and throws after the second statement.
-- [ ] Prove that the failed mutation rolls back both statements and its op-log entry.
-- [ ] Decide whether the public mutation handler remains async or becomes synchronous.
-- [ ] If handlers remain async, replace the current `transactionSync` design with a transaction mechanism that stays atomic across every awaited operation.
-- [ ] If Durable Object SQLite cannot support that contract, change the public handler API now.
+- [x] Write a small workerd test that runs two domain SQL statements in one Durable Object mutation and throws after the second statement.
+- [x] Prove that the failed mutation rolls back both statements and its op-log entry.
+- [x] Decide whether the public mutation handler remains async or becomes synchronous.
+- [x] Make mutation handlers and their argument validators synchronous so they can run inside `transactionSync`.
 - [ ] Put the application manifest and schema in the Cdb isolate through a generated registry, configured subclass, or eagerly bound module runtime.
 - [ ] Remove the runner closure from the Cdb RPC contract.
 - [ ] Make `Cdb.mutate` accept one serializable request containing `ref`, validated `args`, `mutId`, verified auth, and schema epoch.
 - [ ] Resolve the mutation reference inside the owning Cdb isolate.
-- [ ] Construct a real Drizzle database over that Cdb's `SqlStorage`.
-- [ ] Construct `MutationCtx` with the Drizzle database and verified auth.
+- [x] Construct a real Drizzle database over a Cdb `SqlStorage` inside the atomic executor.
+- [x] Construct `MutationCtx` with that Drizzle database and an auth context inside the atomic executor.
 - [ ] Invoke the handler inside the chosen transaction boundary.
-- [ ] Return the handler's exact result. Do not reconstruct it from `returning[0]`.
-- [ ] Store the exact result in the op-log replay envelope.
-- [ ] Return that stored result when the client repeats the same `mutId`.
-- [ ] Keep collision detection for a repeated `mutId` with different arguments.
+- [x] Return the handler's exact result. Do not reconstruct it from `returning[0]`.
+- [x] Validate that mutation results are JSON before committing them.
+- [x] Store the exact result in the op-log replay envelope.
+- [x] Return that stored result when the client repeats the same `mutId`.
+- [x] Keep collision detection for a repeated `mutId` with different arguments.
 - [ ] Make every error path settle the client mutation promise.
 
 ## 2. Make runtime registration and routing coherent
