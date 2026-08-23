@@ -14,6 +14,7 @@ import { DurableObject } from "cloudflare:workers";
 import { createCatalogJwksResolver } from "../../auth/jwks_cache.ts";
 import { verifyJwt } from "../../auth/jwt.ts";
 import { CdbError, docsUrlFor, isCdbErrorCode, isRetryable } from "../../errors.ts";
+import type { SyncSql } from "../../oplog/wrapper.ts";
 import {
     type ChardbRef,
     ClientId,
@@ -26,6 +27,7 @@ import {
     TenantId,
 } from "../../types.ts";
 import type { Vshard } from "../../types.ts";
+import { stableJson } from "../../util/canonical.ts";
 import { rawJsonResult } from "../../util/raw_json.ts";
 import { vshardOf } from "../../vshard.ts";
 import {
@@ -68,6 +70,50 @@ import type {
 } from "../rpc.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
+export const GATEWAY_REGISTRATION_DDL = `
+CREATE TABLE IF NOT EXISTS _gw_registration_generations (
+  registration_id TEXT PRIMARY KEY,
+  principal_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  sub_id INTEGER NOT NULL CHECK (sub_id >= 0),
+  connection_id TEXT NOT NULL,
+  organization_id TEXT NOT NULL,
+  ref TEXT NOT NULL,
+  args_json TEXT NOT NULL,
+  intent_json TEXT NOT NULL,
+  query_hash TEXT NOT NULL,
+  shard_id TEXT NOT NULL,
+  schema_epoch INTEGER NOT NULL CHECK (schema_epoch >= 0),
+  auth_global_epoch INTEGER NOT NULL CHECK (auth_global_epoch >= 0),
+  auth_tenant_epoch INTEGER NOT NULL CHECK (auth_tenant_epoch >= 0),
+  auth_principal_epoch INTEGER NOT NULL CHECK (auth_principal_epoch >= 0),
+  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('installing', 'active', 'retiring')),
+  cdb_state TEXT NOT NULL CHECK (cdb_state IN ('pending', 'active', 'retiring', 'error')),
+  dirty_version INTEGER NOT NULL CHECK (dirty_version >= 0),
+  delivered_version INTEGER NOT NULL CHECK (delivered_version >= 0 AND delivered_version <= dirty_version),
+  run_token TEXT,
+  run_version INTEGER NOT NULL CHECK (run_version >= 0),
+  last_cookie TEXT,
+  retry_count INTEGER NOT NULL CHECK (retry_count >= 0),
+  retry_at INTEGER CHECK (retry_at IS NULL OR retry_at >= 0),
+  retry_error TEXT,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0)
+);
+CREATE INDEX IF NOT EXISTS _gw_registration_generations_logical
+  ON _gw_registration_generations (principal_id, client_id, sub_id, created_at);
+CREATE TABLE IF NOT EXISTS _gw_registration_heads (
+  principal_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  sub_id INTEGER NOT NULL CHECK (sub_id >= 0),
+  registration_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (principal_id, client_id, sub_id),
+  UNIQUE (registration_id),
+  FOREIGN KEY (registration_id) REFERENCES _gw_registration_generations(registration_id)
+);
+` as const;
+
 const GW_DDL = `
 CREATE TABLE IF NOT EXISTS _gw_subs (
   client_id TEXT NOT NULL,
@@ -91,6 +137,7 @@ CREATE TABLE IF NOT EXISTS _gw_presence_subs (
   key TEXT NOT NULL,
   PRIMARY KEY (client_id, key)
 );
+${GATEWAY_REGISTRATION_DDL}
 ` as const;
 
 export const COALESCE_WINDOW_MS = 50 as const;
@@ -436,6 +483,246 @@ function parseStoredCdbRegistration(encoded: string): StoredCdbRegistration | nu
         : null;
 }
 
+type GatewayRegistrationLifecycle = "installing" | "active" | "retiring";
+type GatewayRegistrationCdbState = "pending" | "active" | "retiring" | "error";
+
+export interface GatewayRegistrationKey {
+    readonly principalId: PrincipalId;
+    readonly clientId: ClientId;
+    readonly subId: SubId;
+}
+
+export interface GatewayRegistrationInstall extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly organizationId: TenantId;
+    readonly ref: ChardbRef;
+    readonly args: RawJson;
+    readonly intent: CdbIntent;
+    readonly queryHash: string;
+    readonly shardId: string;
+    readonly schemaEpoch: number;
+    readonly authEpochs: {
+        readonly global: number;
+        readonly tenant: number;
+        readonly principal: number;
+    };
+    readonly lastCookie?: Cookie;
+    readonly nowMs: number;
+}
+
+export interface GatewayRegistrationAdvance extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly expectedRunVersion: number;
+    readonly lifecycle: GatewayRegistrationLifecycle;
+    readonly cdbState: GatewayRegistrationCdbState;
+    readonly dirtyVersion: number;
+    readonly deliveredVersion: number;
+    readonly runToken: string | null;
+    readonly lastCookie: Cookie | null;
+    readonly retryCount: number;
+    readonly retryAt: number | null;
+    readonly retryError: string | null;
+    readonly nowMs: number;
+}
+
+/**
+ * Install a new durable generation. The caller must wrap this helper in the
+ * Gateway storage transaction so the old generation and head move atomically.
+ */
+export function installGatewayRegistration(
+    sql: SyncSql,
+    input: GatewayRegistrationInstall
+): { readonly supersededRegistrationId: string | null } {
+    assertGatewayRegistrationInstall(input);
+    const previous = sql.one<{ registration_id: string }>(
+        `SELECT registration_id FROM _gw_registration_heads
+         WHERE principal_id = ? AND client_id = ? AND sub_id = ?`,
+        input.principalId,
+        input.clientId,
+        input.subId
+    );
+    sql.exec(
+        `INSERT INTO _gw_registration_generations
+         (registration_id, principal_id, client_id, sub_id, connection_id, organization_id,
+          ref, args_json, intent_json, query_hash, shard_id, schema_epoch,
+          auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
+          lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_version,
+          last_cookie, retry_count, retry_at, retry_error, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 'installing', 'pending', 0, 0, NULL, 0, ?, 0, NULL, NULL, ?, ?)`,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId,
+        input.organizationId,
+        input.ref,
+        stableJson(input.args),
+        stableJson(input.intent),
+        input.queryHash,
+        input.shardId,
+        input.schemaEpoch,
+        input.authEpochs.global,
+        input.authEpochs.tenant,
+        input.authEpochs.principal,
+        input.lastCookie ?? null,
+        input.nowMs,
+        input.nowMs
+    );
+    if (previous) {
+        sql.exec(
+            `UPDATE _gw_registration_generations
+             SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL,
+                 run_version = run_version + 1, updated_at = ?
+             WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
+            input.nowMs,
+            previous.registration_id,
+            input.principalId,
+            input.clientId,
+            input.subId
+        );
+    }
+    sql.exec(
+        `INSERT INTO _gw_registration_heads
+         (principal_id, client_id, sub_id, registration_id, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (principal_id, client_id, sub_id)
+         DO UPDATE SET registration_id = excluded.registration_id, updated_at = excluded.updated_at`,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.registrationId,
+        input.nowMs
+    );
+    return { supersededRegistrationId: previous?.registration_id ?? null };
+}
+
+/** Advance state only when this registration still owns its logical head and run version. */
+export function advanceGatewayRegistration(sql: SyncSql, input: GatewayRegistrationAdvance): boolean {
+    assertNonnegativeSafeInteger(input.expectedRunVersion, "expectedRunVersion");
+    assertNonnegativeSafeInteger(input.dirtyVersion, "dirtyVersion");
+    assertNonnegativeSafeInteger(input.deliveredVersion, "deliveredVersion");
+    assertNonnegativeSafeInteger(input.retryCount, "retryCount");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    if (input.retryAt !== null) assertNonnegativeSafeInteger(input.retryAt, "retryAt");
+    if (input.deliveredVersion > input.dirtyVersion) {
+        throw new TypeError("deliveredVersion cannot exceed dirtyVersion");
+    }
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET lifecycle = ?, cdb_state = ?, dirty_version = ?, delivered_version = ?,
+             run_token = ?, run_version = run_version + 1, last_cookie = ?,
+             retry_count = ?, retry_at = ?, retry_error = ?, updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND run_version = ?
+           AND EXISTS (
+             SELECT 1 FROM _gw_registration_heads h
+             WHERE h.principal_id = ? AND h.client_id = ? AND h.sub_id = ?
+               AND h.registration_id = _gw_registration_generations.registration_id
+           )`,
+        input.lifecycle,
+        input.cdbState,
+        input.dirtyVersion,
+        input.deliveredVersion,
+        input.runToken,
+        input.lastCookie,
+        input.retryCount,
+        input.retryAt,
+        input.retryError,
+        input.nowMs,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.expectedRunVersion,
+        input.principalId,
+        input.clientId,
+        input.subId
+    );
+    return sql.changes() === 1;
+}
+
+/**
+ * Remove a current logical head while retaining its generation for Cdb cleanup.
+ * The caller must wrap the head deletion and generation update in one transaction.
+ */
+export function retireGatewayRegistration(
+    sql: SyncSql,
+    key: GatewayRegistrationKey,
+    registrationId: string,
+    nowMs: number
+): boolean {
+    assertNonnegativeSafeInteger(nowMs, "nowMs");
+    sql.exec(
+        `DELETE FROM _gw_registration_heads
+         WHERE principal_id = ? AND client_id = ? AND sub_id = ? AND registration_id = ?`,
+        key.principalId,
+        key.clientId,
+        key.subId,
+        registrationId
+    );
+    const removedHead = sql.changes() === 1;
+    if (!removedHead) return false;
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL,
+             run_version = run_version + 1, updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
+        nowMs,
+        registrationId,
+        key.principalId,
+        key.clientId,
+        key.subId
+    );
+    return true;
+}
+
+/** Delete one retired cleanup row without touching any logical head. */
+export function cleanupGatewayRegistration(sql: SyncSql, key: GatewayRegistrationKey, registrationId: string): boolean {
+    sql.exec(
+        `DELETE FROM _gw_registration_generations
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND lifecycle = 'retiring'
+           AND NOT EXISTS (
+             SELECT 1 FROM _gw_registration_heads h
+             WHERE h.registration_id = _gw_registration_generations.registration_id
+           )`,
+        registrationId,
+        key.principalId,
+        key.clientId,
+        key.subId
+    );
+    return sql.changes() === 1;
+}
+
+function assertGatewayRegistrationInstall(input: GatewayRegistrationInstall): void {
+    for (const [name, value] of [
+        ["subId", input.subId],
+        ["schemaEpoch", input.schemaEpoch],
+        ["authEpochs.global", input.authEpochs.global],
+        ["authEpochs.tenant", input.authEpochs.tenant],
+        ["authEpochs.principal", input.authEpochs.principal],
+        ["nowMs", input.nowMs],
+    ] as const) {
+        assertNonnegativeSafeInteger(value, name);
+    }
+    for (const [name, value] of [
+        ["registrationId", input.registrationId],
+        ["connectionId", input.connectionId],
+        ["organizationId", input.organizationId],
+        ["ref", input.ref],
+        ["queryHash", input.queryHash],
+        ["shardId", input.shardId],
+    ] as const) {
+        if (value.length === 0) throw new TypeError(`${name} must be nonempty`);
+    }
+}
+
+function assertNonnegativeSafeInteger(value: number, name: string): void {
+    if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a nonnegative safe integer`);
+}
+
 export interface GatewayJwtVerificationRequest {
     readonly config: GatewayJwtConfig;
     readonly authOrigin: string;
@@ -621,6 +908,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
     private bootstrap(): void {
         if (this.bootstrapped) return;
         const sql = adaptSqlStorage(this.ctx.storage.sql);
+        sql.exec("PRAGMA foreign_keys = ON");
         for (const stmt of GW_DDL.split(";")
             .map(s => s.trim())
             .filter(Boolean))
