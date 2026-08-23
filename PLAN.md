@@ -6,7 +6,7 @@ Last reviewed: 2026-08-23
 
 Chardb should do one thing well: a developer marks an organization boundary in a Drizzle schema, and chardb routes that organization's data to a SQLite Durable Object with tenant isolation, atomic mutations, idempotent retries, initial queries, and live updates.
 
-The repository does not do that yet. It has good routing, colocation, op-log, policy, and resharding pieces around a missing domain-data execution path. The missing work is architectural. It is not a matter of connecting two existing functions.
+The repository does not do that yet. It can bootstrap domain tables, execute isolated shard-local writes and reads, and enforce insert, update, and delete policy rules. The public auth, routing, query-delivery, and live-update path is still disconnected.
 
 Finish the organization-tenanted SQL path first. Stop presenting files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding as working product features. Keep that code as experimental work until the database path works.
 
@@ -57,16 +57,21 @@ Stable references also need repair:
 
 ## 3. Create and migrate domain tables
 
-Cdb creates its internal tables but never creates the user's domain tables. Auth rows now live in Catalog, which bootstraps synthesized auth tables but has no versioned migration path. The migration command only prints or loops over caller-supplied SQL.
+Cdb now renders the configured `cdbTable` schema on first startup, creates new domain tables and indexes, records signatures, and rejects unsigned or mismatched existing layouts. This is fresh-shard bootstrap, not migration. It cannot upgrade a shard that already contains an older domain schema.
+
+- [x] Render and create configured domain tables and indexes when a fresh Cdb starts.
+- [x] Preserve supported primary keys, unique constraints, local foreign keys, indexes, defaults, nullability, and SQLite column types during bootstrap.
+- [x] Record domain schema signatures and reject unsigned, changed, or incomplete existing layouts.
+- [x] Omit authority foreign keys to Catalog-owned auth tables, and reject other nonlocal domain foreign keys.
 
 - [ ] Pick one migration input format. The sensible choice is the Drizzle migration journal and SQL files.
 - [ ] Make the Vite plugin or CLI package the migration journal with the Worker build.
 - [ ] Store the active schema version and epoch in Catalog.
-- [ ] Apply all required migrations when a new Cdb shard starts.
+- [ ] Replace bootstrap-only table creation with an explicit migration sequence when a new Cdb shard starts.
 - [ ] Apply pending migrations to existing shards.
 - [ ] Record migration progress per shard so retries do not repeat completed work.
 - [ ] Refuse queries and mutations when a shard's schema epoch does not match the routed request.
-- [ ] Preserve primary keys, unique constraints, foreign keys, indexes, defaults, and column types in the domain-table migration path.
+- [ ] Preserve the bootstrap DDL guarantees through every versioned domain migration.
 - [ ] Replace `chardb migrate` output that says "would apply" with real execution and a nonzero exit on failure.
 - [ ] Add a fresh-database test that starts with no domain tables, applies migrations, restarts the Durable Objects, and reads the migrated schema.
 - [ ] Add an upgrade test that applies a second migration without losing existing rows.
@@ -112,29 +117,22 @@ The configured Gateway verifies JWT signatures and registered claims during `hel
 - [x] Test the configured Gateway WebSocket dispatch under workerd with real Catalog SQLite cache and ES256 tokens.
 - [ ] Add tests for revoked membership, changed role, and a socket that outlives its membership authority.
 
-## 6. Replace the policy engine before wiring it in
+## 6. Finish policy enforcement
 
-The current policy helpers are unused by production code. Their semantics are also wrong:
-
-- No matching policy means no restriction, which is default allow.
-- Separate role policies are combined with `AND`, so a valid member can be required to also be an admin.
-- The database proxy only autofills omitted insert fields. It does not stop explicit tenant overrides or protect selects, updates, deletes, and raw SQL.
-
-Replace that behavior with one explicit rule:
+The database proxy now applies one explicit rule to inserts, updates, and deletes:
 
 `mandatory tenant predicate AND one matching row grant AND allowed columns`
 
-Implement it as follows:
-
-- [ ] Compile every `cdbTable` into one operation-specific authorization plan.
-- [ ] Make private tables default deny for anonymous and authenticated callers without a matching grant.
-- [ ] Apply the tenant predicate to select, insert, update, and delete.
-- [ ] Combine alternative roles with `OR`.
-- [ ] Combine the tenant predicate with the chosen role or self grant using `AND`.
-- [ ] Treat `publicRead` as a select-only grant. It must not weaken writes.
-- [ ] Reject an explicit tenant or owner value that conflicts with verified auth.
-- [ ] Autofill tenant and self columns only after checking the incoming payload.
-- [ ] Apply writable-column checks to inserts and updates.
+- [x] Compile each `cdbTable` role matrix into operation-specific row grants and column rules.
+- [x] Make inserts, updates, and deletes default deny when no matching grant applies.
+- [x] Apply tenant and self predicates to inserts, updates, and deletes.
+- [x] Combine alternative role grants with `OR`.
+- [x] Combine the tenant or self floor with caller update and delete filters using `AND`, including operations without an explicit `where`.
+- [x] Compile `publicRead` as a select-only grant. Do not apply it to writes.
+- [x] Reject conflicting insert authority and make managed tenant and self columns immutable during updates.
+- [x] Autofill tenant and self columns only from verified auth.
+- [x] Apply writable-column checks to inserts and updates.
+- [ ] Apply the same default-deny row policy to selects.
 - [ ] Apply readable-column masks to query results.
 - [ ] Block or remove raw SQL from application handlers until it has a safe policy story.
 - [ ] Remove unused policy-digest and auth-epoch claims, or wire them into actual subscription identity and invalidation.
@@ -143,21 +141,22 @@ Implement it as follows:
 
 ## 7. Implement queries instead of subscription registration
 
-The subscription protocol now sends a query reference and raw arguments. Gateway validates the arguments, derives routing intent from its local server manifest, and forwards the validated identity to Cdb. Cdb still only registers intervals and never invokes the query or returns rows.
+Protocol v3 subscriptions send a query reference and raw arguments. Gateway validates the arguments and derives routing intent from its local server manifest. Separately, Cdb can resolve and execute a query handler through an isolated shard-local RPC with a read-only Drizzle wrapper and JSON result validation. The public subscription path does not call that RPC or send its result.
 
 - [x] Change the wire protocol so `sub` carries the query reference and raw arguments.
 - [x] Increment the protocol version and enforce it during `hello` and `welcome`.
 - [x] Validate query arguments with the query's Standard Schema validator before intent extraction.
-- [ ] Resolve the query reference inside the Cdb isolate.
+- [x] Resolve the query reference inside the Cdb isolate.
 - [x] Recompute the query intent on the server. Do not trust the client's intent or query hash.
 - [ ] Canonicalize query identity and include the query ref, validated arguments, verified principal, tenant, auth epoch, and policy epoch.
 - [ ] Route organization queries using the verified tenant and the server-computed intent.
-- [ ] Enumerate Catalog ranges or shard ids for scatter routing. Do not infer coverage by probing every 256th virtual shard.
-- [ ] Construct `QueryCtx` with a read database and verified auth.
+- [x] Enumerate distinct current Catalog shard ids for scatter routing instead of probing virtual shards.
+- [x] Construct `QueryCtx` with a read-only database and the auth carried by the internal request.
 - [ ] Apply row and column policies during query execution.
-- [ ] Execute the query handler.
+- [x] Execute the query handler inside Cdb and reject non-JSON results.
+- [x] Add an explicit protocol-v3 snapshot envelope, including empty row arrays, and replace client subscription state when it arrives.
 - [ ] Send an explicit initial snapshot, including an empty snapshot.
-- [ ] Move the client subscription from `pending` to `live` when that snapshot arrives.
+- [x] Move the client subscription from `pending` to `live` when a valid snapshot arrives.
 - [ ] Define ordering and stable row keys for collection results.
 - [ ] Reject unsupported cross-partition queries instead of silently scattering them.
 - [ ] Remove the requirement that users manually keep a query handler and intent extractor equivalent, or verify that equivalence during the build.
@@ -166,10 +165,10 @@ The subscription protocol now sends a query reference and raw arguments. Gateway
 
 Do not start with incremental row patches. Re-run the affected query after a commit and send a replacement snapshot. Optimize after this is correct.
 
-- [ ] Give every shard subscription a composite identity containing Gateway, client, and subscription IDs. Numeric `subId` alone collides across clients and Gateway objects.
-- [ ] Persist shard subscription registrations.
-- [ ] Rebuild the in-memory interval index after a Cdb restart.
-- [ ] Include query reference, arguments, verified principal, tenant, auth epoch, and last delivered cookie in the persisted record.
+- [x] Give every shard subscription a composite identity containing Gateway, client, and subscription IDs.
+- [x] Persist the composite identity, principal, query ref, arguments, tables, and intervals for each shard registration.
+- [x] Rebuild the in-memory interval index from SQLite when Cdb starts.
+- [ ] Add verified tenant, auth epoch, policy epoch, and last delivered cookie to the persisted record.
 - [ ] Record touched tables for every committed mutation.
 - [ ] Notify the relevant Gateway after a commit.
 - [ ] Re-run subscriptions whose table set intersects the touched tables.
@@ -250,6 +249,8 @@ The chat directory now consumes the packed package and passes compile-time check
 - [x] Test the chat consumer's runtime imports and declarations from the packed package without workspace hoisting.
 - [x] Fix all Biome errors and warnings, or narrow the lint inputs deliberately and document why.
 - [x] Add CI for frozen install, typecheck, lint, unit tests, serialized workerd tests, package build, package consumer test, landing build, and example build.
+- [x] Upgrade compatible `nanoid`, PostCSS, Sharp, SVGO, and `ws` dependency paths past their published advisories.
+- [ ] Upgrade Miniflare when a compatible stable release stops pinning vulnerable `undici@7.28.0`; do not hide the advisory with an override.
 - [ ] Run a full-history secret scan before changing repository visibility.
 
 ## 13. Rewrite the public story

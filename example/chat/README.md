@@ -1,6 +1,6 @@
 # chardb chat example
 
-This is a compile-checked concept example for chardb's chat API: Drizzle tables, better-auth configuration, typed mutations and queries, and React hooks in one small application. It typechecks and produces a Vite build against a packed chardb package. It is not an end-to-end runnable demo. Gateway verifies JWT identity, then public mutations, subscriptions, and presence stop at the unbound membership and policy boundary. Cdb does not execute initial queries or live replacements.
+This is a compile-checked concept example for chardb's chat API: Drizzle tables, better-auth configuration, typed mutations and queries, and React hooks in one small application. It typechecks and produces a Vite build against a packed chardb package. It is not an end-to-end runnable demo. Gateway verifies JWT identity, then public mutations, subscriptions, and presence stop at the unbound membership and policy boundary. Cdb can execute a query through an isolated internal RPC, and the protocol-v3 client can consume a snapshot, but the public subscription path connects neither piece.
 
 The intended backend surface is one factory call:
 
@@ -160,13 +160,13 @@ The reserved chardb prefixes (`/ws`, `/_chardb/*`) and the optional `/api/auth/*
 
 ### Authorization lives on the table
 
-`forOrg()` binds every `cdbTable` in `schema.ts` to the active organization. Each table's `roles` block declares row verbs and writable or readable columns. `selfBy` binds the `self` role to a user foreign key. The runtime compiles this metadata into its row and column policy forms; there are no separate `tenantScope` or `ownerScope` exports to keep in sync.
+`forOrg()` binds every `cdbTable` in `schema.ts` to the active organization. Each table's `roles` block declares row verbs and writable or readable columns. `selfBy` binds the `self` role to a user foreign key. Inserts, updates, and deletes require matching grants. Inserts and updates enforce writable columns, and managed authority columns cannot change. Updates and deletes add tenant and self predicates even without a caller `where`. Select and raw SQL enforcement are still missing. There are no separate `tenantScope` or `ownerScope` exports to keep in sync.
 
 ### Validator-driven args, intent extractors, no per-mutation type aliases
 
 `api.ts` never declares a `Db`, `*Args`, or `*Row` alias. Each `api.mutation({...})` / `api.query({...})` call takes a **StandardSchemaV1 validator** (zod, valibot, arktype, typebox, drizzle-zod, …) as its `args:` field; chardb infers `TArgs` from the validator and runs it at the wire boundary, so the handler receives a fully typed, validated payload.
 
-`api.query({...})` accepts an `intent: (args) => CdbIntent` extractor. The Vite transform stamps the exported handle with a stable ref. `useQuery(handle, args)` sends that ref and the raw arguments under protocol v2. Gateway resolves the server manifest, validates the arguments, and runs the intent extractor locally:
+`api.query({...})` accepts an `intent: (args) => CdbIntent` extractor. The Vite transform stamps the exported handle with a stable ref. `useQuery(handle, args)` sends that ref and the raw arguments under protocol v3. Gateway resolves the server manifest, validates the arguments, and runs the intent extractor locally:
 
 ```tsx
 // src/web/hooks.ts
@@ -195,6 +195,8 @@ The merged auth + domain schema is automatic: `chardb({ schema: domain, auth })`
 
 Catalog generates auth DDL with keys, uniqueness, foreign keys, indexes, supported defaults, nullability, and SQLite types. An existing table must have the exact matching `auth_ddl_v1` signature. Older layouts have no versioned upgrade path yet.
 
+Fresh Cdb storage also renders the configured domain tables and indexes, records their signatures, and rejects drift. This bootstrap does not migrate an existing shard to a newer schema.
+
 If a domain table shadows a reserved name (`organization`, `user`, `member`, …), `chardb({...})` raises `CDB_RESERVED_TABLE_NAME` at construction time with the conflicting names listed; rename the table or drop the plugin that owns the name.
 
 ## What this example demonstrates
@@ -205,7 +207,7 @@ If a domain table shadows a reserved name (`organization`, `user`, `member`, …
 - A browser bundle that consumes the packed package instead of private source subpaths.
 - The current React surface for auth, mutations, and queries.
 
-The last item is API design, not proof of a working database. Gateway verifies JWT signatures and registered claims, but the public socket cannot call the trusted mutation dispatcher until Catalog resolves tenant membership, role, and policy authority. Initial query execution and live updates remain incomplete. Presence, upload, stream, and vector hooks are not exported. Migration commands do not apply domain DDL to deployed shards.
+The last item is API design, not proof of a working database. Gateway verifies JWT signatures and registered claims, but the public socket cannot call the trusted mutation dispatcher until Catalog resolves tenant membership, role, and policy authority. Cdb has isolated read-only query execution and the client understands protocol-v3 snapshots, but Gateway does not connect them. Live updates remain incomplete. Presence, upload, stream, and vector hooks are not exported. Migration commands do not upgrade domain DDL on deployed shards.
 
 ## Running
 
@@ -231,7 +233,9 @@ These commands verify package consumption, TypeScript contracts, the browser bun
 
 ## Runtime wiring still required
 
-Before this can be presented as a runnable demo, chardb needs Catalog-derived membership, role, and policy authority after its verified JWT identity boundary. It also needs domain migrations, initial query execution, and live replacement results. Query scatter must enumerate Catalog ranges instead of probing every 256th virtual shard. Shard subscriptions need composite Gateway, client, and subscription ids. Query identity must use canonical arguments plus verified auth and policy epochs. Existing `auth_ddl_v1` layouts need a versioned upgrade path.
+Before this can be presented as a runnable demo, chardb needs Catalog-derived membership, role, and policy authority after its verified JWT identity boundary. It also needs versioned domain migrations, public routing to the shard-local query executor, a server-produced initial snapshot, and live replacement results. Query identity must use canonical arguments plus verified auth and policy epochs. Persisted shard registrations already use composite Gateway, client, and subscription ids and rebuild after Cdb startup, but they still lack verified tenant, epoch, and delivery-cookie state. Existing `auth_ddl_v1` layouts need a versioned upgrade path.
+
+The repository audit still reports five advisories through `miniflare@4.20260730.0 -> undici@7.28.0`. Miniflare 4 pins that version, and the fixed `undici@7.29.0` currently requires Miniflare 5 alpha. The example does not override the dependency.
 
 Each auth mutation commits with every directly derivable old and new global, tenant, or principal epoch bump. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. Bulk updates and deletes preload matched rows to derive epoch scopes. Indirect plugin relationships without placement metadata or conventional `organizationId` or `userId` fields may lack a secondary scope. Coverage uses a Bun fake-Durable-Object harness, not workerd.
 

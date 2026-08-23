@@ -58,7 +58,7 @@ tenant key -> canonical encoding -> xxHash64 -> vshard 0..16383
 
 API helpers attach a stable `__chardbRef` and a kind marker to mutations, queries, crons, presence keys, and ledgers. The Vite plugin can stamp refs during a build. [`manifestFromExports`](src/server/manifest.ts) walks the marked exports and builds maps for mutations, queries, crons, and ledgers.
 
-Mutation descriptors retain the local handler and an optional partition-key extractor. Query descriptors retain argument validation, intent extraction, and the local handler. `chardb()` closes over the same lazily built manifest in configured Gateway and Cdb classes. The Gateway resolves refs, validates query arguments, and derives routing metadata locally. Cdb resolves mutation refs to handlers inside the shard isolate. The manifest and its functions never cross RPC. Cdb does not yet resolve or execute query handlers.
+Mutation descriptors retain the local handler and an optional partition-key extractor. Query descriptors retain argument validation, intent extraction, and the local handler. `chardb()` closes over the same lazily built manifest in configured Gateway and Cdb classes. The Gateway resolves refs, validates query arguments, and derives routing metadata locally. Cdb resolves both mutation and query refs inside the shard isolate. The manifest and its functions never cross RPC.
 
 ## Mutation and transaction design
 
@@ -96,7 +96,7 @@ Catalog derives epoch scopes from each model's placement and from conventional `
 
 Indirect plugin relationships without placement metadata or conventional `organizationId` or `userId` fields may lack a secondary epoch scope. The adapter reports `transaction: false`, so Better Auth workflows that make several adapter calls remain sequential. The current coverage uses a Bun fake-Durable-Object harness. No full sign-in flow or real workerd restart has been verified.
 
-Table role and column rules compile through [`compileCdbPolicies`](src/server/cdb-policy.ts). [`wrapDb`](src/server/cdb-db-proxy.ts) can fill tenant and owner columns from `ctx.auth` on inserts. Column-mask and writable-column checks also exist as standalone helpers.
+Table role and column rules compile through [`compileCdbPolicies`](src/server/cdb-policy.ts). [`wrapDb`](src/server/cdb-db-proxy.ts) fills tenant and owner columns from `ctx.auth` on inserts, then requires a create grant and checks caller-supplied columns. Updates require an update grant, check writable columns, and forbid changes to managed tenant and self columns. Updates and deletes AND the server tenant and self predicates with the caller's filter, including operations with no caller `where`, and deletes require a matching grant. Select and raw SQL do not yet pass through equivalent enforcement, and query results do not yet receive readable-column masks.
 
 The configured Gateway derives issuer, audience, allowed algorithms, and JWKS location from the Better Auth JWT plugin. During `hello` and `updateAuth`, it verifies the signature and registered claims through a Catalog-backed JWK resolver. The verified attachment contains the subject and token time bounds. It does not copy tenant, role, or custom claims into authority.
 
@@ -106,19 +106,21 @@ Tenant membership, role, auth epoch, and policy authority are still absent. Muta
 
 ## Subscription design
 
-Wire protocol v2 requires `protocolV` in `hello` and `welcome`. Its decoder rejects unknown fields, missing fields, and incorrect field types. A subscription sends a server-stamped query ref and raw arguments. It does not send intent or a query hash.
+Wire protocol v3 requires `protocolV` in `hello` and `welcome`. Its decoder rejects unknown fields, missing fields, and incorrect field types. A subscription sends a server-stamped query ref and raw arguments. It does not send intent or a query hash. The protocol also defines a `snapshot` with a subscription id, cookie, and JSON row array. The client replaces its rows, clears optimistic patches, records the cookie, and marks the subscription `live` when that message arrives.
 
 After the remaining membership boundary, the isolated routing path can resolve the ref in its local manifest, validate the arguments, derive the intent, compute the current query hash, persist the registration, and choose shards:
 
 - explicit partition values route to their owning shards;
 - reference joins route to a canonical shard;
-- other intents currently probe the virtual-shard space every 256 slots.
+- other intents call `Catalog.listShardIds()` to enumerate each physical shard that owns a current range.
 
-The 256-step probe is not a correct Catalog enumeration algorithm. It can miss a shard that owns a narrow, non-aligned range. Gateway needs an RPC that lists current Catalog ranges or unique shard ids.
+Catalog reads distinct shard ids directly from `catalog_ranges` and returns them in stable order. Focused tests cover narrow, non-aligned ranges, duplicate ownership, point routing, reference routing, and scatter without virtual-shard probes.
 
-Each selected Cdb registers the subscription's table, index, and intervals in an in-memory [`IntervalMap`](src/intervals.ts). The interval map is keyed only by numeric `subId`, even though different Gateway objects and clients can reuse that number. The shard registration must use a composite Gateway, client, and subscription identity before multi-client behavior is safe. `matchSubsForRow` can map a committed row's indexed keys back to registrations. Gateway code exists to coalesce patches before sending a `poke`.
+Each selected Cdb persists the subscription's composite Gateway, client, and subscription id along with its principal, ref, arguments, tables, and intervals. The in-memory [`IntervalMap`](src/intervals.ts) uses that composite identity and rebuilds from SQLite when Cdb starts. Focused reconstruction tests cover colliding numeric subscription ids and targeted unsubscribe. `matchSubsForRow` maps a committed row's indexed keys back to composite registrations. Gateway code exists to coalesce patches before sending a `poke`.
 
-The current query hash serializes the ref, validated arguments, and derived intent. It still needs canonical JSON and verified principal, tenant, auth epoch, and policy epoch inputs. Public subscription registration currently fails closed before this routing path. Cdb does not invoke query descriptors, and committed mutations do not generate live replacement results. React presence, upload, stream, and vector hooks are not exported until their client paths exist.
+The current query hash serializes the ref, validated arguments, and derived intent. It still needs canonical JSON and verified principal, tenant, auth epoch, and policy epoch inputs. Public subscription registration currently fails closed before this routing path.
+
+An isolated `Cdb.query` RPC resolves a query descriptor, constructs a read-only Drizzle wrapper, invokes the handler with the request auth context, and validates that its result is JSON. Its tests cover persisted rows, empty arrays, handler failures, and rejected insert, update, delete, raw SQL, and transaction entry points. Gateway does not call this RPC for a public subscription or establish its auth authority, and no server component produces the protocol-v3 snapshot. Committed mutations also do not generate live replacement results. React presence, upload, stream, and vector hooks are not exported until their client paths exist.
 
 ## Package and generated project
 
@@ -126,11 +128,15 @@ The npm tarball contains built `dist` files and public documentation. It does no
 
 `chardb init` generates a separate Bun project with pinned dependencies, strict TypeScript settings, six Durable Object bindings, static assets, and a Wrangler dry-run build. The generated README says that domain migrations and the authenticated mutation, initial-query, and live-update path are incomplete. CI installs the generated project from the packed tarball without workspace aliases, typechecks it, and asks Wrangler to bundle it without deploying.
 
+Compatible dependency updates remove the reported `nanoid`, PostCSS, Sharp, SVGO, and `ws` advisories. Bun still reports five advisories through `miniflare@4.20260730.0 -> undici@7.28.0`. Miniflare 4 pins that dependency exactly. The fixed `undici@7.29.0` currently arrives only through Miniflare 5 alpha, so the lockfile does not force an override or major upgrade.
+
 ## Schema migration, snapshots, and range movement
 
 Schema migration and range movement are different protocols.
 
-Schema migration is not implemented as a distributed apply path. The CLI can read Drizzle migration files and print a plan, but it does not coordinate a barrier or apply DDL to every shard.
+On first startup, Cdb renders the configured domain `cdbTable` definitions, creates missing tables and indexes in one local transaction, and stores a signature per table. It preserves supported keys, constraints, local foreign keys, defaults, nullability, indexes, and SQLite types. Authority foreign keys to Catalog-owned auth tables are omitted because those tables are not local. Other nonlocal domain foreign keys fail bootstrap. Existing unsigned or mismatched tables and missing indexes fail closed with `CDB_PARTITION_CONTRACT_CHANGED`.
+
+That bootstrap is not schema migration. The CLI can read Drizzle migration files and print a plan, but it does not coordinate a barrier, apply versioned DDL to existing shards, or upgrade stored signatures.
 
 The snapshot barrier pieces do exist. A scheduled Worker call asks Catalog to open a barrier, reads each current shard's maximum op-log row id, and records those bookmarks. Catalog marks the barrier complete after all expected shards acknowledge it. The barrier state machine also has a bounded TLA+ model in [`spec/Barrier.tla`](spec/Barrier.tla). Export and restore are not implemented.
 
