@@ -36,6 +36,7 @@ function construct(CdbClass: typeof Cdb, db: Database): { readonly cdb: Cdb; rea
         storage: {
             sql: sqlStorage(db),
             transactionSync: <T>(callback: () => T): T => db.transaction(callback)(),
+            setAlarm: async (): Promise<void> => {},
         },
         blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
             ready = callback();
@@ -127,7 +128,7 @@ describe("configured Cdb domain schema", () => {
             []
         );
 
-        const result = reconstructed.cdb.mutate({
+        const result = await reconstructed.cdb.mutate({
             principalId: "user-1",
             mutId: "create-project-1",
             ref: createProject.__chardbRef,
@@ -260,7 +261,7 @@ describe("configured Cdb domain schema", () => {
         expect(db.query('PRAGMA foreign_key_list("domain_notes")').all()).toEqual([]);
         expect(db.query("SELECT name FROM sqlite_master WHERE name IN ('organization', 'user')").all()).toEqual([]);
         expect(
-            configured.cdb.mutate({
+            await configured.cdb.mutate({
                 principalId: "user-1",
                 mutId: "post-message-1",
                 ref: postMessage.__chardbRef,

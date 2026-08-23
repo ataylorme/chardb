@@ -69,6 +69,32 @@ export interface CdbSubscriptionRpc {
     unsubscribe(subscription: LiveSubscriptionId): Promise<void>;
 }
 
+export interface GatewayInvalidation {
+    readonly subscription: LiveSubscriptionId;
+    readonly changeSeq: number;
+}
+
+export interface GatewayInvalidationRequest {
+    readonly sourceCdbId: string;
+    readonly gatewayId: string;
+    readonly invalidations: readonly GatewayInvalidation[];
+}
+
+export interface GatewayInvalidationAck {
+    readonly registrationId: string;
+    readonly changeSeq: number;
+    readonly status: "accepted" | "stale";
+}
+
+export interface GatewayInvalidationResponse {
+    readonly gatewayId: string;
+    readonly acknowledgements: readonly GatewayInvalidationAck[];
+}
+
+export interface GatewayInvalidationRpc {
+    invalidateSubscriptions(request: GatewayInvalidationRequest): Promise<GatewayInvalidationResponse>;
+}
+
 export interface CdbMutationRequest {
     readonly principalId: string;
     readonly mutId: string;

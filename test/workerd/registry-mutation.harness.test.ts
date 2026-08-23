@@ -52,7 +52,10 @@ beforeAll(async () => {
     mf = new Miniflare({
         modules: true,
         script: await buildWorker(),
-        durableObjects: { CDB: { className: "Cdb", useSQLite: true } },
+        durableObjects: {
+            CDB: { className: "Cdb", useSQLite: true },
+            CDB_GATEWAY: { className: "InvalidationGateway", useSQLite: true },
+        },
         compatibilityDate: "2025-09-01",
         compatibilityFlags: ["nodejs_compat"],
     });
@@ -101,12 +104,20 @@ async function subscribe(): Promise<Record<string, unknown>> {
     return (await response.json()) as Record<string, unknown>;
 }
 
+async function inspectGateway(): Promise<readonly Record<string, unknown>[]> {
+    if (!mf) throw new Error("miniflare not initialized");
+    const response = await mf.dispatchFetch("http://example.com/gateway-state");
+    return (await response.json()) as readonly Record<string, unknown>[];
+}
+
 describe("configured Cdb local mutation registry", () => {
     test("resolves two refs locally, validates synchronously, carries auth, and replays the exact result", async () => {
-        expect(await subscribe()).toMatchObject({
+        const subscribed = await subscribe();
+        expect(subscribed).toMatchObject({
             changeSeq: 0,
-            subscription: { gatewayId: "registry-gateway", registrationId: "registry-registration" },
+            subscription: { registrationId: "registry-registration" },
         });
+        const gatewayId = (subscribed.subscription as { gatewayId: string }).gatewayId;
         expect(await subscribe()).toMatchObject({ changeSeq: 0 });
         const request = {
             operation: "put" as const,
@@ -137,13 +148,31 @@ describe("configured Cdb local mutation registry", () => {
             changeSeq: 1,
             mappings: [
                 {
-                    gateway_id: "registry-gateway",
+                    gateway_id: gatewayId,
                     registration_id: "registry-registration",
                     table_name: "registry_entries",
                 },
             ],
-            outbox: [{ gateway_id: "registry-gateway", registration_id: "registry-registration", change_seq: 1 }],
+            outbox: [],
         });
+        expect(await inspectGateway()).toEqual([
+            {
+                sourceCdbId: expect.any(String),
+                gatewayId,
+                invalidations: [
+                    {
+                        subscription: {
+                            gatewayId,
+                            registrationId: "registry-registration",
+                            connectionId: "registry-connection",
+                            clientId: "registry-client",
+                            subId: 1,
+                        },
+                        changeSeq: 1,
+                    },
+                ],
+            },
+        ]);
 
         const invalid = await mutate({
             operation: "put",

@@ -1,3 +1,4 @@
+import { DurableObject } from "cloudflare:workers";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { chardb } from "../../src/server/chardb.ts";
@@ -5,7 +6,12 @@ import { createApi } from "../../src/server/define.ts";
 import type { CdbMutationRequest, CdbMutationResponse } from "../../src/server/do/cdb.ts";
 import { globalScope } from "../../src/server/index.ts";
 import { manifestFromExports, routeMutation } from "../../src/server/manifest.ts";
-import type { CdbSubscriptionRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
+import type {
+    CdbSubscriptionRequest,
+    GatewayInvalidationRequest,
+    GatewayInvalidationResponse,
+    LiveSubscriptionId,
+} from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId } from "../../src/types.ts";
 
 const { cdbTable } = globalScope();
@@ -107,6 +113,40 @@ export class Cdb extends app.Cdb {
     }
 }
 
+export class InvalidationGateway extends DurableObject<Record<string, never>> {
+    constructor(state: DurableObjectState, env: Record<string, never>) {
+        super(state, env);
+        state.blockConcurrencyWhile(async () => {
+            this.ctx.storage.sql.exec(
+                `CREATE TABLE IF NOT EXISTS invalidation_calls (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   request_json TEXT NOT NULL
+                 )`
+            );
+        });
+    }
+
+    async invalidateSubscriptions(request: GatewayInvalidationRequest): Promise<GatewayInvalidationResponse> {
+        this.ctx.storage.sql.exec("INSERT INTO invalidation_calls (request_json) VALUES (?)", JSON.stringify(request));
+        return {
+            gatewayId: request.gatewayId,
+            acknowledgements: request.invalidations.map(invalidation => ({
+                registrationId: invalidation.subscription.registrationId,
+                changeSeq: invalidation.changeSeq,
+                status: "accepted",
+            })),
+        };
+    }
+
+    inspectInvalidations(): readonly GatewayInvalidationRequest[] {
+        return [
+            ...this.ctx.storage.sql.exec<{ request_json: string }>(
+                "SELECT request_json FROM invalidation_calls ORDER BY id"
+            ),
+        ].map(row => JSON.parse(row.request_json) as GatewayInvalidationRequest);
+    }
+}
+
 interface DispatchBody {
     readonly operation: "put" | "inspect" | "raw" | "unknown";
     readonly mutId: string;
@@ -121,26 +161,33 @@ const AUTH = {
     claims: { probe: "claim-ok" },
 } as const;
 
-const SUBSCRIPTION: LiveSubscriptionId = {
-    gatewayId: "registry-gateway",
-    registrationId: "registry-registration",
-    connectionId: "registry-connection",
-    clientId: ClientId("registry-client"),
-    subId: SubId(1),
-};
+function subscriptionRequest(gatewayId: string): CdbSubscriptionRequest {
+    return {
+        subscription: {
+            gatewayId,
+            registrationId: "registry-registration",
+            connectionId: "registry-connection",
+            clientId: ClientId("registry-client"),
+            subId: SubId(1),
+        },
+        principalId: PrincipalId(AUTH.userId),
+        ref: ChardbRef("queries.ts#registryEntries"),
+        args: {},
+        tables: ["registry_entries"],
+        intervals: [],
+    };
+}
 
-const SUBSCRIBE_REQUEST: CdbSubscriptionRequest = {
-    subscription: SUBSCRIPTION,
-    principalId: PrincipalId(AUTH.userId),
-    ref: ChardbRef("queries.ts#registryEntries"),
-    args: {},
-    tables: ["registry_entries"],
-    intervals: [],
-};
+interface RegistryEnv {
+    readonly CDB: DurableObjectNamespace;
+    readonly CDB_GATEWAY: DurableObjectNamespace;
+}
 
 export default {
-    async fetch(request: Request, env: { readonly CDB: DurableObjectNamespace }): Promise<Response> {
+    async fetch(request: Request, env: RegistryEnv): Promise<Response> {
         const id = env.CDB.idFromName("configured-registry");
+        const gatewayId = env.CDB_GATEWAY.idFromName("registry-gateway");
+        const subscribeRequest = subscriptionRequest(gatewayId.toString());
         const stub = env.CDB.get(id) as unknown as {
             mutate(input: CdbMutationRequest): Promise<CdbMutationResponse>;
             inspectAtomicState(): Promise<unknown>;
@@ -148,11 +195,17 @@ export default {
             unsubscribe(input: LiveSubscriptionId): Promise<void>;
         };
         if (new URL(request.url).pathname === "/state") return Response.json(await stub.inspectAtomicState());
+        if (new URL(request.url).pathname === "/gateway-state") {
+            const gateway = env.CDB_GATEWAY.get(gatewayId) as unknown as {
+                inspectInvalidations(): Promise<readonly GatewayInvalidationRequest[]>;
+            };
+            return Response.json(await gateway.inspectInvalidations());
+        }
         if (new URL(request.url).pathname === "/subscribe") {
-            return Response.json(await stub.subscribe(SUBSCRIBE_REQUEST));
+            return Response.json(await stub.subscribe(subscribeRequest));
         }
         if (new URL(request.url).pathname === "/unsubscribe") {
-            await stub.unsubscribe(SUBSCRIPTION);
+            await stub.unsubscribe(subscribeRequest.subscription);
             return Response.json({ ok: true });
         }
         const body = (await request.json()) as DispatchBody;

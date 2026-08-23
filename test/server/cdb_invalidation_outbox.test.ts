@@ -6,7 +6,13 @@ import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { globalScope } from "../../src/server/index.ts";
 import { manifestFromExports } from "../../src/server/manifest.ts";
-import type { CdbMutationRequest, CdbSubscriptionRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
+import type {
+    CdbMutationRequest,
+    CdbSubscriptionRequest,
+    GatewayInvalidationRequest,
+    GatewayInvalidationResponse,
+    LiveSubscriptionId,
+} from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
@@ -146,6 +152,16 @@ function outbox(db: Database): readonly Record<string, unknown>[] {
         .all() as Record<string, unknown>[];
 }
 
+function outboxDeliveryState(db: Database, registrationId: string): Record<string, unknown> | null {
+    return db
+        .prepare(
+            `SELECT gateway_id, registration_id, change_seq, attempts, next_attempt_at, last_error, dead_lettered_at
+             FROM _chardb_invalidation_outbox
+             WHERE registration_id = ?`
+        )
+        .get(registrationId) as Record<string, unknown> | null;
+}
+
 describe("Cdb invalidation outbox", () => {
     const databases: Database[] = [];
 
@@ -153,23 +169,61 @@ describe("Cdb invalidation outbox", () => {
         for (const db of databases.splice(0)) db.close();
     });
 
-    async function setup(): Promise<{ readonly db: Database; readonly cdb: Cdb }> {
+    async function setup(): Promise<{
+        readonly db: Database;
+        readonly cdb: Cdb;
+        readonly clock: { value: number };
+        readonly alarms: number[];
+        readonly gateway: {
+            calls: GatewayInvalidationRequest[];
+            behavior: (request: GatewayInvalidationRequest) => unknown | Promise<unknown>;
+        };
+        readonly alarm: { fail: boolean };
+    }> {
         const db = new Database(":memory:");
         databases.push(db);
+        const clock = { value: 10_000 };
+        const alarms: number[] = [];
+        const alarm = { fail: false };
+        const gateway = {
+            calls: [] as GatewayInvalidationRequest[],
+            behavior: (() => {
+                throw new Error("Gateway unavailable");
+            }) as (request: GatewayInvalidationRequest) => unknown | Promise<unknown>,
+        };
+        const gatewayRpc = {
+            async invalidateSubscriptions(request: GatewayInvalidationRequest): Promise<GatewayInvalidationResponse> {
+                gateway.calls.push(request);
+                return (await gateway.behavior(request)) as GatewayInvalidationResponse;
+            },
+        };
+        const gatewayNamespace = {
+            idFromString: (id: string) => ({ toString: () => id }),
+            get: () => gatewayRpc,
+        } as unknown as DurableObjectNamespace;
         let ready: Promise<unknown> = Promise.resolve();
         const state = {
             id: { toString: () => "outbox-shard-1" },
             storage: {
                 sql: sqlStorage(db),
                 transactionSync: <T>(callback: () => T): T => db.transaction(callback)(),
+                setAlarm: async (scheduledTime: number | Date): Promise<void> => {
+                    if (alarm.fail) throw new Error("alarm unavailable");
+                    alarms.push(scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime);
+                },
             },
             blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
                 ready = callback();
             },
         } as unknown as DurableObjectState;
-        const cdb = new ConfiguredCdb(state, {});
+        class TestCdb extends ConfiguredCdb {
+            protected override invalidationNowMs(): number {
+                return clock.value;
+            }
+        }
+        const cdb = new TestCdb(state, { CDB_GATEWAY: gatewayNamespace });
         await ready;
-        return { db, cdb };
+        return { db, cdb, clock, alarms, gateway, alarm };
     }
 
     test("advances once per committed write set and coalesces matching registrations", async () => {
@@ -186,7 +240,7 @@ describe("Cdb invalidation outbox", () => {
             [{ table_name: "outbox_messages" }, { table_name: "outbox_reactions" }]
         );
 
-        expect(cdb.mutate(mutation(putMessage, "message-1", { id: "message-1", value: 1 }))).toMatchObject({
+        expect(await cdb.mutate(mutation(putMessage, "message-1", { id: "message-1", value: 1 }))).toMatchObject({
             ok: true,
             ran: true,
             touchedTables: ["outbox_messages"],
@@ -194,27 +248,29 @@ describe("Cdb invalidation outbox", () => {
         expect(changeSeq(db)).toBe(1);
         expect(outbox(db)).toEqual([{ gateway_id: "gateway-1", registration_id: "messages", change_seq: 1 }]);
 
-        expect(cdb.mutate(mutation(putMessage, "message-2", { id: "message-2", value: 2 }))).toMatchObject({
+        expect(await cdb.mutate(mutation(putMessage, "message-2", { id: "message-2", value: 2 }))).toMatchObject({
             ok: true,
             ran: true,
         });
         expect(changeSeq(db)).toBe(2);
         expect(outbox(db)).toEqual([{ gateway_id: "gateway-1", registration_id: "messages", change_seq: 2 }]);
 
-        expect(cdb.mutate(mutation(putMessage, "message-2", { id: "message-2", value: 2 }))).toMatchObject({
+        expect(await cdb.mutate(mutation(putMessage, "message-2", { id: "message-2", value: 2 }))).toMatchObject({
             ok: true,
             ran: false,
             touchedTables: [],
         });
-        expect(cdb.mutate(mutation(inspectMessages, "read-only", {}))).toMatchObject({
+        expect(await cdb.mutate(mutation(inspectMessages, "read-only", {}))).toMatchObject({
             ok: true,
             ran: true,
             touchedTables: [],
         });
-        expect(cdb.mutate(mutation(failAfterWrite, "handler-failure", { id: "failed", value: 9 }))).toMatchObject({
-            ok: false,
-            error: { code: "CDB_INVARIANT" },
-        });
+        expect(await cdb.mutate(mutation(failAfterWrite, "handler-failure", { id: "failed", value: 9 }))).toMatchObject(
+            {
+                ok: false,
+                error: { code: "CDB_INVARIANT" },
+            }
+        );
         expect(changeSeq(db)).toBe(2);
         expect(outbox(db)).toEqual([{ gateway_id: "gateway-1", registration_id: "messages", change_seq: 2 }]);
         expect(db.prepare("SELECT id FROM outbox_messages WHERE id = 'failed'").get()).toBeNull();
@@ -224,7 +280,7 @@ describe("Cdb invalidation outbox", () => {
         expect(
             db.prepare("SELECT * FROM _chardb_live_subscription_tables WHERE registration_id = 'messages'").all()
         ).toEqual([]);
-        expect(cdb.mutate(mutation(putMessage, "message-3", { id: "message-3", value: 3 }))).toMatchObject({
+        expect(await cdb.mutate(mutation(putMessage, "message-3", { id: "message-3", value: 3 }))).toMatchObject({
             ok: true,
             ran: true,
         });
@@ -233,7 +289,7 @@ describe("Cdb invalidation outbox", () => {
             cdb.subscribe(subscription(identity("after-three", 3), ["outbox_messages"]))
         ).resolves.toMatchObject({ changeSeq: 3 });
 
-        expect(cdb.mutate(mutation(putBoth, "both-1", { id: "both-1", value: 4 }))).toMatchObject({
+        expect(await cdb.mutate(mutation(putBoth, "both-1", { id: "both-1", value: 4 }))).toMatchObject({
             ok: true,
             ran: true,
             touchedTables: ["outbox_messages", "outbox_reactions"],
@@ -256,7 +312,9 @@ describe("Cdb invalidation outbox", () => {
              END`
         );
 
-        expect(cdb.mutate(mutation(putMessage, "must-roll-back", { id: "must-roll-back", value: 1 }))).toMatchObject({
+        expect(
+            await cdb.mutate(mutation(putMessage, "must-roll-back", { id: "must-roll-back", value: 1 }))
+        ).toMatchObject({
             ok: false,
             error: { code: "CDB_INVARIANT" },
         });
@@ -264,5 +322,207 @@ describe("Cdb invalidation outbox", () => {
         expect(outbox(db)).toEqual([]);
         expect(db.prepare("SELECT id FROM outbox_messages WHERE id = 'must-roll-back'").get()).toBeNull();
         expect(db.prepare("SELECT mut_id FROM _chardb_op_log WHERE mut_id = 'must-roll-back'").get()).toBeNull();
+    });
+
+    test("groups delivery by Gateway and clears accepted and stale acknowledgements", async () => {
+        const { db, cdb, gateway, alarms } = await setup();
+        const accepted = identity("accepted", 1);
+        const stale = identity("stale", 2);
+        await cdb.subscribe(subscription(accepted, ["outbox_messages"]));
+        await cdb.subscribe(subscription(stale, ["outbox_reactions"]));
+        gateway.behavior = request => ({
+            gatewayId: request.gatewayId,
+            acknowledgements: request.invalidations.map(invalidation => ({
+                registrationId: invalidation.subscription.registrationId,
+                changeSeq: invalidation.changeSeq,
+                status: invalidation.subscription.registrationId === "accepted" ? "accepted" : "stale",
+            })),
+        });
+
+        await expect(
+            cdb.mutate(mutation(putBoth, "deliver-both", { id: "deliver-both", value: 1 }))
+        ).resolves.toMatchObject({ ok: true, ran: true });
+        expect(gateway.calls).toHaveLength(1);
+        expect(gateway.calls[0]).toMatchObject({
+            sourceCdbId: "outbox-shard-1",
+            gatewayId: "gateway-1",
+            invalidations: [
+                { subscription: { registrationId: "accepted", connectionId: "connection-accepted" }, changeSeq: 1 },
+                { subscription: { registrationId: "stale", connectionId: "connection-stale" }, changeSeq: 1 },
+            ],
+        });
+        expect(outbox(db)).toEqual([]);
+        expect(alarms).toEqual([10_001]);
+    });
+
+    test("keeps malformed responses queued and retries them from the alarm", async () => {
+        const { db, cdb, clock, gateway, alarms } = await setup();
+        await cdb.subscribe(subscription(identity("malformed", 1), ["outbox_messages"]));
+        gateway.behavior = request => ({
+            gatewayId: request.gatewayId,
+            acknowledgements: [
+                {
+                    registrationId: "malformed",
+                    changeSeq: request.invalidations[0]?.changeSeq,
+                    status: "accepted",
+                    extra: true,
+                },
+            ],
+        });
+
+        await expect(
+            cdb.mutate(mutation(putMessage, "malformed-response", { id: "malformed-response", value: 1 }))
+        ).resolves.toMatchObject({ ok: true, ran: true });
+        expect(outboxDeliveryState(db, "malformed")).toMatchObject({
+            change_seq: 1,
+            attempts: 1,
+            next_attempt_at: 11_000,
+            dead_lettered_at: null,
+        });
+        expect(alarms).toEqual([10_001, 11_000]);
+
+        gateway.behavior = request => ({
+            gatewayId: request.gatewayId,
+            acknowledgements: request.invalidations.map(invalidation => ({
+                registrationId: invalidation.subscription.registrationId,
+                changeSeq: invalidation.changeSeq,
+                status: "accepted",
+            })),
+        });
+        clock.value = 11_000;
+        await cdb.alarm();
+        expect(outbox(db)).toEqual([]);
+        expect(gateway.calls).toHaveLength(2);
+    });
+
+    test("deletes only the exact acknowledged change sequence", async () => {
+        const { db, cdb, clock, gateway, alarms } = await setup();
+        await cdb.subscribe(subscription(identity("advanced", 1), ["outbox_messages"]));
+        gateway.behavior = request => {
+            db.prepare(
+                `UPDATE _chardb_invalidation_outbox
+                 SET change_seq = change_seq + 1
+                 WHERE registration_id = 'advanced'`
+            ).run();
+            return {
+                gatewayId: request.gatewayId,
+                acknowledgements: request.invalidations.map(invalidation => ({
+                    registrationId: invalidation.subscription.registrationId,
+                    changeSeq: invalidation.changeSeq,
+                    status: "accepted",
+                })),
+            };
+        };
+
+        await cdb.mutate(mutation(putMessage, "advanced-sequence", { id: "advanced-sequence", value: 1 }));
+        expect(outboxDeliveryState(db, "advanced")).toMatchObject({ change_seq: 2, attempts: 0 });
+        expect(alarms.at(-1)).toBe(10_001);
+
+        gateway.behavior = request => ({
+            gatewayId: request.gatewayId,
+            acknowledgements: request.invalidations.map(invalidation => ({
+                registrationId: invalidation.subscription.registrationId,
+                changeSeq: invalidation.changeSeq,
+                status: "stale",
+            })),
+        });
+        clock.value = 10_001;
+        await cdb.alarm();
+        expect(outbox(db)).toEqual([]);
+    });
+
+    test("pre-arms before commit and preserves a committed result when post-commit scheduling fails", async () => {
+        const { db, cdb, clock, gateway, alarm, alarms } = await setup();
+        await cdb.subscribe(subscription(identity("retry-replay", 1), ["outbox_messages"]));
+        alarm.fail = true;
+
+        await expect(
+            cdb.mutate(mutation(putMessage, "retry-replay", { id: "retry-replay", value: 1 }))
+        ).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_SHARD_UNAVAILABLE", retryable: true },
+        });
+        expect(changeSeq(db)).toBe(0);
+        expect(outbox(db)).toEqual([]);
+        expect(db.prepare("SELECT id FROM outbox_messages WHERE id = 'retry-replay'").get()).toBeNull();
+
+        alarm.fail = false;
+        gateway.behavior = () => {
+            alarm.fail = true;
+            throw new Error("delivery unavailable");
+        };
+        await expect(
+            cdb.mutate(mutation(putMessage, "retry-replay", { id: "retry-replay", value: 1 }))
+        ).resolves.toMatchObject({ ok: true, ran: true, touchedTables: ["outbox_messages"] });
+        expect(changeSeq(db)).toBe(1);
+        expect(outboxDeliveryState(db, "retry-replay")).toMatchObject({ change_seq: 1, attempts: 1 });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM outbox_messages").get()).toEqual({ count: 1 });
+        expect(alarms).toEqual([10_001]);
+
+        alarm.fail = false;
+        gateway.behavior = request => ({
+            gatewayId: request.gatewayId,
+            acknowledgements: request.invalidations.map(invalidation => ({
+                registrationId: invalidation.subscription.registrationId,
+                changeSeq: invalidation.changeSeq,
+                status: "accepted",
+            })),
+        });
+        await expect(
+            cdb.mutate(mutation(putMessage, "retry-replay", { id: "retry-replay", value: 1 }))
+        ).resolves.toMatchObject({ ok: true, ran: false, touchedTables: [] });
+        expect(outboxDeliveryState(db, "retry-replay")).toMatchObject({ attempts: 1, next_attempt_at: 11_000 });
+        clock.value = 11_000;
+        await cdb.alarm();
+        expect(outbox(db)).toEqual([]);
+    });
+
+    test("keeps retrying at the capped delay after marking a dead letter", async () => {
+        const { db, cdb, clock, gateway, alarms } = await setup();
+        await cdb.subscribe(subscription(identity("dead-letter", 1), ["outbox_messages"]));
+        await cdb.mutate(mutation(putMessage, "dead-letter", { id: "dead-letter", value: 1 }));
+
+        let firstDeadLetteredAt: unknown;
+        for (let expectedAttempts = 2; expectedAttempts <= 9; expectedAttempts++) {
+            const state = outboxDeliveryState(db, "dead-letter");
+            clock.value = state?.next_attempt_at as number;
+            await cdb.alarm();
+            const retried = outboxDeliveryState(db, "dead-letter");
+            expect(retried).toMatchObject({ attempts: expectedAttempts });
+            if (expectedAttempts === 8) firstDeadLetteredAt = retried?.dead_lettered_at;
+        }
+        const deadLetter = outboxDeliveryState(db, "dead-letter");
+        expect(deadLetter).toMatchObject({ attempts: 9, last_error: "Gateway unavailable" });
+        expect(deadLetter?.dead_lettered_at).toEqual(expect.any(Number));
+        expect(deadLetter?.dead_lettered_at).toBe(firstDeadLetteredAt);
+        expect((deadLetter?.next_attempt_at as number) - clock.value).toBe(60_000);
+        expect(gateway.calls).toHaveLength(9);
+        expect(alarms.at(-1)).toBe(deadLetter?.next_attempt_at as number);
+    });
+
+    test("drains at most one bounded batch and alarms the remainder", async () => {
+        const { db, cdb, clock, gateway, alarms } = await setup();
+        for (let index = 0; index < 65; index++) {
+            const registrationId = `batch-${index.toString().padStart(2, "0")}`;
+            await cdb.subscribe(subscription(identity(registrationId, index + 1), ["outbox_messages"]));
+        }
+        gateway.behavior = request => ({
+            gatewayId: request.gatewayId,
+            acknowledgements: request.invalidations.map(invalidation => ({
+                registrationId: invalidation.subscription.registrationId,
+                changeSeq: invalidation.changeSeq,
+                status: "accepted",
+            })),
+        });
+
+        await cdb.mutate(mutation(putMessage, "bounded-batch", { id: "bounded-batch", value: 1 }));
+        expect(gateway.calls.map(call => call.invalidations.length)).toEqual([64]);
+        expect(db.prepare("SELECT COUNT(*) AS count FROM _chardb_invalidation_outbox").get()).toEqual({ count: 1 });
+        expect(alarms.at(-1)).toBe(10_001);
+
+        clock.value = 10_001;
+        await cdb.alarm();
+        expect(gateway.calls.map(call => call.invalidations.length)).toEqual([64, 1]);
+        expect(outbox(db)).toEqual([]);
     });
 });

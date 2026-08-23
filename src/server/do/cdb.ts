@@ -36,6 +36,10 @@ import type {
     CdbQueryRequest,
     CdbQueryResponse,
     CdbSubscriptionRequest,
+    GatewayInvalidationAck,
+    GatewayInvalidationRequest,
+    GatewayInvalidationResponse,
+    GatewayInvalidationRpc,
     LiveSubscriptionId,
 } from "../rpc.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
@@ -48,6 +52,7 @@ export type {
 } from "../rpc.ts";
 
 export interface CdbEnv {
+    readonly CDB_GATEWAY?: DurableObjectNamespace;
     readonly CDB_R2?: unknown;
     readonly CDB_VECTORIZE?: unknown;
 }
@@ -110,6 +115,10 @@ CREATE TABLE IF NOT EXISTS _chardb_invalidation_outbox (
   gateway_id TEXT NOT NULL,
   registration_id TEXT NOT NULL,
   change_seq INTEGER NOT NULL CHECK (change_seq > 0),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  next_attempt_at INTEGER NOT NULL DEFAULT 0 CHECK (next_attempt_at >= 0),
+  last_error TEXT,
+  dead_lettered_at INTEGER,
   PRIMARY KEY (gateway_id, registration_id),
   FOREIGN KEY (gateway_id, registration_id)
     REFERENCES _chardb_live_subscriptions (gateway_id, registration_id)
@@ -143,6 +152,25 @@ interface PreparedInterval {
     readonly set: IntervalSet;
 }
 
+interface StoredInvalidationRow {
+    readonly [column: string]: string | number | null;
+    readonly gateway_id: string;
+    readonly registration_id: string;
+    readonly connection_id: string;
+    readonly client_id: string;
+    readonly sub_id: number;
+    readonly change_seq: number;
+    readonly attempts: number;
+    readonly next_attempt_at: number;
+    readonly last_error: string | null;
+    readonly dead_lettered_at: number | null;
+}
+
+const INVALIDATION_BATCH_SIZE = 64;
+const INVALIDATION_MAX_ATTEMPTS = 8;
+const INVALIDATION_BASE_RETRY_MS = 1_000;
+const INVALIDATION_MAX_RETRY_MS = 60_000;
+
 function subscriptionKey(subscription: LiveSubscriptionId): string {
     return JSON.stringify([subscription.gatewayId, subscription.registrationId]);
 }
@@ -162,6 +190,21 @@ function subscriptionPayloadHash(args: CdbSubscriptionRequest): string {
 
 function subscriptionInvariant(message: string): CdbError {
     return new CdbError({ code: "CDB_INVARIANT", message });
+}
+
+function ensureInvalidationOutboxColumns(sql: SyncSql): void {
+    const columns = new Set(
+        sql.all<{ name: string }>("PRAGMA table_info(_chardb_invalidation_outbox)").map(column => column.name)
+    );
+    const additions = [
+        ["attempts", "attempts INTEGER NOT NULL DEFAULT 0"],
+        ["next_attempt_at", "next_attempt_at INTEGER NOT NULL DEFAULT 0"],
+        ["last_error", "last_error TEXT"],
+        ["dead_lettered_at", "dead_lettered_at INTEGER"],
+    ] as const;
+    for (const [name, definition] of additions) {
+        if (!columns.has(name)) sql.exec(`ALTER TABLE _chardb_invalidation_outbox ADD COLUMN ${definition}`);
+    }
 }
 
 function currentChangeSeq(sql: SyncSql): number {
@@ -226,7 +269,11 @@ function enqueueInvalidations(sql: SyncSql, touchedTables: readonly string[]): n
             `INSERT INTO _chardb_invalidation_outbox (gateway_id, registration_id, change_seq)
              VALUES (?, ?, ?)
              ON CONFLICT(gateway_id, registration_id) DO UPDATE SET
-               change_seq = MAX(change_seq, excluded.change_seq)`,
+               change_seq = MAX(change_seq, excluded.change_seq),
+               attempts = CASE WHEN excluded.change_seq > change_seq THEN 0 ELSE attempts END,
+               next_attempt_at = CASE WHEN excluded.change_seq > change_seq THEN 0 ELSE next_attempt_at END,
+               last_error = CASE WHEN excluded.change_seq > change_seq THEN NULL ELSE last_error END,
+               dead_lettered_at = CASE WHEN excluded.change_seq > change_seq THEN NULL ELSE dead_lettered_at END`,
             registration.gatewayId,
             registration.registrationId,
             changeSeq
@@ -243,6 +290,61 @@ function sameSubscriptionIdentity(row: StoredSubscriptionRow, subscription: Live
         row.client_id === subscription.clientId &&
         row.sub_id === subscription.subId
     );
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+    const actual = Object.keys(value).sort();
+    const expected = [...keys].sort();
+    return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function validateInvalidationResponse(
+    value: unknown,
+    gatewayId: string,
+    requested: ReadonlyMap<string, number>
+): readonly GatewayInvalidationAck[] {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw subscriptionInvariant("Gateway invalidation response must be an object");
+    }
+    const response = value as Record<string, unknown>;
+    if (!hasExactKeys(response, ["gatewayId", "acknowledgements"])) {
+        throw subscriptionInvariant("Gateway invalidation response has an unexpected shape");
+    }
+    if (response.gatewayId !== gatewayId || !Array.isArray(response.acknowledgements)) {
+        throw subscriptionInvariant("Gateway invalidation response does not match the requested Gateway");
+    }
+    const seen = new Set<string>();
+    const acknowledgements: GatewayInvalidationAck[] = [];
+    for (const value of response.acknowledgements) {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) {
+            throw subscriptionInvariant("Gateway invalidation acknowledgement must be an object");
+        }
+        const acknowledgement = value as Record<string, unknown>;
+        if (!hasExactKeys(acknowledgement, ["registrationId", "changeSeq", "status"])) {
+            throw subscriptionInvariant("Gateway invalidation acknowledgement has an unexpected shape");
+        }
+        if (
+            typeof acknowledgement.registrationId !== "string" ||
+            !Number.isSafeInteger(acknowledgement.changeSeq) ||
+            (acknowledgement.status !== "accepted" && acknowledgement.status !== "stale") ||
+            requested.get(acknowledgement.registrationId) !== acknowledgement.changeSeq ||
+            seen.has(acknowledgement.registrationId)
+        ) {
+            throw subscriptionInvariant("Gateway invalidation acknowledgement does not match the request");
+        }
+        seen.add(acknowledgement.registrationId);
+        acknowledgements.push({
+            registrationId: acknowledgement.registrationId,
+            changeSeq: acknowledgement.changeSeq as number,
+            status: acknowledgement.status,
+        });
+    }
+    return acknowledgements;
+}
+
+function invalidationErrorMessage(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.slice(0, 512);
 }
 
 function domainSchemaMismatch(tableName: string): CdbError {
@@ -305,6 +407,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             .filter(Boolean)) {
             sql.exec(stmt);
         }
+        ensureInvalidationOutboxColumns(sql);
         sql.exec("PRAGMA foreign_keys = ON");
         this.ensureDomainTables();
         const cursor = this.ctx.storage.sql.exec<StoredSubscriptionRow>(
@@ -429,6 +532,156 @@ export class Cdb extends DurableObject<CdbEnv> {
         this.subscriptions.set(key, subscription);
     }
 
+    protected invalidationNowMs(): number {
+        return Date.now();
+    }
+
+    protected invalidationRetryDelayMs(attempts: number): number {
+        return Math.min(INVALIDATION_MAX_RETRY_MS, INVALIDATION_BASE_RETRY_MS * 2 ** Math.max(0, attempts - 1));
+    }
+
+    private dueInvalidations(nowMs: number): readonly StoredInvalidationRow[] {
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        return sql.all<StoredInvalidationRow>(
+            `SELECT outbox.gateway_id, outbox.registration_id, subscriptions.connection_id,
+                    subscriptions.client_id, subscriptions.sub_id, outbox.change_seq, outbox.attempts,
+                    outbox.next_attempt_at, outbox.last_error, outbox.dead_lettered_at
+             FROM _chardb_invalidation_outbox AS outbox
+             INNER JOIN _chardb_live_subscriptions AS subscriptions
+               ON subscriptions.gateway_id = outbox.gateway_id
+              AND subscriptions.registration_id = outbox.registration_id
+             WHERE outbox.next_attempt_at <= ?
+             ORDER BY outbox.next_attempt_at, outbox.gateway_id, outbox.registration_id
+             LIMIT ?`,
+            nowMs,
+            INVALIDATION_BATCH_SIZE
+        );
+    }
+
+    private recordInvalidationFailure(rows: readonly StoredInvalidationRow[], nowMs: number, error: unknown): void {
+        const message = invalidationErrorMessage(error);
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            for (const row of rows) {
+                const attempts = row.attempts + 1;
+                const deadLetteredAt = row.dead_lettered_at ?? (attempts >= INVALIDATION_MAX_ATTEMPTS ? nowMs : null);
+                const nextAttemptAt = nowMs + this.invalidationRetryDelayMs(attempts);
+                sql.exec(
+                    `UPDATE _chardb_invalidation_outbox
+                     SET attempts = ?, next_attempt_at = ?, last_error = ?, dead_lettered_at = ?
+                     WHERE gateway_id = ? AND registration_id = ? AND change_seq = ?`,
+                    attempts,
+                    nextAttemptAt,
+                    message,
+                    deadLetteredAt,
+                    row.gateway_id,
+                    row.registration_id,
+                    row.change_seq
+                );
+            }
+        });
+    }
+
+    private acknowledgeInvalidations(
+        gatewayId: string,
+        rows: readonly StoredInvalidationRow[],
+        acknowledgements: readonly GatewayInvalidationAck[],
+        nowMs: number
+    ): void {
+        const acknowledged = new Set(acknowledgements.map(ack => JSON.stringify([ack.registrationId, ack.changeSeq])));
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            for (const acknowledgement of acknowledgements) {
+                sql.exec(
+                    `DELETE FROM _chardb_invalidation_outbox
+                     WHERE gateway_id = ? AND registration_id = ? AND change_seq = ?`,
+                    gatewayId,
+                    acknowledgement.registrationId,
+                    acknowledgement.changeSeq
+                );
+            }
+        });
+        const omitted = rows.filter(row => !acknowledged.has(JSON.stringify([row.registration_id, row.change_seq])));
+        if (omitted.length > 0) {
+            this.recordInvalidationFailure(omitted, nowMs, "Gateway omitted an invalidation acknowledgement");
+        }
+    }
+
+    private async drainInvalidations(nowMs: number): Promise<void> {
+        const rows = this.dueInvalidations(nowMs);
+        const groups = new Map<string, StoredInvalidationRow[]>();
+        for (const row of rows) {
+            const group = groups.get(row.gateway_id) ?? [];
+            group.push(row);
+            groups.set(row.gateway_id, group);
+        }
+        for (const [gatewayId, group] of groups) {
+            try {
+                if (!this.env.CDB_GATEWAY) throw new Error("CDB_GATEWAY binding is unavailable");
+                const id = this.env.CDB_GATEWAY.idFromString(gatewayId);
+                const gateway = this.env.CDB_GATEWAY.get(id) as unknown as GatewayInvalidationRpc;
+                const request: GatewayInvalidationRequest = {
+                    sourceCdbId: this.ctx.id.toString(),
+                    gatewayId,
+                    invalidations: group.map(row => ({
+                        subscription: {
+                            gatewayId: row.gateway_id,
+                            registrationId: row.registration_id,
+                            connectionId: row.connection_id,
+                            clientId: ClientId(row.client_id),
+                            subId: SubId(row.sub_id),
+                        },
+                        changeSeq: row.change_seq,
+                    })),
+                };
+                const rawResponse: GatewayInvalidationResponse = await gateway.invalidateSubscriptions(request);
+                const requested = new Map(group.map(row => [row.registration_id, row.change_seq] as const));
+                const acknowledgements = validateInvalidationResponse(rawResponse, gatewayId, requested);
+                this.acknowledgeInvalidations(gatewayId, group, acknowledgements, nowMs);
+            } catch (error) {
+                this.recordInvalidationFailure(group, nowMs, error);
+            }
+        }
+    }
+
+    private nextInvalidationAlarmAt(): number | null {
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        const row = sql.one<{ next_attempt_at: number | null }>(
+            `SELECT MIN(next_attempt_at) AS next_attempt_at
+             FROM _chardb_invalidation_outbox`
+        );
+        return row?.next_attempt_at ?? null;
+    }
+
+    private async maintainInvalidationDelivery(): Promise<void> {
+        const nowMs = this.invalidationNowMs();
+        try {
+            await this.drainInvalidations(nowMs);
+        } catch (deliveryError) {
+            try {
+                await this.ctx.storage.setAlarm(nowMs + INVALIDATION_BASE_RETRY_MS);
+                return;
+            } catch (alarmError) {
+                throw new CdbError({
+                    code: "CDB_SHARD_UNAVAILABLE",
+                    message: "invalidation delivery and alarm scheduling failed after mutation commit",
+                    cause: { deliveryError, alarmError },
+                });
+            }
+        }
+        const nextAttemptAt = this.nextInvalidationAlarmAt();
+        if (nextAttemptAt === null) return;
+        try {
+            await this.ctx.storage.setAlarm(Math.max(nowMs + 1, nextAttemptAt));
+        } catch (error) {
+            throw new CdbError({
+                code: "CDB_SHARD_UNAVAILABLE",
+                message: "invalidation alarm scheduling failed after mutation commit",
+                cause: error,
+            });
+        }
+    }
+
     /**
      * Register a live-query subscription on this shard. Caller is the Gateway DO.
      */
@@ -545,9 +798,19 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     /** Resolve and run a registered mutation entirely inside this shard isolate. */
-    mutate(request: CdbMutationRequest): CdbMutationResponse {
+    async mutate(request: CdbMutationRequest): Promise<CdbMutationResponse> {
+        let response: CdbMutationResponse;
         try {
             const descriptor = resolveMutation(this.mutationManifest(), request.ref as ChardbRef);
+            try {
+                await this.ctx.storage.setAlarm(this.invalidationNowMs() + 1);
+            } catch (error) {
+                throw new CdbError({
+                    code: "CDB_SHARD_UNAVAILABLE",
+                    message: "could not arm invalidation recovery before mutation commit",
+                    cause: error,
+                });
+            }
             const result = executeAtomicMutation({
                 storage: this.ctx.storage,
                 schema: this.mutationSchema(),
@@ -560,10 +823,21 @@ export class Cdb extends DurableObject<CdbEnv> {
                     enqueueInvalidations(sql, touchedTables);
                 },
             });
-            return { ok: true, ...result };
+            response = { ok: true, ...result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
         }
+        try {
+            await this.maintainInvalidationDelivery();
+        } catch {
+            // The pre-armed alarm owns recovery. The mutation is committed and
+            // its result must remain stable across an op-log replay.
+        }
+        return response;
+    }
+
+    override async alarm(): Promise<void> {
+        await this.maintainInvalidationDelivery();
     }
 
     /** Execute a registered shard-local query without exposing it through Gateway yet. */
