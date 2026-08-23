@@ -16,8 +16,8 @@ import * as domain from "./schema.ts";
 export const auth = defineAuth({
   appName: "chat",
   plugins: [anonymous(), jwt()],
-  // Bootstrap a shared demo org on every sign-in. Production apps
-  // gate org creation behind their own flow.
+  // Reuse the shared demo org and this user's membership on sign-in.
+  // Production apps gate org creation behind their own flow.
   databaseHooks: { /* see worker.ts for the full hook */ },
 });
 
@@ -160,7 +160,9 @@ The reserved chardb prefixes (`/ws`, `/_chardb/*`) and the optional `/api/auth/*
 
 ### Authorization lives on the table
 
-`forOrg()` binds every `cdbTable` in `schema.ts` to the active organization. Each table's `roles` block declares row verbs and writable or readable columns. `selfBy` binds the `self` role to a user foreign key. Inserts, updates, and deletes require matching grants. Inserts and updates enforce writable columns, and managed authority columns cannot change. Updates and deletes add tenant and self predicates even without a caller `where`. Select and raw SQL enforcement are still missing. There are no separate `tenantScope` or `ownerScope` exports to keep in sync.
+`forOrg()` binds every `cdbTable` in `schema.ts` to the active organization. Each table's `roles` block declares row verbs and writable or readable columns. `selfBy` binds the `self` role to a user foreign key. Inserts, updates, deletes, and full-row selects require matching grants. Inserts and updates enforce writable columns, and managed authority columns cannot change. Updates, deletes, and selects add tenant and self predicates even without a caller `where`. Select results receive readable-column masks. Projections and joins stay blocked until their result shapes can be masked safely. There are no separate `tenantScope` or `ownerScope` exports to keep in sync.
+
+Handlers can use typed builders only against registered `cdbTable` definitions. Chardb rejects raw SQL, session and client access, relational and count shortcuts, plain-table CRUD, insert-select, conflict methods, `returning`, and unsupported builder paths before policy enforcement can be bypassed.
 
 ### Validator-driven args, intent extractors, no per-mutation type aliases
 
@@ -196,6 +198,8 @@ The merged auth + domain schema is automatic: `chardb({ schema: domain, auth })`
 Catalog generates auth DDL with keys, uniqueness, foreign keys, indexes, supported defaults, nullability, and SQLite types. An existing table must have the exact matching `auth_ddl_v1` signature. Older layouts have no versioned upgrade path yet.
 
 Fresh Cdb storage also renders the configured domain tables and indexes, records their signatures, and rejects drift. This bootstrap does not migrate an existing shard to a newer schema.
+
+The demo session hook finds or creates the shared organization, reuses the user's existing membership, and sets the session's active organization. It confirms a row exists before treating a concurrent create error as success. Focused tests cover repeated bootstrap, so returning users no longer collide with the demo membership primary key.
 
 If a domain table shadows a reserved name (`organization`, `user`, `member`, …), `chardb({...})` raises `CDB_RESERVED_TABLE_NAME` at construction time with the conflicting names listed; rename the table or drop the plugin that owns the name.
 

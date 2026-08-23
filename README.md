@@ -21,7 +21,8 @@ Implemented and tested in isolation:
 - Constraint-complete Catalog auth DDL with exact `auth_ddl_v1` compatibility checks
 - Atomic Catalog auth mutations with directly derivable old and new epoch bumps
 - Gateway JWT signature and registered-claim verification
-- Schema-first insert, update, and delete authorization, with writable-column checks on inserts and updates
+- Schema-first insert, update, delete, and full-row select authorization, including writable-column checks and readable-column masks
+- A fail-closed database wrapper that rejects raw, session, client, plain-table, insert-select, conflict, returning, and unsupported builder paths
 - Read-only shard-local query execution with JSON result validation
 - Protocol-v3 snapshot decoding and client replacement handling
 - Catalog-backed scatter enumeration without sampled virtual-shard probes
@@ -33,7 +34,6 @@ Still missing from the application path:
 
 - Resolving tenant membership, role, and policy authority after Gateway verifies identity
 - Constructing the handler's auth context from verified identity and server-owned authority
-- Applying row and column policies to select paths
 - Routing a public subscription to shard-local query execution
 - Producing the protocol-v3 initial snapshot on the server
 - Sending live results after a committed mutation
@@ -49,7 +49,11 @@ The JWT tests use real signatures and the Catalog resolver contract. A Miniflare
 
 Each auth mutation commits with every directly derivable old and new global, tenant, or principal epoch bump. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. Bulk updates and deletes preload matched rows to derive epoch scopes. Indirect plugin relationships without placement metadata or conventional `organizationId` or `userId` fields may lack a secondary scope. These cases have Bun fake-Durable-Object coverage, not workerd coverage.
 
-Fresh Cdb objects render domain tables and indexes from the configured Drizzle schema, record signatures, and reject drift. This does not migrate an existing shard. Inserts, updates, and deletes require schema-declared grants. Inserts and updates check writable columns; updates forbid authority-column changes. Updates and deletes AND tenant and self predicates with the caller's filter, including operations with no filter. Select and raw SQL enforcement remain open. Direct `Cdb.query` calls can execute a registered handler through a read-only wrapper, but Gateway does not route public subscriptions to that RPC.
+Fresh Cdb objects render domain tables and indexes from the configured Drizzle schema, record signatures, and reject drift. This does not migrate an existing shard. Inserts, updates, deletes, and full-row selects require schema-declared grants. Inserts and updates check writable columns; updates forbid authority-column changes. Updates, deletes, and selects AND tenant and self predicates with the caller's filter, including operations with no filter. Select results receive readable-column masks. Projections, joins, and other shapes that cannot yet be masked safely fail closed.
+
+Application handlers can use only typed builders against registered `cdbTable` definitions. The wrapper rejects raw SQL, Drizzle session and client access, relational and count shortcuts, plain-table CRUD, insert-select, conflict methods, `returning`, and unsupported properties before or after policy attachment. Direct `Cdb.query` calls can execute a registered handler through this read-only policy wrapper, but Gateway does not route public subscriptions to that RPC.
+
+The chat example's sign-in hook reuses the shared demo organization and an existing membership for the user, then updates the session's active organization. Repeated sessions and concurrent bootstrap attempts do not blindly insert the same rows. This improves the concept example; it does not close the public Gateway authority gap.
 
 Scatter routing asks Catalog for the distinct physical shards that own current ranges. Cdb persists shard registrations under composite Gateway, client, and subscription ids, then rebuilds its interval map from SQLite on startup. Persisted registrations still lack verified tenant, auth epoch, policy epoch, and delivery-cookie state.
 

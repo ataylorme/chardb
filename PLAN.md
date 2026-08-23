@@ -6,7 +6,7 @@ Last reviewed: 2026-08-23
 
 Chardb should do one thing well: a developer marks an organization boundary in a Drizzle schema, and chardb routes that organization's data to a SQLite Durable Object with tenant isolation, atomic mutations, idempotent retries, initial queries, and live updates.
 
-The repository does not do that yet. It can bootstrap domain tables, execute isolated shard-local writes and reads, and enforce insert, update, and delete policy rules. The public auth, routing, query-delivery, and live-update path is still disconnected.
+The repository does not do that yet. It can bootstrap domain tables, execute isolated shard-local writes and reads, and enforce insert, update, delete, and full-row select policy rules. The public auth, routing, query-delivery, and live-update path is still disconnected.
 
 Finish the organization-tenanted SQL path first. Stop presenting files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding as working product features. Keep that code as experimental work until the database path works.
 
@@ -119,7 +119,7 @@ The configured Gateway verifies JWT signatures and registered claims during `hel
 
 ## 6. Finish policy enforcement
 
-The database proxy now applies one explicit rule to inserts, updates, and deletes:
+The database proxy now applies one explicit rule to registered-table inserts, updates, deletes, and full-row selects:
 
 `mandatory tenant predicate AND one matching row grant AND allowed columns`
 
@@ -132,9 +132,10 @@ The database proxy now applies one explicit rule to inserts, updates, and delete
 - [x] Reject conflicting insert authority and make managed tenant and self columns immutable during updates.
 - [x] Autofill tenant and self columns only from verified auth.
 - [x] Apply writable-column checks to inserts and updates.
-- [ ] Apply the same default-deny row policy to selects.
-- [ ] Apply readable-column masks to query results.
-- [ ] Block or remove raw SQL from application handlers until it has a safe policy story.
+- [x] Apply the same default-deny row policy to full-row single-`cdbTable` selects.
+- [x] Apply readable-column masks to full-row select results.
+- [ ] Compile safe readable-column masks for projections and joins. Keep those shapes blocked until then.
+- [x] Block raw SQL, session and client access, relational shortcuts, plain-table CRUD, insert-select, conflict methods, `returning`, and unsupported pre-policy builder paths from application handlers.
 - [ ] Remove unused policy-digest and auth-epoch claims, or wire them into actual subscription identity and invalidation.
 - [ ] Add hostile two-tenant tests for every CRUD operation.
 - [ ] Test admin, member, self, public read, no matching role, forbidden columns, explicit tenant override, and membership revocation.
@@ -206,7 +207,7 @@ The chat directory now consumes the packed package and passes compile-time check
 - [x] Give `postMessage` a concrete organization partition key and reject an auth tenant mismatch.
 - [x] Delete stale `tenantScope`, `ownerScope`, and `requirePermission` documentation.
 - [ ] Generate the example schema through real migrations.
-- [x] Add an auth hook that provisions the demo organization and membership, then sets the active organization.
+- [x] Add an idempotent auth hook that reuses the demo organization and user membership, tolerates confirmed concurrent creation, then sets the active organization.
 - [ ] Make posting a message use the real mutation path.
 - [ ] Make opening a channel return a persisted initial query result.
 - [ ] Make a second browser receive the live replacement result.
