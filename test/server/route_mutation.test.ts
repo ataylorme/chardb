@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import type { StandardSchemaV1 } from "@standard-schema/spec";
+import { z } from "zod";
 import { defineMutation } from "../../src/server/define.ts";
 import { manifestFromExports, routeMutation } from "../../src/server/manifest.ts";
 import type { RawJson } from "../../src/types.ts";
@@ -13,7 +15,7 @@ const postMessage = defineMutation<unknown, PostArgs, { id: string }>(
     function postMessage(_ctx, _args) {
         return { id: "x" };
     },
-    { singlePartition: true, partitionKey: a => a.orgId }
+    { ref: "api/messages#post", authority: "organization", singlePartition: true, partitionKey: a => a.orgId }
 );
 
 const broadcast = defineMutation<unknown, BroadcastArgs, void>(function broadcast() {
@@ -39,6 +41,8 @@ describe("routeMutation — pure routing decision", () => {
         expect(r.ok).toBe(true);
         if (!r.ok) throw new Error("unreachable");
         expect(r.vshard).toBe(Number(vshardOf(["org-42"])));
+        expect(r.authority).toBe("organization");
+        expect(r.partitionKey).toBe("org-42");
     });
 
     test("same orgId across calls routes to a single vshard (idempotent partitioning)", () => {
@@ -52,7 +56,18 @@ describe("routeMutation — pure routing decision", () => {
             { ref: postMessage.__chardbRef, args: { orgId: "tenant-7", body: "2" } },
             vshardOf
         );
-        expect(a).toEqual(b);
+        expect(a).toMatchObject({
+            ok: true,
+            vshard: Number(vshardOf(["tenant-7"])),
+            authority: "organization",
+            partitionKey: "tenant-7",
+        });
+        expect(b).toMatchObject({
+            ok: true,
+            vshard: Number(vshardOf(["tenant-7"])),
+            authority: "organization",
+            partitionKey: "tenant-7",
+        });
     });
 
     test("singlePartition without resolvable partitionKey → CDB_CROSS_PARTITION", () => {
@@ -73,5 +88,83 @@ describe("routeMutation — pure routing decision", () => {
     test("non-singlePartition mutation without key falls back to canonical-args vshard", () => {
         const r = routeMutation(manifest, { ref: broadcast.__chardbRef, args: { msg: "ping" } }, vshardOf);
         expect(r.ok).toBe(true);
+        if (!r.ok) throw new Error("unreachable");
+        expect(r).toMatchObject({ authority: null, partitionKey: null });
+    });
+
+    test("organization authority rejects missing and non-string partition keys as invalid args", () => {
+        for (const args of [{ body: "missing" }, { orgId: 42, body: "numeric" }]) {
+            const result = routeMutation(manifest, { ref: postMessage.__chardbRef, args: args as never }, vshardOf);
+            expect(result).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS" } });
+        }
+    });
+
+    test("validates transforms, defaults, and refinements before extracting organization authority", () => {
+        const normalized = defineMutation({
+            ref: "api/normalized#post",
+            args: z.object({
+                orgId: z
+                    .string()
+                    .trim()
+                    .transform(value => `org:${value}`),
+                body: z.string().min(1).default("default body"),
+            }),
+            authority: "organization",
+            partitionKey: "orgId",
+            handler: () => null,
+        });
+        const normalizedManifest = manifestFromExports({ normalized });
+        const routed = routeMutation(
+            normalizedManifest,
+            { ref: normalized.__chardbRef, args: { orgId: " 7 " } },
+            vshardOf
+        );
+        expect(routed).toEqual({
+            ok: true,
+            vshard: Number(vshardOf(["org:7"])),
+            authority: "organization",
+            partitionKey: "org:7",
+            args: { orgId: "org:7", body: "default body" },
+        });
+
+        const rejected = routeMutation(
+            normalizedManifest,
+            { ref: normalized.__chardbRef, args: { orgId: "7", body: "" } },
+            vshardOf
+        );
+        expect(rejected).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS" } });
+    });
+
+    test("rejects every non-JSON validator output before routing", () => {
+        const cyclic: Record<string, unknown> = {};
+        cyclic.self = cyclic;
+        const outputs = [
+            { orgId: "org-1", value: new Date(0) },
+            { orgId: "org-1", value: undefined },
+            { orgId: "org-1", value: Number.NaN },
+            { orgId: "org-1", value: cyclic },
+        ];
+        for (const output of outputs) {
+            const schema = {
+                "~standard": {
+                    version: 1,
+                    vendor: "test",
+                    validate: () => ({ value: output }),
+                },
+            } as StandardSchemaV1<unknown, { orgId: string }>;
+            const invalid = defineMutation({
+                ref: `api/non-json#${outputs.indexOf(output)}`,
+                args: schema,
+                authority: "organization",
+                partitionKey: "orgId",
+                handler: () => null,
+            });
+            const result = routeMutation(
+                manifestFromExports({ invalid }),
+                { ref: invalid.__chardbRef, args: { orgId: "raw" } },
+                vshardOf
+            );
+            expect(result).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS" } });
+        }
     });
 });

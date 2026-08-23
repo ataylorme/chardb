@@ -13,7 +13,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { createCatalogJwksResolver } from "../../auth/jwks_cache.ts";
 import { verifyJwt } from "../../auth/jwt.ts";
-import { CdbError, docsUrlFor, isRetryable } from "../../errors.ts";
+import { CdbError, docsUrlFor, isCdbErrorCode, isRetryable } from "../../errors.ts";
 import {
     type ChardbRef,
     type ClientId,
@@ -23,8 +23,10 @@ import {
     PrincipalId,
     type RawJson,
     SubId,
+    TenantId,
 } from "../../types.ts";
 import type { Vshard } from "../../types.ts";
+import { rawJsonResult } from "../../util/raw_json.ts";
 import { vshardOf } from "../../vshard.ts";
 import {
     type CdbIntent,
@@ -38,6 +40,7 @@ import {
     decodeWire,
     encodeWire,
 } from "../../wire.ts";
+import type { AuthCtx } from "../define.ts";
 import {
     type ChardbManifest,
     type QueryRouteResponse,
@@ -47,6 +50,7 @@ import {
 } from "../manifest.ts";
 import type {
     CatalogMutationRpc,
+    CatalogOrganizationAuthorityRpc,
     CatalogRoutingRpc,
     CdbErrorWire,
     CdbMutationResponse,
@@ -95,11 +99,19 @@ export const PRESENCE_TTL_DEFAULT_MS = 30_000 as const;
 
 interface PendingGwAttachment {
     readonly kind: "pending";
+    readonly connectionId: string;
+    readonly authOrigin: string;
+}
+
+interface RejectedGwAttachment {
+    readonly kind: "rejected";
+    readonly connectionId: string;
     readonly authOrigin: string;
 }
 
 export interface VerifiedGwAttachment {
     readonly kind: "verified";
+    readonly connectionId: string;
     readonly authOrigin: string;
     readonly clientId: ClientId;
     readonly lastCookie?: Cookie;
@@ -111,7 +123,7 @@ export interface VerifiedGwAttachment {
     readonly jwtNbf?: number;
 }
 
-type GwAttachment = PendingGwAttachment | VerifiedGwAttachment;
+type GwAttachment = PendingGwAttachment | RejectedGwAttachment | VerifiedGwAttachment;
 
 export interface GatewayEnv {
     readonly CDB_CATALOG: DurableObjectNamespace;
@@ -122,7 +134,7 @@ type CdbRpc = CdbSubscriptionRpc;
 
 export interface TrustedMutationDispatchDeps {
     readonly routeMutation: MutationRouteResolver;
-    readonly catalog: CatalogMutationRpc;
+    readonly catalog: CatalogMutationRpc & CatalogOrganizationAuthorityRpc;
     readonly cdb: (shardId: string) => CdbMutationRpc;
 }
 
@@ -148,6 +160,129 @@ interface CatalogJwksRpc extends CatalogMutationRpc {
 
 function mutationFailure(code: import("../../errors.ts").CdbErrorCode, message: string): CdbMutationResponse {
     return { ok: false, error: new CdbError({ code, message }).toJSON() };
+}
+
+/** Reject stale or malformed shard RPC envelopes before WebSocket settlement. */
+export function projectCdbMutationResponse(value: unknown): CdbMutationResponse {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return mutationFailure("CDB_INVARIANT", "Cdb returned a malformed mutation response");
+    }
+    const response = value as Record<string, unknown>;
+    if (response.ok === true) {
+        if (
+            typeof response.cookie !== "string" ||
+            response.cookie.length === 0 ||
+            typeof response.ran !== "boolean" ||
+            typeof response.rowsAffected !== "number" ||
+            !Number.isSafeInteger(response.rowsAffected) ||
+            response.rowsAffected < 0
+        ) {
+            return mutationFailure("CDB_INVARIANT", "Cdb returned a malformed mutation success");
+        }
+        try {
+            const result = rawJsonResult(response.result, "Cdb mutation result");
+            return {
+                ok: true,
+                cookie: response.cookie,
+                ran: response.ran,
+                result,
+                rowsAffected: response.rowsAffected,
+            };
+        } catch {
+            return mutationFailure("CDB_INVARIANT", "Cdb returned a non-JSON mutation result");
+        }
+    }
+    if (response.ok === false) {
+        const error = response.error;
+        if (typeof error !== "object" || error === null || Array.isArray(error)) {
+            return mutationFailure("CDB_INVARIANT", "Cdb returned a malformed mutation failure");
+        }
+        const wire = error as Record<string, unknown>;
+        if (
+            !isCdbErrorCode(wire.code) ||
+            typeof wire.retryable !== "boolean" ||
+            typeof wire.message !== "string" ||
+            typeof wire.docs !== "string" ||
+            (wire.correlationId !== undefined && typeof wire.correlationId !== "string") ||
+            (wire.retryAfterMs !== undefined &&
+                (typeof wire.retryAfterMs !== "number" || !Number.isFinite(wire.retryAfterMs))) ||
+            (wire.hint !== undefined && typeof wire.hint !== "string")
+        ) {
+            return mutationFailure("CDB_INVARIANT", "Cdb returned a malformed mutation failure");
+        }
+        return { ok: false, error: wire as unknown as CdbErrorWire };
+    }
+    return mutationFailure("CDB_INVARIANT", "Cdb returned a malformed mutation response");
+}
+
+type OrganizationAuthProjection =
+    | { readonly ok: true; readonly auth: AuthCtx }
+    | {
+          readonly ok: false;
+          readonly code: "CDB_FORBIDDEN" | "CDB_CATALOG_UNAVAILABLE";
+          readonly message: string;
+      };
+
+/** Validate the Catalog authority envelope before it becomes mutation auth. */
+export function projectOrganizationMutationAuth(
+    value: unknown,
+    expected: { readonly principalId: PrincipalId; readonly organizationId: TenantId }
+): OrganizationAuthProjection {
+    if (value === null) {
+        return { ok: false, code: "CDB_FORBIDDEN", message: "organization membership is missing or revoked" };
+    }
+    if (typeof value !== "object" || Array.isArray(value)) {
+        return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog returned malformed authority" };
+    }
+    const authority = value as Record<string, unknown>;
+    const roles = authority.roles;
+    const epochs = authority.authEpochs;
+    if (
+        typeof authority.principalId !== "string" ||
+        typeof authority.organizationId !== "string" ||
+        typeof authority.role !== "string" ||
+        !Array.isArray(roles) ||
+        !roles.every(role => typeof role === "string") ||
+        typeof epochs !== "object" ||
+        epochs === null ||
+        Array.isArray(epochs)
+    ) {
+        return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog returned malformed authority" };
+    }
+    const epochRecord = epochs as Record<string, unknown>;
+    if (
+        ![epochRecord.global, epochRecord.tenant, epochRecord.principal].every(
+            epoch => typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch >= 0
+        )
+    ) {
+        return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog returned malformed auth epochs" };
+    }
+    if (
+        authority.principalId !== expected.principalId ||
+        authority.organizationId !== expected.organizationId ||
+        authority.role.length === 0 ||
+        roles.length === 0
+    ) {
+        return { ok: false, code: "CDB_FORBIDDEN", message: "organization membership is missing or revoked" };
+    }
+    if (roles.some(role => role.length === 0) || authority.role !== roles.join(",")) {
+        return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog returned inconsistent roles" };
+    }
+    return {
+        ok: true,
+        auth: {
+            userId: authority.principalId,
+            tenantId: authority.organizationId,
+            role: authority.role,
+            roles,
+            authEpochs: {
+                global: epochRecord.global as number,
+                tenant: epochRecord.tenant as number,
+                principal: epochRecord.principal as number,
+            },
+            claims: {},
+        },
+    };
 }
 
 /** Build a Down.error envelope with the locked metadata for its code. */
@@ -200,6 +335,7 @@ export interface GatewayJwtVerificationRequest {
     readonly authOrigin: string;
     readonly catalog: CatalogJwksRpc;
     readonly jwt: string;
+    readonly connectionId: string;
     readonly clientId: ClientId;
     readonly lastCookie?: Cookie;
     readonly presenceKeys?: readonly string[];
@@ -229,6 +365,7 @@ export async function verifyGatewayJwt(request: GatewayJwtVerificationRequest): 
     }
     return {
         kind: "verified",
+        connectionId: request.connectionId,
         authOrigin: request.authOrigin,
         clientId: request.clientId,
         ...(request.lastCookie !== undefined ? { lastCookie: request.lastCookie } : {}),
@@ -254,12 +391,11 @@ export function isCurrentVerifiedAttachment(
 }
 
 /**
- * A verified subject is identity, not tenant authority. Mutation dispatch
- * remains closed until Catalog-derived membership and policy enforcement can
- * construct the full trusted AuthCtx.
+ * Project the verified subject into the mutation dispatcher input. Catalog
+ * still decides organization membership and roles for each declared mutation.
  */
-export function trustedMutationAuthFromAttachment(_attachment: VerifiedGwAttachment): TrustedMutationAuth | null {
-    return null;
+export function trustedMutationAuthFromAttachment(attachment: VerifiedGwAttachment): TrustedMutationAuth {
+    return { principalId: attachment.principalId };
 }
 
 /**
@@ -279,6 +415,30 @@ export async function dispatchTrustedMutation(
         return mutationFailure("CDB_INVARIANT", "local mutation routing failed");
     }
     if (!routed.ok) return routed;
+    if (routed.authority !== "organization") {
+        return mutationFailure("CDB_AUTH_NOT_BOUND", "mutation has no declared organization authority");
+    }
+    if (!routed.partitionKey) {
+        return mutationFailure("CDB_INVALID_ARGS", "organization mutation has no organization partition key");
+    }
+
+    let authority: Awaited<ReturnType<CatalogOrganizationAuthorityRpc["resolveOrganizationAuthority"]>>;
+    try {
+        authority = await deps.catalog.resolveOrganizationAuthority({
+            principalId: request.principalId,
+            organizationId: TenantId(routed.partitionKey),
+        });
+    } catch {
+        return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog organization authority RPC failed");
+    }
+    const projected = projectOrganizationMutationAuth(authority, {
+        principalId: request.principalId,
+        organizationId: TenantId(routed.partitionKey),
+    });
+    if (!projected.ok) return mutationFailure(projected.code, projected.message);
+    // This Catalog read is the authorization linearization point. A later
+    // revocation blocks the next dispatch but does not cancel this in-flight
+    // shard call; Cdb does not revalidate membership epochs yet.
 
     let location: Awaited<ReturnType<CatalogMutationRpc["route"]>>;
     try {
@@ -288,14 +448,15 @@ export async function dispatchTrustedMutation(
     }
 
     try {
-        return await deps.cdb(location.shardId).mutate({
-            principalId: request.auth.userId,
+        const response = await deps.cdb(location.shardId).mutate({
+            principalId: request.principalId,
             mutId: request.mutId,
             ref: request.ref,
-            args: request.args,
-            auth: request.auth,
+            args: routed.args,
+            auth: projected.auth,
             schemaEpoch: location.schemaEpoch,
         });
+        return projectCdbMutationResponse(response);
     } catch {
         return mutationFailure("CDB_SHARD_UNAVAILABLE", "Cdb mutation RPC failed");
     }
@@ -324,6 +485,8 @@ export class Gateway extends DurableObject<GatewayEnv> {
     private bootstrapped = false;
     private coalesceTimer: ReturnType<typeof setTimeout> | null = null;
     private readonly pendingPatches = new Map<ClientId, RowPatch[]>();
+    private readonly authRefreshBarriers = new Map<string, Promise<boolean>>();
+    private readonly activeMutations = new Map<string, Set<Promise<void>>>();
 
     constructor(state: DurableObjectState, env: GatewayEnv) {
         super(state, env);
@@ -371,6 +534,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         this.ctx.acceptWebSocket(server);
         server.serializeAttachment({
             kind: "pending",
+            connectionId: crypto.randomUUID(),
             authOrigin: new URL(request.url).origin,
         } satisfies PendingGwAttachment);
         return new Response(null, { status: 101, webSocket: pair[0] });
@@ -390,7 +554,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 void this.onHello(ws, msg as Extract<Up, { t: "hello" }>);
                 break;
             case "updateAuth":
-                void this.onUpdateAuth(ws, msg as Extract<Up, { t: "updateAuth" }>);
+                this.onUpdateAuth(ws, msg as Extract<Up, { t: "updateAuth" }>);
                 break;
             case "sub":
                 void this.onSub(ws, msg as Extract<Up, { t: "sub" }>);
@@ -416,7 +580,11 @@ export class Gateway extends DurableObject<GatewayEnv> {
     }
 
     override webSocketClose(ws: WebSocket): void {
-        void ws;
+        const attachment = ws.deserializeAttachment() as GwAttachment | null;
+        if (attachment) {
+            this.authRefreshBarriers.delete(attachment.connectionId);
+            this.activeMutations.delete(attachment.connectionId);
+        }
         // Subs persist in `_gw_subs` so a hibernated socket can resume with its
         // last cookie after a wake-up without re-running the user's `useQuery`.
     }
@@ -435,49 +603,98 @@ export class Gateway extends DurableObject<GatewayEnv> {
         }
         const attachment = await this.verifyAttachment(ws, {
             authOrigin: pending.authOrigin,
+            connectionId: pending.connectionId,
             clientId: msg.clientId,
             jwt: msg.jwt,
             ...(msg.resumeFromCookie ? { lastCookie: msg.resumeFromCookie } : {}),
         });
         if (!attachment) return;
-        ws.serializeAttachment(attachment);
+        const baseCookie = Cookie(`${msg.clientId}:0`);
+        ws.serializeAttachment({
+            ...attachment,
+            lastCookie: msg.resumeFromCookie ?? baseCookie,
+        } satisfies VerifiedGwAttachment);
         const welcome: Down = {
             t: "welcome",
             protocolV: PROTOCOL_V,
-            baseCookie: Cookie(`${msg.clientId}:0`),
+            baseCookie,
             region: "WNAM",
             ...(msg.resumeFromCookie ? { resumedFromCookie: msg.resumeFromCookie } : {}),
         };
         this.send(ws, welcome);
     }
 
-    private async onUpdateAuth(ws: WebSocket, msg: Extract<Up, { t: "updateAuth" }>): Promise<void> {
+    private onUpdateAuth(ws: WebSocket, msg: Extract<Up, { t: "updateAuth" }>): void {
         const current = ws.deserializeAttachment() as GwAttachment | null;
         if (!isVerifiedAttachment(current)) {
             this.rejectAuth(ws, "CDB_FORBIDDEN");
             return;
         }
+        const connectionId = current.connectionId;
+        const previous = this.authRefreshBarriers.get(connectionId) ?? Promise.resolve(true);
+        const barrier = previous
+            .then(previousSucceeded => (previousSucceeded ? this.performUpdateAuth(ws, connectionId, msg) : false))
+            .catch(() => {
+                this.rejectAuth(ws, "CDB_CATALOG_UNAVAILABLE");
+                return false;
+            });
+        this.authRefreshBarriers.set(connectionId, barrier);
+        void barrier.then(succeeded => {
+            if (succeeded && this.authRefreshBarriers.get(connectionId) === barrier) {
+                this.authRefreshBarriers.delete(connectionId);
+            }
+        });
+    }
+
+    private async performUpdateAuth(
+        ws: WebSocket,
+        connectionId: string,
+        msg: Extract<Up, { t: "updateAuth" }>
+    ): Promise<boolean> {
+        const current = ws.deserializeAttachment() as GwAttachment | null;
+        if (!isVerifiedAttachment(current) || current.connectionId !== connectionId) {
+            this.rejectAuth(ws, "CDB_FORBIDDEN");
+            return false;
+        }
         const attachment = await this.verifyAttachment(ws, {
             authOrigin: current.authOrigin,
+            connectionId,
             clientId: current.clientId,
             jwt: msg.jwt,
             ...(current.lastCookie !== undefined ? { lastCookie: current.lastCookie } : {}),
             ...(current.presenceKeys !== undefined ? { presenceKeys: current.presenceKeys } : {}),
         });
-        if (!attachment) return;
-        ws.serializeAttachment(attachment);
-        this.pendingPatches.delete(current.clientId);
+        if (!attachment) return false;
+
+        const active = this.activeMutations.get(connectionId);
+        if (active && active.size > 0) await Promise.allSettled([...active]);
+
+        const latest = ws.deserializeAttachment() as GwAttachment | null;
+        if (
+            !isVerifiedAttachment(latest) ||
+            latest.connectionId !== connectionId ||
+            latest.clientId !== current.clientId
+        ) {
+            this.rejectAuth(ws, "CDB_FORBIDDEN");
+            return false;
+        }
+        ws.serializeAttachment({
+            ...attachment,
+            ...(latest.lastCookie !== undefined ? { lastCookie: latest.lastCookie } : {}),
+            ...(latest.presenceKeys !== undefined ? { presenceKeys: latest.presenceKeys } : {}),
+        } satisfies VerifiedGwAttachment);
+        this.pendingPatches.delete(latest.clientId);
         try {
-            const { subIds, rpcFailed } = await this.invalidateClientSubscriptions(current.clientId);
+            const { subIds, rpcFailed } = await this.invalidateClientSubscriptions(latest.clientId);
             if (rpcFailed) {
-                this.sendError(ws, "CDB_SHARD_UNAVAILABLE");
-                ws.close(1011, "subscription invalidation failed");
-                return;
+                this.rejectConnection(ws, "CDB_SHARD_UNAVAILABLE", 1011, "subscription invalidation failed");
+                return false;
             }
             this.send(ws, { t: "mustRefetch", subIds, reason: "authChanged" });
+            return true;
         } catch {
-            this.sendError(ws, "CDB_SHARD_UNAVAILABLE");
-            ws.close(1011, "subscription invalidation failed");
+            this.rejectConnection(ws, "CDB_SHARD_UNAVAILABLE", 1011, "subscription invalidation failed");
+            return false;
         }
     }
 
@@ -503,8 +720,25 @@ export class Gateway extends DurableObject<GatewayEnv> {
     }
 
     private rejectAuth(ws: WebSocket, code: import("../../errors.ts").CdbErrorCode): void {
+        this.rejectConnection(ws, code, 1008, code);
+    }
+
+    private rejectConnection(
+        ws: WebSocket,
+        code: import("../../errors.ts").CdbErrorCode,
+        closeCode: number,
+        reason: string
+    ): void {
+        const current = ws.deserializeAttachment() as GwAttachment | null;
+        if (current) {
+            ws.serializeAttachment({
+                kind: "rejected",
+                connectionId: current.connectionId,
+                authOrigin: current.authOrigin,
+            } satisfies RejectedGwAttachment);
+        }
         this.sendError(ws, code);
-        ws.close(1008, code);
+        ws.close(closeCode, reason);
     }
 
     private async onSub(ws: WebSocket, msg: Extract<Up, { t: "sub" }>): Promise<void> {
@@ -526,6 +760,18 @@ export class Gateway extends DurableObject<GatewayEnv> {
     }
 
     private onMut(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): void {
+        const attachment = ws.deserializeAttachment() as GwAttachment | null;
+        const barrier = attachment ? this.authRefreshBarriers.get(attachment.connectionId) : undefined;
+        if (barrier) {
+            void barrier.then(succeeded => {
+                if (succeeded) this.admitMutation(ws, msg);
+            });
+            return;
+        }
+        this.admitMutation(ws, msg);
+    }
+
+    private admitMutation(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): void {
         const att = ws.deserializeAttachment() as GwAttachment | null;
         if (!isVerifiedAttachment(att)) {
             this.sendMutFailure(
@@ -545,48 +791,40 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return;
         }
         const trusted = trustedMutationAuthFromAttachment(att);
-        if (!trusted) {
-            this.sendMutFailure(
-                ws,
-                msg.mutId,
-                new CdbError({
-                    code: "CDB_AUTH_NOT_BOUND",
-                    message: "tenant membership and policy authority are not bound",
-                }).toJSON(),
-                att.lastCookie
-            );
-            return;
+        const task = this.settleMut(ws, att, msg, trusted);
+        let active = this.activeMutations.get(att.connectionId);
+        if (!active) {
+            active = new Set();
+            this.activeMutations.set(att.connectionId, active);
         }
-        void this.routeMut(ws, att, msg, trusted);
+        active.add(task);
+        void task
+            .catch(() => {
+                // The only uncaught failure here is the final WebSocket send.
+                // A second send would violate exactly-once settlement.
+            })
+            .finally(() => {
+                active?.delete(task);
+                if (active?.size === 0) this.activeMutations.delete(att.connectionId);
+            });
     }
 
     /**
      * Resolve a mutation through the worker manifest, route the resulting vshard
      * via the Catalog, and call `Cdb.mutate` on the owning shard. The handler
      * intentionally does not re-evaluate the user's mutation body; that runs
-     * inside the shard DO under `transactionSync`. Errors flow back over the
-     * wire as `Down.mutAck { ok: false, error }`.
+     * inside the shard DO under `transactionSync`.
      */
-    private async routeMut(
-        ws: WebSocket,
-        att: VerifiedGwAttachment,
-        msg: Extract<Up, { t: "mut" }>,
-        trusted: TrustedMutationAuth
-    ): Promise<void> {
-        let catalog: CatalogMutationRpc;
+    private async routeMut(msg: Extract<Up, { t: "mut" }>, trusted: TrustedMutationAuth): Promise<CdbMutationResponse> {
+        let catalog: CatalogMutationRpc & CatalogOrganizationAuthorityRpc;
         try {
             const catalogId = this.env.CDB_CATALOG.idFromName("global");
-            catalog = this.env.CDB_CATALOG.get(catalogId) as unknown as CatalogMutationRpc;
+            catalog = this.env.CDB_CATALOG.get(catalogId) as unknown as CatalogMutationRpc &
+                CatalogOrganizationAuthorityRpc;
         } catch {
-            this.sendMutFailure(
-                ws,
-                msg.mutId,
-                new CdbError({ code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog binding unavailable" }).toJSON(),
-                att.lastCookie
-            );
-            return;
+            return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog binding unavailable");
         }
-        const ack = await dispatchTrustedMutation(
+        return dispatchTrustedMutation(
             {
                 routeMutation: request => this.routeMutation(request),
                 catalog,
@@ -602,8 +840,27 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 ...trusted,
             }
         );
+    }
+
+    /** Settle one accepted mutation exactly once, including unexpected async failures. */
+    private async settleMut(
+        ws: WebSocket,
+        att: VerifiedGwAttachment,
+        msg: Extract<Up, { t: "mut" }>,
+        trusted: TrustedMutationAuth
+    ): Promise<void> {
+        let ack: CdbMutationResponse;
+        try {
+            ack = await this.routeMut(msg, trusted);
+        } catch {
+            ack = mutationFailure("CDB_INVARIANT", "mutation dispatch failed unexpectedly");
+        }
         if (ack.ok) {
             const cookie = Cookie(ack.cookie);
+            const current = ws.deserializeAttachment() as GwAttachment | null;
+            if (isVerifiedAttachment(current)) {
+                ws.serializeAttachment({ ...current, lastCookie: cookie } satisfies VerifiedGwAttachment);
+            }
             this.send(ws, {
                 t: "poke",
                 cookie,
@@ -611,7 +868,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 mutResults: [{ mutId: msg.mutId, ok: true, result: ack.result, cookie }],
             });
         } else {
-            this.sendMutFailure(ws, msg.mutId, ack.error, att.lastCookie);
+            const current = ws.deserializeAttachment() as GwAttachment | null;
+            const lastCookie = isVerifiedAttachment(current) ? current.lastCookie : att.lastCookie;
+            this.sendMutFailure(ws, msg.mutId, ack.error, lastCookie);
         }
     }
 
@@ -757,6 +1016,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             const patches = this.pendingPatches.get(att.clientId);
             if (!patches || patches.length === 0) continue;
             const cookie = Cookie(`${att.clientId}:${Date.now()}`);
+            ws.serializeAttachment({ ...att, lastCookie: cookie } satisfies VerifiedGwAttachment);
             this.send(ws, { t: "poke", cookie, patches });
             patches.length = 0;
         }

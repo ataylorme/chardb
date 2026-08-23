@@ -40,6 +40,8 @@ const auth = defineAuth({
 type RoutedArgs = { readonly organizationId: string } & { readonly [key: string]: RawJson };
 type RoutedQueryArgs = { readonly organizationId: string; readonly limit: number };
 const routedMutation = defineMutation<unknown, RoutedArgs, null>(() => null, {
+    ref: "api/items#route",
+    authority: "organization",
     singlePartition: true,
     partitionKey: args => args.organizationId,
 });
@@ -54,6 +56,15 @@ const routedQuery = defineQuery<unknown, RoutedQueryArgs, readonly []>({
     }),
 });
 const queryWithoutIntent = defineQuery<unknown, RoutedArgs, readonly []>(async (): Promise<readonly []> => []);
+const queryWithNonJsonTransform = defineQuery({
+    args: z.object({ organizationId: z.string(), at: z.string().transform(() => new Date(0)) }),
+    handler: async () => [],
+    intent: args => ({
+        kind: "select",
+        tables: ["items"],
+        partitionKey: { table: "items", column: "organization_id", values: [args.organizationId] },
+    }),
+});
 
 describe("chardb({…})", () => {
     test("returns a Hono instance the user can chain routes on", async () => {
@@ -89,7 +100,13 @@ describe("chardb({…})", () => {
                 ref: routedMutation.__chardbRef,
                 args: { organizationId: "org-7" },
             })
-        ).toEqual({ ok: true, vshard: Number(vshardOf(["org-7"])) });
+        ).toEqual({
+            ok: true,
+            vshard: Number(vshardOf(["org-7"])),
+            authority: "organization",
+            partitionKey: "org-7",
+            args: { organizationId: "org-7" },
+        });
         const missing = gateway.routeMutation({ ref: "api.ts#missing", args: {} });
         expect(missing.ok).toBe(false);
         if (!missing.ok) expect(missing.error.code).toBe("CDB_REF_NOT_FOUND");
@@ -121,6 +138,16 @@ describe("chardb({…})", () => {
         });
         expect(closed.ok).toBe(false);
         if (!closed.ok) expect(closed.error.code).toBe("CDB_NO_INTENT_FOR_RAW_SQL");
+    });
+
+    test("query routing rejects non-JSON validator transforms", async () => {
+        const app = chardb({ auth, schema: { items }, api: { queryWithNonJsonTransform } });
+        const gateway = Object.create(app.Gateway.prototype) as InstanceType<typeof app.Gateway>;
+        const result = await gateway.routeQuery({
+            ref: queryWithNonJsonTransform.__chardbRef,
+            args: { organizationId: "org-7", at: "now" },
+        });
+        expect(result).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS" } });
     });
 
     test("`auth` is the pre-built bundle when supplied", () => {

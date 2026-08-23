@@ -15,6 +15,7 @@ const ORIGIN = "https://app.example";
 const ISSUER = "https://issuer.example";
 const AUDIENCE = "chardb-app";
 const KID = "key-1";
+const CONNECTION_ID = "connection-1";
 
 async function signingFixture() {
     const { privateKey, publicKey } = await generateKeyPair("ES256");
@@ -75,6 +76,7 @@ describe("Gateway verified JWT boundary", () => {
         const attachment = await verifyGatewayJwt({
             config: config(),
             authOrigin: ORIGIN,
+            connectionId: CONNECTION_ID,
             catalog,
             jwt: await sign(),
             clientId: ClientId("client-1"),
@@ -82,6 +84,7 @@ describe("Gateway verified JWT boundary", () => {
 
         expect(attachment).toMatchObject({
             kind: "verified",
+            connectionId: CONNECTION_ID,
             authOrigin: ORIGIN,
             clientId: "client-1",
             principalId: "user-1",
@@ -108,6 +111,7 @@ describe("Gateway verified JWT boundary", () => {
                 verifyGatewayJwt({
                     config: config(),
                     authOrigin: ORIGIN,
+                    connectionId: CONNECTION_ID,
                     catalog,
                     jwt: token,
                     clientId: ClientId("client-1"),
@@ -118,6 +122,7 @@ describe("Gateway verified JWT boundary", () => {
             verifyGatewayJwt({
                 config: config({ algorithms: ["RS256"] }),
                 authOrigin: ORIGIN,
+                connectionId: CONNECTION_ID,
                 catalog,
                 jwt: valid,
                 clientId: ClientId("client-1"),
@@ -125,18 +130,19 @@ describe("Gateway verified JWT boundary", () => {
         ).rejects.toMatchObject({ code: "CDB_FORBIDDEN" });
     });
 
-    test("rechecks expiry but keeps mutation authority closed for a valid identity", async () => {
+    test("rechecks expiry and projects only the verified subject for mutation dispatch", async () => {
         const { catalog, sign } = await signingFixture();
         const attachment = await verifyGatewayJwt({
             config: config(),
             authOrigin: ORIGIN,
+            connectionId: CONNECTION_ID,
             catalog,
             jwt: await sign(),
             clientId: ClientId("client-1"),
         });
         expect(isCurrentVerifiedAttachment(attachment, attachment.jwtExp - 1)).toBe(true);
         expect(isCurrentVerifiedAttachment(attachment, attachment.jwtExp)).toBe(false);
-        expect(trustedMutationAuthFromAttachment(attachment)).toBeNull();
+        expect(trustedMutationAuthFromAttachment(attachment)).toEqual({ principalId: PrincipalId("user-1") });
     });
 
     test("a verified refresh can replace the subject; a failed refresh yields no replacement", async () => {
@@ -144,6 +150,7 @@ describe("Gateway verified JWT boundary", () => {
         const current = await verifyGatewayJwt({
             config: config(),
             authOrigin: ORIGIN,
+            connectionId: CONNECTION_ID,
             catalog,
             jwt: await sign(),
             clientId: ClientId("client-1"),
@@ -151,6 +158,7 @@ describe("Gateway verified JWT boundary", () => {
         const refreshed = await verifyGatewayJwt({
             config: config(),
             authOrigin: current.authOrigin,
+            connectionId: current.connectionId,
             catalog,
             jwt: await sign({ subject: "user-2" }),
             clientId: current.clientId,
@@ -162,6 +170,7 @@ describe("Gateway verified JWT boundary", () => {
             verifyGatewayJwt({
                 config: config(),
                 authOrigin: current.authOrigin,
+                connectionId: current.connectionId,
                 catalog,
                 jwt: "invalid.refresh.token",
                 clientId: current.clientId,

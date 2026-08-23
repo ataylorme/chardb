@@ -312,7 +312,9 @@ export class Cdb extends DurableObject<CdbEnv> {
                 storage: this.ctx.storage,
                 schema: this.mutationSchema(),
                 request,
-                handler: (ctx, args) => descriptor.invoke(ctx, args),
+                // This is an internal post-validation RPC. The configured
+                // Gateway validates raw wire args and forwards this exact value.
+                handler: (ctx, args) => descriptor.invokeValidated(ctx, args),
                 cookie: `${this.ctx.id.toString()}:${Date.now()}:${crypto.randomUUID()}`,
             });
             return { ok: true, ...result };

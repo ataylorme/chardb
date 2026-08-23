@@ -126,6 +126,8 @@ import { z } from "zod";
 import { messages } from "./schema.ts";
 
 export const postMessage = api.mutation({
+  ref: "src/api.ts#postMessage",
+  authority: "organization",
   args: z.object({
     id: z.string(),
     organizationId: z.string(),

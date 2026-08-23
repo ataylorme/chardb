@@ -68,11 +68,125 @@ describe("@chardb/vite-plugin", () => {
         for (const ref of refs) expect(registry).toContain(`"ref": "${ref}"`);
     });
 
+    test("preserves explicit config refs for two mutations and a query", () => {
+        const p = makePlugin();
+        const code = `
+      import { api } from "chardb/server";
+      export const createPost = api.mutation({ ref: "api/posts#create", handler: () => ({}) });
+      export const deletePost = api.mutation({ ref: "api/posts#delete", handler: () => ({}) });
+      export const listPosts = api.query({ ref: "api/posts#list", handler: async () => [] });
+    `;
+        const out = transform(p, code, "/abs/proj/src/routes/posts.ts");
+        const refs = Array.from(out.code.matchAll(/value: "([^"]+)"/g), match => match[1]);
+        expect(refs).toEqual(["api/posts#create", "api/posts#delete", "api/posts#list"]);
+        expect(out.code).not.toContain("src/routes/posts.ts#createPost");
+    });
+
+    test("preserves a positional mutation ref from its options object", () => {
+        const p = makePlugin();
+        const out = transform(
+            p,
+            `
+      import { defineMutation } from "chardb/server";
+      export const save = defineMutation((_ctx, args) => args, { ref: "api/items#save" });
+    `,
+            "/abs/proj/src/items.ts"
+        );
+        expect(out.code).toContain('value: "api/items#save"');
+        expect(out.code).not.toContain("src/items.ts#save");
+    });
+
+    test("preserves positional api mutation authority and ref options", () => {
+        const p = makePlugin();
+        const out = transform(
+            p,
+            `
+      import { api } from "chardb/server";
+      export const save = api.mutation((_ctx, args) => args, {
+        authority: "organization",
+        ref: "api/items#save",
+        partitionKey: args => args.organizationId,
+      });
+    `,
+            "/abs/proj/src/items.ts"
+        );
+        expect(out.code).toContain('value: "api/items#save"');
+    });
+
+    test("rejects an organization mutation without a literal ref", () => {
+        const p = makePlugin();
+        expect(() =>
+            p.transform(
+                `
+          import { api } from "chardb/server";
+          export const save = api.mutation({
+            authority: "organization",
+            partitionKey: "organizationId",
+            handler: () => null,
+          });
+        `,
+                "/abs/proj/src/authority.ts"
+            )
+        ).toThrow("Organization mutation save requires a literal ref");
+    });
+
+    test("rejects duplicate and nonliteral explicit refs", () => {
+        const duplicate = makePlugin();
+        expect(() =>
+            duplicate.transform(
+                `
+          import { api } from "chardb/server";
+          export const first = api.mutation({ ref: "api/posts#same", handler: () => null });
+          export const second = api.mutation({ ref: "api/posts#same", handler: () => null });
+        `,
+                "/abs/proj/src/duplicate.ts"
+            )
+        ).toThrow('Duplicate stable ref "api/posts#same"');
+
+        const dynamic = makePlugin();
+        expect(() =>
+            dynamic.transform(
+                `
+          import { api } from "chardb/server";
+          const ref = "api/posts#dynamic";
+          export const save = api.mutation({ ref, handler: () => null });
+        `,
+                "/abs/proj/src/dynamic.ts"
+            )
+        ).toThrow("must be a string literal");
+    });
+
+    test("explicit refs survive moving the source module", () => {
+        const code = `
+      import { api } from "chardb/server";
+      export const save = api.mutation({ ref: "api/items#save", handler: () => null });
+    `;
+        const first = transform(makePlugin(), code, "/first/src/items.ts");
+        const moved = transform(makePlugin(), code, "/moved/src/domain/items.ts");
+        expect(first.code).toContain('value: "api/items#save"');
+        expect(moved.code).toContain('value: "api/items#save"');
+    });
+
+    test("rejects variable, spread, shorthand, and computed api configs", () => {
+        const cases = [
+            `const config = { ref: "api/items#save", handler: () => null }; export const save = api.mutation(config);`,
+            `const common = { handler: () => null }; export const save = api.mutation({ ...common, ref: "api/items#save" });`,
+            `const ref = "api/items#save"; export const save = api.mutation({ ref, handler: () => null });`,
+            `const key = "ref"; export const save = api.mutation({ [key]: "api/items#save", handler: () => null });`,
+        ];
+        for (const source of cases) {
+            const p = makePlugin();
+            expect(() =>
+                p.transform(`import { api } from "chardb/server"; ${source}`, "/abs/proj/src/rejected.ts")
+            ).toThrow();
+        }
+    });
+
     test("fails clearly when two modules produce the same stable ref", () => {
         const p = makePlugin();
         const code = `
       import { api } from "chardb/server";
-      export const save = api.mutation({ handler: () => ({}) });
+      export const save = api.mutation({ ref: "src/shared.ts#save", handler: () => ({}) });
     `;
         p.transform(code, "/workspace/first/src/shared.ts");
         expect(() => p.transform(code, "/workspace/second/src/shared.ts")).toThrow(

@@ -182,7 +182,7 @@ export function chardb(options: ChardbVitePluginOptions = {}): Plugin {
             registry.splice(0, registry.length, ...nextRegistry);
             let mutated = code;
             for (const e of found) {
-                const stamp = `;Object.defineProperty(${e.exportName}, "__chardbRef", { value: ${JSON.stringify(e.ref)}, enumerable: false, configurable: true });`;
+                const stamp = `;if (!${e.exportName}.__chardbExplicitRef) Object.defineProperty(${e.exportName}, "__chardbRef", { value: ${JSON.stringify(e.ref)}, enumerable: false, configurable: true });`;
                 if (mutated.includes(stamp)) continue;
                 mutated += `\n${stamp}`;
             }
@@ -303,6 +303,84 @@ function collectExports(code: string, id: string): FoundExport[] {
         return undefined;
     };
 
+    const isApiFactoryCall = (expression: import("typescript").LeftHandSideExpression): boolean => {
+        if (!ts.isPropertyAccessExpression(expression)) return false;
+        if (ts.isIdentifier(expression.expression) && apiObjects.has(expression.expression.text)) return true;
+        return (
+            ts.isPropertyAccessExpression(expression.expression) &&
+            ts.isIdentifier(expression.expression.expression) &&
+            namespaceAliases.has(expression.expression.expression.text) &&
+            expression.expression.name.text === "api"
+        );
+    };
+
+    const explicitConfigRef = (
+        call: import("typescript").CallExpression,
+        kind: (typeof DEFINE_HELPERS)[number],
+        exportName: string,
+        apiFactoryCall: boolean
+    ): string | undefined => {
+        if (kind !== "defineMutation" && kind !== "defineQuery") return undefined;
+        const first = call.arguments[0];
+        const positional = kind === "defineMutation" && first && !ts.isObjectLiteralExpression(first);
+        if (
+            apiFactoryCall &&
+            positional &&
+            !call.arguments[1] &&
+            !ts.isArrowFunction(first) &&
+            !ts.isFunctionExpression(first)
+        ) {
+            throw new Error(`[chardb/vite] ${exportName} must use an inline config object`);
+        }
+        const config = positional ? call.arguments[1] : first;
+        if (!config || !ts.isObjectLiteralExpression(config)) return undefined;
+        if (config.properties.some(property => ts.isSpreadAssignment(property))) {
+            throw new Error(`[chardb/vite] ${exportName} config cannot spread ref metadata`);
+        }
+        const namedProperty = (name: string) =>
+            config.properties.find(
+                candidate =>
+                    ((ts.isPropertyAssignment(candidate) || ts.isShorthandPropertyAssignment(candidate)) &&
+                        ((ts.isIdentifier(candidate.name) && candidate.name.text === name) ||
+                            (ts.isStringLiteral(candidate.name) && candidate.name.text === name))) ||
+                    (ts.isPropertyAssignment(candidate) && ts.isComputedPropertyName(candidate.name))
+            );
+        const refProperty = namedProperty("ref");
+        const authorityProperty = namedProperty("authority");
+        let organizationAuthority = false;
+        if (authorityProperty) {
+            if (
+                !ts.isPropertyAssignment(authorityProperty) ||
+                ts.isComputedPropertyName(authorityProperty.name) ||
+                !ts.isStringLiteralLike(authorityProperty.initializer)
+            ) {
+                throw new Error(`[chardb/vite] Authority for ${exportName} must be a string literal`);
+            }
+            organizationAuthority = authorityProperty.initializer.text === "organization";
+        }
+        if (!refProperty) {
+            if (kind === "defineMutation" && organizationAuthority) {
+                throw new Error(`[chardb/vite] Organization mutation ${exportName} requires a literal ref`);
+            }
+            return undefined;
+        }
+        const property = config.properties.find(
+            candidate =>
+                ((ts.isPropertyAssignment(candidate) || ts.isShorthandPropertyAssignment(candidate)) &&
+                    ((ts.isIdentifier(candidate.name) && candidate.name.text === "ref") ||
+                        (ts.isStringLiteral(candidate.name) && candidate.name.text === "ref"))) ||
+                (ts.isPropertyAssignment(candidate) && ts.isComputedPropertyName(candidate.name))
+        );
+        if (!property) return undefined;
+        if (!ts.isPropertyAssignment(property) || ts.isComputedPropertyName(property.name)) {
+            throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a string literal`);
+        }
+        if (!ts.isStringLiteralLike(property.initializer)) {
+            throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a string literal`);
+        }
+        return validExplicitRef(property.initializer.text, exportName);
+    };
+
     const out: FoundExport[] = [];
     const visit = (node: import("typescript").Node): void => {
         if (ts.isVariableStatement(node) && node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) {
@@ -313,7 +391,13 @@ function collectExports(code: string, id: string): FoundExport[] {
                 const kind = kindOf(init.expression);
                 if (!kind) continue;
                 const exportName = decl.name.text;
-                out.push({ exportName, kind, ref: refOf(exportName) });
+                out.push({
+                    exportName,
+                    kind,
+                    ref:
+                        explicitConfigRef(init, kind, exportName, isApiFactoryCall(init.expression)) ??
+                        refOf(exportName),
+                });
             }
         }
         ts.forEachChild(node, visit);
@@ -330,16 +414,111 @@ function regexCollect(code: string, refOf: (name: string) => string): FoundExpor
     for (const match of code.matchAll(exportRe)) {
         const exportName = match[1] as string;
         const kind = match[2] as (typeof DEFINE_HELPERS)[number];
-        out.push({ exportName, kind, ref: refOf(exportName) });
+        out.push({
+            exportName,
+            kind,
+            ref:
+                regexExplicitConfigRef(code, (match.index ?? 0) + match[0].length, exportName, kind, false) ??
+                refOf(exportName),
+        });
     }
     const apiExportRe = /export\s+(?:const|let|var)\s+(\w+)\s*=\s*api\.(mutation|query)\b/g;
     for (const match of code.matchAll(apiExportRe)) {
         const exportName = match[1] as string;
         const method = match[2] as "mutation" | "query";
         const kind = method === "mutation" ? "defineMutation" : "defineQuery";
-        out.push({ exportName, kind, ref: refOf(exportName) });
+        out.push({
+            exportName,
+            kind,
+            ref:
+                regexExplicitConfigRef(code, (match.index ?? 0) + match[0].length, exportName, kind, true) ??
+                refOf(exportName),
+        });
     }
     return out;
+}
+
+function validExplicitRef(ref: string, exportName: string): string {
+    if (ref.length === 0 || !ref.includes("#")) {
+        throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a nonempty string containing #`);
+    }
+    return ref;
+}
+
+function regexExplicitConfigRef(
+    code: string,
+    callEnd: number,
+    exportName: string,
+    kind: (typeof DEFINE_HELPERS)[number],
+    apiFactoryCall: boolean
+): string | undefined {
+    let cursor = callEnd;
+    while (/\s/.test(code[cursor] ?? "")) cursor++;
+    if (code[cursor] !== "(") return undefined;
+    const args: string[] = [];
+    let start = cursor + 1;
+    let parens = 1;
+    let braces = 0;
+    let brackets = 0;
+    let quote: '"' | "'" | "`" | null = null;
+    let escaped = false;
+    for (cursor++; cursor < code.length; cursor++) {
+        const character = code[cursor] as string;
+        if (quote) {
+            if (escaped) escaped = false;
+            else if (character === "\\") escaped = true;
+            else if (character === quote) quote = null;
+            continue;
+        }
+        if (character === '"' || character === "'" || character === "`") {
+            quote = character;
+            continue;
+        }
+        if (character === "(") parens++;
+        else if (character === ")") {
+            parens--;
+            if (parens === 0) {
+                args.push(code.slice(start, cursor).trim());
+                break;
+            }
+        } else if (character === "{") braces++;
+        else if (character === "}") braces--;
+        else if (character === "[") brackets++;
+        else if (character === "]") brackets--;
+        else if (character === "," && parens === 1 && braces === 0 && brackets === 0) {
+            args.push(code.slice(start, cursor).trim());
+            start = cursor + 1;
+        }
+    }
+    const firstIsConfig = args[0]?.startsWith("{") === true;
+    if (
+        apiFactoryCall &&
+        !firstIsConfig &&
+        !args[1] &&
+        !/^(?:async\s*)?(?:function\b|\(?[\w\s,:{}<>?\[\]|&.]*\)?\s*=>)/.test(args[0] ?? "")
+    ) {
+        throw new Error(`[chardb/vite] ${exportName} must use an inline config object`);
+    }
+    const config = kind === "defineMutation" && !firstIsConfig ? args[1] : args[0];
+    if (!config?.startsWith("{")) return undefined;
+    if (/\.\.\./.test(config)) {
+        throw new Error(`[chardb/vite] ${exportName} config cannot spread ref metadata`);
+    }
+    const hasAuthority = /\bauthority\s*:/.test(config);
+    const organizationAuthority = /\bauthority\s*:\s*(["'])organization\1/.test(config);
+    if (hasAuthority && !organizationAuthority) {
+        const literalAuthority = /\bauthority\s*:\s*(["'])[^"'\\]*\1/.test(config);
+        if (!literalAuthority) throw new Error(`[chardb/vite] Authority for ${exportName} must be a string literal`);
+    }
+    if (!/\bref\s*:/.test(config)) {
+        if (kind === "defineMutation" && organizationAuthority) {
+            throw new Error(`[chardb/vite] Organization mutation ${exportName} requires a literal ref`);
+        }
+        return undefined;
+    }
+    const literal = /\bref\s*:\s*(["'])([^"'\\]*)\1/.exec(config);
+    if (!literal?.[2]) throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a string literal`);
+    return validExplicitRef(literal[2], exportName);
 }
 
 function cleanModuleId(id: string): string {

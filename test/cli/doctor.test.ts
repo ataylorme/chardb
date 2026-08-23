@@ -111,6 +111,8 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.get("/tmp/proj/src/schema.ts")).toContain("const { cdbTable } = forOrg()");
         expect(files.get("/tmp/proj/src/schema.ts")).toContain('selfBy: "authorId"');
         expect(files.get("/tmp/proj/src/api.ts")).toContain('partitionKey: "organizationId"');
+        expect(files.get("/tmp/proj/src/api.ts")).toContain('authority: "organization"');
+        expect(files.get("/tmp/proj/src/api.ts")).toContain('ref: "src/api.ts#postMessage"');
         expect(files.get("/tmp/proj/src/api.ts")).toContain("handler: (ctx, args) =>");
         expect(files.get("/tmp/proj/src/api.ts")).toContain("}).run()");
         expect(files.get("/tmp/proj/src/api.ts")).not.toContain("handler: async");

@@ -1,13 +1,13 @@
-import { CdbError } from "../errors.ts";
+import { CdbError, type CdbErrorCode } from "../errors.ts";
 import type { RawJson } from "../types.ts";
 
 /** Validate an exact JSON value without coercing unsupported JavaScript data. */
-export function rawJsonResult(value: unknown, subject: string): RawJson {
+export function rawJsonResult(value: unknown, subject: string, code: CdbErrorCode = "CDB_INVARIANT"): RawJson {
     const active = new WeakSet<object>();
 
     const fail = (path: string, reason: string): never => {
         throw new CdbError({
-            code: "CDB_INVARIANT",
+            code,
             message: `${subject} is not JSON at ${path}: ${reason}`,
             hint: "return only null, booleans, finite numbers, strings, arrays, and plain objects",
         });

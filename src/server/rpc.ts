@@ -1,7 +1,7 @@
 import type { CdbError } from "../errors.ts";
 import type { ChardbRef, ClientId, PrincipalId, RawJson, ShardId, SubId } from "../types.ts";
 import type { WireInterval } from "../wire.ts";
-import type { AuthCtx } from "./define.ts";
+import type { AuthCtx, MutationAuthority } from "./define.ts";
 import type { OrganizationAuthority, OrganizationAuthorityRequest, RouteResult } from "./do/catalog.ts";
 
 /** Structured-cloneable error envelope shared by every mutation RPC hop. */
@@ -14,7 +14,13 @@ export interface MutationRouteRequest {
 }
 
 export type MutationRouteResponse =
-    | { readonly ok: true; readonly vshard: number }
+    | {
+          readonly ok: true;
+          readonly vshard: number;
+          readonly authority: MutationAuthority | null;
+          readonly partitionKey: string | null;
+          readonly args: RawJson;
+      }
     | { readonly ok: false; readonly error: CdbErrorWire };
 
 export type MutationRouteResolver = (request: MutationRouteRequest) => MutationRouteResponse;
@@ -105,7 +111,7 @@ export interface CdbQueryRpc {
 
 /** Auth accepted by dispatch only after a verifier has established it. */
 export interface TrustedMutationAuth {
-    readonly auth: AuthCtx;
+    readonly principalId: PrincipalId;
 }
 
 export interface TrustedMutationDispatchRequest extends TrustedMutationAuth {

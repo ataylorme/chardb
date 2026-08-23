@@ -12,6 +12,7 @@ import {
 } from "../../src/server/define.ts";
 import { defineLedger } from "../../src/server/ledger.ts";
 import { readRef } from "../../src/server/refs.ts";
+import { ChardbRef } from "../../src/types.ts";
 
 describe("defineXxx — function-ref identity", () => {
     test("defineMutation attaches __chardbRef and __chardbKind", async () => {
@@ -91,6 +92,32 @@ describe("defineXxx — function-ref identity", () => {
         expect(internals.__chardbSinglePartition).toBe(true);
         expect(internals.__chardbIdempotencyTtl).toBe("24h");
         expect(internals.__chardbPartitionKey?.({ organizationId: "org-1" })).toBe("org-1");
+    });
+
+    test("organization authority is explicit mutation metadata", () => {
+        const fn = defineMutation<unknown, { organizationId: string }, null>(() => null, {
+            ref: "api/messages#post",
+            authority: "organization",
+            partitionKey: args => args.organizationId,
+        });
+        expect((fn as unknown as { __chardbAuthority?: string }).__chardbAuthority).toBe("organization");
+        expect(fn.__chardbRef).toBe(ChardbRef("api/messages#post"));
+    });
+
+    test("config mutation and query refs are stable and validated", () => {
+        const mutation = defineMutation({ ref: "api/items#create", handler: () => null });
+        const query = defineQuery({ ref: "api/items#list", handler: async () => [] });
+        expect(mutation.__chardbRef).toBe(ChardbRef("api/items#create"));
+        expect(query.__chardbRef).toBe(ChardbRef("api/items#list"));
+        expect(() => defineMutation({ ref: "missing-separator", handler: () => null })).toThrow(/containing #/);
+        expect(() => defineQuery({ ref: "", handler: async () => [] })).toThrow(/containing #/);
+        expect(() =>
+            defineMutation({
+                authority: "organization",
+                partitionKey: (_args: { organizationId: string }) => "org-1",
+                handler: () => null,
+            } as never)
+        ).toThrow(/require an explicit ref/);
     });
 
     test("explicit singlePartition: false beats the partitionKey-implied default", () => {

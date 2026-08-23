@@ -44,22 +44,19 @@ export interface QueryCtx<TDb> {
 }
 
 /**
- * Authentication context handed to every mutation / query / policy
- * callback. Chardb populates this from the inbound JWT (better-auth
- * session shape):
+ * Authentication context handed to every mutation, query, and policy
+ * callback. For organization mutations, Gateway takes only the verified JWT
+ * subject and resolves the remaining fields from Catalog membership:
  *
- *   - `userId`           ← `session.userId`
- *   - `tenantId`         ← `session.activeOrganizationId` (set by the
- *                          better-auth `organization` plugin's
- *                          `setActiveOrganization` route)
- *   - `role`             ← `member.role` for the active org; comma
+ *   - `userId`           ← signature-verified JWT subject
+ *   - `tenantId`         ← the declared mutation partition key
+ *   - `role`             ← `member.role` for that org; comma
  *                          separated for multi-role membership (matches
  *                          the better-auth convention from
  *                          `plugins/organization/permission.ts`)
  *   - `roles`            ← `role.split(",")` for convenience
- *   - `activeTeamId`     ← `session.activeTeamId` when the teams sub-
- *                          feature is enabled
- *   - `claims`           ← every remaining session field, opaque
+ *   - `authEpochs`       ← current Catalog global, tenant, and principal epochs
+ *   - `claims`           ← empty on this path; JWT tenant and role claims are ignored
  *
  * The shape mirrors better-auth's session so policies can be written
  * against the same vocabulary the rest of the app uses (no chardb-
@@ -70,6 +67,13 @@ export interface AuthCtx {
     readonly tenantId?: string | undefined;
     readonly role?: string | undefined;
     readonly roles?: readonly string[] | undefined;
+    readonly authEpochs?:
+        | {
+              readonly global: number;
+              readonly tenant: number;
+              readonly principal: number;
+          }
+        | undefined;
     readonly activeTeamId?: string | undefined;
     /** Remaining session fields the user added via better-auth's custom-session / additional-fields plugins. */
     readonly claims: { readonly [k: string]: RawJson };
@@ -81,11 +85,14 @@ export interface AuthCtx {
  * ergonomics, not a knob that weakens the per-shard op-log floor.
  */
 export type IdempotencyTtl = "24h";
+export type MutationAuthority = "organization";
 export type IdempotentMutation<F, _Ttl extends IdempotencyTtl> = F & {
     readonly __chardbIdempotencyTtl: _Ttl;
 };
 
-export interface MutationOptions<TArgs = unknown> {
+interface MutationOptionsBase<TArgs = unknown> {
+    /** Stable wire ref shared by browser and Worker builds. Must contain `#`. */
+    readonly ref?: string;
     readonly idempotencyTtl?: IdempotencyTtl;
     /** Hint to the type system + scheduler that this mutation only writes a single partition. */
     readonly singlePartition?: boolean;
@@ -100,6 +107,14 @@ export interface MutationOptions<TArgs = unknown> {
      */
     readonly partitionKey?: (args: TArgs) => string | number | bigint | undefined;
 }
+
+export type MutationOptions<TArgs = unknown> =
+    | (MutationOptionsBase<TArgs> & {
+          /** Opens dispatch only after Catalog confirms membership in the extracted organization partition. */
+          readonly authority: "organization";
+          readonly ref: string;
+      })
+    | (MutationOptionsBase<TArgs> & { readonly authority?: undefined });
 
 export type MutationFn<TDb, TArgs, TResult> = ((ctx: MutationCtx<TDb>, args: TArgs) => TResult) & {
     readonly __chardbKind: "mutation";
@@ -169,7 +184,9 @@ type PartitionKeyOf<TArgs> = {
 }[keyof TArgs] &
     string;
 
-export interface MutationConfig<TDb, TArgs extends Record<string, unknown>, TResult> {
+interface MutationConfigBase<TDb, TArgs extends Record<string, unknown>, TResult> {
+    /** Stable wire ref shared by browser and Worker builds. Must contain `#`. */
+    readonly ref?: string;
     readonly args?: StandardSchemaV1<unknown, TArgs>;
     readonly handler: (ctx: MutationCtx<TDb>, args: TArgs) => TResult;
     /**
@@ -181,6 +198,14 @@ export interface MutationConfig<TDb, TArgs extends Record<string, unknown>, TRes
     readonly idempotencyTtl?: IdempotencyTtl;
     readonly returnUserErrors?: boolean;
 }
+
+export type MutationConfig<TDb, TArgs extends Record<string, unknown>, TResult> =
+    | (MutationConfigBase<TDb, TArgs, TResult> & {
+          /** Opens dispatch only after Catalog confirms membership in the extracted organization partition. */
+          readonly authority: "organization";
+          readonly ref: string;
+      })
+    | (MutationConfigBase<TDb, TArgs, TResult> & { readonly authority?: undefined });
 
 /**
  * Mutation handler. The body runs inside the partition-owning `Cdb` shard DO,
@@ -221,6 +246,14 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
     const isConfig = typeof configOrHandler === "object";
     const handler = isConfig ? configOrHandler.handler : configOrHandler;
     const validator: StandardSchemaV1<unknown, TArgs> | undefined = isConfig ? configOrHandler.args : undefined;
+    const explicitRef = isConfig ? configOrHandler.ref : optionsArg?.ref;
+    if (explicitRef !== undefined && (explicitRef.length === 0 || !explicitRef.includes("#"))) {
+        throw new TypeError("chardb: mutation ref must be a nonempty string containing #");
+    }
+    const authority = isConfig ? configOrHandler.authority : optionsArg?.authority;
+    if (authority === "organization" && explicitRef === undefined) {
+        throw new TypeError("chardb: organization mutations require an explicit ref");
+    }
     const partitionKey = isConfig ? configOrHandler.partitionKey : optionsArg?.partitionKey;
     const partitionKeyFn: ((args: TArgs) => string | number | bigint | undefined) | undefined =
         typeof partitionKey === "string"
@@ -229,6 +262,10 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
                   return typeof v === "string" || typeof v === "number" || typeof v === "bigint" ? v : undefined;
               }
             : partitionKey;
+    const invokeValidated = (ctx: MutationCtx<TDb>, args: TArgs): TResult => {
+        const wrappedCtx = wrapCtxDb(ctx) as MutationCtx<TDb>;
+        return handler(wrappedCtx, args);
+    };
     // Chardb's pragmatic defaults for the config-object form (Phase 1 of
     // the "just makes sense" cluster):
     //   - declaring `partitionKey` implies `singlePartition: true` —
@@ -245,20 +282,22 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
     const inferredIdempotencyTtl = isConfig
         ? (configOrHandler.idempotencyTtl ?? (inferredSinglePartition ? ("24h" as const) : undefined))
         : optionsArg?.idempotencyTtl;
-    const options: MutationOptions<TArgs> | undefined = isConfig
-        ? {
-              ...(partitionKeyFn ? { partitionKey: partitionKeyFn } : {}),
-              ...(inferredSinglePartition ? { singlePartition: inferredSinglePartition } : {}),
-              ...(inferredIdempotencyTtl ? { idempotencyTtl: inferredIdempotencyTtl } : {}),
-              ...(configOrHandler.returnUserErrors !== undefined
-                  ? { returnUserErrors: configOrHandler.returnUserErrors }
-                  : {}),
-          }
-        : optionsArg;
+    const options = (
+        isConfig
+            ? {
+                  ...(partitionKeyFn ? { partitionKey: partitionKeyFn } : {}),
+                  ...(authority ? { authority } : {}),
+                  ...(inferredSinglePartition ? { singlePartition: inferredSinglePartition } : {}),
+                  ...(inferredIdempotencyTtl ? { idempotencyTtl: inferredIdempotencyTtl } : {}),
+                  ...(configOrHandler.returnUserErrors !== undefined
+                      ? { returnUserErrors: configOrHandler.returnUserErrors }
+                      : {}),
+              }
+            : optionsArg
+    ) as MutationOptions<TArgs> | undefined;
     const fn = ((ctx: MutationCtx<TDb>, args: TArgs) => {
         const validated = validator ? runValidatorSync(validator, args) : args;
-        const wrappedCtx = wrapCtxDb(ctx) as MutationCtx<TDb>;
-        return handler(wrappedCtx, validated);
+        return invokeValidated(ctx, validated);
     }) as MutationFn<TDb, TArgs, TResult>;
     // Preserve the handler's identity for `autoRef` (dev/test path before the
     // Vite plugin rewrites refs). Without this every wrapper collapses to
@@ -278,10 +317,29 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
             enumerable: false,
         });
     }
+    if (options?.authority) {
+        Object.defineProperty(fn, "__chardbAuthority", {
+            value: options.authority,
+            enumerable: false,
+        });
+    }
     if (options?.singlePartition) {
         Object.defineProperty(fn, "__chardbSinglePartition", { value: true, enumerable: false });
     }
-    return attachRef(fn, "mutation") as MutationFn<TDb, TArgs, TResult>;
+    if (explicitRef) {
+        Object.defineProperty(fn, "__chardbExplicitRef", { value: true, enumerable: false });
+    }
+    Object.defineProperty(fn, "__chardbInvokeValidated", {
+        value: invokeValidated,
+        enumerable: false,
+    });
+    if (validator) {
+        Object.defineProperty(fn, "__chardbValidateArgs", {
+            value: (args: unknown) => runValidatorSync(validator, args),
+            enumerable: false,
+        });
+    }
+    return attachRef(fn, "mutation", explicitRef) as MutationFn<TDb, TArgs, TResult>;
 }
 
 function runValidatorSync<T>(schema: StandardSchemaV1<unknown, T>, value: unknown): T {
@@ -297,6 +355,8 @@ function runValidatorSync<T>(schema: StandardSchemaV1<unknown, T>, value: unknow
  * `MutationConfig`.
  */
 export interface QueryConfig<TDb, TArgs extends Record<string, unknown>, TResult> {
+    /** Stable wire ref shared by browser and Worker builds. Must contain `#`. */
+    readonly ref?: string;
     readonly args?: StandardSchemaV1<unknown, TArgs>;
     readonly handler: (ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>;
     /**
@@ -333,6 +393,10 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
     const handler = isConfig ? configOrHandler.handler : configOrHandler;
     const validator: StandardSchemaV1<unknown, TArgs> | undefined = isConfig ? configOrHandler.args : undefined;
     const intent = isConfig ? configOrHandler.intent : undefined;
+    const explicitRef = isConfig ? configOrHandler.ref : undefined;
+    if (explicitRef !== undefined && (explicitRef.length === 0 || !explicitRef.includes("#"))) {
+        throw new TypeError("chardb: query ref must be a nonempty string containing #");
+    }
     const fn = (async (ctx: QueryCtx<TDb>, args: TArgs) => {
         const validated = validator ? await runValidator(validator, args) : args;
         const wrappedCtx = wrapCtxDb(ctx) as QueryCtx<TDb>;
@@ -340,6 +404,9 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
     }) as QueryFn<TDb, TArgs, TResult>;
     if (handler.name && handler.name !== "fn") {
         Object.defineProperty(fn, "name", { value: handler.name, configurable: true });
+    }
+    if (explicitRef) {
+        Object.defineProperty(fn, "__chardbExplicitRef", { value: true, enumerable: false });
     }
     if (intent) {
         Object.defineProperty(fn, "__chardbIntent", {
@@ -355,7 +422,7 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
             configurable: false,
         });
     }
-    return attachRef(fn, "query") as QueryFn<TDb, TArgs, TResult>;
+    return attachRef(fn, "query", explicitRef) as QueryFn<TDb, TArgs, TResult>;
 }
 
 /**

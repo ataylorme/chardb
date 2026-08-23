@@ -26,6 +26,7 @@ export {
     type IdempotentMutation,
     type InferArgs,
     type MutationConfig,
+    type MutationAuthority,
     type MutationCtx,
     type MutationFn,
     type MutationOptions,

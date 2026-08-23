@@ -37,7 +37,9 @@
 
 import { CdbError } from "../errors.ts";
 import type { Brand, ChardbRef, RawJson } from "../types.ts";
+import { rawJsonResult } from "../util/raw_json.ts";
 import type { CdbIntent } from "../wire.ts";
+import type { MutationAuthority } from "./define.ts";
 import type { ChardbFunctionKind } from "./refs.ts";
 
 interface RefMarked {
@@ -49,6 +51,9 @@ interface MutationMarked extends RefMarked {
     readonly __chardbKind: "mutation";
     readonly __chardbPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
     readonly __chardbSinglePartition?: boolean;
+    readonly __chardbAuthority?: MutationAuthority;
+    readonly __chardbInvokeValidated?: (ctx: unknown, args: RawJson) => unknown;
+    readonly __chardbValidateArgs?: (args: unknown) => RawJson;
 }
 
 interface QueryMarked extends RefMarked {
@@ -65,8 +70,11 @@ interface CronMarked extends RefMarked {
 export interface MutationDescriptor {
     readonly ref: ChardbRef;
     readonly invoke: (ctx: unknown, args: RawJson) => unknown;
+    readonly invokeValidated: (ctx: unknown, args: RawJson) => unknown;
+    readonly validateArgs?: (args: unknown) => RawJson;
     readonly extractPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
     readonly singlePartition: boolean;
+    readonly authority?: MutationAuthority;
 }
 
 export interface QueryDescriptor {
@@ -126,23 +134,44 @@ export function manifestFromExports(exports: Record<string, unknown>): ChardbMan
     const queries = new Map<ChardbRef, QueryDescriptor>();
     const crons: CronDescriptor[] = [];
     const ledgers = new Map<ChardbRef, LedgerDescriptor>();
+    const seenRefs = new Map<ChardbRef, { readonly kind: string; readonly value: unknown }>();
 
     for (const value of Object.values(exports)) {
         if (!isRefMarked(value)) continue;
         const ref = value.__chardbRef as ChardbRef;
+        const seen = seenRefs.get(ref);
+        if (seen && seen.value !== value) {
+            throw new CdbError({
+                code: "CDB_INVARIANT",
+                message: `duplicate ref across ${seen.kind} and ${value.__chardbKind}: ${ref}`,
+            });
+        }
+        if (seen) continue;
+        seenRefs.set(ref, { kind: value.__chardbKind, value });
         switch (value.__chardbKind) {
             case "mutation": {
                 const m = value as MutationMarked & ((ctx: unknown, args: RawJson) => unknown);
+                const duplicate = mutations.get(ref);
+                if (duplicate && duplicate.invoke !== m) {
+                    throw new CdbError({ code: "CDB_INVARIANT", message: `duplicate mutation ref: ${ref}` });
+                }
                 mutations.set(ref, {
                     ref,
                     invoke: m,
+                    invokeValidated: m.__chardbInvokeValidated ?? m,
+                    ...(m.__chardbValidateArgs ? { validateArgs: m.__chardbValidateArgs } : {}),
                     ...(m.__chardbPartitionKey ? { extractPartitionKey: m.__chardbPartitionKey } : {}),
                     singlePartition: m.__chardbSinglePartition === true,
+                    ...(m.__chardbAuthority ? { authority: m.__chardbAuthority } : {}),
                 });
                 break;
             }
             case "query": {
                 const query = value as QueryMarked & ((ctx: unknown, args: RawJson) => Promise<unknown>);
+                const duplicate = queries.get(ref);
+                if (duplicate && duplicate.invoke !== query) {
+                    throw new CdbError({ code: "CDB_INVARIANT", message: `duplicate query ref: ${ref}` });
+                }
                 queries.set(ref, {
                     ref,
                     invoke: query,
@@ -201,7 +230,11 @@ export async function routeQuery(
                 message: `query ${input.ref} has no server intent extractor`,
             });
         }
-        const validatedArgs = descriptor.validateArgs ? await descriptor.validateArgs(input.args) : input.args;
+        const validatedArgs = rawJsonResult(
+            descriptor.validateArgs ? await descriptor.validateArgs(input.args) : input.args,
+            "query arguments",
+            "CDB_INVALID_ARGS"
+        );
         const intent = descriptor.extractIntent(validatedArgs);
         return {
             ok: true,
@@ -229,13 +262,29 @@ export function routeMutation(
     input: { readonly ref: string; readonly args: RawJson },
     vshardOf: (parts: readonly (string | number | bigint | Uint8Array)[]) => number
 ):
-    | { readonly ok: true; readonly vshard: number }
+    | {
+          readonly ok: true;
+          readonly vshard: number;
+          readonly authority: MutationAuthority | null;
+          readonly partitionKey: string | null;
+          readonly args: RawJson;
+      }
     | { readonly ok: false; readonly error: ReturnType<CdbError["toJSON"]> } {
     try {
         const desc = resolveMutation(manifest, input.ref as ChardbRef);
-        const argsObj = (input.args ?? {}) as RawJson;
+        const argsObj = rawJsonResult(
+            desc.validateArgs ? desc.validateArgs(input.args) : input.args,
+            "mutation arguments",
+            "CDB_INVALID_ARGS"
+        );
         let key: string | number | bigint | undefined;
         if (desc.extractPartitionKey) key = desc.extractPartitionKey(argsObj);
+        if (desc.authority === "organization" && (typeof key !== "string" || key.length === 0)) {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: `organization mutation ${input.ref} requires a nonempty string partition key`,
+            });
+        }
         if (key === undefined && desc.singlePartition) {
             throw new CdbError({
                 code: "CDB_CROSS_PARTITION",
@@ -243,7 +292,13 @@ export function routeMutation(
             });
         }
         const scalar = key === undefined ? JSON.stringify(argsObj) : String(key);
-        return { ok: true, vshard: Number(vshardOf([scalar])) };
+        return {
+            ok: true,
+            vshard: Number(vshardOf([scalar])),
+            authority: desc.authority ?? null,
+            partitionKey: key === undefined ? null : String(key),
+            args: argsObj,
+        };
     } catch (err) {
         if (err instanceof CdbError) return { ok: false, error: err.toJSON() };
         const cdb = new CdbError({
