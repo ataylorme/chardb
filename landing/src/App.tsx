@@ -4,7 +4,6 @@ import { TopNav } from "./components/TopNav";
 import { Auth } from "./components/sections/Auth";
 import { Binding } from "./components/sections/Binding";
 import { Closing } from "./components/sections/Closing";
-import { Files } from "./components/sections/Files";
 import { License } from "./components/sections/License";
 import { Scale } from "./components/sections/Scale";
 import { Tenancy } from "./components/sections/Tenancy";
@@ -27,7 +26,6 @@ export function App() {
                 <Scale />
                 <Tenancy />
                 <Auth />
-                <Files />
                 <License />
                 <Closing />
             </main>

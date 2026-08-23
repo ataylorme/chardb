@@ -5,12 +5,12 @@ import { Cmt, Fn, Id, Kw, P, Str } from "../syn";
 export function Tenancy() {
     return (
         <Section id="tenancy" num="03" label="tenancy">
-            <SectionHeading>Sharded the way your app already works.</SectionHeading>
+            <SectionHeading>Put the tenant boundary in the schema.</SectionHeading>
             <SectionLead>
                 Per-tenant ACID, declared in the schema. <InlineCode>forOrg()</InlineCode>,{" "}
                 <InlineCode>forUser()</InlineCode>, and <InlineCode>globalScope()</InlineCode> from{" "}
-                <InlineCode>chardb/server</InlineCode> mark the boundary; chardb routes every query and transaction by
-                it.
+                <InlineCode>chardb/server</InlineCode> mark the intended boundary. The colocation compiler already
+                derives placement from it. Runtime enforcement is the main unfinished work.
             </SectionLead>
 
             <div className="mt-10">
@@ -34,7 +34,7 @@ export function Tenancy() {
                     <Fn>primaryKey</Fn>
                     <P>(),</P>
                     {"\n  "}
-                    <Cmt>// shard key — you already wrote it.</Cmt>
+                    <Cmt>{"// intended tenant and placement key"}</Cmt>
                     {"\n  "}
                     <Id>organizationId</Id>
                     <P>:</P> <Fn>text</Fn>

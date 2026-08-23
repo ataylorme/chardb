@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { GITHUB_URL } from "../lib/constants";
 
-const SECTIONS = ["binding", "scale", "tenancy", "auth", "files"] as const;
+const SECTIONS = ["binding", "scale", "tenancy", "auth"] as const;
 
 export function TopNav() {
     const [scrolled, setScrolled] = useState(false);
@@ -20,13 +20,13 @@ export function TopNav() {
         if (!els.length) return;
         const io = new IntersectionObserver(
             entries => {
-                entries.forEach(e => {
+                for (const e of entries) {
                     if (e.isIntersecting) setActive(e.target.id);
-                });
+                }
             },
             { rootMargin: "-40% 0px -55% 0px", threshold: 0 }
         );
-        els.forEach(el => io.observe(el));
+        for (const el of els) io.observe(el);
         return () => io.disconnect();
     }, []);
 

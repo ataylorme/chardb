@@ -8,19 +8,19 @@ export function Scale() {
                     <p className="eyebrow">
                         <span className="num">02</span> / scale
                     </p>
-                    <SectionHeading>Scale up to ~160 TB without changing a line.</SectionHeading>
+                    <SectionHeading>Separate tenant placement from physical shards.</SectionHeading>
                     <SectionLead>
-                        chardb auto-reshards as your data grows. No 10 GB cap, no manual split, no second provider for
-                        the data that actually matters.
+                        The router maps tenant keys into 16,384 logical ranges. Catalog can move a range between Durable
+                        Objects without changing application keys. Automatic production resharding is not wired yet.
                     </SectionLead>
                     <BulletList
                         items={[
                             "16,384 vshards, range-routed",
-                            "reshards online, no app pause",
-                            "one bill, not two providers",
+                            "Catalog owns the physical range map",
+                            "resharding helpers and state machines are tested in isolation",
                         ]}
                     />
-                    <PullQuote>scale isn't a migration.</PullQuote>
+                    <PullQuote>routing is implemented. automation is unfinished.</PullQuote>
                 </div>
 
                 <div className="lg:col-span-5">

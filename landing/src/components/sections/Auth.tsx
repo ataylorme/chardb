@@ -5,17 +5,17 @@ import { Cmt, Fn, Id, Kw, P, Str } from "../syn";
 export function Auth() {
     return (
         <Section id="auth" num="04" label="auth">
-            <SectionHeading>Auth and data, one schema.</SectionHeading>
+            <SectionHeading>Declare access beside the table.</SectionHeading>
             <SectionLead>
-                Auth tables live in the same schema, the same client, the same query layer. Roles, permissions, and
-                column-level access compile down with the rest of your types.
+                Better Auth tables and row and column rules compile from the same schema. The compiler exists. The read
+                and write executors still need to enforce its output.
             </SectionLead>
 
             <BulletList
                 items={[
-                    "better-auth under the hood",
-                    "roles and column masks in the schema",
-                    "one query layer, not three services",
+                    "Better Auth schema synthesis",
+                    "role and column matrices checked at startup",
+                    "default-deny runtime enforcement still in progress",
                 ]}
             />
 
@@ -171,9 +171,11 @@ export function Auth() {
                 </CodeCard>
             </div>
 
-            <p className="mt-6 text-sm text-fg-muted">row + column policies live with the column. validated at boot.</p>
+            <p className="mt-6 text-sm text-fg-muted">
+                Policy declarations compile today. Do not rely on them in production.
+            </p>
 
-            <PullQuote>users are just another table.</PullQuote>
+            <PullQuote>the declaration is real. enforcement comes next.</PullQuote>
         </Section>
     );
 }

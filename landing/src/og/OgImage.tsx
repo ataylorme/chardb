@@ -15,20 +15,20 @@ export function OgImage() {
                         className="mt-8 font-sans font-semibold tracking-tight text-fg"
                         style={{ fontSize: 70, lineHeight: 1.05, letterSpacing: "-0.02em" }}
                     >
-                        A real database in your Cloudflare Worker.
+                        Tenant-sharded SQLite experiments on Cloudflare.
                     </h1>
 
                     <p className="mt-7 text-fg-muted" style={{ fontSize: 24, lineHeight: 1.5, maxWidth: 640 }}>
-                        Unlimited SQL, per-tenant ACID, auth, files, vectors. One Drizzle schema. One Worker binding.
+                        Derive tenant placement, transactions, and access rules from a Drizzle schema. Runtime work is
+                        in progress.
                     </p>
 
-                    <div className="mt-10 inline-flex items-center gap-3 rounded-full border border-line2 bg-ink-850 px-6 py-2.5 font-mono">
-                        <span className="text-fg-dim text-[20px] select-none">$</span>
-                        <span className="text-fg text-[20px]">npm i chardb</span>
+                    <div className="mt-10 inline-flex items-center rounded-full border border-line2 bg-ink-850 px-6 py-2.5 font-mono">
+                        <span className="text-fg text-[20px]">experimental prototype</span>
                     </div>
 
                     <div className="mt-12 font-mono text-[16px] text-fg-dim lowercase flex items-center gap-3">
-                        <span>MIT</span>
+                        <span>source available</span>
                         <span className="text-fg-dim/60">·</span>
                         <span>for Cloudflare Workers</span>
                         <span className="text-fg-dim/60">·</span>

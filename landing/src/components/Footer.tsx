@@ -12,11 +12,7 @@ export function Footer() {
                     GitHub
                 </a>
                 <span aria-hidden="true">·</span>
-                <a href="#" className="hover:text-fg transition-colors">
-                    Docs
-                </a>
-                <span aria-hidden="true">·</span>
-                <span>npm i chardb</span>
+                <span>experimental prototype</span>
             </div>
         </footer>
     );

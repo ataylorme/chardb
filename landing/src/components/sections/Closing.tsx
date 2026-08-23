@@ -1,4 +1,4 @@
-import { CopyPill } from "../CopyPill";
+import { GITHUB_URL } from "../../lib/constants";
 
 export function Closing() {
     return (
@@ -13,16 +13,16 @@ export function Closing() {
                         maxWidth: "18ch",
                     }}
                 >
-                    A real database. Inside your Worker. Finally.
+                    Does tenant-as-transaction-boundary fit your app?
                 </h2>
 
                 <div className="mt-10 flex flex-col sm:flex-row items-center justify-center gap-5">
-                    <CopyPill />
                     <a
-                        href="#"
+                        href={GITHUB_URL}
+                        rel="noopener"
                         className="inline-flex items-center gap-1 text-sm text-fg-muted hover:text-fg transition-colors"
                     >
-                        Read the docs <span aria-hidden="true">→</span>
+                        Read the code and tell us where it breaks <span aria-hidden="true">→</span>
                     </a>
                 </div>
             </div>

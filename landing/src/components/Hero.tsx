@@ -1,6 +1,5 @@
 import { GITHUB_URL } from "../lib/constants";
 import { CoalShader } from "./CoalShader";
-import { CopyPill } from "./CopyPill";
 
 export function Hero() {
     return (
@@ -11,29 +10,28 @@ export function Hero() {
                         className="font-sans font-semibold tracking-tight text-fg"
                         style={{ fontSize: "clamp(40px, 6vw, 72px)", lineHeight: 1.05, letterSpacing: "-0.02em" }}
                     >
-                        Finally, a real database in your Cloudflare Worker.
+                        A database experiment for tenant-shaped apps.
                     </h1>
                     <p
                         className="mt-6 text-fg-muted max-w-2xl"
                         style={{ fontSize: "clamp(16px, 1.4vw, 18px)", lineHeight: 1.6 }}
                     >
-                        Unlimited SQL that lives inside your Worker. Auth, files, vectors, and live queries in one
-                        schema. Open source.
+                        Declare an organization boundary in Drizzle, then derive placement, transactions, policy, and
+                        live-query routing on Cloudflare Durable Objects. The runtime is still under construction.
                     </p>
 
                     <div className="mt-8 flex flex-col sm:flex-row sm:items-center gap-4">
-                        <CopyPill />
                         <a
                             href={GITHUB_URL}
                             rel="noopener"
                             className="inline-flex items-center gap-1 text-sm text-fg-muted hover:text-fg transition-colors"
                         >
-                            GitHub <span aria-hidden="true">→</span>
+                            Read the code and current plan <span aria-hidden="true">→</span>
                         </a>
                     </div>
 
                     <p className="mt-8 text-xs text-fg-dim font-mono lowercase">
-                        <span>MIT</span>
+                        <span>experimental</span>
                         <span className="px-2 text-fg-dim/70" aria-hidden="true">
                             ·
                         </span>

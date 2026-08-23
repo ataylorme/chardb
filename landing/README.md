@@ -1,6 +1,6 @@
 # chardb landing
 
-Marketing site for [chardb.dev](https://chardb.dev). Vite + React + TypeScript + Tailwind, deployed to Cloudflare Pages.
+Project site for [chardb.dev](https://chardb.dev). Vite + React + TypeScript + Tailwind, deployed to Cloudflare Pages.
 
 This package is a Bun workspace member of the repo root, so install from the repo root:
 
@@ -55,7 +55,7 @@ Requires Google Chrome installed at `/Applications/Google Chrome.app` (the scrip
 ## Structure
 
 - `src/components/` — UI components
-- `src/components/sections/` — landing sections (Binding, Scale, Tenancy, Auth, Files, License, Closing)
+- `src/components/sections/` — site sections (Binding, Scale, Tenancy, Auth, License, Closing)
 - `src/components/CoalShader.tsx` — WebGL coal/ember shader for the hero
-- `src/lib/constants.ts` — site URL, GitHub URL, install command
+- `src/lib/constants.ts` — site URL, GitHub URL, repository setup command
 - `tailwind.config.ts` — design tokens (ink, accent, syntax colors, fonts)
