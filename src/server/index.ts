@@ -72,15 +72,15 @@ export {
 } from "./policy.ts";
 export { forOrg, forUser, globalScope } from "./cdb-tenant.ts";
 export type { BoundCdbTable } from "./cdb-tenant.ts";
-export {
-    type CdbTableConfig,
-    type CdbTableMeta,
-    type ColumnSpec,
-    type RoleName,
-    type RoleValue,
-    type TenantKind,
-    type Verb,
-    type VerbValue,
+export type {
+    CdbTableConfig,
+    CdbTableMeta,
+    ColumnSpec,
+    RoleName,
+    RoleValue,
+    TenantKind,
+    Verb,
+    VerbValue,
 } from "./cdb-table-types.ts";
 export { getCdbMeta, isCdbTable, collectCdbTables, CDB_TABLE_SYMBOL } from "./cdb-table-registry.ts";
 export { resolveCdbMeta } from "./cdb-table.ts";
@@ -106,6 +106,13 @@ export {
     type MountChardbOptions,
 } from "./entrypoint.ts";
 export { chardb, type ChardbApp, type ChardbFactoryInput } from "./chardb.ts";
+export {
+    Cdb,
+    type CdbMutationFailure,
+    type CdbMutationRequest,
+    type CdbMutationResponse,
+    type CdbMutationSuccess,
+} from "./do/cdb.ts";
 export {
     defineAuth,
     synthesizeAuthSchema,
@@ -137,7 +144,6 @@ export {
     type VectorColumnHandle,
     type VectorConfig,
 } from "../vector.ts";
-export { Cdb } from "./do/cdb.ts";
 export { Catalog } from "./do/catalog.ts";
 export { Gateway } from "./do/gateway.ts";
 export { BlobMeta } from "./do/blobmeta.ts";

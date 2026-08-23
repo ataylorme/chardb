@@ -7,4 +7,5 @@ bun.lockb
 test/workerd/.test-worker.bundle.mjs
 test/workerd/.test-catalog.bundle.mjs
 test/workerd/.test-atomic-mutation.bundle.mjs
+test/workerd/.test-registry-mutation.bundle.mjs
 landing/.tsbuild/

@@ -12,12 +12,12 @@
 
 import type { StandardSchemaV1 } from "@standard-schema/spec";
 import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
-import type { CdbErrorCode } from "../errors.ts";
+import { CdbError, type CdbErrorCode } from "../errors.ts";
 import type { Brand, RawJson } from "../types.ts";
 import type { CdbIntent } from "../wire.ts";
+import { wrapDb } from "./cdb-db-proxy.ts";
 import { type PolicyDefinition, chardbPolicy } from "./policy.ts";
 import { attachRef } from "./refs.ts";
-import { wrapDb } from "./cdb-db-proxy.ts";
 
 /**
  * Type-level inference helper. `InferArgs<S>` resolves to the output
@@ -368,10 +368,9 @@ function wrapCtxDb<TCtx extends { readonly db: unknown; readonly auth?: AuthCtx 
 }
 
 /**
- * Run a `StandardSchemaV1` validator over an unknown payload. Throws
- * `TypeError` with the first issue's path + message on failure, so the
- * Gateway sees a 4xx-flavoured boundary error rather than a panic deep
- * inside the user's mutation closure.
+ * Run a `StandardSchemaV1` validator over an unknown payload. Invalid caller
+ * input is a typed, non-retryable boundary error rather than a server
+ * invariant failure deep inside the user's handler.
  */
 async function runValidator<T>(schema: StandardSchemaV1<unknown, T>, value: unknown): Promise<T> {
     const result = await schema["~standard"].validate(value);
@@ -386,7 +385,10 @@ function valueFromValidationResult<T>(result: StandardSchemaV1.Result<T>): T {
                   .map(p => (typeof p === "object" && "key" in p ? String(p.key) : String(p)))
                   .join(".")
             : "(root)";
-        throw new TypeError(`chardb: args validation failed at ${path}: ${first?.message ?? "invalid"}`);
+        throw new CdbError({
+            code: "CDB_INVALID_ARGS",
+            message: `chardb: args validation failed at ${path}: ${first?.message ?? "invalid"}`,
+        });
     }
     return result.value;
 }

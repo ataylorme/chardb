@@ -14,21 +14,19 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { getTableConfig } from "drizzle-orm/sqlite-core";
-import { authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
 import { getAuthRuntime, tableFor } from "../../auth/runtime.ts";
+import { authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
+import { CdbError, isCdbError, isCdbErrorCode } from "../../errors.ts";
 import { type IntervalKey, IntervalMap, type IntervalSet } from "../../intervals.ts";
 import { intervalSetFromWire } from "../../intervals_wire.ts";
 import { SHARD_BOOTSTRAP_DDL } from "../../oplog/schema.ts";
-import {
-    type JsonText,
-    type MutationOutcome,
-    canonicalRequest,
-    parseJsonColumn,
-    runWrappedMutation,
-} from "../../oplog/wrapper.ts";
+import { type JsonText, parseJsonColumn } from "../../oplog/wrapper.ts";
 import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/range.ts";
 import { type TableSpec, renderRowApply, renderTableTriggers } from "../../reshard/triggers.ts";
-import { Cookie, MutId, type PrincipalId, type RawJson, SubId } from "../../types.ts";
+import { type ChardbRef, type PrincipalId, type RawJson, SubId } from "../../types.ts";
+import { executeAtomicMutation } from "../atomic-mutation.ts";
+import type { AuthCtx } from "../define.ts";
+import { type ChardbManifest, emptyManifest, resolveMutation } from "../manifest.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
 export interface CdbEnv {
@@ -47,12 +45,33 @@ export interface SubscribeArgs {
     }[];
 }
 
-export interface MutateArgs {
-    readonly principalId: PrincipalId;
+export interface CdbMutationRequest {
+    readonly principalId: string;
     readonly mutId: string;
     readonly ref: string;
     readonly args: RawJson;
+    readonly auth: AuthCtx;
     readonly schemaEpoch: number;
+}
+
+export interface CdbMutationSuccess {
+    readonly ok: true;
+    readonly cookie: string;
+    readonly ran: boolean;
+    readonly result: RawJson;
+    readonly rowsAffected: number;
+}
+
+export interface CdbMutationFailure {
+    readonly ok: false;
+    readonly error: ReturnType<CdbError["toJSON"]>;
+}
+
+export type CdbMutationResponse = CdbMutationSuccess | CdbMutationFailure;
+
+export interface CdbRuntimeConfig<TSchema extends Record<string, unknown>> {
+    readonly schema: () => TSchema;
+    readonly manifest: () => ChardbManifest;
 }
 
 /**
@@ -65,6 +84,14 @@ export class Cdb extends DurableObject<CdbEnv> {
     constructor(state: DurableObjectState, env: CdbEnv) {
         super(state, env);
         state.blockConcurrencyWhile(async () => this.bootstrap());
+    }
+
+    protected mutationSchema(): Record<string, unknown> {
+        return {};
+    }
+
+    protected mutationManifest(): ChardbManifest {
+        return emptyManifest();
     }
 
     private async bootstrap(): Promise<void> {
@@ -88,7 +115,7 @@ export class Cdb extends DurableObject<CdbEnv> {
      * models are skipped here — they live on the Catalog DO.
      */
     private ensureAuthTables(): void {
-        let runtime;
+        let runtime: ReturnType<typeof getAuthRuntime>;
         try {
             runtime = getAuthRuntime();
         } catch {
@@ -127,52 +154,21 @@ export class Cdb extends DurableObject<CdbEnv> {
         this.intervalMap.unregister(subId);
     }
 
-    /**
-     * Run a mutation under the op-log wrapper inside `transactionSync`.
-     * `runner` is the user closure; chardb passes the partition-pinned db handle.
-     */
-    async mutate<R>(
-        args: MutateArgs,
-        runner: () => MutationOutcome<R>
-    ): Promise<{
-        cookie: Cookie;
-        ran: boolean;
-        result: MutationOutcome<R>;
-    }> {
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        const cookie = Cookie(`${this.ctx.id.toString()}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`);
-        let outcome!: MutationOutcome<R>;
-        this.ctx.storage.transactionSync(() => {
-            const r = runWrappedMutation({
-                sql,
-                principalId: args.principalId,
-                mutId: MutId(args.mutId),
-                canonicalRequest: canonicalRequest(args.ref, args.args),
-                schemaEpoch: args.schemaEpoch,
-                nowMs: Date.now(),
-                cookie,
-                run: () => runner(),
+    /** Resolve and run a registered mutation entirely inside this shard isolate. */
+    mutate(request: CdbMutationRequest): CdbMutationResponse {
+        try {
+            const descriptor = resolveMutation(this.mutationManifest(), request.ref as ChardbRef);
+            const result = executeAtomicMutation({
+                storage: this.ctx.storage,
+                schema: this.mutationSchema(),
+                request,
+                handler: (ctx, args) => descriptor.invoke(ctx, args),
+                cookie: `${this.ctx.id.toString()}:${Date.now()}:${crypto.randomUUID()}`,
             });
-            outcome =
-                r.envelope.status === "ok"
-                    ? ({
-                          status: "ok",
-                          result: (r.envelope.result ?? null) as R,
-                          rowsAffected: r.envelope.rowsAffected,
-                          ...(r.envelope.lastInsertRowid !== undefined
-                              ? { lastInsertRowid: r.envelope.lastInsertRowid }
-                              : {}),
-                          ...(r.envelope.returning ? { returning: r.envelope.returning } : {}),
-                      } as MutationOutcome<R>)
-                    : ({
-                          status: "user_error",
-                          errorCode: r.envelope.errorCode ?? "CDB_FORBIDDEN",
-                          errorMessage: r.envelope.errorMessage ?? "user_error",
-                      } as MutationOutcome<R>);
-            // The result of `r.ran` flows back via outer closure variable.
-            (outcome as { ran?: boolean }).ran = r.ran;
-        });
-        return { cookie, ran: (outcome as { ran?: boolean }).ran ?? false, result: outcome };
+            return { ok: true, ...result };
+        } catch (error) {
+            return { ok: false, error: mutationError(error).toJSON() };
+        }
     }
 
     /**
@@ -279,7 +275,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             args.limit
         );
         const rows = filterRowsInRange(raw, args.table.partitionColumn, args.range);
-        const lastRowid = raw.length > 0 ? raw[raw.length - 1]!.rowid : args.afterRowid;
+        const lastRowid = raw.at(-1)?.rowid ?? args.afterRowid;
         const done = raw.length < args.limit;
         return { rows, lastRowid, done };
     }
@@ -333,7 +329,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             args.afterLsn,
             args.limit
         );
-        const lastLsn = entries.length > 0 ? entries[entries.length - 1]!.lsn : args.afterLsn;
+        const lastLsn = entries.at(-1)?.lsn ?? args.afterLsn;
         const done = entries.length < args.limit;
         return { entries, lastLsn, done };
     }
@@ -512,6 +508,33 @@ export class Cdb extends DurableObject<CdbEnv> {
         }
         return authFindMany(sql, table, args.where, args.limit);
     }
+}
+
+/** Bind one application schema and handler manifest into a shard-local DO class. */
+export function configureCdbRuntime<TSchema extends Record<string, unknown>>(
+    config: CdbRuntimeConfig<TSchema>
+): typeof Cdb {
+    return class ConfiguredCdb extends Cdb {
+        protected override mutationSchema(): TSchema {
+            return config.schema();
+        }
+
+        protected override mutationManifest(): ChardbManifest {
+            return config.manifest();
+        }
+    };
+}
+
+function mutationError(error: unknown): CdbError {
+    if (isCdbError(error)) return error;
+    if (error instanceof Error) {
+        const match = /^(CDB_[A-Z_]+)(?::\s*)?/.exec(error.message);
+        if (match?.[1] && isCdbErrorCode(match[1])) {
+            return new CdbError({ code: match[1], message: error.message });
+        }
+        return new CdbError({ code: "CDB_INVARIANT", message: error.message });
+    }
+    return new CdbError({ code: "CDB_INVARIANT", message: "mutation failed with a non-Error value" });
 }
 
 export type { IntervalSet, IntervalKey };

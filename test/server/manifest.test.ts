@@ -23,6 +23,9 @@ describe("manifestFromExports", () => {
         const desc = resolveMutation(m, ref);
         expect(desc.singlePartition).toBe(true);
         expect(desc.extractPartitionKey?.({ authorId: "u1", body: "hi" })).toBe("u1");
+        expect(desc.invoke({ db: {}, auth: { userId: "u1", claims: {} } }, { authorId: "u1", body: "hi" })).toEqual({
+            id: "post-u1",
+        });
         expect(m.crons[0]?.cronExpr).toBe("0 0 * * *");
     });
 

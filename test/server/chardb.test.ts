@@ -20,6 +20,7 @@ import { organization } from "better-auth/plugins/organization";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { defineAuth } from "../../src/auth/synthesize.ts";
 import { chardb } from "../../src/server/chardb.ts";
+import { Cdb } from "../../src/server/do/cdb.ts";
 
 const items = sqliteTable("items", {
     id: text("id").primaryKey(),
@@ -48,6 +49,7 @@ describe("chardb({…})", () => {
         const app = chardb({ auth, schema: { items } });
         // Existence + identity — these are the named exports wrangler binds.
         expect(typeof app.Cdb).toBe("function");
+        expect(app.Cdb).not.toBe(Cdb);
         expect(typeof app.Catalog).toBe("function");
         expect(typeof app.Gateway).toBe("function");
         expect(typeof app.BlobMeta).toBe("function");

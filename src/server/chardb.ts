@@ -48,7 +48,7 @@ import {
 import { buildAccessControl } from "./cdb-access.ts";
 import { BlobMeta } from "./do/blobmeta.ts";
 import { Catalog } from "./do/catalog.ts";
-import { Cdb } from "./do/cdb.ts";
+import { type Cdb, configureCdbRuntime } from "./do/cdb.ts";
 import { Gateway } from "./do/gateway.ts";
 import { GsiShard } from "./do/gsishard.ts";
 import { Resharder } from "./do/resharder.ts";
@@ -175,6 +175,14 @@ export function chardb<
         ...(input.policy ? { policy: input.policy } : {}),
         ...(input.manifest ? { manifest: input.manifest } : {}),
     });
+    const runtimeEntrypoint = Chardb as typeof Chardb & {
+        readonly schema: Record<string, unknown>;
+        readonly chardbManifest: import("./manifest.ts").ChardbManifest;
+    };
+    const ConfiguredCdb = configureCdbRuntime({
+        schema: () => runtimeEntrypoint.schema,
+        manifest: () => runtimeEntrypoint.chardbManifest,
+    });
 
     const hono = new Hono<{ Bindings: ChardbEnv }>();
     if (input.routes) input.routes(hono);
@@ -231,7 +239,7 @@ export function chardb<
     const merged = Object.assign(hono, {
         fetch: mounted.fetch,
         auth,
-        Cdb,
+        Cdb: ConfiguredCdb,
         Catalog,
         Gateway,
         BlobMeta,

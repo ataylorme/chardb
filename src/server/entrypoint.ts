@@ -30,11 +30,11 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { BetterAuthOptions } from "better-auth";
 import { bindAuthRuntime } from "../auth/runtime.ts";
-import { assertNoReservedTableShadow, type SynthesizedAuthSchema, synthesizeAuthSchema } from "../auth/synthesize.ts";
-import { buildColocationOverrides } from "./cdb-colocation.ts";
+import { type SynthesizedAuthSchema, assertNoReservedTableShadow, synthesizeAuthSchema } from "../auth/synthesize.ts";
 import type { CdbError } from "../errors.ts";
 import type { RawJson } from "../types.ts";
 import { vshardOf } from "../vshard.ts";
+import { buildColocationOverrides } from "./cdb-colocation.ts";
 import { type ChardbManifest, emptyManifest, manifestFromExports, routeMutation } from "./manifest.ts";
 import { decorateResponse, extractCorrelationId, selectMatchingCrons } from "./observability_helpers.ts";
 
@@ -116,11 +116,11 @@ class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
     /**
      * Resolve a mutation by ref, derive its partition vshard from `args` (if the
      * mutation declared `partitionKey`), and dispatch to the owning shard. The
-     * Gateway DO calls into this RPC for `Up.mut` messages so the user's
-     * mutation closure stays in the Worker isolate while the Gateway handles
-     * fan-in/fan-out. Cross-binding contract: only structured-cloneable args
-     * cross the boundary; the partition extractor is invoked here, not in the
-     * Gateway.
+     * Gateway DO calls into this RPC for `Up.mut` messages. This method only
+     * makes the routing decision; the configured Cdb class resolves and runs
+     * the mutation locally. Cross-binding contract: only structured-cloneable
+     * args cross this boundary; the partition extractor is invoked here, not
+     * in the Gateway.
      */
     async runMutation(input: {
         readonly ref: string;

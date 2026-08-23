@@ -8,7 +8,7 @@ import { adaptSqlStorage } from "./do/sql_adapter.ts";
 
 export type AtomicMutationDb<TSchema extends Record<string, unknown>> = DrizzleSqliteDODatabase<TSchema>;
 
-export interface AtomicMutationRequest<TArgs> {
+export interface AtomicMutationRequest<TArgs extends RawJson> {
     readonly principalId: string;
     readonly mutId: string;
     readonly ref: string;
@@ -27,7 +27,7 @@ export type AtomicMutationHandler<TSchema extends Record<string, unknown>, TArgs
     args: TArgs
 ) => TResult;
 
-export interface ExecuteAtomicMutationInput<TSchema extends Record<string, unknown>, TArgs, TResult> {
+export interface ExecuteAtomicMutationInput<TSchema extends Record<string, unknown>, TArgs extends RawJson, TResult> {
     readonly storage: DurableObjectStorage;
     readonly schema: TSchema;
     readonly request: AtomicMutationRequest<TArgs>;
@@ -36,10 +36,10 @@ export interface ExecuteAtomicMutationInput<TSchema extends Record<string, unkno
     readonly nowMs?: number;
 }
 
-export interface AtomicMutationResult<TResult> {
+export interface AtomicMutationResult {
     readonly cookie: Cookie;
     readonly ran: boolean;
-    readonly result: TResult;
+    readonly result: RawJson;
     /** SQLite `changes()` for the handler's final data-modifying statement. */
     readonly rowsAffected: number;
 }
@@ -48,14 +48,14 @@ export interface AtomicMutationResult<TResult> {
  * Execute a locally registered mutation handler with the Durable Object SQL
  * database and op-log entry in the same `transactionSync` boundary.
  *
- * RPC callers must never supply `handler`; a later runtime-registration step
- * resolves it inside the Cdb isolate. Keeping the handler parameter here makes
- * the atomic boundary independently testable without pretending a function
- * can cross a service-binding RPC.
+ * RPC callers never supply `handler`; the configured Cdb resolves it from its
+ * isolate-local manifest and passes it into this boundary. Keeping the handler
+ * parameter here also makes the atomic contract independently testable without
+ * pretending a function can cross service-binding RPC.
  */
-export function executeAtomicMutation<TSchema extends Record<string, unknown>, TArgs, TResult extends RawJson>(
+export function executeAtomicMutation<TSchema extends Record<string, unknown>, TArgs extends RawJson, TResult>(
     input: ExecuteAtomicMutationInput<TSchema, TArgs, TResult>
-): AtomicMutationResult<TResult> {
+): AtomicMutationResult {
     assertSynchronousHandler(input.handler);
 
     const cookie = Cookie(input.cookie);
@@ -99,7 +99,7 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
     return {
         cookie: wrappedResult.envelope.cookie,
         ran: wrappedResult.ran,
-        result: wrappedResult.envelope.result as TResult,
+        result: wrappedResult.envelope.result ?? null,
         rowsAffected: wrappedResult.envelope.rowsAffected,
     };
 }

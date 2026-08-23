@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { z } from "zod";
+import { isCdbError } from "../../src/errors.ts";
 import {
     type MutationCtx,
     defineCron,
@@ -98,5 +100,28 @@ describe("defineXxx — function-ref identity", () => {
             singlePartition: false,
         });
         expect((fn as unknown as { __chardbSinglePartition?: boolean }).__chardbSinglePartition).toBeUndefined();
+    });
+
+    test("synchronous mutation validation rejects caller input with CDB_INVALID_ARGS before the handler", () => {
+        let invoked = false;
+        const fn = defineMutation({
+            args: z.object({ id: z.string() }),
+            handler: () => {
+                invoked = true;
+                return null;
+            },
+        });
+
+        try {
+            fn({ db: null, auth: { userId: "u", claims: {} } }, { id: 7 } as never);
+            throw new Error("expected validation failure");
+        } catch (error) {
+            expect(isCdbError(error)).toBe(true);
+            if (isCdbError(error)) {
+                expect(error.code).toBe("CDB_INVALID_ARGS");
+                expect(error.retryable).toBe(false);
+            }
+        }
+        expect(invoked).toBe(false);
     });
 });

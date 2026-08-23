@@ -4,14 +4,13 @@
  * Every helper attaches `__chardbRef` and `__chardbKind` markers (see
  * `src/server/refs.ts`). The Vite plugin walks the user's worker entry, pulls
  * each named export through `manifestFromExports`, and the result is supplied
- * to `defineChardb({ manifest })`. At runtime the entrypoint dispatches by ref
- * without re-evaluating the user's closures: the Gateway's `onMut` extracts a
- * partition key from `args` (via `MutationOptions.partitionKey`) without
- * needing to load the mutation body, and `scheduled()` invokes user
- * `defineCron` callbacks on the matching cron expression.
+ * to `defineChardb({ manifest })`. The configured Cdb class retains this
+ * registry in its own isolate and resolves mutation refs locally. The Worker
+ * entrypoint uses the same manifest for partition extraction, while
+ * `scheduled()` invokes user `defineCron` callbacks.
  *
- * The manifest is intentionally an inert plain object so it can travel cleanly
- * over service-binding RPC and across module boundaries.
+ * The manifest contains functions and Maps and must never cross RPC. Only the
+ * serializable mutation request crosses into Cdb.
  *
  * ### Wire boundary: TArgs is `RawJson`
  *
@@ -21,8 +20,8 @@
  * `RawJson`. This is the wire contract: an `Up.mut` envelope carries
  * `args: RawJson` after `decodeWire`, the worker's `runMutation` RPC accepts
  * `RawJson`, and the Gateway sends `RawJson` over the service binding. The
- * manifest sits at exactly that boundary, so widening to `RawJson` here is
- * not a type-safety hole — it's the type we already have at this point.
+ * manifest descriptor accepts that erased argument shape. Mutation results
+ * remain `unknown` until the op-log wrapper verifies they are JSON.
  *
  * A phantom-map alternative (parallel `WeakMap<ChardbRef, TArgs>`) was
  * rejected because TypeScript lacks generic existentials: the map's value
@@ -58,7 +57,7 @@ interface CronMarked extends RefMarked {
 
 export interface MutationDescriptor {
     readonly ref: ChardbRef;
-    readonly invoke: (ctx: unknown, args: RawJson) => Promise<unknown>;
+    readonly invoke: (ctx: unknown, args: RawJson) => unknown;
     readonly extractPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
     readonly singlePartition: boolean;
 }
@@ -120,7 +119,7 @@ export function manifestFromExports(exports: Record<string, unknown>): ChardbMan
         const ref = value.__chardbRef as ChardbRef;
         switch (value.__chardbKind) {
             case "mutation": {
-                const m = value as MutationMarked & ((ctx: unknown, args: RawJson) => Promise<unknown>);
+                const m = value as MutationMarked & ((ctx: unknown, args: RawJson) => unknown);
                 mutations.set(ref, {
                     ref,
                     invoke: m,
@@ -155,8 +154,7 @@ export function manifestFromExports(exports: Record<string, unknown>): ChardbMan
 
 /**
  * Resolve a mutation by ref, raising `CDB_REF_NOT_FOUND` if the manifest
- * doesn't know about it. Used by the Gateway and by the `runMutation` RPC on
- * the entrypoint.
+ * doesn't know about it. Used for entrypoint routing and shard-local execution.
  */
 export function resolveMutation(manifest: ChardbManifest, ref: ChardbRef): MutationDescriptor {
     const desc = manifest.mutations.get(ref);

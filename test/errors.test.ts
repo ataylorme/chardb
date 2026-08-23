@@ -9,6 +9,7 @@ describe("CdbError", () => {
         expect(isRetryable("CDB_CROSS_PARTITION")).toBe(false);
         expect(isRetryable("CDB_FORBIDDEN")).toBe(false);
         expect(isRetryable("CDB_MUT_ID_COLLISION")).toBe(false);
+        expect(isRetryable("CDB_INVALID_ARGS")).toBe(false);
     });
 
     test("docs url format is stable", () => {
