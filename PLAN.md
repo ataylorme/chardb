@@ -42,20 +42,17 @@ Do this work before touching the higher-level features:
 
 ## 2. Make runtime registration and routing coherent
 
-The package currently has three incompatible ideas about how requests reach user code. The Worker entrypoint owns the manifest, the Gateway needs a worker service binding, and the Cdb needs to execute the handler locally.
+The configured Gateway now owns partition extraction and manifest lookup. It routes through Catalog, then sends a serializable request to the configured Cdb. The remaining routing problem is trust. The partition key must come from verified tenant state rather than caller-controlled arguments.
 
-- [ ] Choose one owner for partition extraction and manifest lookup.
-- [ ] Give the Gateway a typed RPC interface instead of local `as unknown as` method shapes.
-- [ ] Rename the generated service binding to the name the Gateway actually reads, or change the Gateway to read the generated name.
-- [ ] Point that binding at the application Worker entrypoint, not the `Cdb` class.
-- [ ] Add the same binding to the chat Wrangler configuration.
-- [ ] Make `chardb doctor` verify the real binding name and entrypoint.
-- [ ] Remove the current `runMutation` response that only returns a vshard while dropping `mutId` and auth.
+- [x] Make the configured Gateway own partition extraction and manifest lookup.
+- [x] Define typed routing, Catalog, and Cdb mutation interfaces in one shared module.
+- [x] Remove the invalid Worker service self-binding from generated and example Wrangler configuration.
+- [x] Make `chardb doctor` validate the Durable Object bindings without requiring a service self-binding.
+- [x] Remove the Worker `runMutation` RPC that returned only a vshard while dropping `mutId` and auth.
 - [ ] Pass the verified tenant-derived partition key through routing.
-- [ ] Read the current routing table and schema epoch from Catalog before invoking Cdb.
-- [ ] Define typed request and response interfaces once and share them across Gateway, entrypoint, Catalog, and Cdb.
-- [ ] Catch Worker, Catalog, and Cdb RPC failures in `Gateway.routeMut` and translate them to the existing typed error set.
-- [ ] Use `isRetryable` when building wire errors instead of marking every error non-retryable.
+- [x] Read the current routing table and schema epoch from Catalog before invoking Cdb.
+- [x] Catch local routing, Catalog, and Cdb failures and translate them to typed mutation responses.
+- [x] Preserve each error code's retryable flag and documentation URL in mutation wire responses.
 
 Stable references also need repair:
 

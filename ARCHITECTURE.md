@@ -58,7 +58,7 @@ tenant key -> canonical encoding -> xxHash64 -> vshard 0..16383
 
 API helpers attach a stable `__chardbRef` and a kind marker to mutations, queries, crons, presence keys, and ledgers. The Vite plugin can stamp refs during a build. [`manifestFromExports`](src/server/manifest.ts) walks the marked exports and builds maps for mutations, queries, crons, and ledgers.
 
-Mutation descriptors retain the local handler and an optional partition-key extractor. At the current Worker RPC boundary, [`runMutation`](src/server/entrypoint.ts) uses the manifest only to resolve a ref and compute its target virtual shard. The handler is not transferred through RPC. Query descriptors are collected but the Gateway does not dispatch them yet.
+Mutation descriptors retain the local handler and an optional partition-key extractor. `chardb()` closes over the same lazily built manifest in configured Gateway and Cdb classes. The Gateway resolves the ref and partition key locally. Cdb resolves the same ref to the handler inside the shard isolate. The manifest and its functions never cross RPC. Query descriptors are collected but the Gateway does not dispatch them yet.
 
 ## Mutation and transaction design
 
@@ -66,8 +66,7 @@ The intended single-partition write path is:
 
 ```text
 Up.mut
-  -> Gateway resolves ref through the Worker
-  -> Worker extracts the partition key
+  -> Gateway verifies auth, then resolves the ref and partition key locally
   -> Catalog resolves vshard to Cdb shard
   -> Cdb resolves the handler locally
   -> one transactionSync commits user SQL and the op-log result
@@ -80,7 +79,7 @@ The op-log key is the principal and mutation id. A retry with the same canonical
 
 Durable Object SQLite transactions cannot span `await`. The atomic executor rejects native async handlers and thenables. Input validation and any external I/O must finish before entering the transaction.
 
-The public Gateway-to-Cdb mutation path does not yet call this executor. The current RPC still attempts to call `Cdb.mutate` without the required local runner. See [STATUS.md](STATUS.md).
+The typed Gateway dispatcher now performs local routing, reads the shard and schema epoch from Catalog, and calls the configured Cdb with one serializable request. Cdb runs the atomic executor. The public WebSocket path still stops before dispatch because Gateway has no production JWT verifier bound to it. Decode-only claims never become mutation authority. See [STATUS.md](STATUS.md).
 
 ## Auth and policy design
 

@@ -21,8 +21,8 @@ Implemented and tested in isolation:
 
 Still missing from the application path:
 
-- Executing a user mutation inside the owning Durable Object transaction
-- Constructing the handler's Drizzle database and verified auth context
+- Verifying WebSocket auth so public mutations can reach the owning Durable Object
+- Constructing the handler's auth context from verified identity and membership
 - Applying row and column policies during real reads and writes
 - Executing an initial query for a subscription
 - Sending live results after a committed mutation

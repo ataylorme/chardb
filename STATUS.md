@@ -20,12 +20,12 @@ This status reflects the code in the repository, not the broader product describ
 | Virtual-shard hashing and range routing | Implemented | Deterministic key encoding, 16,384 virtual shards, range splits, and routing tests live in [`src/vshard.ts`](src/vshard.ts) and [`test/vshard.test.ts`](test/vshard.test.ts). |
 | Foreign-key colocation derivation | Implemented | The graph derivation and determinism properties are tested in [`test/colocation/derive.test.ts`](test/colocation/derive.test.ts). |
 | Schema-bound tenancy metadata | Implemented | `forOrg`, `forUser`, `globalScope`, role matrices, and column rules have construction and compiler tests. Runtime enforcement is separate and remains partial. |
-| Manifest construction and mutation routing decision | Implemented | Ref discovery, descriptor construction, ref lookup, and virtual-shard selection have unit tests. The manifest does not complete handler dispatch. |
+| Manifest construction and mutation routing decision | Implemented | Ref discovery, stable refs, configured Gateway lookup, virtual-shard selection, Catalog routing, and typed Cdb dispatch have focused tests. |
 | Op-log idempotency | Implemented | Replay, request collision, error envelopes, and rollback behavior are tested against the synchronous SQL abstraction. |
-| Atomic domain transaction core | Isolated | A focused workerd test runs two Drizzle writes and the op-log in one Durable Object SQLite transaction and tests rollback and replay. The Gateway does not call this path. |
+| Atomic domain transaction core | Isolated | A focused workerd test runs two Drizzle writes and the op-log in one Durable Object SQLite transaction and tests rollback and replay. The trusted Gateway dispatcher calls this path, but the public WebSocket path has no verified auth source yet. |
 | Catalog routing and snapshot barrier storage | Isolated | Focused workerd tests use real Durable Object SQL storage. Full scheduled backup and restore do not exist. |
 | Cdb reshard copy and tail RPCs | Isolated | Focused workerd tests cover bulk copy, trigger capture, tail replay, and range filtering. They do not drive the complete Resharder object through a deployed application. |
-| End-to-end domain mutation | Missing | Gateway resolves a shard, then calls `Cdb.mutate` without the required handler runner. `runMutation` returns only a virtual shard. No user handler executes through the public path. |
+| End-to-end domain mutation | Missing | Gateway, Catalog, and Cdb now share a serializable request and response contract, and Cdb resolves the handler locally. Public WebSocket mutations fail closed with `CDB_AUTH_NOT_BOUND` until Gateway verifies JWTs and membership. |
 | Initial query | Missing | A subscription registers intervals but never invokes its query descriptor or returns the initial row set. |
 | Live query update | Missing | Interval matching and patch batching exist, but committed writes do not produce row patches through the public runtime. |
 | WebSocket reconnect and cookies | Isolated | The client state machine is tested with a fake WebSocket. The full Worker, Gateway, and Cdb resume path is not tested together. |
@@ -58,8 +58,8 @@ Until that test passes, passing helper tests do not establish that Chardb works 
 
 ## Verification state
 
-The strict TypeScript check and package build pass. The package dry-run includes the MIT license.
+The strict TypeScript check, repository-wide Biome check, package build, landing build, and packed chat typecheck and build pass. The package dry-run includes the MIT license.
 
-Repository-wide lint is not clean. The full test command also needs a reliable strategy for running multiple Miniflare workerd harnesses without port-startup conflicts. CI now records these failures rather than treating local helper results as a release signal.
+CI runs ordinary tests together and starts each Miniflare workerd harness in its own process. The workerd harnesses can still fail to acquire their ephemeral port in this local sandbox, so CI on a normal runner remains the useful result for that part of the suite.
 
 The remaining work is listed in dependency order in [`PLAN.md`](PLAN.md). Runtime relationships are described in [`ARCHITECTURE.md`](ARCHITECTURE.md).
