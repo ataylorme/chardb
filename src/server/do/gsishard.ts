@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS _gsi_entry (
 CREATE INDEX IF NOT EXISTS idx_gsi_value ON _gsi_entry (index_value);
 ` as const;
 
-export type GsiShardEnv = {};
+export type GsiShardEnv = Record<string, never>;
 
 export class GsiShard extends DurableObject<GsiShardEnv> {
     private bootstrapped = false;

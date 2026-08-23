@@ -18,8 +18,8 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { getTableConfig } from "drizzle-orm/sqlite-core";
-import { authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
 import { getAuthRuntime, tableFor } from "../../auth/runtime.ts";
+import { authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
 import type { RawJson } from "../../types.ts";
 import { type PrincipalId, ShardId, type TenantId, type Vshard } from "../../types.ts";
 import { VSHARD_COUNT, VshardMap, type VshardRange } from "../../vshard.ts";
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS catalog_policy_digest (
 );
 ` as const;
 
-export type CatalogEnv = {};
+export type CatalogEnv = Record<string, never>;
 
 /**
  * Render a Drizzle column's SQLite affinity. Mirrors the four type
@@ -138,7 +138,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
      * additions in better-auth plugins flow through automatically.
      */
     private ensureReplicatedAuthTables(): void {
-        let runtime;
+        let runtime: ReturnType<typeof getAuthRuntime>;
         try {
             runtime = getAuthRuntime();
         } catch {

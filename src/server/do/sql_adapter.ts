@@ -38,7 +38,6 @@ export function adaptSqlStorage(storage: SqlStorageLike | SqlStorage): SyncSql {
     return {
         exec(query, ...params) {
             const c = s.exec(query, ...(params as SqlParam[]));
-            // biome-ignore lint/correctness/noUnusedVariables: drain the cursor
             for (const _ of c.raw()) {
                 /* drain */
             }
