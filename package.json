@@ -19,12 +19,13 @@
     "bin": {
         "chardb": "./dist/cli/bin.mjs"
     },
-    "files": ["dist", "src", "README.md"],
+    "files": ["dist", "README.md", "STATUS.md", "ARCHITECTURE.md", "SECURITY.md", "CONTRIBUTING.md"],
     "workspaces": ["landing"],
     "scripts": {
         "build": "unbuild",
         "build:stub": "unbuild --stub",
         "prepack": "bun run build",
+        "smoke:package": "bun scripts/smoke-packed-package.mjs",
         "test": "bun test",
         "test:watch": "bun test --watch",
         "typecheck": "tsc --noEmit",
