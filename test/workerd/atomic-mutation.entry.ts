@@ -24,13 +24,13 @@ const securedEntries = cdbTable(
             .references(() => organization.id),
         secretNote: text("secret_note"),
     },
-    { tenantBy: "organizationId", roles: { member: { create: ["id"] } } }
+    { tenantBy: "organizationId", roles: { member: { create: ["id"], update: ["id"] } } }
 );
 
 const securedSchema = { entries, securedEntries };
 
 interface ExecuteArgs {
-    readonly mode: "commit" | "throw" | "async" | "forbidden" | "policy";
+    readonly mode: "commit" | "throw" | "async" | "forbidden" | "policy" | "updatePolicy";
     readonly mutId: string;
     readonly firstId: string;
     readonly secondId: string;
@@ -97,7 +97,10 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
         try {
             return executeAtomicMutation({
                 ...common,
-                schema: args.mode === "forbidden" || args.mode === "policy" ? securedSchema : schema,
+                schema:
+                    args.mode === "forbidden" || args.mode === "policy" || args.mode === "updatePolicy"
+                        ? securedSchema
+                        : schema,
                 handler: ({ db }) => {
                     db.insert(entries).values({ id: args.firstId, sequence: 1 }).run();
                     if (args.mode === "forbidden") {
@@ -105,6 +108,9 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
                     }
                     if (args.mode === "policy") {
                         db.insert(securedEntries).values({ id: args.secondId, secretNote: "forbidden" }).run();
+                    }
+                    if (args.mode === "updatePolicy") {
+                        db.update(securedEntries).set({ secretNote: "forbidden" }).run();
                     }
                     db.insert(entries).values({ id: args.secondId, sequence: 2 }).run();
                     if (args.mode === "throw") throw new Error("probe failure after second statement");

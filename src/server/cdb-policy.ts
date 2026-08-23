@@ -27,7 +27,7 @@
  * invalidate the same way pre/post migration.
  */
 
-import { type SQL, eq, sql } from "drizzle-orm";
+import { type SQL, eq, getTableColumns, sql } from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { COL_VERBS, type CdbTableMeta, type ColVerb, type Verb } from "./cdb-table-types.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
@@ -77,7 +77,8 @@ function tenantValueFromAuth(meta: CdbTableMeta, auth: AuthCtx): string | undefi
 
 function sqlEqColumn(table: SQLiteTable, column: string, value: string | undefined): SQL | undefined {
     if (value === undefined) return undefined;
-    const col = (table as unknown as Record<string, unknown>)[column];
+    const columns = getTableColumns(table) as Record<string, { readonly name: string }>;
+    const col = columns[column] ?? Object.values(columns).find(candidate => candidate.name === column);
     if (!col) return undefined;
     return eq(col as never, value);
 }

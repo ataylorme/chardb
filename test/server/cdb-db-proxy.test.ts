@@ -20,9 +20,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { type SQL, eq } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import type { BaseSQLiteDatabase, SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../../src/errors.ts";
+import type { RoleValue } from "../../src/server/cdb-table-types.ts";
 import type { AuthCtx } from "../../src/server/define.ts";
 import { forOrg, forUser, wrapDb } from "../../src/server/index.ts";
 
@@ -44,14 +46,21 @@ interface CapturedInsert {
     rows: unknown;
 }
 
+interface CapturedUpdate {
+    readonly table: SQLiteTable;
+    values: unknown;
+    where: unknown;
+}
+
 /**
  * Minimal stub for the surface the proxy actually inspects: an
  * `insert(table)` method that returns a builder whose `.values(rows)`
  * captures its argument and forwards a chainable `returning()` for the
  * "other methods pass through" case.
  */
-function makeStubDb(): { db: StubDb; captured: CapturedInsert[] } {
+function makeStubDb(): { db: StubDb; captured: CapturedInsert[]; capturedUpdates: CapturedUpdate[] } {
     const captured: CapturedInsert[] = [];
+    const capturedUpdates: CapturedUpdate[] = [];
     const db: unknown = {
         insert(table: SQLiteTable) {
             const entry: CapturedInsert = { table, rows: undefined };
@@ -70,8 +79,29 @@ function makeStubDb(): { db: StubDb; captured: CapturedInsert[] } {
             };
             return builder;
         },
+        update(table: SQLiteTable) {
+            const entry: CapturedUpdate = { table, values: undefined, where: undefined };
+            capturedUpdates.push(entry);
+            const builder = {
+                set(values: unknown) {
+                    entry.values = values;
+                    return builder;
+                },
+                where(where: unknown) {
+                    entry.where = where;
+                    return builder;
+                },
+                returning() {
+                    return Promise.resolve([]);
+                },
+                run() {
+                    return { changes: 0 };
+                },
+            };
+            return builder;
+        },
     };
-    return { db: db as StubDb, captured };
+    return { db: db as StubDb, captured, capturedUpdates };
 }
 
 const baseAuth: AuthCtx = Object.freeze({
@@ -106,6 +136,15 @@ function forbiddenError(run: () => unknown): CdbError {
     return cdbError;
 }
 
+function renderSql(value: unknown) {
+    return (value as SQL).toQuery({
+        casing: { getColumnCasing: (column: { readonly name: string }) => column.name } as never,
+        escapeName: (name: string) => `"${name}"`,
+        escapeParam: (index: number) => `?${index + 1}`,
+        escapeString: (value: string) => `'${value}'`,
+    } as never);
+}
+
 describe("wrapDb / cdbTable insert auto-fill", () => {
     test("explicit selfBy column is filled from auth.userId", () => {
         const { cdbTable } = forOrg();
@@ -121,7 +160,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
                     .references(() => userTable.id),
                 body: text("body").notNull(),
             },
-            { selfBy: "authorId", roles: { self: { create: "*" } } }
+            { selfBy: "authorId", roles: { self: { create: ["id", "body"] } } }
         );
 
         const { db, captured } = makeStubDb();
@@ -364,7 +403,9 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         );
 
         const allowed = makeStubDb();
-        wrapDb(allowed.db, baseAuth).insert(profiles).values({ id: "profile-1", displayName: "Ada" });
+        wrapDb(allowed.db, baseAuth)
+            .insert(profiles)
+            .values({ id: "profile-1", organizationId: "org-acme", displayName: "Ada" });
         expect(allowed.captured[0]?.rows).toEqual({
             id: "profile-1",
             displayName: "Ada",
@@ -490,5 +531,146 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
             .onConflictDoNothing()
             .returning();
         expect(await inserted).toEqual([]);
+    });
+});
+
+describe("wrapDb / cdbTable update authorization", () => {
+    type ProfileColumns = {
+        readonly id: unknown;
+        readonly organizationId: unknown;
+        readonly displayName: unknown;
+        readonly secretNote: unknown;
+    };
+
+    function profileTable(
+        name: string,
+        roles: {
+            readonly admin?: RoleValue<ProfileColumns>;
+            readonly member?: RoleValue<ProfileColumns>;
+        }
+    ) {
+        const { cdbTable } = forOrg();
+        return cdbTable(
+            name,
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                displayName: text("display_name").notNull(),
+                secretNote: text("secret_note"),
+            },
+            { roles }
+        );
+    }
+
+    test("denies update when no applicable grant exists", () => {
+        const profiles = profileTable("profiles_update_denied", { member: { read: "*" } });
+        const { db, capturedUpdates } = makeStubDb();
+        const error = forbiddenError(() => wrapDb(db, baseAuth).update(profiles));
+        expect(error.message).toBe("profiles_update_denied: caller has no applicable update grant");
+        expect(capturedUpdates).toHaveLength(0);
+    });
+
+    test("allows a member column and installs the tenant floor without a user WHERE", () => {
+        const profiles = profileTable("profiles_update_no_where", {
+            member: { update: ["displayName"] },
+        });
+        const { db, capturedUpdates } = makeStubDb();
+        wrapDb(db, baseAuth).update(profiles).set({ displayName: "Updated" }).run();
+
+        expect(capturedUpdates[0]?.values).toEqual({ displayName: "Updated" });
+        const scoped = renderSql(capturedUpdates[0]?.where);
+        expect(scoped.params).toContain("org-acme");
+        expect(scoped.sql).toContain("organization_id");
+    });
+
+    test("ANDs a hostile tenant WHERE with the server tenant floor", () => {
+        const profiles = profileTable("profiles_update_tenant_floor", {
+            member: { update: ["displayName"] },
+        });
+        const { db, capturedUpdates } = makeStubDb();
+        wrapDb(db, baseAuth)
+            .update(profiles)
+            .set({ displayName: "Wrong tenant" })
+            .where(eq(profiles.organizationId, "org-other"))
+            .run();
+
+        const scoped = renderSql(capturedUpdates[0]?.where);
+        expect(scoped.params).toContain("org-other");
+        expect(scoped.params).toContain("org-acme");
+        expect(scoped.sql.toLowerCase()).toContain(" and ");
+    });
+
+    test("rejects a column outside the caller's update grant", () => {
+        const profiles = profileTable("profiles_update_columns", {
+            member: { update: ["displayName"] },
+        });
+        const { db, capturedUpdates } = makeStubDb();
+        const error = forbiddenError(() => wrapDb(db, baseAuth).update(profiles).set({ secretNote: "not allowed" }));
+        expect(error.message).toBe('profiles_update_columns: caller is not authorized to update column "secret_note"');
+        expect(capturedUpdates[0]?.values).toBeUndefined();
+    });
+
+    test("ORs alternative role grants for update", () => {
+        const profiles = profileTable("profiles_update_roles", {
+            admin: { update: ["secretNote"] },
+            member: { update: ["displayName"] },
+        });
+        const { db, capturedUpdates } = makeStubDb();
+        wrapDb(db, baseAuth).update(profiles).set({ displayName: "Member edit" }).run();
+        expect(capturedUpdates[0]?.values).toEqual({ displayName: "Member edit" });
+        expect(renderSql(capturedUpdates[0]?.where).sql.toLowerCase()).toContain(" or ");
+    });
+
+    test("rejects every attempt to update tenant authority columns", () => {
+        const profiles = profileTable("profiles_update_tenant_column", {
+            member: { update: "*" },
+        });
+        const { db, capturedUpdates } = makeStubDb();
+        const error = forbiddenError(() => wrapDb(db, baseAuth).update(profiles).set({ organizationId: "org-acme" }));
+        expect(error.message).toBe('cannot update managed tenant column "organizationId"');
+        expect(capturedUpdates[0]?.values).toBeUndefined();
+    });
+
+    test("a self update grant scopes no-WHERE updates by both tenant and user", () => {
+        const { cdbTable } = forOrg();
+        const profiles = cdbTable(
+            "profiles_update_self",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                ownerId: text("owner_id")
+                    .notNull()
+                    .references(() => userTable.id),
+                displayName: text("display_name").notNull(),
+            },
+            { selfBy: "ownerId", roles: { self: { update: ["displayName"] } } }
+        );
+        const { db, capturedUpdates } = makeStubDb();
+        wrapDb(db, baseAuth).update(profiles).set({ displayName: "Mine" }).run();
+
+        const scoped = renderSql(capturedUpdates[0]?.where);
+        expect(scoped.params).toContain("org-acme");
+        expect(scoped.params).toContain("u-alice");
+        expect(scoped.sql).toContain("organization_id");
+        expect(scoped.sql).toContain("owner_id");
+
+        const denied = makeStubDb();
+        const error = forbiddenError(() => wrapDb(denied.db, baseAuth).update(profiles).set({ ownerId: "u-alice" }));
+        expect(error.message).toBe('cannot update managed self column "ownerId"');
+        expect(denied.capturedUpdates[0]?.values).toBeUndefined();
+    });
+
+    test("non-cdbTable updates remain passthrough", () => {
+        const raw = sqliteTable("raw_update_passthrough", {
+            id: text("id").primaryKey(),
+            value: text("value").notNull(),
+        });
+        const { db, capturedUpdates } = makeStubDb();
+        wrapDb(db, baseAuth).update(raw).set({ value: "changed" }).run();
+        expect(capturedUpdates[0]).toMatchObject({ values: { value: "changed" }, where: undefined });
     });
 });
