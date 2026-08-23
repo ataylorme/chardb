@@ -25,6 +25,7 @@ import { defineMutation, defineQuery } from "../../src/server/define.ts";
 import { Cdb } from "../../src/server/do/cdb.ts";
 import { Gateway } from "../../src/server/do/gateway.ts";
 import type { RawJson } from "../../src/types.ts";
+import { stableJson } from "../../src/util/canonical.ts";
 import { vshardOf } from "../../src/vshard.ts";
 
 const items = sqliteTable("items", {
@@ -130,8 +131,9 @@ describe("chardb({…})", () => {
         expect(routed.args).toEqual({ organizationId: "org-7", limit: 25 });
         expect(routed.authority).toBe("organization");
         expect(routed.partitionKey).toBe("org-7");
-        expect(routed.queryHash).toContain(routedQuery.__chardbRef);
-        expect(routed.queryHash).toContain('"limit":25');
+        expect(routed.queryHash).toBe(
+            stableJson({ ref: routedQuery.__chardbRef, args: routed.args, intent: routed.intent })
+        );
 
         const invalid = await gateway.routeQuery({ ref: routedQuery.__chardbRef, args: { organizationId: 7 } });
         expect(invalid.ok).toBe(false);

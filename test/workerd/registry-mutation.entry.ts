@@ -15,7 +15,8 @@ import type {
     GatewayInvalidationResponse,
     LiveSubscriptionId,
 } from "../../src/server/rpc.ts";
-import { ChardbRef, ClientId, PrincipalId, SubId } from "../../src/types.ts";
+import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
+import { stableJson } from "../../src/util/canonical.ts";
 
 const { cdbTable } = globalScope();
 const entries = cdbTable(
@@ -70,7 +71,19 @@ const rawAfterTyped = api.mutation({
 
 let registeredQueryRuns = 0;
 const registryEntries = api.query({
-    args: z.object({ minimum: z.number().int() }),
+    ref: "queries.ts#registryEntries",
+    args: z.object({ organizationId: z.string(), minimum: z.number().int() }),
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: (args: { organizationId: string; minimum: number }) => ({
+        kind: "select" as const,
+        tables: ["registry_entries"],
+        partitionKey: {
+            table: "registry_entries",
+            column: "organization_id",
+            values: [args.organizationId],
+        },
+    }),
     handler: async function registryEntries(ctx, args) {
         registeredQueryRuns++;
         const rows = await ctx.db
@@ -224,14 +237,26 @@ function subscriptionRequest(gatewayId: string): CdbSubscriptionRequest {
             subId: SubId(1),
         },
         principalId: PrincipalId(AUTH.userId),
+        organizationId: TenantId(AUTH.tenantId),
         ref: ChardbRef("queries.ts#registryEntries"),
         args: {},
+        queryHash: "registry-invalidation-query-hash",
         tables: ["registry_entries"],
         intervals: [],
     };
 }
 
 function registeredSubscriptionRequest(gatewayId: string, registrationId: string): CdbSubscriptionRequest {
+    const args = { organizationId: AUTH.tenantId, minimum: 60 };
+    const intent = {
+        kind: "select" as const,
+        tables: ["registry_entries"],
+        partitionKey: {
+            table: "registry_entries",
+            column: "organization_id",
+            values: [AUTH.tenantId],
+        },
+    };
     return {
         subscription: {
             gatewayId,
@@ -241,8 +266,10 @@ function registeredSubscriptionRequest(gatewayId: string, registrationId: string
             subId: SubId(2),
         },
         principalId: PrincipalId(AUTH.userId),
+        organizationId: TenantId(AUTH.tenantId),
         ref: registryEntries.__chardbRef,
-        args: { minimum: 60 },
+        args,
+        queryHash: stableJson({ ref: registryEntries.__chardbRef, args, intent }),
         tables: ["registry_entries"],
         intervals: [],
     };
@@ -288,6 +315,7 @@ export default {
                 readonly registrationId: string;
                 readonly forgedIdentity?: boolean;
                 readonly forgedPrincipal?: boolean;
+                readonly forgedOrganization?: boolean;
                 readonly corruption?: "malformed" | "mismatch" | "mapping";
             };
             const registered = registeredSubscriptionRequest(gatewayId.toString(), body.registrationId);
@@ -315,6 +343,7 @@ export default {
                         auth: {
                             ...AUTH,
                             userId: body.forgedPrincipal ? "forged-principal" : AUTH.userId,
+                            tenantId: body.forgedOrganization ? "forged-organization" : AUTH.tenantId,
                             claims: { probe: "fresh-query-auth" },
                         },
                     })

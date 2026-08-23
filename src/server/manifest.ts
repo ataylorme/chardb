@@ -37,6 +37,7 @@
 
 import { CdbError } from "../errors.ts";
 import type { Brand, ChardbRef, RawJson } from "../types.ts";
+import { stableJson } from "../util/canonical.ts";
 import { rawJsonResult } from "../util/raw_json.ts";
 import type { CdbIntent } from "../wire.ts";
 import type { MutationAuthority } from "./define.ts";
@@ -233,6 +234,36 @@ export function resolveQuery(manifest: ChardbManifest, ref: ChardbRef): QueryDes
     return descriptor;
 }
 
+/** Re-derive query placement from arguments that Gateway already validated. */
+export function routeValidatedQuery(
+    manifest: ChardbManifest,
+    input: { readonly ref: string; readonly args: RawJson }
+): Extract<QueryRouteResponse, { readonly ok: true }> {
+    const descriptor = resolveQuery(manifest, input.ref as ChardbRef);
+    if (!descriptor.extractIntent) {
+        throw new CdbError({
+            code: "CDB_NO_INTENT_FOR_RAW_SQL",
+            message: `query ${input.ref} has no server intent extractor`,
+        });
+    }
+    const intent = descriptor.extractIntent(input.args);
+    const key = descriptor.extractPartitionKey?.(input.args);
+    if (descriptor.authority === "organization" && (typeof key !== "string" || key.length === 0)) {
+        throw new CdbError({
+            code: "CDB_INVALID_ARGS",
+            message: `organization query ${input.ref} requires a nonempty string partition key`,
+        });
+    }
+    return {
+        ok: true,
+        args: input.args,
+        intent,
+        queryHash: stableJson({ ref: input.ref, args: input.args, intent }),
+        authority: descriptor.authority ?? null,
+        partitionKey: key === undefined ? null : String(key),
+    };
+}
+
 /** Resolve server-owned query routing metadata without executing the query. */
 export async function routeQuery(
     manifest: ChardbManifest,
@@ -251,22 +282,7 @@ export async function routeQuery(
             "query arguments",
             "CDB_INVALID_ARGS"
         );
-        const intent = descriptor.extractIntent(validatedArgs);
-        const key = descriptor.extractPartitionKey?.(validatedArgs);
-        if (descriptor.authority === "organization" && (typeof key !== "string" || key.length === 0)) {
-            throw new CdbError({
-                code: "CDB_INVALID_ARGS",
-                message: `organization query ${input.ref} requires a nonempty string partition key`,
-            });
-        }
-        return {
-            ok: true,
-            args: validatedArgs,
-            intent,
-            queryHash: JSON.stringify({ ref: input.ref, args: validatedArgs, intent }),
-            authority: descriptor.authority ?? null,
-            partitionKey: key === undefined ? null : String(key),
-        };
+        return routeValidatedQuery(manifest, { ref: input.ref, args: validatedArgs });
     } catch (error) {
         const cdb =
             error instanceof CdbError

@@ -1,5 +1,5 @@
 import type { CdbError } from "../errors.ts";
-import type { ChardbRef, ClientId, PrincipalId, RawJson, ShardId, SubId } from "../types.ts";
+import type { ChardbRef, ClientId, PrincipalId, RawJson, ShardId, SubId, TenantId } from "../types.ts";
 import type { WireInterval } from "../wire.ts";
 import type { AuthCtx, MutationAuthority } from "./define.ts";
 import type { OrganizationAuthority, OrganizationAuthorityRequest, RouteResult } from "./do/catalog.ts";
@@ -54,8 +54,10 @@ export interface LiveSubscriptionId {
 export interface CdbSubscriptionRequest {
     readonly subscription: LiveSubscriptionId;
     readonly principalId: PrincipalId;
+    readonly organizationId: TenantId;
     readonly ref: ChardbRef;
     readonly args: RawJson;
+    readonly queryHash: string;
     readonly tables: readonly string[];
     readonly intervals: readonly {
         readonly table: string;

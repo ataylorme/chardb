@@ -89,8 +89,10 @@ describe("trusted Gateway mutation dispatch", () => {
                 clientId: ClientId("client-3"),
                 subId: SubId(4),
                 principalId: PrincipalId("user-1"),
+                organizationId: TenantId("org-1"),
                 ref: ChardbRef("queries.ts#listMessages"),
                 args: { organizationId: "org-1", channelId: "channel-1" },
+                queryHash: "query-hash-1",
                 intent: {
                     kind: "select",
                     tables: ["messages"],
@@ -106,8 +108,10 @@ describe("trusted Gateway mutation dispatch", () => {
                 subId: SubId(4),
             },
             principalId: PrincipalId("user-1"),
+            organizationId: TenantId("org-1"),
             ref: ChardbRef("queries.ts#listMessages"),
             args: { organizationId: "org-1", channelId: "channel-1" },
+            queryHash: "query-hash-1",
             tables: ["messages"],
             intervals: [{ table: "messages", indexName: "by_channel", intervals: [{ kind: "full" }] }],
         });

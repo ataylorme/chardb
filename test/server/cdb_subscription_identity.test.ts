@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Cdb } from "../../src/server/do/cdb.ts";
 import type { CdbSubscriptionRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
-import { ChardbRef, ClientId, PrincipalId, SubId } from "../../src/types.ts";
+import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -49,8 +49,10 @@ function request(
     return {
         subscription: identity,
         principalId: PrincipalId("user-1"),
+        organizationId: TenantId("org-1"),
         ref: ChardbRef("queries.ts#messages"),
         args: { organizationId: "org-1" },
+        queryHash: "query-hash-1",
         tables: ["messages"],
         intervals: [{ table: "messages", indexName: "by_org", intervals: [{ kind: "full" }] }],
         ...overrides,
@@ -97,7 +99,7 @@ describe("Cdb live subscription identity", () => {
         expect(
             db
                 .prepare(
-                    `SELECT state, principal_id, ref, args_json, tables_json, intervals_json
+                    `SELECT state, principal_id, organization_id, ref, args_json, query_hash, tables_json, intervals_json
                      FROM _chardb_live_subscriptions
                      WHERE gateway_id = ? AND registration_id = ?`
                 )
@@ -105,8 +107,10 @@ describe("Cdb live subscription identity", () => {
         ).toEqual({
             state: "active",
             principal_id: "user-1",
+            organization_id: "org-1",
             ref: "queries.ts#messages",
             args_json: '{"organizationId":"org-1"}',
+            query_hash: "query-hash-1",
             tables_json: '["messages"]',
             intervals_json: '[{"table":"messages","indexName":"by_org","intervals":[{"kind":"full"}]}]',
         });
@@ -162,6 +166,12 @@ describe("Cdb live subscription identity", () => {
         await expect(cdb.subscribe(request(identity, { args: { organizationId: "org-2" } }))).rejects.toMatchObject({
             code: "CDB_INVARIANT",
         });
+        await expect(cdb.subscribe(request(identity, { organizationId: TenantId("org-2") }))).rejects.toMatchObject({
+            code: "CDB_INVARIANT",
+        });
+        await expect(cdb.subscribe(request(identity, { queryHash: "query-hash-drifted" }))).rejects.toMatchObject({
+            code: "CDB_INVARIANT",
+        });
         expect(cdb.matchSubsForRow("messages", [{ indexName: "by_org", key: ["org-1"] }])).toEqual([identity]);
     });
 
@@ -186,7 +196,8 @@ describe("Cdb live subscription identity", () => {
         expect(
             db
                 .prepare(
-                    `SELECT state, payload_hash, principal_id, ref, args_json, tables_json, intervals_json
+                    `SELECT state, payload_hash, principal_id, organization_id, ref, args_json, query_hash,
+                            tables_json, intervals_json
                      FROM _chardb_live_subscriptions
                      WHERE gateway_id = ? AND registration_id = ?`
                 )
@@ -195,8 +206,10 @@ describe("Cdb live subscription identity", () => {
             state: "retired",
             payload_hash: null,
             principal_id: null,
+            organization_id: null,
             ref: null,
             args_json: null,
+            query_hash: null,
             tables_json: null,
             intervals_json: null,
         });
@@ -245,5 +258,90 @@ describe("Cdb live subscription identity", () => {
 
         cdb = new Cdb(state, {});
         await expect(bootstrap).rejects.toMatchObject({ code: "CDB_INVARIANT" });
+    });
+
+    test("retires pre-authority active rows during bootstrap", async () => {
+        const legacyDb = new Database(":memory:");
+        try {
+            legacyDb.exec(`
+                CREATE TABLE _chardb_live_subscriptions (
+                  gateway_id TEXT NOT NULL,
+                  registration_id TEXT NOT NULL,
+                  connection_id TEXT NOT NULL,
+                  client_id TEXT NOT NULL,
+                  sub_id INTEGER NOT NULL,
+                  state TEXT NOT NULL,
+                  payload_hash TEXT,
+                  principal_id TEXT,
+                  ref TEXT,
+                  args_json TEXT,
+                  tables_json TEXT,
+                  intervals_json TEXT,
+                  PRIMARY KEY (gateway_id, registration_id)
+                );
+                CREATE TABLE _chardb_live_subscription_tables (
+                  gateway_id TEXT NOT NULL,
+                  registration_id TEXT NOT NULL,
+                  table_name TEXT NOT NULL,
+                  PRIMARY KEY (gateway_id, registration_id, table_name)
+                );
+                INSERT INTO _chardb_live_subscriptions VALUES (
+                  'gateway-legacy', 'registration-legacy', 'connection-legacy', 'client-legacy', 1,
+                  'active', 'legacy-hash', 'user-1', 'queries.ts#messages', '{"organizationId":"org-1"}',
+                  '["messages"]', '[]'
+                );
+                INSERT INTO _chardb_live_subscription_tables VALUES (
+                  'gateway-legacy', 'registration-legacy', 'messages'
+                );
+            `);
+            let legacyReady: Promise<unknown> = Promise.resolve();
+            const legacyState = {
+                id: { toString: () => "shard-legacy" },
+                storage: {
+                    sql: sqlStorage(legacyDb),
+                    transactionSync: <T>(callback: () => T): T => legacyDb.transaction(callback)(),
+                },
+                blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
+                    legacyReady = callback();
+                },
+            } as unknown as DurableObjectState;
+            const legacyCdb = new Cdb(legacyState, {});
+            await legacyReady;
+
+            expect(
+                legacyDb
+                    .prepare(
+                        `SELECT state, payload_hash, principal_id, organization_id, ref, args_json, query_hash,
+                                tables_json, intervals_json
+                         FROM _chardb_live_subscriptions
+                         WHERE registration_id = 'registration-legacy'`
+                    )
+                    .get()
+            ).toEqual({
+                state: "retired",
+                payload_hash: null,
+                principal_id: null,
+                organization_id: null,
+                ref: null,
+                args_json: null,
+                query_hash: null,
+                tables_json: null,
+                intervals_json: null,
+            });
+            expect(legacyDb.query("SELECT * FROM _chardb_live_subscription_tables").all()).toEqual([]);
+            await expect(
+                legacyCdb.subscribe(
+                    request({
+                        gatewayId: "gateway-legacy",
+                        registrationId: "registration-legacy",
+                        connectionId: "connection-legacy",
+                        clientId: ClientId("client-legacy"),
+                        subId: SubId(1),
+                    })
+                )
+            ).rejects.toMatchObject({ code: "CDB_INVARIANT" });
+        } finally {
+            legacyDb.close();
+        }
     });
 });

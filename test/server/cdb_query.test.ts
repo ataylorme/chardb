@@ -5,14 +5,15 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { forOrg } from "../../src/server/index.ts";
-import { manifestFromExports } from "../../src/server/manifest.ts";
+import { manifestFromExports, resolveQuery } from "../../src/server/manifest.ts";
 import type {
     CdbQueryRequest,
     CdbRegisteredQueryRequest,
     CdbSubscriptionRequest,
     LiveSubscriptionId,
 } from "../../src/server/rpc.ts";
-import { ChardbRef, ClientId, PrincipalId, SubId } from "../../src/types.ts";
+import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
+import { stableJson } from "../../src/util/canonical.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -112,9 +113,57 @@ const awaitRecords = api.query(async function awaitRecordsHandler(ctx) {
     return await ctx.db.select().from(records).orderBy(records.id);
 });
 let registeredProbeRuns = 0;
-const registeredListRecords = api.query(async function registeredListRecordsHandler(ctx, args: { groupId: string }) {
-    registeredProbeRuns++;
-    return ctx.db.select().from(records).where(eq(records.groupId, args.groupId)).orderBy(records.id).all();
+const registeredListRecords = api.query({
+    ref: "queries.ts#registeredListRecords",
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: (args: { organizationId: string; groupId: string }) => ({
+        kind: "select" as const,
+        tables: ["query_records"],
+        partitionKey: {
+            table: "query_records",
+            column: "organization_id",
+            values: [args.organizationId],
+        },
+    }),
+    handler: async function registeredListRecordsHandler(ctx, args: { organizationId: string; groupId: string }) {
+        registeredProbeRuns++;
+        return ctx.db.select().from(records).where(eq(records.groupId, args.groupId)).orderBy(records.id).all();
+    },
+});
+const registeredGetRecord = api.query({
+    ref: "queries.ts#registeredGetRecord",
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: (args: { organizationId: string; id: string }) => ({
+        kind: "select" as const,
+        tables: ["query_records"],
+        partitionKey: {
+            table: "query_records",
+            column: "organization_id",
+            values: [args.organizationId],
+        },
+    }),
+    handler: async function registeredGetRecordHandler(ctx, args: { organizationId: string; id: string }) {
+        return ctx.db.select().from(records).where(eq(records.id, args.id)).get();
+    },
+});
+const registeredNonJsonResult = api.query({
+    ref: "queries.ts#registeredNonJsonResult",
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: (args: { organizationId: string }) => ({
+        kind: "select" as const,
+        tables: ["query_records"],
+        partitionKey: {
+            table: "query_records",
+            column: "organization_id",
+            values: [args.organizationId],
+        },
+    }),
+    handler: async function registeredNonJsonResultHandler() {
+        return new Date("2026-08-23T00:00:00Z");
+    },
 });
 const listPrivateRecords = api.query(async function listPrivateRecordsHandler(ctx) {
     return ctx.db.select().from(privateRecords).all();
@@ -178,6 +227,8 @@ const manifest = manifestFromExports({
     getRecord,
     awaitRecords,
     registeredListRecords,
+    registeredGetRecord,
+    registeredNonJsonResult,
     listPrivateRecords,
     listPublicRecords,
     projectionAttempt,
@@ -219,13 +270,24 @@ function liveIdentity(overrides: Partial<LiveSubscriptionId> = {}): LiveSubscrip
 function liveRequest(
     subscription: LiveSubscriptionId,
     ref: ChardbRef = registeredListRecords.__chardbRef,
-    args: CdbSubscriptionRequest["args"] = { groupId: "group-a" }
+    args: CdbSubscriptionRequest["args"] = { organizationId: "org-a", groupId: "group-a" }
 ): CdbSubscriptionRequest {
+    const intent = {
+        kind: "select" as const,
+        tables: ["query_records"],
+        partitionKey: {
+            table: "query_records",
+            column: "organization_id",
+            values: ["org-a"],
+        },
+    };
     return {
         subscription,
         principalId: PrincipalId("user-1"),
+        organizationId: TenantId("org-a"),
         ref,
         args,
+        queryHash: stableJson({ ref, args, intent }),
         tables: ["query_records"],
         intervals: [{ table: "query_records", indexName: "by_group", intervals: [{ kind: "full" }] }],
     };
@@ -308,6 +370,7 @@ describe("Cdb registered query execution", () => {
             registeredQuery(liveIdentity({ registrationId: "missing" })),
             registeredQuery({ ...subscription, connectionId: "connection-forged" }),
             registeredQuery(subscription, { ...AUTH, userId: "user-forged" }),
+            registeredQuery(subscription, { ...AUTH, tenantId: "org-forged" }),
         ]) {
             await expect(cdb.queryRegistered(request)).resolves.toMatchObject({
                 ok: false,
@@ -320,6 +383,44 @@ describe("Cdb registered query execution", () => {
             error: { code: "CDB_INVARIANT" },
         });
         expect(registeredProbeRuns).toBe(0);
+    });
+
+    test("rejects authority, partition, and intent deploy drift before execution", async () => {
+        const queries = manifest.queries as Map<ChardbRef, ReturnType<typeof resolveQuery>>;
+        const original = resolveQuery(manifest, registeredListRecords.__chardbRef);
+        const { authority: _authority, ...withoutAuthority } = original;
+        const drifted = [
+            withoutAuthority,
+            { ...original, extractPartitionKey: () => "org-drifted" },
+            {
+                ...original,
+                extractIntent: () => ({
+                    kind: "select" as const,
+                    tables: ["query_records", "query_drifted"],
+                    partitionKey: {
+                        table: "query_records",
+                        column: "organization_id",
+                        values: ["org-a"],
+                    },
+                }),
+            },
+        ];
+
+        for (const [index, descriptor] of drifted.entries()) {
+            const { cdb } = await setup();
+            const subscription = liveIdentity({ registrationId: `registration-drift-${index}` });
+            await cdb.subscribe(liveRequest(subscription));
+            queries.set(registeredListRecords.__chardbRef, descriptor);
+            try {
+                await expect(cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject({
+                    ok: false,
+                    error: { code: "CDB_INVARIANT" },
+                });
+                expect(registeredProbeRuns).toBe(0);
+            } finally {
+                queries.set(registeredListRecords.__chardbRef, original);
+            }
+        }
     });
 
     test("rejects corrupt payloads and table mappings before execution", async () => {
@@ -363,8 +464,8 @@ describe("Cdb registered query execution", () => {
     test("returns typed failures for unknown refs and non-array or invalid results", async () => {
         const cases = [
             { ref: ChardbRef("queries.ts#missing"), args: {} },
-            { ref: getRecord.__chardbRef, args: { id: "record-1" } },
-            { ref: nonJsonResult.__chardbRef, args: {} },
+            { ref: registeredGetRecord.__chardbRef, args: { organizationId: "org-a", id: "record-1" } },
+            { ref: registeredNonJsonResult.__chardbRef, args: { organizationId: "org-a" } },
         ] as const;
 
         for (const [index, testCase] of cases.entries()) {

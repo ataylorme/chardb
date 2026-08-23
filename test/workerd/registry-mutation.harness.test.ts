@@ -116,6 +116,7 @@ async function registeredProof(
         readonly registrationId: string;
         readonly forgedIdentity?: boolean;
         readonly forgedPrincipal?: boolean;
+        readonly forgedOrganization?: boolean;
         readonly corruption?: "malformed" | "mismatch" | "mapping";
     }
 ): Promise<Record<string, unknown>> {
@@ -309,6 +310,7 @@ describe("configured Cdb local mutation registry", () => {
         for (const forged of [
             { registrationId: active, forgedIdentity: true },
             { registrationId: active, forgedPrincipal: true },
+            { registrationId: active, forgedOrganization: true },
         ]) {
             expect(await registeredProof("query", forged)).toMatchObject({
                 ok: false,

@@ -444,8 +444,10 @@ export function cdbSubscriptionRequest(input: {
     readonly clientId: ClientId;
     readonly subId: SubId;
     readonly principalId: PrincipalId;
+    readonly organizationId: TenantId;
     readonly ref: ChardbRef;
     readonly args: RawJson;
+    readonly queryHash: string;
     readonly intent: CdbIntent;
 }): CdbSubscriptionRequest {
     return {
@@ -457,8 +459,10 @@ export function cdbSubscriptionRequest(input: {
             input.subId
         ),
         principalId: input.principalId,
+        organizationId: input.organizationId,
         ref: input.ref,
         args: input.args,
+        queryHash: input.queryHash,
         tables: [...input.intent.tables],
         intervals: (input.intent.intervals ?? []).map(bundle => ({
             table: bundle.table,
@@ -1959,6 +1963,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         queryHash: string,
         intent: CdbIntent,
         principalId: PrincipalId,
+        organizationId: TenantId,
         connectionId: string,
         registrationId: string
     ): Promise<void> {
@@ -1990,8 +1995,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
             clientId,
             subId,
             principalId,
+            organizationId,
             ref,
             args,
+            queryHash,
             intent,
         });
         await Promise.all(

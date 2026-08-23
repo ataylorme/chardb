@@ -13,7 +13,7 @@ import type {
     GatewayInvalidationResponse,
     LiveSubscriptionId,
 } from "../../src/server/rpc.ts";
-import { ChardbRef, ClientId, PrincipalId, SubId } from "../../src/types.ts";
+import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -112,8 +112,10 @@ function subscription(registration: LiveSubscriptionId, tables: readonly string[
     return {
         subscription: registration,
         principalId: PrincipalId("user-1"),
+        organizationId: TenantId("org-1"),
         ref: ChardbRef("queries.ts#outboxProbe"),
         args: {},
+        queryHash: "outbox-query-hash",
         tables,
         intervals: [],
     };
