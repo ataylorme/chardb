@@ -227,6 +227,16 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                     }
                 }
                 return;
+            case "snapshot": {
+                const sub = subs.get(msg.subId);
+                if (!sub) return;
+                lastCookie = msg.cookie;
+                sub.rows = [...msg.rows];
+                sub.optimisticPatches = [];
+                sub.state = "live";
+                notify(sub);
+                return;
+            }
             case "mustRefetch":
                 if (state === "connecting" && msg.reason === "protocolMismatch") {
                     failSession("CDB_UNSUPPORTED_FEATURE", "server rejected the Chardb protocol version");

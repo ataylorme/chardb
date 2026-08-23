@@ -115,7 +115,7 @@ describe("createChardbClient — wire round-trip", () => {
             })
         );
         ws.onmessage?.({
-            data: JSON.stringify({ t: "welcome", protocolV: 1, baseCookie: "c-1:42", region: "test" }),
+            data: JSON.stringify({ t: "welcome", protocolV: 2, baseCookie: "c-1:42", region: "test" }),
         });
         await flush();
         expect(c.state).toBe("closed");
@@ -293,6 +293,98 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
         expect(seen.length).toBe(1);
         expect(seen[0]).toEqual([{ id: "r-1", __key: "row-1" }]);
+    });
+
+    test("snapshot replaces existing rows exactly", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: unknown[][] = [];
+        c.subscribe("queries.ts#listMessages", {}, rows => seen.push([...rows]));
+        await flush();
+
+        ws.emit({
+            t: "poke",
+            cookie: Cookie("c-1:1"),
+            patches: [{ op: "put", subId: SubId(1), rowKey: "stale", row: { id: "stale" } }],
+        });
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:2"),
+            rows: [{ id: "fresh-1" }, { id: "fresh-2", nested: { value: true } }],
+        });
+        await flush();
+
+        expect(seen.at(-1)).toEqual([{ id: "fresh-1" }, { id: "fresh-2", nested: { value: true } }]);
+        c.close();
+    });
+
+    test("empty snapshot replaces rows and notifies the subscription", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: unknown[][] = [];
+        c.subscribe("queries.ts#listMessages", {}, rows => seen.push([...rows]));
+        await flush();
+
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:1"),
+            rows: [],
+        });
+        await flush();
+
+        expect(seen).toEqual([[]]);
+        c.close();
+    });
+
+    test("snapshot for an unknown subscription is ignored", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: unknown[][] = [];
+        c.subscribe("queries.ts#listMessages", {}, rows => seen.push([...rows]));
+        await flush();
+
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(999),
+            cookie: Cookie("c-1:99"),
+            rows: [{ id: "not-for-this-client" }],
+        });
+        await flush();
+
+        expect(seen).toEqual([]);
+        expect(c.state).toBe("open");
+        ws.close();
+        await new Promise(resolve => setTimeout(resolve, 350));
+        const reconnected = fakeWebSocket(1);
+        await flush();
+        const hello = reconnected.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "hello");
+        if (!hello || hello.t !== "hello") throw new Error("expected hello on reconnect");
+        expect(hello.resumeFromCookie).toBe(Cookie("c-test:0"));
+        c.close();
+    });
+
+    test("malformed snapshot terminates the established session", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        let subscriptionNotifications = 0;
+        c.subscribe("queries.ts#listMessages", {}, () => subscriptionNotifications++);
+        await flush();
+
+        ws.onmessage?.({ data: JSON.stringify({ t: "snapshot", subId: 1, cookie: "c-1:1" }) });
+        await flush();
+
+        expect(c.state).toBe("closed");
+        expect(subscriptionNotifications).toBe(1);
     });
 
     test("mutate → server poke.mutResults ok=true resolves the promise with the result", async () => {

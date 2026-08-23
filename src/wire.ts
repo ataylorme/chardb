@@ -1,11 +1,11 @@
 /**
- * Wire envelope at `protocolV: 2`.
+ * Wire envelope at `protocolV: 3`.
  *
  * The set of fields, the tag values for `Up` / `Down` messages, every error
  * `code` identifier, every `retryable` polarity and every `mustRefetch` reason
  * are part of the locked surface; adding new fields under `featureSet`
  * advertisement is permitted, renaming or repurposing existing ones is not.
- * Adding new error codes and new `mustRefetch` reasons is additive. A v1
+ * Adding new error codes and new `mustRefetch` reasons is additive. The
  * decoder normalizes unknown reasons to `lagged` and unknown error codes to
  * `CDB_INVARIANT`, preserving a sound local tagged union while remaining
  * forward-compatible with newer peers.
@@ -16,7 +16,7 @@ import type { ChardbRef, ClientId, Cookie, CorrelationId, MutId, RawJson, SubId 
 
 export type { RawJson } from "./types.ts";
 
-export const PROTOCOL_V = 2 as const;
+export const PROTOCOL_V = 3 as const;
 export type ProtocolV = typeof PROTOCOL_V;
 
 export const PRESENCE_V = 1 as const;
@@ -146,6 +146,12 @@ export type Down =
           readonly mutResults?: readonly MutResult[] | undefined;
       }
     | {
+          readonly t: "snapshot";
+          readonly subId: SubId;
+          readonly cookie: Cookie;
+          readonly rows: readonly RawJson[];
+      }
+    | {
           readonly t: "mustRefetch";
           readonly subIds: readonly SubId[];
           readonly reason: MustRefetchReason;
@@ -200,6 +206,7 @@ export const UP_TAGS = [
 export const DOWN_TAGS = [
     "welcome",
     "poke",
+    "snapshot",
     "mustRefetch",
     "presence",
     "streamChunk",
@@ -436,6 +443,14 @@ function validateMessage(message: WireObject, tag: string): void {
                     validateMutResult(results[index], `${path}.mutResults[${index}]`);
                 }
             }
+            return;
+        }
+        case "snapshot": {
+            onlyKeys(message, path, ["t", "subId", "cookie", "rows"]);
+            integerId(required(message, "subId", path), `${path}.subId`);
+            stringValue(required(message, "cookie", path), `${path}.cookie`);
+            const rows = arrayValue(required(message, "rows", path), `${path}.rows`);
+            for (let index = 0; index < rows.length; index++) rawJson(rows[index], `${path}.rows[${index}]`);
             return;
         }
         case "mustRefetch": {

@@ -142,6 +142,20 @@ const CASES = {
             },
         ],
     },
+    snapshot: {
+        valid: {
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("cookie-2"),
+            rows: [{ id: "row-1" }, null, [1, true]],
+        },
+        malformed: [
+            { t: "snapshot", cookie: "cookie-2", rows: [] },
+            { t: "snapshot", subId: 1, rows: [] },
+            { t: "snapshot", subId: 1, cookie: "cookie-2", rows: {} },
+            { t: "snapshot", subId: 1, cookie: 2, rows: [] },
+        ],
+    },
     mustRefetch: {
         valid: { t: "mustRefetch", subIds: [SubId(1), SubId(2)], reason: "schemaChanged" },
         malformed: [
@@ -317,9 +331,12 @@ describe("wire envelope", () => {
 
     test("rejects numeric overflow as non-JSON data after parsing", () => {
         expect(() => decodeWire('{"t":"ping","overflow":1e400}')).toThrow(/finite number/);
+        expect(() => decodeWire('{"t":"snapshot","subId":1,"cookie":"cookie-1","rows":[1e400]}')).toThrow(
+            /finite number/
+        );
     });
 
-    test("normalizes additive mustRefetch reasons to lagged for protocol-v2 consumers", () => {
+    test("normalizes additive mustRefetch reasons to lagged for protocol-v3 consumers", () => {
         expect(decodeWire('{"t":"mustRefetch","subIds":[1],"reason":"futureReason"}')).toEqual({
             t: "mustRefetch",
             subIds: [SubId(1)],
@@ -339,7 +356,7 @@ describe("wire envelope", () => {
         });
     });
 
-    test("decodeWire rejects unknown tags (closed at protocolV=2)", () => {
+    test("decodeWire rejects unknown tags (closed at protocolV=3)", () => {
         expect(() => decodeWire(JSON.stringify({ t: "haxx" }))).toThrow(/unknown tag "haxx"/);
         expect(() => decodeWire(JSON.stringify({ t: "MUT" }))).toThrow(/unknown tag/);
     });
@@ -353,10 +370,10 @@ describe("wire envelope", () => {
         for (const t of UP_TAGS) expect(DOWN_TAGS as readonly string[]).not.toContain(t);
     });
 
-    test("checkProtocolV(2) accepts; mismatched versions emit mustRefetch:protocolMismatch", () => {
-        expect(checkProtocolV(2)).toBeNull();
-        expect(checkProtocolV(1)).toEqual({ t: "mustRefetch", subIds: [], reason: "protocolMismatch" });
-        expect(checkProtocolV("2")).toEqual({
+    test("checkProtocolV(3) accepts; mismatched versions emit mustRefetch:protocolMismatch", () => {
+        expect(checkProtocolV(3)).toBeNull();
+        expect(checkProtocolV(2)).toEqual({ t: "mustRefetch", subIds: [], reason: "protocolMismatch" });
+        expect(checkProtocolV("3")).toEqual({
             t: "mustRefetch",
             subIds: [],
             reason: "protocolMismatch",
@@ -368,7 +385,7 @@ describe("wire envelope", () => {
         });
     });
 
-    test("PROTOCOL_V is locked at 2", () => {
-        expect(PROTOCOL_V).toBe(2);
+    test("PROTOCOL_V is locked at 3", () => {
+        expect(PROTOCOL_V).toBe(3);
     });
 });

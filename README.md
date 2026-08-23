@@ -15,7 +15,7 @@ Implemented and tested in isolation:
 - SQLite mutation deduplication through an operation log
 - Catalog routing, snapshot barriers, and resharding state machines
 - Hibernated WebSocket bookkeeping
-- Strict protocol-v2 decoding and server-owned query routing metadata
+- Strict protocol-v3 decoding and server-owned query routing metadata
 - Better Auth schema synthesis with all auth rows stored in Catalog
 - Constraint-complete Catalog auth DDL with exact `auth_ddl_v1` compatibility checks
 - Atomic Catalog auth mutations with directly derivable old and new epoch bumps
