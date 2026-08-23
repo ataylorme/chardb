@@ -5,11 +5,13 @@
  * `code` identifier, every `retryable` polarity and every `mustRefetch` reason
  * are part of the locked surface; adding new fields under `featureSet`
  * advertisement is permitted, renaming or repurposing existing ones is not.
- * Adding new error codes and new `mustRefetch` reasons is additive — clients
- * MUST treat unknown reasons as `lagged`.
+ * Adding new error codes and new `mustRefetch` reasons is additive. A v1
+ * decoder normalizes unknown reasons to `lagged` and unknown error codes to
+ * `CDB_INVARIANT`, preserving a sound local tagged union while remaining
+ * forward-compatible with newer peers.
  */
 
-import type { CdbErrorCode } from "./errors.ts";
+import { type CdbErrorCode, docsUrlFor, isCdbErrorCode, isRetryable } from "./errors.ts";
 import type { ChardbRef, ClientId, Cookie, CorrelationId, MutId, RawJson, SubId } from "./types.ts";
 
 export type { RawJson } from "./types.ts";
@@ -205,13 +207,372 @@ export const DOWN_TAGS = [
 
 const ALL_TAGS = new Set<string>([...UP_TAGS, ...DOWN_TAGS]);
 
+type WireObject = Record<string, unknown>;
+
+function malformed(path: string, expected: string): never {
+    throw new TypeError(`malformed wire message: ${path} must ${expected}`);
+}
+
+function objectValue(value: unknown, path: string): WireObject {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        return malformed(path, "be an object");
+    }
+    return value as WireObject;
+}
+
+function required(object: WireObject, key: string, path: string): unknown {
+    if (!Object.hasOwn(object, key)) return malformed(`${path}.${key}`, "be present");
+    return object[key];
+}
+
+function optional(object: WireObject, key: string): unknown {
+    return Object.hasOwn(object, key) ? object[key] : undefined;
+}
+
+function onlyKeys(object: WireObject, path: string, keys: readonly string[]): void {
+    const allowed = new Set(keys);
+    for (const key of Object.keys(object)) {
+        if (!allowed.has(key)) malformed(`${path}.${key}`, "not be present");
+    }
+}
+
+function stringValue(value: unknown, path: string): string {
+    if (typeof value !== "string") return malformed(path, "be a string");
+    return value;
+}
+
+function booleanValue(value: unknown, path: string): boolean {
+    if (typeof value !== "boolean") return malformed(path, "be a boolean");
+    return value;
+}
+
+function finiteNumber(value: unknown, path: string): number {
+    if (typeof value !== "number" || !Number.isFinite(value)) return malformed(path, "be a finite number");
+    return value;
+}
+
+function nonnegativeNumber(value: unknown, path: string): number {
+    const number = finiteNumber(value, path);
+    if (number < 0) return malformed(path, "be nonnegative");
+    return number;
+}
+
+function integerId(value: unknown, path: string): number {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        return malformed(path, "be a nonnegative safe integer");
+    }
+    return value;
+}
+
+function arrayValue(value: unknown, path: string): unknown[] {
+    if (!Array.isArray(value)) return malformed(path, "be an array");
+    return value;
+}
+
+function enumValue<const T extends string>(value: unknown, path: string, allowed: ReadonlySet<T>): T {
+    if (typeof value !== "string" || !allowed.has(value as T)) {
+        return malformed(path, `be one of ${[...allowed].join(", ")}`);
+    }
+    return value as T;
+}
+
+function rawJson(value: unknown, path: string, depth = 0): void {
+    if (depth > 100) malformed(path, "have nesting depth at most 100");
+    if (value === null || typeof value === "string" || typeof value === "boolean") return;
+    if (typeof value === "number") {
+        finiteNumber(value, path);
+        return;
+    }
+    if (Array.isArray(value)) {
+        for (let index = 0; index < value.length; index++) rawJson(value[index], `${path}[${index}]`, depth + 1);
+        return;
+    }
+    if (typeof value === "object") {
+        for (const [key, child] of Object.entries(value as WireObject)) {
+            rawJson(child, `${path}.${key}`, depth + 1);
+        }
+        return;
+    }
+    malformed(path, "be JSON-compatible");
+}
+
+const INTENT_KINDS = new Set<CdbIntent["kind"]>(["select", "insert", "update", "delete", "execute"]);
+const JOIN_SHAPES = new Set<NonNullable<CdbIntent["joinShape"]>>(["colocated", "reference", "cross-partition"]);
+const PATCH_OPS = new Set<RowPatchOp>(["put", "del", "edit"]);
+const REFETCH_REASONS = new Set<MustRefetchReason>([
+    "lagged",
+    "authChanged",
+    "schemaChanged",
+    "protocolMismatch",
+    "shardsChanged",
+    "pitrIdempotencyReset",
+    "gsiLag",
+]);
+
+function stringArray(value: unknown, path: string): void {
+    const values = arrayValue(value, path);
+    for (let index = 0; index < values.length; index++) stringValue(values[index], `${path}[${index}]`);
+}
+
+function rawJsonArray(value: unknown, path: string): void {
+    const values = arrayValue(value, path);
+    for (let index = 0; index < values.length; index++) rawJson(values[index], `${path}[${index}]`);
+}
+
+function validateEndpoint(value: unknown, path: string): void {
+    const endpoint = objectValue(value, path);
+    const kind = enumValue(required(endpoint, "kind", path), `${path}.kind`, new Set(["neg_inf", "pos_inf", "value"]));
+    if (kind !== "value") {
+        onlyKeys(endpoint, path, ["kind"]);
+        return;
+    }
+    onlyKeys(endpoint, path, ["kind", "value", "inclusive"]);
+    rawJsonArray(required(endpoint, "value", path), `${path}.value`);
+    booleanValue(required(endpoint, "inclusive", path), `${path}.inclusive`);
+}
+
+function validateInterval(value: unknown, path: string): void {
+    const interval = objectValue(value, path);
+    const kind = enumValue(required(interval, "kind", path), `${path}.kind`, new Set(["full", "range"]));
+    if (kind !== "range") {
+        onlyKeys(interval, path, ["kind"]);
+        return;
+    }
+    onlyKeys(interval, path, ["kind", "lo", "hi"]);
+    validateEndpoint(required(interval, "lo", path), `${path}.lo`);
+    validateEndpoint(required(interval, "hi", path), `${path}.hi`);
+}
+
+function validateIntent(value: unknown, path: string): void {
+    const intent = objectValue(value, path);
+    onlyKeys(intent, path, ["kind", "tables", "partitionKey", "joinShape", "intervals", "relational"]);
+    enumValue(required(intent, "kind", path), `${path}.kind`, INTENT_KINDS);
+    stringArray(required(intent, "tables", path), `${path}.tables`);
+
+    const partitionKey = optional(intent, "partitionKey");
+    if (partitionKey !== undefined) {
+        const partition = objectValue(partitionKey, `${path}.partitionKey`);
+        onlyKeys(partition, `${path}.partitionKey`, ["table", "column", "values"]);
+        stringValue(required(partition, "table", `${path}.partitionKey`), `${path}.partitionKey.table`);
+        stringValue(required(partition, "column", `${path}.partitionKey`), `${path}.partitionKey.column`);
+        rawJsonArray(required(partition, "values", `${path}.partitionKey`), `${path}.partitionKey.values`);
+    }
+
+    const joinShape = optional(intent, "joinShape");
+    if (joinShape !== undefined) enumValue(joinShape, `${path}.joinShape`, JOIN_SHAPES);
+
+    const intervals = optional(intent, "intervals");
+    if (intervals !== undefined) {
+        const blocks = arrayValue(intervals, `${path}.intervals`);
+        for (let index = 0; index < blocks.length; index++) {
+            const blockPath = `${path}.intervals[${index}]`;
+            const block = objectValue(blocks[index], blockPath);
+            onlyKeys(block, blockPath, ["table", "indexName", "intervals"]);
+            stringValue(required(block, "table", blockPath), `${blockPath}.table`);
+            stringValue(required(block, "indexName", blockPath), `${blockPath}.indexName`);
+            const wireIntervals = arrayValue(required(block, "intervals", blockPath), `${blockPath}.intervals`);
+            for (let inner = 0; inner < wireIntervals.length; inner++) {
+                validateInterval(wireIntervals[inner], `${blockPath}.intervals[${inner}]`);
+            }
+        }
+    }
+
+    const relational = optional(intent, "relational");
+    if (relational !== undefined) {
+        const relation = objectValue(relational, `${path}.relational`);
+        onlyKeys(relation, `${path}.relational`, ["plan"]);
+        rawJson(required(relation, "plan", `${path}.relational`), `${path}.relational.plan`);
+    }
+}
+
+function validateRowPatch(value: unknown, path: string): void {
+    const patch = objectValue(value, path);
+    onlyKeys(patch, path, ["op", "subId", "rowKey", "row"]);
+    enumValue(required(patch, "op", path), `${path}.op`, PATCH_OPS);
+    integerId(required(patch, "subId", path), `${path}.subId`);
+    stringValue(required(patch, "rowKey", path), `${path}.rowKey`);
+    const row = optional(patch, "row");
+    if (row !== undefined) rawJson(row, `${path}.row`);
+}
+
+function validateMutResult(value: unknown, path: string): void {
+    const result = objectValue(value, path);
+    stringValue(required(result, "mutId", path), `${path}.mutId`);
+    const ok = booleanValue(required(result, "ok", path), `${path}.ok`);
+    if (ok) {
+        onlyKeys(result, path, ["mutId", "ok", "result", "cookie"]);
+        rawJson(required(result, "result", path), `${path}.result`);
+        stringValue(required(result, "cookie", path), `${path}.cookie`);
+        return;
+    }
+    onlyKeys(result, path, ["mutId", "ok", "error"]);
+    const error = objectValue(required(result, "error", path), `${path}.error`);
+    onlyKeys(error, `${path}.error`, ["code", "retryable", "docs"]);
+    validateErrorFields(error, `${path}.error`);
+}
+
+function validateErrorFields(error: WireObject, path: string): void {
+    const code = stringValue(required(error, "code", path), `${path}.code`);
+    const retryable = booleanValue(required(error, "retryable", path), `${path}.retryable`);
+    stringValue(required(error, "docs", path), `${path}.docs`);
+    if (!isCdbErrorCode(code)) {
+        error.code = "CDB_INVARIANT";
+        error.retryable = false;
+        error.docs = docsUrlFor("CDB_INVARIANT");
+        return;
+    }
+    if (retryable !== isRetryable(code)) malformed(`${path}.retryable`, `match the locked polarity for ${code}`);
+}
+
+function validateMessage(message: WireObject, tag: string): void {
+    const path = tag;
+    switch (tag) {
+        case "hello": {
+            onlyKeys(message, path, ["t", "clientId", "resume", "resumeFromCookie", "jwt"]);
+            stringValue(required(message, "clientId", path), `${path}.clientId`);
+            stringValue(required(message, "jwt", path), `${path}.jwt`);
+            const resume = optional(message, "resume");
+            if (resume !== undefined) stringValue(resume, `${path}.resume`);
+            const resumeFromCookie = optional(message, "resumeFromCookie");
+            if (resumeFromCookie !== undefined) stringValue(resumeFromCookie, `${path}.resumeFromCookie`);
+            return;
+        }
+        case "sub": {
+            onlyKeys(message, path, ["t", "subId", "queryHash", "intent", "ttlMs"]);
+            integerId(required(message, "subId", path), `${path}.subId`);
+            stringValue(required(message, "queryHash", path), `${path}.queryHash`);
+            validateIntent(required(message, "intent", path), `${path}.intent`);
+            const ttlMs = optional(message, "ttlMs");
+            if (ttlMs !== undefined) nonnegativeNumber(ttlMs, `${path}.ttlMs`);
+            return;
+        }
+        case "unsub":
+            onlyKeys(message, path, ["t", "subId"]);
+            integerId(required(message, "subId", path), `${path}.subId`);
+            return;
+        case "mut":
+            onlyKeys(message, path, ["t", "mutId", "ref", "args"]);
+            stringValue(required(message, "mutId", path), `${path}.mutId`);
+            validateRef(required(message, "ref", path), `${path}.ref`);
+            rawJson(required(message, "args", path), `${path}.args`);
+            return;
+        case "updateAuth":
+            onlyKeys(message, path, ["t", "jwt"]);
+            stringValue(required(message, "jwt", path), `${path}.jwt`);
+            return;
+        case "ack":
+            onlyKeys(message, path, ["t", "cookie"]);
+            stringValue(required(message, "cookie", path), `${path}.cookie`);
+            return;
+        case "presencePub": {
+            onlyKeys(message, path, ["t", "key", "state", "ttlMs"]);
+            stringValue(required(message, "key", path), `${path}.key`);
+            rawJson(required(message, "state", path), `${path}.state`);
+            const ttlMs = optional(message, "ttlMs");
+            if (ttlMs !== undefined) nonnegativeNumber(ttlMs, `${path}.ttlMs`);
+            return;
+        }
+        case "presenceSub":
+            onlyKeys(message, path, ["t", "key"]);
+            stringValue(required(message, "key", path), `${path}.key`);
+            return;
+        case "streamReq":
+            onlyKeys(message, path, ["t", "streamReqId", "ref", "args", "mutId"]);
+            integerId(required(message, "streamReqId", path), `${path}.streamReqId`);
+            validateRef(required(message, "ref", path), `${path}.ref`);
+            rawJson(required(message, "args", path), `${path}.args`);
+            stringValue(required(message, "mutId", path), `${path}.mutId`);
+            return;
+        case "ping":
+            onlyKeys(message, path, ["t"]);
+            return;
+        case "welcome": {
+            onlyKeys(message, path, ["t", "baseCookie", "region", "colo", "resumedFromCookie"]);
+            stringValue(required(message, "baseCookie", path), `${path}.baseCookie`);
+            stringValue(required(message, "region", path), `${path}.region`);
+            const colo = optional(message, "colo");
+            if (colo !== undefined) stringValue(colo, `${path}.colo`);
+            const resumedFromCookie = optional(message, "resumedFromCookie");
+            if (resumedFromCookie !== undefined) stringValue(resumedFromCookie, `${path}.resumedFromCookie`);
+            return;
+        }
+        case "poke": {
+            onlyKeys(message, path, ["t", "cookie", "patches", "mutResults"]);
+            stringValue(required(message, "cookie", path), `${path}.cookie`);
+            const patches = arrayValue(required(message, "patches", path), `${path}.patches`);
+            for (let index = 0; index < patches.length; index++) {
+                validateRowPatch(patches[index], `${path}.patches[${index}]`);
+            }
+            const mutResults = optional(message, "mutResults");
+            if (mutResults !== undefined) {
+                const results = arrayValue(mutResults, `${path}.mutResults`);
+                for (let index = 0; index < results.length; index++) {
+                    validateMutResult(results[index], `${path}.mutResults[${index}]`);
+                }
+            }
+            return;
+        }
+        case "mustRefetch": {
+            onlyKeys(message, path, ["t", "subIds", "reason"]);
+            const subIds = arrayValue(required(message, "subIds", path), `${path}.subIds`);
+            for (let index = 0; index < subIds.length; index++) integerId(subIds[index], `${path}.subIds[${index}]`);
+            const reason = stringValue(required(message, "reason", path), `${path}.reason`);
+            if (!REFETCH_REASONS.has(reason as MustRefetchReason)) message.reason = "lagged";
+            return;
+        }
+        case "presence": {
+            onlyKeys(message, path, ["t", "key", "version", "states"]);
+            stringValue(required(message, "key", path), `${path}.key`);
+            const version = required(message, "version", path);
+            if (version !== PRESENCE_V) malformed(`${path}.version`, `equal ${PRESENCE_V}`);
+            const states = arrayValue(required(message, "states", path), `${path}.states`);
+            for (let index = 0; index < states.length; index++) {
+                const statePath = `${path}.states[${index}]`;
+                const state = objectValue(states[index], statePath);
+                onlyKeys(state, statePath, ["clientId", "state", "ts"]);
+                stringValue(required(state, "clientId", statePath), `${statePath}.clientId`);
+                rawJson(required(state, "state", statePath), `${statePath}.state`);
+                finiteNumber(required(state, "ts", statePath), `${statePath}.ts`);
+            }
+            return;
+        }
+        case "streamChunk":
+            onlyKeys(message, path, ["t", "streamReqId", "chunk"]);
+            integerId(required(message, "streamReqId", path), `${path}.streamReqId`);
+            rawJson(required(message, "chunk", path), `${path}.chunk`);
+            return;
+        case "streamEnd":
+            onlyKeys(message, path, ["t", "streamReqId", "finalMutResult"]);
+            integerId(required(message, "streamReqId", path), `${path}.streamReqId`);
+            validateMutResult(required(message, "finalMutResult", path), `${path}.finalMutResult`);
+            return;
+        case "error": {
+            onlyKeys(message, path, ["t", "code", "subId", "streamReqId", "retryable", "correlationId", "docs"]);
+            const subId = optional(message, "subId");
+            if (subId !== undefined) integerId(subId, `${path}.subId`);
+            const streamReqId = optional(message, "streamReqId");
+            if (streamReqId !== undefined) integerId(streamReqId, `${path}.streamReqId`);
+            stringValue(required(message, "correlationId", path), `${path}.correlationId`);
+            validateErrorFields(message, path);
+            return;
+        }
+        default:
+            throw new TypeError(`malformed wire message: unknown tag "${tag}" — closed at protocolV=${PROTOCOL_V}`);
+    }
+}
+
+function validateRef(value: unknown, path: string): void {
+    const ref = stringValue(value, path);
+    if (ref.length === 0 || !ref.includes("#")) malformed(path, "be a nonempty ChardbRef containing #");
+}
+
 /**
- * Parse a wire message with a closed-set tag check.
+ * Parse and structurally validate a wire message.
  *
  * Throws `TypeError` for malformed JSON or unknown tags so callers can
  * distinguish a structurally-broken envelope from a semantically-rejected
- * one. Field-level shape validation beyond the tag is the SDK's job — the
- * `Up`/`Down` sum-type guards each individual handler downstream.
+ * one. Every field is validated before the value crosses into an Up/Down
+ * handler; no unchecked cast is exposed to the rest of the runtime.
  */
 export function decodeWire(raw: string): WireMessage {
     let parsed: unknown;
@@ -222,6 +583,7 @@ export function decodeWire(raw: string): WireMessage {
             `malformed wire message: invalid JSON (${err instanceof Error ? err.message : String(err)})`
         );
     }
+    rawJson(parsed, "$root");
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new TypeError("malformed wire message: not an object");
     }
@@ -232,6 +594,7 @@ export function decodeWire(raw: string): WireMessage {
     if (!ALL_TAGS.has(tag)) {
         throw new TypeError(`malformed wire message: unknown tag "${tag}" — closed at protocolV=${PROTOCOL_V}`);
     }
+    validateMessage(parsed as WireObject, tag);
     return parsed as WireMessage;
 }
 

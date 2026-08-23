@@ -12,7 +12,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { decodeJwtClaims, principalIdFromJwt } from "../../auth/jwt.ts";
-import { CdbError, isCdbErrorCode } from "../../errors.ts";
+import { CdbError, docsUrlFor, isCdbErrorCode, isRetryable } from "../../errors.ts";
 import {
     type ClientId,
     Cookie,
@@ -152,6 +152,22 @@ export interface GatewayRuntimeConfig {
 
 function mutationFailure(code: import("../../errors.ts").CdbErrorCode, message: string): CdbMutationResponse {
     return { ok: false, error: new CdbError({ code, message }).toJSON() };
+}
+
+/** Build a Down.error envelope with the locked metadata for its code. */
+export function gatewayErrorEnvelope(
+    code: import("../../errors.ts").CdbErrorCode,
+    correlationId: CorrelationId,
+    subId?: SubId
+): Extract<Down, { readonly t: "error" }> {
+    return {
+        t: "error",
+        code,
+        retryable: isRetryable(code),
+        correlationId,
+        docs: docsUrlFor(code),
+        ...(subId !== undefined ? { subId } : {}),
+    };
 }
 
 /**
@@ -606,14 +622,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     private sendError(ws: WebSocket, code: import("../../errors.ts").CdbErrorCode, subId?: SubId): void {
         const corr = CorrelationId(crypto.randomUUID());
-        this.send(ws, {
-            t: "error",
-            code,
-            retryable: false,
-            correlationId: corr,
-            docs: `https://chardb.dev/errors/${code.toLowerCase()}`,
-            ...(subId !== undefined ? { subId } : {}),
-        });
+        this.send(ws, gatewayErrorEnvelope(code, corr, subId));
     }
 
     private sendMutFailure(ws: WebSocket, mutId: MutId, error: CdbErrorWire, lastCookie?: Cookie): void {
@@ -627,8 +636,8 @@ export class Gateway extends DurableObject<GatewayEnv> {
                     ok: false,
                     error: {
                         code: error.code,
-                        retryable: error.retryable,
-                        docs: error.docs,
+                        retryable: isRetryable(error.code),
+                        docs: docsUrlFor(error.code),
                     },
                 },
             ],

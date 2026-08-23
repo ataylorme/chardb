@@ -1,17 +1,272 @@
 import { describe, expect, test } from "bun:test";
-import { ChardbRef, ClientId, Cookie, MutId, SubId } from "../src/types.ts";
+import { ChardbRef, ClientId, Cookie, CorrelationId, MutId, SubId } from "../src/types.ts";
 import {
     DOWN_TAGS,
     type Down,
     PROTOCOL_V,
     UP_TAGS,
     type Up,
+    type WireMessage,
     checkProtocolV,
     decodeWire,
     encodeWire,
 } from "../src/wire.ts";
 
+type WireCases = {
+    readonly [Tag in WireMessage["t"]]: {
+        readonly valid: Extract<WireMessage, { readonly t: Tag }>;
+        readonly malformed: readonly Record<string, unknown>[];
+    };
+};
+
+const CASES = {
+    hello: {
+        valid: {
+            t: "hello",
+            clientId: ClientId("client-1"),
+            resume: Cookie("cookie-0"),
+            resumeFromCookie: Cookie("cookie-1"),
+            jwt: "jwt",
+        },
+        malformed: [
+            { t: "hello", clientId: "client-1" },
+            { t: "hello", clientId: [], jwt: "jwt" },
+        ],
+    },
+    sub: {
+        valid: {
+            t: "sub",
+            subId: SubId(1),
+            queryHash: "query-1",
+            ttlMs: 1_000,
+            intent: {
+                kind: "select",
+                tables: ["messages"],
+                partitionKey: { table: "messages", column: "org_id", values: ["org-1"] },
+                joinShape: "colocated",
+                intervals: [
+                    {
+                        table: "messages",
+                        indexName: "messages_org",
+                        intervals: [
+                            {
+                                kind: "range",
+                                lo: { kind: "value", value: ["a"], inclusive: true },
+                                hi: { kind: "pos_inf" },
+                            },
+                        ],
+                    },
+                ],
+                relational: { plan: { with: "author" } },
+            },
+        },
+        malformed: [
+            { t: "sub", subId: 1.5, queryHash: "q", intent: { kind: "select", tables: [] } },
+            { t: "sub", subId: 1, queryHash: "q", intent: [] },
+        ],
+    },
+    unsub: {
+        valid: { t: "unsub", subId: SubId(1) },
+        malformed: [{ t: "unsub" }, { t: "unsub", subId: -1 }],
+    },
+    mut: {
+        valid: { t: "mut", mutId: MutId("mut-1"), ref: ChardbRef("api.ts#create"), args: { body: "hi" } },
+        malformed: [
+            { t: "mut", mutId: "mut-1", ref: "not-a-ref", args: {} },
+            { t: "mut", mutId: "mut-1", ref: "api.ts#create" },
+        ],
+    },
+    updateAuth: {
+        valid: { t: "updateAuth", jwt: "new-jwt" },
+        malformed: [{ t: "updateAuth" }, { t: "updateAuth", jwt: {} }],
+    },
+    ack: {
+        valid: { t: "ack", cookie: Cookie("cookie-1") },
+        malformed: [{ t: "ack" }, { t: "ack", cookie: 4 }],
+    },
+    presencePub: {
+        valid: { t: "presencePub", key: "room-1", state: { typing: true }, ttlMs: 5_000 },
+        malformed: [
+            { t: "presencePub", key: "room-1" },
+            { t: "presencePub", key: "room-1", state: null, ttlMs: -1 },
+        ],
+    },
+    presenceSub: {
+        valid: { t: "presenceSub", key: "room-1" },
+        malformed: [{ t: "presenceSub" }, { t: "presenceSub", key: [] }],
+    },
+    streamReq: {
+        valid: {
+            t: "streamReq",
+            streamReqId: 1,
+            ref: ChardbRef("api.ts#exportRows"),
+            args: { limit: 10 },
+            mutId: MutId("mut-2"),
+        },
+        malformed: [
+            { t: "streamReq", streamReqId: -1, ref: "api.ts#exportRows", args: {}, mutId: "mut-2" },
+            { t: "streamReq", streamReqId: 1, ref: "bad", args: {}, mutId: "mut-2" },
+        ],
+    },
+    ping: {
+        valid: { t: "ping" },
+        malformed: [
+            { t: "ping", payload: true },
+            { t: "ping", payload: [] },
+        ],
+    },
+    welcome: {
+        valid: {
+            t: "welcome",
+            baseCookie: Cookie("cookie-1"),
+            region: "WNAM",
+            colo: "SJC",
+            resumedFromCookie: Cookie("cookie-0"),
+        },
+        malformed: [
+            { t: "welcome", baseCookie: "cookie-1" },
+            { t: "welcome", baseCookie: "cookie-1", region: "WNAM", colo: 7 },
+        ],
+    },
+    poke: {
+        valid: {
+            t: "poke",
+            cookie: Cookie("cookie-2"),
+            patches: [{ op: "put", subId: SubId(1), rowKey: "row-1", row: { id: "row-1" } }],
+            mutResults: [
+                { mutId: MutId("mut-1"), ok: true, result: { id: "row-1" }, cookie: Cookie("cookie-2") },
+                {
+                    mutId: MutId("mut-2"),
+                    ok: false,
+                    error: { code: "CDB_INVALID_ARGS", retryable: false, docs: "https://chardb.dev/errors/x" },
+                },
+            ],
+        },
+        malformed: [
+            { t: "poke", cookie: "cookie-2", patches: {} },
+            { t: "poke", cookie: "cookie-2", patches: [], mutResults: [{ mutId: "mut-1", ok: "yes" }] },
+            {
+                t: "poke",
+                cookie: "cookie-2",
+                patches: [],
+                mutResults: [
+                    {
+                        mutId: "mut-1",
+                        ok: false,
+                        error: { code: "CDB_INVALID_ARGS", retryable: true, docs: "docs" },
+                    },
+                ],
+            },
+        ],
+    },
+    mustRefetch: {
+        valid: { t: "mustRefetch", subIds: [SubId(1), SubId(2)], reason: "schemaChanged" },
+        malformed: [
+            { t: "mustRefetch", subIds: [1.2], reason: "schemaChanged" },
+            { t: "mustRefetch", subIds: [], reason: 7 },
+        ],
+    },
+    presence: {
+        valid: {
+            t: "presence",
+            key: "room-1",
+            version: 1,
+            states: [{ clientId: ClientId("client-1"), state: { typing: true }, ts: 1_700_000_000_000 }],
+        },
+        malformed: [
+            { t: "presence", key: "room-1", version: 2, states: [] },
+            { t: "presence", key: "room-1", version: 1, states: [{ clientId: "client-1", state: null }] },
+        ],
+    },
+    streamChunk: {
+        valid: { t: "streamChunk", streamReqId: 1, chunk: [1, 2, 3] },
+        malformed: [
+            { t: "streamChunk", streamReqId: -1, chunk: null },
+            { t: "streamChunk", streamReqId: 1 },
+        ],
+    },
+    streamEnd: {
+        valid: {
+            t: "streamEnd",
+            streamReqId: 1,
+            finalMutResult: {
+                mutId: MutId("mut-1"),
+                ok: false,
+                error: { code: "CDB_SHARD_UNAVAILABLE", retryable: true, docs: "https://chardb.dev/errors/x" },
+            },
+        },
+        malformed: [
+            { t: "streamEnd", streamReqId: 1.5, finalMutResult: {} },
+            { t: "streamEnd", streamReqId: 1, finalMutResult: [] },
+            {
+                t: "streamEnd",
+                streamReqId: 1,
+                finalMutResult: {
+                    mutId: "mut-1",
+                    ok: false,
+                    error: { code: 7, retryable: false, docs: "docs" },
+                },
+            },
+        ],
+    },
+    error: {
+        valid: {
+            t: "error",
+            code: "CDB_CATALOG_UNAVAILABLE",
+            subId: SubId(1),
+            streamReqId: 2,
+            retryable: true,
+            correlationId: CorrelationId("corr-1"),
+            docs: "https://chardb.dev/errors/cdb_catalog_unavailable",
+        },
+        malformed: [
+            {
+                t: "error",
+                code: 7,
+                retryable: false,
+                correlationId: "corr-1",
+                docs: "docs",
+            },
+            {
+                t: "error",
+                code: "CDB_INVARIANT",
+                retryable: "no",
+                correlationId: "corr-1",
+                docs: "docs",
+            },
+            {
+                t: "error",
+                code: "CDB_INVARIANT",
+                retryable: true,
+                correlationId: "corr-1",
+                docs: "docs",
+            },
+        ],
+    },
+} satisfies WireCases;
+
 describe("wire envelope", () => {
+    const everyTag = [...UP_TAGS, ...DOWN_TAGS];
+
+    test("table covers every member of the Up/Down tagged union", () => {
+        expect(Object.keys(CASES).sort()).toEqual([...everyTag].sort());
+    });
+
+    for (const tag of everyTag) {
+        test(`decodeWire accepts the complete valid ${tag} shape`, () => {
+            const valid = CASES[tag].valid;
+            expect(decodeWire(encodeWire(valid))).toEqual(valid);
+        });
+
+        test(`decodeWire rejects several malformed ${tag} shapes`, () => {
+            const entry = CASES[tag];
+            const unexpected = { ...entry.valid, unexpected: true };
+            for (const malformed of [...entry.malformed, unexpected]) {
+                expect(() => decodeWire(JSON.stringify(malformed))).toThrow(TypeError);
+            }
+        });
+    }
+
     test("Up.hello round-trips", () => {
         const up: Up = {
             t: "hello",
@@ -59,6 +314,30 @@ describe("wire envelope", () => {
         expect(() => decodeWire(JSON.stringify({ no: "tag" }))).toThrow(/missing string tag/);
         expect(() => decodeWire(JSON.stringify(null))).toThrow(/not an object/);
         expect(() => decodeWire(JSON.stringify([]))).toThrow(/not an object/);
+    });
+
+    test("rejects numeric overflow as non-JSON data after parsing", () => {
+        expect(() => decodeWire('{"t":"ping","overflow":1e400}')).toThrow(/finite number/);
+    });
+
+    test("normalizes additive mustRefetch reasons to lagged for protocol-v1 consumers", () => {
+        expect(decodeWire('{"t":"mustRefetch","subIds":[1],"reason":"futureReason"}')).toEqual({
+            t: "mustRefetch",
+            subIds: [SubId(1)],
+            reason: "lagged",
+        });
+    });
+
+    test("normalizes additive error codes to a locked invariant envelope", () => {
+        expect(
+            decodeWire('{"t":"error","code":"CDB_FUTURE_CODE","retryable":true,"correlationId":"corr","docs":"future"}')
+        ).toEqual({
+            t: "error",
+            code: "CDB_INVARIANT",
+            retryable: false,
+            correlationId: CorrelationId("corr"),
+            docs: "https://chardb.dev/errors/cdb_invariant",
+        });
     });
 
     test("decodeWire rejects unknown tags (closed at protocolV=1)", () => {

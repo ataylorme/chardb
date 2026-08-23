@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { CdbError } from "../../src/errors.ts";
-import { type TrustedMutationDispatchDeps, dispatchTrustedMutation } from "../../src/server/do/gateway.ts";
+import {
+    type TrustedMutationDispatchDeps,
+    dispatchTrustedMutation,
+    gatewayErrorEnvelope,
+} from "../../src/server/do/gateway.ts";
 import type { CdbMutationRequest, TrustedMutationDispatchRequest } from "../../src/server/rpc.ts";
-import { ShardId } from "../../src/types.ts";
+import { CorrelationId, ShardId, SubId } from "../../src/types.ts";
+import { decodeWire, encodeWire } from "../../src/wire.ts";
 
 const request: TrustedMutationDispatchRequest = {
     mutId: "mut-1",
@@ -49,6 +54,16 @@ function workingDeps(): TrustedMutationDispatchDeps {
 }
 
 describe("trusted Gateway mutation dispatch", () => {
+    test("Gateway error envelopes use locked retryability and pass strict decoding", () => {
+        const retryable = gatewayErrorEnvelope("CDB_SHARD_UNAVAILABLE", CorrelationId("corr-1"), SubId(7));
+        expect(retryable).toMatchObject({ retryable: true, docs: "https://chardb.dev/errors/cdb_shard_unavailable" });
+        expect(decodeWire(encodeWire(retryable))).toEqual(retryable);
+
+        const terminal = gatewayErrorEnvelope("CDB_UNSUPPORTED_FEATURE", CorrelationId("corr-2"));
+        expect(terminal).toMatchObject({ retryable: false, docs: "https://chardb.dev/errors/cdb_unsupported_feature" });
+        expect(decodeWire(encodeWire(terminal))).toEqual(terminal);
+    });
+
     test("routes locally, calls Catalog, and derives Cdb principalId from trusted auth.userId", async () => {
         await expect(dispatchTrustedMutation(workingDeps(), request)).resolves.toEqual({
             ok: true,
