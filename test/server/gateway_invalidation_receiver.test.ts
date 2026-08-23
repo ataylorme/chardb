@@ -175,7 +175,7 @@ describe("Gateway invalidation receiver", () => {
         expect(alarms).toHaveLength(1);
     });
 
-    test("requires the exact socket, client, and sub identity", async () => {
+    test("rejects current registrations whose socket, client, or sub identity conflicts", async () => {
         const current = registration("registration-exact");
         install(current);
         const mismatches: LiveSubscriptionId[] = [
@@ -187,16 +187,13 @@ describe("Gateway invalidation receiver", () => {
         for (const subscription of mismatches) {
             await expect(
                 gateway.invalidateSubscriptions(invalidationRequest([{ subscription, changeSeq: 4 }]))
-            ).resolves.toEqual({
-                gatewayId: "gateway-do-1",
-                acknowledgements: [{ registrationId: current.registrationId, changeSeq: 4, status: "stale" }],
-            });
+            ).rejects.toMatchObject({ code: "CDB_INVARIANT" });
         }
         expect(dirtyVersion(current.registrationId)).toBe(0);
         expect(alarms).toEqual([]);
     });
 
-    test("rejects a physical Cdb source mismatch without confusing it with logical shardId", async () => {
+    test("rejects a current physical Cdb source mismatch without acknowledging it as stale", async () => {
         const current = registration("registration-source");
         install(current);
 
@@ -206,11 +203,33 @@ describe("Gateway invalidation receiver", () => {
                     sourceCdbId: "logical-shard-1",
                 })
             )
-        ).resolves.toEqual({
-            gatewayId: "gateway-do-1",
-            acknowledgements: [{ registrationId: current.registrationId, changeSeq: 5, status: "stale" }],
-        });
+        ).rejects.toMatchObject({ code: "CDB_INVARIANT" });
         expect(dirtyVersion(current.registrationId)).toBe(0);
+        expect(alarms).toEqual([]);
+    });
+
+    test("rolls back earlier accepted items when a later current identity conflicts", async () => {
+        const first = registration("registration-batch-first");
+        const second = registration("registration-batch-second", {
+            clientId: ClientId("client-2"),
+            subId: SubId(2),
+        });
+        install(first);
+        install(second);
+
+        await expect(
+            gateway.invalidateSubscriptions(
+                invalidationRequest([
+                    { subscription: identity(first), changeSeq: 7 },
+                    {
+                        subscription: identity(second, { connectionId: "connection-conflict" }),
+                        changeSeq: 8,
+                    },
+                ])
+            )
+        ).rejects.toMatchObject({ code: "CDB_INVARIANT" });
+        expect(dirtyVersion(first.registrationId)).toBe(0);
+        expect(dirtyVersion(second.registrationId)).toBe(0);
         expect(alarms).toEqual([]);
     });
 

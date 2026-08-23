@@ -1333,6 +1333,49 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const acknowledgements = this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             return validated.invalidations.map(({ subscription, changeSeq }): GatewayInvalidationAck => {
+                const stored = sql.one<{
+                    registration_id: string;
+                    connection_id: string;
+                    client_id: string;
+                    sub_id: number;
+                    source_cdb_id: string | null;
+                    lifecycle: GatewayRegistrationLifecycle;
+                    cdb_state: GatewayRegistrationCdbState;
+                    head_registration_id: string | null;
+                }>(
+                    `SELECT g.registration_id, g.connection_id, g.client_id, g.sub_id,
+                            g.source_cdb_id, g.lifecycle, g.cdb_state,
+                            h.registration_id AS head_registration_id
+                     FROM _gw_registration_generations AS g
+                     LEFT JOIN _gw_registration_heads AS h
+                       ON h.principal_id = g.principal_id
+                      AND h.client_id = g.client_id
+                      AND h.sub_id = g.sub_id
+                     WHERE g.registration_id = ?`,
+                    subscription.registrationId
+                );
+                if (
+                    !stored ||
+                    stored.head_registration_id !== stored.registration_id ||
+                    stored.lifecycle === "retiring" ||
+                    stored.cdb_state === "retiring"
+                ) {
+                    return {
+                        registrationId: subscription.registrationId,
+                        changeSeq,
+                        status: "stale",
+                    };
+                }
+                if (
+                    stored.source_cdb_id !== validated.sourceCdbId ||
+                    stored.connection_id !== subscription.connectionId ||
+                    stored.client_id !== subscription.clientId ||
+                    stored.sub_id !== subscription.subId
+                ) {
+                    throw gatewayInvalidationInvariant(
+                        "current Gateway registration conflicts with its Cdb invalidation identity"
+                    );
+                }
                 sql.exec(
                     `UPDATE _gw_registration_generations
                      SET dirty_version = MAX(dirty_version, ?), updated_at = ?
@@ -1354,10 +1397,15 @@ export class Gateway extends DurableObject<GatewayEnv> {
                     subscription.subId,
                     validated.sourceCdbId
                 );
+                if (sql.changes() !== 1) {
+                    throw gatewayInvalidationInvariant(
+                        "current Gateway registration changed while accepting a Cdb invalidation"
+                    );
+                }
                 return {
                     registrationId: subscription.registrationId,
                     changeSeq,
-                    status: sql.changes() === 1 ? "accepted" : "stale",
+                    status: "accepted",
                 };
             });
         });
