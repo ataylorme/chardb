@@ -105,21 +105,7 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("creates and looks up core and membership rows by non-owner fields", async () => {
-        const bumps: string[] = [];
-        const adapter = chardbAuthAdapter({
-            env: { CDB_CATALOG: namespaceFor(harness) },
-            dispatcher: {
-                bumpGlobal: async () => {
-                    bumps.push("global");
-                },
-                bumpTenant: async id => {
-                    bumps.push(`tenant:${id}`);
-                },
-                bumpPrincipal: async id => {
-                    bumps.push(`principal:${id}`);
-                },
-            },
-        })(auth.options);
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
         const now = new Date("2026-08-23T00:00:00Z");
 
         await adapter.create({
@@ -207,31 +193,15 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(await adapter.findMany({ model: "member", where: eq("userId", "user-1") })).toEqual([
             expect.objectContaining({ id: "member-1", organizationId: "org-1" }),
         ]);
-        expect(bumps).toEqual([
-            "principal:user-1",
-            "principal:user-1",
-            "principal:user-1",
-            "tenant:org-1",
-            "tenant:org-1",
-        ]);
+        expect(harness.catalog.authEpoch({ tenantId: "org-1" as never, principalId: "user-1" as never })).toEqual({
+            global: 1,
+            tenant: 2,
+            principal: 4,
+        });
     });
 
     test("updates and deletes through non-owner lookups while preserving epoch bumps", async () => {
-        const bumps: string[] = [];
-        const adapter = chardbAuthAdapter({
-            env: { CDB_CATALOG: namespaceFor(harness) },
-            dispatcher: {
-                bumpGlobal: async () => {
-                    bumps.push("global");
-                },
-                bumpTenant: async id => {
-                    bumps.push(`tenant:${id}`);
-                },
-                bumpPrincipal: async id => {
-                    bumps.push(`principal:${id}`);
-                },
-            },
-        })(auth.options);
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
         const now = new Date("2026-08-23T00:00:00Z");
 
         await adapter.create({
@@ -267,7 +237,185 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         });
         await adapter.delete({ model: "session", where: eq("token", "delete-token") });
         expect(await adapter.findOne({ model: "session", where: eq("token", "delete-token") })).toBeNull();
-        expect(bumps).toEqual(["principal:user-2", "principal:user-2", "principal:user-2", "principal:user-2"]);
+        expect(harness.catalog.authEpoch({ principalId: "user-2" as never }).principal).toBe(4);
+    });
+
+    test("rolls back an auth row when its atomic epoch bump fails", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        harness.db.run(`CREATE TRIGGER fail_auth_epoch
+            BEFORE UPDATE ON catalog_epoch
+            WHEN NEW.scope = 'auth_principal'
+            BEGIN SELECT RAISE(ABORT, 'forced epoch failure'); END`);
+        const now = new Date("2026-08-23T00:00:00Z");
+
+        await expect(
+            adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id: "rollback-user",
+                    name: "Rollback",
+                    email: "rollback@example.com",
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            })
+        ).rejects.toThrow("forced epoch failure");
+        expect(await adapter.findOne({ model: "user", where: eq("email", "rollback@example.com") })).toBeNull();
+        expect(harness.catalog.authEpoch({ principalId: "rollback-user" as never }).principal).toBe(0);
+    });
+
+    test("updateMany bumps every affected principal before returning", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const now = new Date("2026-08-23T00:00:00Z");
+        for (const id of ["batch-user-1", "batch-user-2"]) {
+            await adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id,
+                    name: "Before",
+                    email: `${id}@example.com`,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                    role: "batch",
+                },
+            });
+        }
+
+        expect(await adapter.updateMany({ model: "user", where: eq("role", "batch"), update: { name: "After" } })).toBe(
+            2
+        );
+        expect(await adapter.findMany({ model: "user", where: eq("name", "After") })).toHaveLength(2);
+        expect(harness.catalog.authEpoch({ principalId: "batch-user-1" as never }).principal).toBe(2);
+        expect(harness.catalog.authEpoch({ principalId: "batch-user-2" as never }).principal).toBe(2);
+    });
+
+    test("updateMany bumps every tenant and principal touched by membership rows", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const now = new Date("2026-08-23T00:00:00Z");
+        for (const suffix of ["1", "2"]) {
+            const userId = `batch-member-user-${suffix}`;
+            const organizationId = `batch-member-org-${suffix}`;
+            await adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id: userId,
+                    name: userId,
+                    email: `${userId}@example.com`,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+            await adapter.create({
+                model: "organization",
+                forceAllowId: true,
+                data: { id: organizationId, name: organizationId, slug: organizationId, createdAt: now },
+            });
+            await adapter.create({
+                model: "member",
+                forceAllowId: true,
+                data: {
+                    id: `batch-member-${suffix}`,
+                    organizationId,
+                    userId,
+                    role: "pending-batch",
+                    createdAt: now,
+                },
+            });
+        }
+        const before = ["1", "2"].map(suffix =>
+            harness.catalog.authEpoch({
+                tenantId: `batch-member-org-${suffix}` as never,
+                principalId: `batch-member-user-${suffix}` as never,
+            })
+        );
+
+        expect(
+            await adapter.updateMany({
+                model: "member",
+                where: eq("role", "pending-batch"),
+                update: { role: "member" },
+            })
+        ).toBe(2);
+        for (const [index, suffix] of ["1", "2"].entries()) {
+            const after = harness.catalog.authEpoch({
+                tenantId: `batch-member-org-${suffix}` as never,
+                principalId: `batch-member-user-${suffix}` as never,
+            });
+            expect(after.tenant).toBe((before[index]?.tenant ?? 0) + 1);
+            expect(after.principal).toBe((before[index]?.principal ?? 0) + 1);
+        }
+    });
+
+    test("moving a membership bumps every old and new tenant and principal scope", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const now = new Date("2026-08-23T00:00:00Z");
+        for (const id of ["move-user-1", "move-user-2"]) {
+            await adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id,
+                    name: id,
+                    email: `${id}@example.com`,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+        }
+        for (const id of ["move-org-1", "move-org-2"]) {
+            await adapter.create({
+                model: "organization",
+                forceAllowId: true,
+                data: { id, name: id, slug: id, createdAt: now },
+            });
+        }
+        await adapter.create({
+            model: "member",
+            forceAllowId: true,
+            data: {
+                id: "moving-member",
+                organizationId: "move-org-1",
+                userId: "move-user-1",
+                role: "member",
+                createdAt: now,
+            },
+        });
+
+        const beforeOld = harness.catalog.authEpoch({
+            tenantId: "move-org-1" as never,
+            principalId: "move-user-1" as never,
+        });
+        const beforeNew = harness.catalog.authEpoch({
+            tenantId: "move-org-2" as never,
+            principalId: "move-user-2" as never,
+        });
+        expect(
+            await adapter.update({
+                model: "member",
+                where: eq("id", "moving-member"),
+                update: { organizationId: "move-org-2", userId: "move-user-2" },
+            })
+        ).toMatchObject({ organizationId: "move-org-2", userId: "move-user-2" });
+
+        const afterOld = harness.catalog.authEpoch({
+            tenantId: "move-org-1" as never,
+            principalId: "move-user-1" as never,
+        });
+        const afterNew = harness.catalog.authEpoch({
+            tenantId: "move-org-2" as never,
+            principalId: "move-user-2" as never,
+        });
+        expect(afterOld.tenant).toBe(beforeOld.tenant + 1);
+        expect(afterOld.principal).toBe(beforeOld.principal + 1);
+        expect(afterNew.tenant).toBe(beforeNew.tenant + 1);
+        expect(afterNew.principal).toBe(beforeNew.principal + 1);
     });
 
     test("a restarted Catalog instance reads rows from the same durable storage", async () => {

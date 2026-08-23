@@ -10,10 +10,9 @@
  * central storage keeps those reads deterministic without shard fan-out or
  * a second set of auth-specific indexes.
  *
- * Auth-epoch invalidation rides on top of every successful write — the
- * dispatcher passes `(model, row)` to `bumpAuthEpoch` so cached query
- * results that depend on the row's tenant or principal are forced to
- * re-fetch on the next request.
+ * Catalog applies each auth write and every affected auth-epoch bump in
+ * one SQLite transaction. The adapter does not issue a second invalidation
+ * RPC after the row has committed.
  *
  * Where-clause translation: the only operator currently supported is
  * `eq` joined by AND. Better-auth's standard model-store operations
@@ -27,8 +26,6 @@ import type { BetterAuthOptions } from "better-auth";
 import { createAdapterFactory } from "better-auth/adapters";
 import { CdbError } from "../errors.ts";
 import type { RawJson } from "../types.ts";
-import type { AuthEpochDispatcher } from "./adapter.ts";
-import { placementFor } from "./runtime.ts";
 
 /**
  * Bindings the adapter needs at runtime. Provided by `mountChardb` /
@@ -50,49 +47,16 @@ interface CatalogRpc {
         where: { [k: string]: RawJson };
         limit?: number;
     }): Promise<readonly Record<string, RawJson>[]>;
-    bumpAuthEpoch(scope: "global" | "tenant" | "principal", scopeId: string): Promise<number>;
 }
 
 export interface ChardbAuthAdapterOptions {
     readonly env: ChardbAuthAdapterEnv;
-    /**
-     * Optional epoch dispatcher override. If omitted, the adapter
-     * derives a default one that calls `Catalog.bumpAuthEpoch`
-     * directly. Custom dispatchers are useful in tests.
-     */
-    readonly dispatcher?: AuthEpochDispatcher;
 }
 
 export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactory<BetterAuthOptions> {
     const { env } = opts;
     const catalog = (): CatalogRpc =>
         env.CDB_CATALOG.get(env.CDB_CATALOG.idFromName("global")) as unknown as CatalogRpc;
-
-    const dispatcher: AuthEpochDispatcher = opts.dispatcher ?? {
-        async bumpGlobal() {
-            await catalog().bumpAuthEpoch("global", "global");
-        },
-        async bumpTenant(tenantId) {
-            await catalog().bumpAuthEpoch("tenant", tenantId);
-        },
-        async bumpPrincipal(principalId) {
-            await catalog().bumpAuthEpoch("principal", principalId);
-        },
-    };
-
-    async function maybeBump(model: string, row: Record<string, RawJson> | null | undefined): Promise<void> {
-        if (!row) return;
-        const rule = placementFor(model);
-        if (rule.kind === "tenant") {
-            const t = row[rule.column];
-            if (typeof t === "string") await dispatcher.bumpTenant(t);
-        } else if (rule.kind === "principal") {
-            const p = row[rule.column];
-            if (typeof p === "string") await dispatcher.bumpPrincipal(p);
-        } else {
-            await dispatcher.bumpGlobal();
-        }
-    }
 
     return createAdapterFactory({
         config: {
@@ -108,7 +72,6 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
             async create({ model, data }) {
                 const payload = data as { [k: string]: RawJson };
                 const r = await catalog().mutateAuth({ model, op: "create", payload });
-                await maybeBump(model, r.row ?? payload);
                 return (r.row ?? payload) as never;
             },
 
@@ -138,7 +101,6 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                     where: flat,
                     payload: update as { [k: string]: RawJson },
                 });
-                await maybeBump(model, r.row);
                 return (r.row ?? null) as never;
             },
 
@@ -150,25 +112,18 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                     where: flat,
                     payload: update as { [k: string]: RawJson },
                 });
-                await maybeBump(model, r.row);
                 return r.affected ?? 0;
             },
 
             async delete({ model, where }) {
                 const flat = whereToFlat(where);
-                // Read row first so we can bump the right epoch after
-                // the delete commits.
-                const before = (await catalog().queryAuth({ model, where: flat, limit: 1 }))[0];
                 await catalog().mutateAuth({ model, op: "delete", where: flat });
-                await maybeBump(model, before ?? null);
             },
 
             async deleteMany({ model, where }) {
                 const flat = whereToFlat(where);
-                const before = await catalog().queryAuth({ model, where: flat });
                 const r = await catalog().mutateAuth({ model, op: "delete", where: flat });
-                for (const row of before) await maybeBump(model, row);
-                return r.affected ?? before.length;
+                return r.affected ?? 0;
             },
         }),
     }) as AdapterFactory<BetterAuthOptions>;

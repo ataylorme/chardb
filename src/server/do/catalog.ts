@@ -18,7 +18,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { renderSqliteTableDdl } from "../../auth/ddl.ts";
-import { getAuthRuntime, tableFor } from "../../auth/runtime.ts";
+import { getAuthRuntime, placementFor, tableFor } from "../../auth/runtime.ts";
 import { authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
 import { CdbError } from "../../errors.ts";
 import type { RawJson } from "../../types.ts";
@@ -64,6 +64,49 @@ CREATE TABLE IF NOT EXISTS catalog_policy_digest (
 ` as const;
 
 export type CatalogEnv = Record<string, never>;
+
+type AuthEpochScope = "global" | "tenant" | "principal";
+type CatalogSql = ReturnType<typeof adaptSqlStorage>;
+
+function addEpochScope(
+    scopes: Map<string, { scope: AuthEpochScope; scopeId: string }>,
+    scope: AuthEpochScope,
+    scopeId: string
+) {
+    scopes.set(`${scope}\0${scopeId}`, { scope, scopeId });
+}
+
+function addRowEpochScopes(
+    scopes: Map<string, { scope: AuthEpochScope; scopeId: string }>,
+    model: string,
+    row: Record<string, RawJson>
+): void {
+    const rule = placementFor(model);
+    if (rule.kind === "replicated") {
+        addEpochScope(scopes, "global", "global");
+    } else {
+        const scopeId = row[rule.column];
+        if (typeof scopeId === "string") addEpochScope(scopes, rule.kind, scopeId);
+    }
+
+    // Membership-like models affect both halves of auth-dependent state.
+    // The placement rule supplies the primary scope; conventional Better
+    // Auth fields add the other scope when the row carries one.
+    if (typeof row.organizationId === "string") addEpochScope(scopes, "tenant", row.organizationId);
+    if (typeof row.userId === "string") addEpochScope(scopes, "principal", row.userId);
+}
+
+function bumpAuthEpochInSql(sql: CatalogSql, scope: AuthEpochScope, scopeId: string): number {
+    const dbScope = scope === "global" ? "auth_global" : scope === "tenant" ? "auth_tenant" : "auth_principal";
+    sql.exec("INSERT OR IGNORE INTO catalog_epoch (scope, scope_id, epoch) VALUES (?, ?, 0)", dbScope, scopeId);
+    sql.exec("UPDATE catalog_epoch SET epoch = epoch + 1 WHERE scope = ? AND scope_id = ?", dbScope, scopeId);
+    const row = sql.one<{ epoch: number }>(
+        "SELECT epoch FROM catalog_epoch WHERE scope = ? AND scope_id = ?",
+        dbScope,
+        scopeId
+    );
+    return row?.epoch ?? 1;
+}
 
 export interface RouteResult {
     readonly shardId: ShardId;
@@ -188,26 +231,43 @@ export class Catalog extends DurableObject<CatalogEnv> {
         let affected = 0;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const scopes = new Map<string, { scope: AuthEpochScope; scopeId: string }>();
             switch (args.op) {
-                case "create":
+                case "create": {
                     if (!args.payload) throw new Error("auth: create requires payload");
                     row = authCreate(sql, table, args.payload);
                     affected = 1;
+                    addRowEpochScopes(scopes, args.model, row);
                     break;
+                }
                 case "update": {
                     if (!args.where || !args.payload) {
                         throw new Error("auth: update requires where and payload");
                     }
+                    const before = authFindMany(sql, table, args.where);
                     const r = authUpdate(sql, table, args.where, args.payload);
-                    row = r.row;
                     affected = r.affected;
+                    if (affected > 0) {
+                        const after = before.map(previous => ({ ...previous, ...args.payload }));
+                        row = r.row ?? after[0] ?? null;
+                        for (const previous of before) addRowEpochScopes(scopes, args.model, previous);
+                        for (const next of after) addRowEpochScopes(scopes, args.model, next);
+                    } else {
+                        row = r.row;
+                    }
                     break;
                 }
-                case "delete":
+                case "delete": {
                     if (!args.where) throw new Error("auth: delete requires where");
+                    const before = authFindMany(sql, table, args.where);
                     affected = authDelete(sql, table, args.where).affected;
+                    if (affected > 0) {
+                        for (const previous of before) addRowEpochScopes(scopes, args.model, previous);
+                    }
                     break;
+                }
             }
+            for (const scope of scopes.values()) bumpAuthEpochInSql(sql, scope.scope, scope.scopeId);
         });
         return { ok: true, row: row ?? null, affected };
     }
@@ -306,18 +366,10 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }
 
     bumpAuthEpoch(scope: "global" | "tenant" | "principal", scopeId: string): number {
-        const dbScope = scope === "global" ? "auth_global" : scope === "tenant" ? "auth_tenant" : "auth_principal";
         let next = 1;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
-            sql.exec("INSERT OR IGNORE INTO catalog_epoch (scope, scope_id, epoch) VALUES (?, ?, 0)", dbScope, scopeId);
-            sql.exec("UPDATE catalog_epoch SET epoch = epoch + 1 WHERE scope = ? AND scope_id = ?", dbScope, scopeId);
-            const row = sql.one<{ epoch: number }>(
-                "SELECT epoch FROM catalog_epoch WHERE scope = ? AND scope_id = ?",
-                dbScope,
-                scopeId
-            );
-            next = row?.epoch ?? 1;
+            next = bumpAuthEpochInSql(sql, scope, scopeId);
         });
         return next;
     }
