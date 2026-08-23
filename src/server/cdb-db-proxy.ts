@@ -75,8 +75,10 @@ function sqlToJsMap(table: SQLiteTable): ReadonlyMap<string, string> {
  */
 interface AutoFillPlan {
     readonly table: SQLiteTable;
+    readonly tableName: string;
     readonly auth: AuthCtx;
     readonly policies: ReturnType<typeof compileCdbPolicies>;
+    readonly onWrite: ((tableName: string) => void) | undefined;
     readonly bindings: ReadonlyArray<{
         readonly jsKey: string;
         readonly value: string;
@@ -126,7 +128,8 @@ function buildPlan(
     table: SQLiteTable,
     meta: CdbTableMeta,
     auth: AuthCtx,
-    operation: "insert" | "update" | "delete" = "insert"
+    operation: "insert" | "update" | "delete" = "insert",
+    onWrite?: (tableName: string) => void
 ): AutoFillPlan {
     const bindings: Array<{ jsKey: string; value: string; authority: "tenant" | "self" }> = [];
     const sqlToJs = sqlToJsMap(table);
@@ -163,7 +166,7 @@ function buildPlan(
         }
     }
 
-    return { table, auth, policies: compileCdbPolicies(table), bindings };
+    return { table, tableName: meta.name, auth, policies: compileCdbPolicies(table), onWrite, bindings };
 }
 
 function applyPlan<T extends Record<string, unknown>>(plan: AutoFillPlan, row: T): T {
@@ -200,20 +203,18 @@ function wrapInsertBuilder(builder: unknown, plan: AutoFillPlan): unknown {
                 const filled = Array.isArray(rows)
                     ? rows.map(r => applyPlan(plan, r as Record<string, unknown>))
                     : applyPlan(plan, rows as Record<string, unknown>);
-                return wrapInsertResult((v as (input: unknown) => unknown).call(target, filled));
+                return wrapInsertResult((v as (input: unknown) => unknown).call(target, filled), plan);
             };
         },
     });
 }
 
-function wrapInsertResult(builder: unknown): unknown {
+function wrapInsertResult(builder: unknown, plan: AutoFillPlan): unknown {
     return new Proxy(builder as object, {
         get(target, prop, receiver) {
             if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
-            if (SAFE_WRITE_EXECUTION_METHODS.has(prop)) {
-                const value = Reflect.get(target, prop, receiver);
-                if (typeof value === "function") return value.bind(target);
-            }
+            if (SAFE_WRITE_EXECUTION_METHODS.has(prop))
+                return writeExecutionMethod(target, prop, receiver, plan, "insert");
             throw unsupportedWrite("insert", prop);
         },
     });
@@ -253,9 +254,10 @@ function buildWritePlan(
     table: SQLiteTable,
     meta: CdbTableMeta,
     auth: AuthCtx,
-    operation: "update" | "delete"
+    operation: "update" | "delete",
+    onWrite?: (tableName: string) => void
 ): AutoFillPlan {
-    const plan = buildPlan(table, meta, auth, operation);
+    const plan = buildPlan(table, meta, auth, operation, onWrite);
     const authorityRow: Record<string, unknown> = {};
     const jsToSql = jsToSqlMap(table);
     for (const binding of plan.bindings) authorityRow[jsToSql.get(binding.jsKey) ?? binding.jsKey] = binding.value;
@@ -511,13 +513,35 @@ function wrapScopedPolicyBuilder(builder: unknown, plan: AutoFillPlan, operation
                     );
                 };
             }
-            if (SAFE_WRITE_EXECUTION_METHODS.has(prop)) {
-                const value = Reflect.get(target, prop, receiver);
-                if (typeof value === "function") return value.bind(target);
-            }
+            if (SAFE_WRITE_EXECUTION_METHODS.has(prop))
+                return writeExecutionMethod(target, prop, receiver, plan, operation);
             throw unsupportedWrite(operation, prop);
         },
     });
+}
+
+function writeExecutionMethod(
+    target: object,
+    prop: PropertyKey,
+    receiver: unknown,
+    plan: AutoFillPlan,
+    operation: "insert" | "update" | "delete"
+): unknown {
+    const value = Reflect.get(target, prop, receiver);
+    if (typeof value !== "function") throw unsupportedWrite(operation, prop);
+    const onWrite = plan.onWrite;
+    if (prop !== "run" || !onWrite) return value.bind(target);
+    return (...args: readonly unknown[]) => {
+        const result = (value as (...args: readonly unknown[]) => unknown).call(target, ...args);
+        if (result && typeof result === "object" && typeof (result as { then?: unknown }).then === "function") {
+            return Promise.resolve(result).then(resolved => {
+                onWrite(plan.tableName);
+                return resolved;
+            });
+        }
+        onWrite(plan.tableName);
+        return result;
+    };
 }
 
 function jsToSqlMap(table: SQLiteTable): ReadonlyMap<string, string> {
@@ -570,14 +594,24 @@ function conflictingAuthority(authority: "tenant" | "self", column: string): Cdb
  * fail closed. Transactions receive the same wrapper recursively.
  */
 export function wrapDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
-    return wrapDbInternal(db, auth, false);
+    return wrapDbInternal(db, auth, false, undefined);
 }
 
 export function wrapQueryDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
-    return wrapDbInternal(db, auth, true);
+    return wrapDbInternal(db, auth, true, undefined);
 }
 
-function wrapDbInternal<TDb extends object>(db: TDb, auth: AuthCtx, queryBoundary: boolean): TDb {
+/** Internal mutation wrapper used by the atomic executor to collect committed table names. */
+export function wrapMutationDb<TDb extends object>(db: TDb, auth: AuthCtx, onWrite?: (tableName: string) => void): TDb {
+    return wrapDbInternal(db, auth, false, onWrite);
+}
+
+function wrapDbInternal<TDb extends object>(
+    db: TDb,
+    auth: AuthCtx,
+    queryBoundary: boolean,
+    onWrite: ((tableName: string) => void) | undefined
+): TDb {
     return new Proxy(db, {
         get(target, prop, receiver) {
             if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
@@ -608,7 +642,7 @@ function wrapDbInternal<TDb extends object>(db: TDb, auth: AuthCtx, queryBoundar
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
                     if (!meta) throw unsupportedWrite("insert", "plain table");
-                    const plan = buildPlan(table, meta, auth);
+                    const plan = buildPlan(table, meta, auth, "insert", onWrite);
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
                     return wrapInsertBuilder(builder, plan);
                 };
@@ -617,7 +651,7 @@ function wrapDbInternal<TDb extends object>(db: TDb, auth: AuthCtx, queryBoundar
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
                     if (!meta) throw unsupportedWrite("update", "plain table");
-                    const plan = buildWritePlan(table, meta, auth, "update");
+                    const plan = buildWritePlan(table, meta, auth, "update", onWrite);
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
                     return wrapUpdateBuilder(builder, plan);
                 };
@@ -626,14 +660,14 @@ function wrapDbInternal<TDb extends object>(db: TDb, auth: AuthCtx, queryBoundar
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
                     if (!meta) throw unsupportedWrite("delete", "plain table");
-                    const plan = buildWritePlan(table, meta, auth, "delete");
+                    const plan = buildWritePlan(table, meta, auth, "delete", onWrite);
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
                     return scopePolicyBuilder(builder, plan, "delete");
                 };
             }
             if (prop === "transaction") {
                 return (callback: (tx: TDb) => Promise<unknown>, ...rest: readonly unknown[]) => {
-                    const wrapped = (tx: TDb) => callback(wrapDbInternal(tx, auth, queryBoundary));
+                    const wrapped = (tx: TDb) => callback(wrapDbInternal(tx, auth, queryBoundary, onWrite));
                     return (v as (cb: (tx: TDb) => Promise<unknown>, ...r: readonly unknown[]) => unknown).call(
                         target,
                         wrapped,

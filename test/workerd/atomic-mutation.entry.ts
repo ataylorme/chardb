@@ -16,7 +16,16 @@ const entries = globalTable(
     { partitionBy: "id", roles: { member: { create: "*" } } }
 );
 
-const schema = { entries };
+const auxEntries = globalTable(
+    "atomic_aux_entries",
+    {
+        id: text("id").primaryKey(),
+        sequence: integer("sequence").notNull(),
+    },
+    { partitionBy: "id", roles: { member: { create: "*" } } }
+);
+
+const schema = { entries, auxEntries };
 
 const organization = sqliteTable("atomic_organization", { id: text("id").primaryKey() });
 const { cdbTable } = forOrg();
@@ -54,6 +63,7 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
                 sql.exec(statement);
             }
             sql.exec("CREATE TABLE IF NOT EXISTS atomic_entries (id TEXT PRIMARY KEY, sequence INTEGER NOT NULL)");
+            sql.exec("CREATE TABLE IF NOT EXISTS atomic_aux_entries (id TEXT PRIMARY KEY, sequence INTEGER NOT NULL)");
             sql.exec(
                 "CREATE TABLE IF NOT EXISTS atomic_secured_entries (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, secret_note TEXT)"
             );
@@ -65,6 +75,7 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
         readonly ran: boolean;
         readonly result: unknown;
         readonly rowsAffected: number;
+        readonly touchedTables: readonly string[];
     } {
         const common = {
             storage: this.ctx.storage,
@@ -122,6 +133,9 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
                     }
                     if (args.mode === "deletePolicy") {
                         db.delete(securedEntries).run();
+                    }
+                    if (args.mode === "commit") {
+                        db.insert(auxEntries).values({ id: args.mutId, sequence: 1 }).run();
                     }
                     db.insert(entries).values({ id: args.secondId, sequence: 2 }).run();
                     if (args.mode === "throw") throw new Error("probe failure after second statement");

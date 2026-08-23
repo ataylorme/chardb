@@ -2,7 +2,7 @@ import { type DrizzleSqliteDODatabase, drizzle } from "drizzle-orm/durable-sqlit
 import { CdbError } from "../errors.ts";
 import { type MutationOutcome, canonicalRequest, runWrappedMutation } from "../oplog/wrapper.ts";
 import { Cookie, MutId, PrincipalId, type RawJson } from "../types.ts";
-import { wrapDb } from "./cdb-db-proxy.ts";
+import { wrapMutationDb } from "./cdb-db-proxy.ts";
 import type { AuthCtx, MutationCtx } from "./define.ts";
 import { adaptSqlStorage } from "./do/sql_adapter.ts";
 
@@ -42,6 +42,8 @@ export interface AtomicMutationResult {
     readonly result: RawJson;
     /** SQLite `changes()` for the handler's final data-modifying statement. */
     readonly rowsAffected: number;
+    /** Registered cdbTables whose write builders ran in this committed mutation. */
+    readonly touchedTables: readonly string[];
 }
 
 /**
@@ -61,7 +63,8 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
     const cookie = Cookie(input.cookie);
     const sql = adaptSqlStorage(input.storage.sql);
     const rawDb = drizzle(input.storage, { schema: input.schema });
-    const db = wrapDb(rawDb, input.request.auth);
+    const touchedTables = new Set<string>();
+    const db = wrapMutationDb(rawDb, input.request.auth, tableName => touchedTables.add(tableName));
     let wrappedResult: ReturnType<typeof runWrappedMutation<TResult>> | undefined;
 
     input.storage.transactionSync(() => {
@@ -101,6 +104,7 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
         ran: wrappedResult.ran,
         result: wrappedResult.envelope.result ?? null,
         rowsAffected: wrappedResult.envelope.rowsAffected,
+        touchedTables: wrappedResult.ran ? [...touchedTables].sort() : [],
     };
 }
 

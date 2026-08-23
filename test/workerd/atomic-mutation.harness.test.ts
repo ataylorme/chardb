@@ -91,6 +91,7 @@ describe("atomic domain mutation on real Durable Object SqlStorage", () => {
             ran: true,
             result: { ids: ["committed-1", "committed-2"] },
             rowsAffected: 1,
+            touchedTables: ["atomic_aux_entries", "atomic_entries"],
         });
 
         const replay = await execute(body);
@@ -101,6 +102,7 @@ describe("atomic domain mutation on real Durable Object SqlStorage", () => {
                 ran: false,
                 result: { ids: ["committed-1", "committed-2"] },
                 rowsAffected: 1,
+                touchedTables: [],
             },
         });
 

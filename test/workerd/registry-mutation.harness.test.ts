@@ -102,6 +102,7 @@ describe("configured Cdb local mutation registry", () => {
             ok: true,
             ran: true,
             rowsAffected: 1,
+            touchedTables: ["registry_entries"],
             result: {
                 saved: { id: "entry-1", value: 41 },
                 actor: {
@@ -114,7 +115,7 @@ describe("configured Cdb local mutation registry", () => {
         });
 
         const replay = await mutate(request);
-        expect(replay.body).toEqual({ ...first.body, ran: false });
+        expect(replay.body).toEqual({ ...first.body, ran: false, touchedTables: [] });
 
         const invalid = await mutate({
             operation: "put",
@@ -137,6 +138,7 @@ describe("configured Cdb local mutation registry", () => {
         });
         expect(inspected.body).toMatchObject({
             ok: true,
+            touchedTables: [],
             result: {
                 label: "after-validation",
                 reader: "registry-user",

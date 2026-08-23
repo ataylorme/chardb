@@ -80,6 +80,8 @@ export interface CdbMutationSuccess {
     readonly ran: boolean;
     readonly result: RawJson;
     readonly rowsAffected: number;
+    /** Internal coarse write set. Gateway omits this from the public wire result. */
+    readonly touchedTables?: readonly string[];
 }
 
 export interface CdbMutationFailure {

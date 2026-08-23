@@ -22,6 +22,7 @@ import { type SQL, eq } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import type { BaseSQLiteDatabase, SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../../src/errors.ts";
+import { wrapMutationDb } from "../../src/server/cdb-db-proxy.ts";
 import type { RoleValue } from "../../src/server/cdb-table-types.ts";
 import type { AuthCtx } from "../../src/server/define.ts";
 import { forOrg, forUser, wrapDb } from "../../src/server/index.ts";
@@ -875,6 +876,70 @@ describe("wrapDb / cdbTable delete authorization", () => {
         const plain = forbiddenFeature(() => wrapDb(db, baseAuth).delete(raw));
         expect(plain.message).toContain("plain table");
         expect(capturedDeletes).toHaveLength(0);
+    });
+});
+
+describe("wrapMutationDb / write observation", () => {
+    const { cdbTable } = forOrg();
+    const records = cdbTable(
+        "observed_records",
+        {
+            id: text("id").primaryKey(),
+            organizationId: text("organization_id")
+                .notNull()
+                .references(() => orgTable.id),
+            value: integer("value").notNull(),
+        },
+        { roles: { member: { create: "*", update: ["value"], delete: true } } }
+    );
+
+    test("observes successful insert, update, and delete execution but not SQL inspection", () => {
+        const { db } = makeStubDb();
+        const touched: string[] = [];
+        const wrapped = wrapMutationDb(db, baseAuth, tableName => touched.push(tableName));
+
+        const insert = wrapped.insert(records).values({ id: "record-1", value: 1 });
+        insert.toSQL();
+        expect(touched).toEqual([]);
+
+        insert.run();
+        wrapped.update(records).set({ value: 2 }).run();
+        wrapped.delete(records).run();
+        // The stub reports zero changed rows for update and delete. The observer
+        // intentionally records successful builder execution for coarse invalidation.
+        expect(touched).toEqual(["observed_records", "observed_records", "observed_records"]);
+    });
+
+    test("does not observe a write whose execution throws", () => {
+        const builder = {
+            values() {
+                return builder;
+            },
+            run() {
+                throw new Error("write failed");
+            },
+        };
+        const raw = { insert: () => builder } as unknown as StubDb;
+        const touched: string[] = [];
+        const wrapped = wrapMutationDb(raw, baseAuth, tableName => touched.push(tableName));
+
+        expect(() => wrapped.insert(records).values({ id: "record-1", value: 1 }).run()).toThrow("write failed");
+        expect(touched).toEqual([]);
+    });
+
+    test("shares the observer with transaction callback wrappers", () => {
+        const nested = makeStubDb();
+        const raw = {
+            transaction(callback: (tx: StubDb) => void) {
+                callback(nested.db);
+            },
+        };
+        const touched: string[] = [];
+        wrapMutationDb(raw, baseAuth, tableName => touched.push(tableName)).transaction(tx => {
+            tx.insert(records).values({ id: "record-1", value: 1 }).run();
+        });
+
+        expect(touched).toEqual(["observed_records"]);
     });
 });
 
