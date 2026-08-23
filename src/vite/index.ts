@@ -3,8 +3,9 @@
  *
  * Responsibilities:
  *   - Walk each module's TypeScript AST (via the `typescript` peer dep), find
- *     every `defineMutation/defineQuery/defineCron/defineStream/defineGsi/
- *     defineLedger/definePresenceKey` call assigned to a named export, and
+ *     every direct `defineMutation/defineQuery/defineCron/defineStream/
+ *     defineGsi/defineLedger/definePresenceKey` call, plus `api.mutation`
+ *     and `api.query`, assigned to a named export, and
  *     emit a `<modulePath>#<exportName>` → wire-id mapping for the registry
  *     virtual module.
  *   - Append a non-enumerable `__chardbRef` property to every such export so
@@ -21,8 +22,8 @@
  *     DO restart on destructive diffs is future work — the dev-server
  *     ping is the foundation for both.
  *
- * The AST walk is robust against `export const x = defineMutation(...)`,
- * `export { x }` re-exports, and aliased imports
+ * The AST walk handles `export const x = defineMutation(...)`, API objects
+ * returned by `createApi()`, namespace imports, and aliased imports
  * (`import { defineMutation as dm } from "chardb/server"`). It falls back to
  * a regex pre-scan when the `typescript` peer is missing so the foundation
  * still builds in environments without it.
@@ -137,27 +138,53 @@ export function chardb(options: ChardbVitePluginOptions = {}): Plugin {
                     return src;
                 }
                 case "schema":
-                    return options.schema ? `export * from ${JSON.stringify(options.schema)};` : `export {};`;
+                    return options.schema ? `export * from ${JSON.stringify(options.schema)};` : "export {};";
                 case "migrations":
-                    return `export const migrations = [];`;
+                    return "export const migrations = [];";
                 case "dashboard-config":
-                    return `export const dashboardConfig = { version: 1 };`;
+                    return "export const dashboardConfig = { version: 1 };";
                 default:
                     return null;
             }
         },
         transform(code, id) {
-            if (!/\.(t|j)sx?$/.test(id)) return null;
-            const found = collectExports(code, id);
-            if (found.length === 0) return null;
+            const moduleId = cleanModuleId(id);
+            if (!/\.(t|j)sx?$/.test(moduleId)) return null;
+            const found = collectExports(code, moduleId);
+            const nextRegistry = registry.filter(entry => entry.module !== moduleId);
+            if (found.length === 0) {
+                registry.splice(0, registry.length, ...nextRegistry);
+                return null;
+            }
+            const refsInModule = new Set<string>();
+            for (const entry of found) {
+                if (refsInModule.has(entry.ref)) {
+                    throw new Error(
+                        `[chardb/vite] Duplicate stable ref ${JSON.stringify(entry.ref)} in ${JSON.stringify(moduleId)}`
+                    );
+                }
+                refsInModule.add(entry.ref);
+                const duplicate = nextRegistry.find(candidate => candidate.ref === entry.ref);
+                if (duplicate) {
+                    throw new Error(
+                        `[chardb/vite] Duplicate stable ref ${JSON.stringify(entry.ref)} from ` +
+                            `${JSON.stringify(duplicate.module)}#${duplicate.exportName} and ` +
+                            `${JSON.stringify(moduleId)}#${entry.exportName}`
+                    );
+                }
+                nextRegistry.push({
+                    module: moduleId,
+                    exportName: entry.exportName,
+                    kind: entry.kind,
+                    ref: entry.ref,
+                });
+            }
+            registry.splice(0, registry.length, ...nextRegistry);
             let mutated = code;
             for (const e of found) {
-                if (!registry.some(r => r.ref === e.ref)) {
-                    registry.push({ module: id, exportName: e.exportName, kind: e.kind, ref: e.ref });
-                }
-                const guard = `__chardbRef:${JSON.stringify(e.ref)}`;
-                if (mutated.includes(guard)) continue;
-                mutated += `\n;Object.defineProperty(${e.exportName}, "__chardbRef", { value: ${JSON.stringify(e.ref)}, enumerable: false, configurable: true });`;
+                const stamp = `;Object.defineProperty(${e.exportName}, "__chardbRef", { value: ${JSON.stringify(e.ref)}, enumerable: false, configurable: true });`;
+                if (mutated.includes(stamp)) continue;
+                mutated += `\n${stamp}`;
             }
             return mutated === code ? null : { code: mutated, map: null };
         },
@@ -189,11 +216,14 @@ interface FoundExport {
  * helpers are picked up; otherwise falls back to a regex pre-scan.
  */
 function collectExports(code: string, id: string): FoundExport[] {
-    const refOf = (name: string): string => `${id.replace(/.*\/src\//, "src/")}#${name}`;
+    const refOf = (name: string): string => `${modulePath(id)}#${name}`;
     const ts = loadTypeScript();
     if (!ts) return regexCollect(code, refOf);
 
     const aliases = new Map<string, (typeof DEFINE_HELPERS)[number]>();
+    const apiObjects = new Set<string>();
+    const createApiAliases = new Set<string>();
+    const namespaceAliases = new Set<string>();
     const sf = ts.createSourceFile(
         id,
         code,
@@ -204,40 +234,89 @@ function collectExports(code: string, id: string): FoundExport[] {
     const isFromChardbServer = (mod: string): boolean => mod === "chardb/server" || mod === "chardb";
 
     const walkImports = (node: import("typescript").Node): void => {
-        if (ts!.isImportDeclaration(node) && ts!.isStringLiteral(node.moduleSpecifier)) {
+        if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
             const mod = node.moduleSpecifier.text;
             if (!isFromChardbServer(mod)) return;
             const clause = node.importClause;
             if (!clause) return;
             const named = clause.namedBindings;
-            if (named && ts!.isNamedImports(named)) {
+            if (named && ts.isNamedImports(named)) {
                 for (const el of named.elements) {
                     const original = (el.propertyName ?? el.name).text;
                     const local = el.name.text;
                     if ((DEFINE_HELPERS as readonly string[]).includes(original)) {
                         aliases.set(local, original as (typeof DEFINE_HELPERS)[number]);
+                    } else if (original === "api") {
+                        apiObjects.add(local);
+                    } else if (original === "createApi") {
+                        createApiAliases.add(local);
                     }
                 }
+            } else if (named && ts.isNamespaceImport(named)) {
+                namespaceAliases.add(named.name.text);
             }
         }
     };
     sf.forEachChild(walkImports);
 
+    const walkApiBindings = (node: import("typescript").Node): void => {
+        if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+            const init = node.initializer;
+            if (ts.isCallExpression(init)) {
+                const callee = init.expression;
+                const directFactory = ts.isIdentifier(callee) && createApiAliases.has(callee.text);
+                const namespaceFactory =
+                    ts.isPropertyAccessExpression(callee) &&
+                    ts.isIdentifier(callee.expression) &&
+                    namespaceAliases.has(callee.expression.text) &&
+                    callee.name.text === "createApi";
+                if (directFactory || namespaceFactory) apiObjects.add(node.name.text);
+            }
+        }
+        ts.forEachChild(node, walkApiBindings);
+    };
+    sf.forEachChild(walkApiBindings);
+
+    const kindOf = (expression: import("typescript").LeftHandSideExpression) => {
+        if (ts.isIdentifier(expression)) return aliases.get(expression.text);
+        if (!ts.isPropertyAccessExpression(expression)) return undefined;
+        const property = expression.name.text;
+        if (ts.isIdentifier(expression.expression)) {
+            const objectName = expression.expression.text;
+            if (namespaceAliases.has(objectName) && (DEFINE_HELPERS as readonly string[]).includes(property)) {
+                return property as (typeof DEFINE_HELPERS)[number];
+            }
+            if (apiObjects.has(objectName)) {
+                if (property === "mutation") return "defineMutation";
+                if (property === "query") return "defineQuery";
+            }
+        }
+        if (
+            (property === "mutation" || property === "query") &&
+            ts.isPropertyAccessExpression(expression.expression) &&
+            ts.isIdentifier(expression.expression.expression) &&
+            namespaceAliases.has(expression.expression.expression.text) &&
+            expression.expression.name.text === "api"
+        ) {
+            return property === "mutation" ? "defineMutation" : "defineQuery";
+        }
+        return undefined;
+    };
+
     const out: FoundExport[] = [];
     const visit = (node: import("typescript").Node): void => {
-        if (ts!.isVariableStatement(node) && node.modifiers?.some(m => m.kind === ts!.SyntaxKind.ExportKeyword)) {
+        if (ts.isVariableStatement(node) && node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) {
             for (const decl of node.declarationList.declarations) {
-                if (!ts!.isIdentifier(decl.name) || !decl.initializer) continue;
+                if (!ts.isIdentifier(decl.name) || !decl.initializer) continue;
                 const init = decl.initializer;
-                if (!ts!.isCallExpression(init) || !ts!.isIdentifier(init.expression)) continue;
-                const calleeLocal = init.expression.text;
-                const kind = aliases.get(calleeLocal);
+                if (!ts.isCallExpression(init)) continue;
+                const kind = kindOf(init.expression);
                 if (!kind) continue;
                 const exportName = decl.name.text;
                 out.push({ exportName, kind, ref: refOf(exportName) });
             }
         }
-        ts!.forEachChild(node, visit);
+        ts.forEachChild(node, visit);
     };
     sf.forEachChild(visit);
     if (out.length === 0) return regexCollect(code, refOf);
@@ -253,5 +332,22 @@ function regexCollect(code: string, refOf: (name: string) => string): FoundExpor
         const kind = match[2] as (typeof DEFINE_HELPERS)[number];
         out.push({ exportName, kind, ref: refOf(exportName) });
     }
+    const apiExportRe = /export\s+(?:const|let|var)\s+(\w+)\s*=\s*api\.(mutation|query)\b/g;
+    for (const match of code.matchAll(apiExportRe)) {
+        const exportName = match[1] as string;
+        const method = match[2] as "mutation" | "query";
+        const kind = method === "mutation" ? "defineMutation" : "defineQuery";
+        out.push({ exportName, kind, ref: refOf(exportName) });
+    }
     return out;
+}
+
+function cleanModuleId(id: string): string {
+    return id.replace(/[?#].*$/, "").replaceAll("\\", "/");
+}
+
+function modulePath(id: string): string {
+    const clean = cleanModuleId(id);
+    const srcIndex = clean.lastIndexOf("/src/");
+    return srcIndex === -1 ? clean : clean.slice(srcIndex + 1);
 }
