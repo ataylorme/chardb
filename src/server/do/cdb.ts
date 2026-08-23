@@ -20,7 +20,7 @@ import { SHARD_BOOTSTRAP_DDL } from "../../oplog/schema.ts";
 import { type JsonText, parseJsonColumn } from "../../oplog/wrapper.ts";
 import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/range.ts";
 import { type TableSpec, renderRowApply, renderTableTriggers } from "../../reshard/triggers.ts";
-import { type ChardbRef, type RawJson, SubId } from "../../types.ts";
+import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId } from "../../types.ts";
 import { executeAtomicMutation } from "../atomic-mutation.ts";
 import { type ChardbManifest, emptyManifest, resolveMutation } from "../manifest.ts";
 import type { CdbMutationRequest, CdbMutationResponse, CdbSubscriptionRequest, LiveSubscriptionId } from "../rpc.ts";
@@ -39,6 +39,38 @@ export interface CdbEnv {
 }
 
 export type SubscribeArgs = CdbSubscriptionRequest;
+
+const SUBSCRIPTION_DDL = `
+CREATE TABLE IF NOT EXISTS _chardb_subscriptions (
+  gateway_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  sub_id INTEGER NOT NULL,
+  principal_id TEXT NOT NULL,
+  ref TEXT NOT NULL,
+  args_json TEXT NOT NULL,
+  tables_json TEXT NOT NULL,
+  intervals_json TEXT NOT NULL,
+  PRIMARY KEY (gateway_id, client_id, sub_id)
+);
+` as const;
+
+interface StoredSubscriptionRow {
+    readonly [column: string]: string | number;
+    readonly gateway_id: string;
+    readonly client_id: string;
+    readonly sub_id: number;
+    readonly principal_id: string;
+    readonly ref: string;
+    readonly args_json: string;
+    readonly tables_json: string;
+    readonly intervals_json: string;
+}
+
+interface PreparedInterval {
+    readonly table: string;
+    readonly indexName: string;
+    readonly set: IntervalSet;
+}
 
 function subscriptionKey(subscription: LiveSubscriptionId): string {
     return JSON.stringify([subscription.gatewayId, subscription.clientId, subscription.subId]);
@@ -73,30 +105,94 @@ export class Cdb extends DurableObject<CdbEnv> {
     private async bootstrap(): Promise<void> {
         if (this.bootstrapped) return;
         const sql = adaptSqlStorage(this.ctx.storage.sql);
-        for (const stmt of SHARD_BOOTSTRAP_DDL.split(";")
+        for (const stmt of `${SHARD_BOOTSTRAP_DDL}\n${SUBSCRIPTION_DDL}`
+            .split(";")
             .map(s => s.trim())
             .filter(Boolean)) {
             sql.exec(stmt);
         }
+        const cursor = this.ctx.storage.sql.exec<StoredSubscriptionRow>(
+            `SELECT gateway_id, client_id, sub_id, principal_id, ref, args_json, tables_json, intervals_json
+             FROM _chardb_subscriptions
+             ORDER BY gateway_id, client_id, sub_id`
+        );
+        for (const row of cursor) {
+            const request: CdbSubscriptionRequest = {
+                subscription: {
+                    gatewayId: row.gateway_id,
+                    clientId: ClientId(row.client_id),
+                    subId: SubId(row.sub_id),
+                },
+                principalId: PrincipalId(row.principal_id),
+                ref: ChardbRef(row.ref),
+                args: JSON.parse(row.args_json) as RawJson,
+                tables: JSON.parse(row.tables_json) as readonly string[],
+                intervals: JSON.parse(row.intervals_json) as CdbSubscriptionRequest["intervals"],
+            };
+            this.installSubscription(request.subscription, this.prepareIntervals(request));
+        }
         this.bootstrapped = true;
+    }
+
+    private prepareIntervals(args: CdbSubscriptionRequest): PreparedInterval[] {
+        return args.intervals.map(block => ({
+            table: block.table,
+            indexName: block.indexName,
+            set: intervalSetFromWire(block.intervals),
+        }));
+    }
+
+    private installSubscription(subscription: LiveSubscriptionId, intervals: readonly PreparedInterval[]): void {
+        const key = subscriptionKey(subscription);
+        this.intervalMap.unregister(key);
+        for (const interval of intervals) {
+            this.intervalMap.register(key, interval.table, interval.indexName, interval.set);
+        }
+        this.subscriptions.set(key, subscription);
     }
 
     /**
      * Register a live-query subscription on this shard. Caller is the Gateway DO.
      */
     async subscribe(args: SubscribeArgs): Promise<{ subscription: LiveSubscriptionId }> {
-        const key = subscriptionKey(args.subscription);
-        this.intervalMap.unregister(key);
-        for (const block of args.intervals) {
-            const set = intervalSetFromWire(block.intervals);
-            this.intervalMap.register(key, block.table, block.indexName, set);
-        }
-        this.subscriptions.set(key, args.subscription);
+        const intervals = this.prepareIntervals(args);
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            sql.exec(
+                `INSERT INTO _chardb_subscriptions
+                 (gateway_id, client_id, sub_id, principal_id, ref, args_json, tables_json, intervals_json)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(gateway_id, client_id, sub_id) DO UPDATE SET
+                   principal_id = excluded.principal_id,
+                   ref = excluded.ref,
+                   args_json = excluded.args_json,
+                   tables_json = excluded.tables_json,
+                   intervals_json = excluded.intervals_json`,
+                args.subscription.gatewayId,
+                args.subscription.clientId,
+                args.subscription.subId,
+                args.principalId,
+                args.ref,
+                JSON.stringify(args.args),
+                JSON.stringify(args.tables),
+                JSON.stringify(args.intervals)
+            );
+        });
+        this.installSubscription(args.subscription, intervals);
         return { subscription: args.subscription };
     }
 
     async unsubscribe(subscription: LiveSubscriptionId): Promise<void> {
         const key = subscriptionKey(subscription);
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            sql.exec(
+                "DELETE FROM _chardb_subscriptions WHERE gateway_id = ? AND client_id = ? AND sub_id = ?",
+                subscription.gatewayId,
+                subscription.clientId,
+                subscription.subId
+            );
+        });
         this.intervalMap.unregister(key);
         this.subscriptions.delete(key);
     }

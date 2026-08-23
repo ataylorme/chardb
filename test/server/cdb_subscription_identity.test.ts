@@ -36,7 +36,7 @@ function request(identity: LiveSubscriptionId): CdbSubscriptionRequest {
         subscription: identity,
         principalId: PrincipalId("user-1"),
         ref: ChardbRef("queries.ts#messages"),
-        args: {},
+        args: { organizationId: "org-1" },
         tables: ["messages"],
         intervals: [{ table: "messages", indexName: "by_org", intervals: [{ kind: "full" }] }],
     };
@@ -46,11 +46,17 @@ describe("Cdb live subscription identity", () => {
     let db: Database;
     let cdb: Cdb;
     let bootstrap: Promise<unknown>;
+    let state: DurableObjectState;
+
+    async function reconstruct(): Promise<void> {
+        cdb = new Cdb(state, {});
+        await bootstrap;
+    }
 
     beforeEach(async () => {
         db = new Database(":memory:");
         bootstrap = Promise.resolve();
-        const state = {
+        state = {
             id: { toString: () => "shard-do-1" },
             storage: {
                 sql: sqlStorage(db),
@@ -60,19 +66,36 @@ describe("Cdb live subscription identity", () => {
                 bootstrap = callback();
             },
         } as unknown as DurableObjectState;
-        cdb = new Cdb(state, {});
-        await bootstrap;
+        await reconstruct();
     });
 
     afterEach(() => db.close());
 
-    test("keeps identical numeric subIds distinct across clients and Gateway objects", async () => {
+    test("rebuilds colliding numeric subIds and persists a targeted unsubscribe", async () => {
         const first = subscription("gateway-do-1", "client-1");
         const second = subscription("gateway-do-1", "client-2");
         const third = subscription("gateway-do-2", "client-1");
         await cdb.subscribe(request(first));
         await cdb.subscribe(request(second));
         await cdb.subscribe(request(third));
+
+        expect(
+            db
+                .prepare(
+                    `SELECT principal_id, ref, args_json, tables_json, intervals_json
+                     FROM _chardb_subscriptions
+                     WHERE gateway_id = ? AND client_id = ? AND sub_id = ?`
+                )
+                .get(second.gatewayId, second.clientId, second.subId)
+        ).toEqual({
+            principal_id: "user-1",
+            ref: "queries.ts#messages",
+            args_json: '{"organizationId":"org-1"}',
+            tables_json: '["messages"]',
+            intervals_json: '[{"table":"messages","indexName":"by_org","intervals":[{"kind":"full"}]}]',
+        });
+
+        await reconstruct();
 
         expect(cdb.matchSubsForRow("messages", [{ indexName: "by_org", key: ["org-1"] }])).toEqual([
             first,
@@ -81,6 +104,8 @@ describe("Cdb live subscription identity", () => {
         ]);
 
         await cdb.unsubscribe({ ...second });
+
+        await reconstruct();
 
         expect(cdb.matchSubsForRow("messages", [{ indexName: "by_org", key: ["org-1"] }])).toEqual([first, third]);
     });
