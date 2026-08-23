@@ -22,7 +22,7 @@ const PACKAGE_TEMPLATE = (name: string) =>
                 dev: "wrangler dev",
             },
             dependencies: {
-                "better-auth": "1.6.10",
+                "better-auth": "1.6.30",
                 chardb: "0.1.0",
                 "drizzle-orm": "0.45.2",
                 zod: "4.4.3",
