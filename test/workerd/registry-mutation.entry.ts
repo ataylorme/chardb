@@ -1,12 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
+import { gte } from "drizzle-orm";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
+import { isCdbError } from "../../src/errors.ts";
 import { chardb } from "../../src/server/chardb.ts";
 import { createApi } from "../../src/server/define.ts";
 import type { CdbMutationRequest, CdbMutationResponse } from "../../src/server/do/cdb.ts";
 import { globalScope } from "../../src/server/index.ts";
 import { manifestFromExports, routeMutation } from "../../src/server/manifest.ts";
 import type {
+    CdbRegisteredQueryRequest,
     CdbSubscriptionRequest,
     GatewayInvalidationRequest,
     GatewayInvalidationResponse,
@@ -65,8 +68,23 @@ const rawAfterTyped = api.mutation({
     },
 });
 
-const app = chardb({ schema, api: { putEntry, inspectEntries, rawAfterTyped } });
-const manifest = manifestFromExports({ putEntry, inspectEntries, rawAfterTyped });
+let registeredQueryRuns = 0;
+const registryEntries = api.query({
+    args: z.object({ minimum: z.number().int() }),
+    handler: async function registryEntries(ctx, args) {
+        registeredQueryRuns++;
+        const rows = await ctx.db
+            .select()
+            .from(entries)
+            .where(gte(entries.value, args.minimum))
+            .orderBy(entries.id)
+            .all();
+        return rows.map(row => ({ ...row, freshProbe: ctx.auth.claims.probe ?? null }));
+    },
+});
+
+const app = chardb({ schema, api: { putEntry, inspectEntries, rawAfterTyped, registryEntries } });
+const manifest = manifestFromExports({ putEntry, inspectEntries, rawAfterTyped, registryEntries });
 
 interface StoredEntry extends Record<string, SqlStorageValue> {
     readonly id: string;
@@ -79,6 +97,41 @@ interface CountRow extends Record<string, SqlStorageValue> {
 }
 
 export class Cdb extends app.Cdb {
+    registeredQueryRunCount(): number {
+        return registeredQueryRuns;
+    }
+
+    corruptRegisteredQuery(registrationId: string, kind: "malformed" | "mismatch" | "mapping"): void {
+        if (kind === "mapping") {
+            this.ctx.storage.sql.exec(
+                `DELETE FROM _chardb_live_subscription_tables
+                 WHERE registration_id = ?`,
+                registrationId
+            );
+            return;
+        }
+        this.ctx.storage.sql.exec(
+            `UPDATE _chardb_live_subscriptions
+             SET args_json = ?
+             WHERE registration_id = ?`,
+            kind === "malformed" ? "{" : '{"minimum":0}',
+            registrationId
+        );
+    }
+
+    async subscribeForProof(request: CdbSubscriptionRequest): Promise<Record<string, unknown>> {
+        try {
+            return { ok: true, result: await this.subscribe(request) };
+        } catch (error) {
+            return {
+                ok: false,
+                error: isCdbError(error)
+                    ? error.toJSON()
+                    : { code: "CDB_INVARIANT", message: error instanceof Error ? error.message : "unknown failure" },
+            };
+        }
+    }
+
     inspectAtomicState(): {
         readonly entries: readonly StoredEntry[];
         readonly opLogRows: number;
@@ -178,6 +231,23 @@ function subscriptionRequest(gatewayId: string): CdbSubscriptionRequest {
     };
 }
 
+function registeredSubscriptionRequest(gatewayId: string, registrationId: string): CdbSubscriptionRequest {
+    return {
+        subscription: {
+            gatewayId,
+            registrationId,
+            connectionId: `connection-${registrationId}`,
+            clientId: ClientId(`client-${registrationId}`),
+            subId: SubId(2),
+        },
+        principalId: PrincipalId(AUTH.userId),
+        ref: registryEntries.__chardbRef,
+        args: { minimum: 60 },
+        tables: ["registry_entries"],
+        intervals: [],
+    };
+}
+
 interface RegistryEnv {
     readonly CDB: DurableObjectNamespace;
     readonly CDB_GATEWAY: DurableObjectNamespace;
@@ -191,22 +261,66 @@ export default {
         const stub = env.CDB.get(id) as unknown as {
             mutate(input: CdbMutationRequest): Promise<CdbMutationResponse>;
             inspectAtomicState(): Promise<unknown>;
+            registeredQueryRunCount(): Promise<number>;
+            corruptRegisteredQuery(registrationId: string, kind: "malformed" | "mismatch" | "mapping"): Promise<void>;
+            subscribeForProof(input: CdbSubscriptionRequest): Promise<Record<string, unknown>>;
             subscribe(input: CdbSubscriptionRequest): Promise<unknown>;
             unsubscribe(input: LiveSubscriptionId): Promise<void>;
+            queryRegistered(input: CdbRegisteredQueryRequest): Promise<unknown>;
         };
-        if (new URL(request.url).pathname === "/state") return Response.json(await stub.inspectAtomicState());
-        if (new URL(request.url).pathname === "/gateway-state") {
+        const url = new URL(request.url);
+        if (url.pathname === "/state") return Response.json(await stub.inspectAtomicState());
+        if (url.pathname === "/gateway-state") {
             const gateway = env.CDB_GATEWAY.get(gatewayId) as unknown as {
                 inspectInvalidations(): Promise<readonly GatewayInvalidationRequest[]>;
             };
             return Response.json(await gateway.inspectInvalidations());
         }
-        if (new URL(request.url).pathname === "/subscribe") {
+        if (url.pathname === "/subscribe") {
             return Response.json(await stub.subscribe(subscribeRequest));
         }
-        if (new URL(request.url).pathname === "/unsubscribe") {
+        if (url.pathname === "/unsubscribe") {
             await stub.unsubscribe(subscribeRequest.subscription);
             return Response.json({ ok: true });
+        }
+        if (url.pathname.startsWith("/registered/")) {
+            const body = (await request.json()) as {
+                readonly registrationId: string;
+                readonly forgedIdentity?: boolean;
+                readonly forgedPrincipal?: boolean;
+                readonly corruption?: "malformed" | "mismatch" | "mapping";
+            };
+            const registered = registeredSubscriptionRequest(gatewayId.toString(), body.registrationId);
+            if (url.pathname === "/registered/runs") {
+                return Response.json({ runs: await stub.registeredQueryRunCount() });
+            }
+            if (url.pathname === "/registered/subscribe") {
+                return Response.json(await stub.subscribeForProof(registered));
+            }
+            if (url.pathname === "/registered/unsubscribe") {
+                await stub.unsubscribe(registered.subscription);
+                return Response.json({ ok: true });
+            }
+            if (url.pathname === "/registered/corrupt") {
+                if (!body.corruption) return Response.json({ ok: false }, { status: 400 });
+                await stub.corruptRegisteredQuery(body.registrationId, body.corruption);
+                return Response.json({ ok: true });
+            }
+            if (url.pathname === "/registered/query") {
+                return Response.json(
+                    await stub.queryRegistered({
+                        subscription: body.forgedIdentity
+                            ? { ...registered.subscription, connectionId: "forged-connection" }
+                            : registered.subscription,
+                        auth: {
+                            ...AUTH,
+                            userId: body.forgedPrincipal ? "forged-principal" : AUTH.userId,
+                            claims: { probe: "fresh-query-auth" },
+                        },
+                    })
+                );
+            }
+            return Response.json({ ok: false }, { status: 404 });
         }
         const body = (await request.json()) as DispatchBody;
         const ref =

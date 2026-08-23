@@ -110,6 +110,24 @@ async function inspectGateway(): Promise<readonly Record<string, unknown>[]> {
     return (await response.json()) as readonly Record<string, unknown>[];
 }
 
+async function registeredProof(
+    operation: "subscribe" | "unsubscribe" | "query" | "corrupt" | "runs",
+    body: {
+        readonly registrationId: string;
+        readonly forgedIdentity?: boolean;
+        readonly forgedPrincipal?: boolean;
+        readonly corruption?: "malformed" | "mismatch" | "mapping";
+    }
+): Promise<Record<string, unknown>> {
+    if (!mf) throw new Error("miniflare not initialized");
+    const response = await mf.dispatchFetch(`http://example.com/registered/${operation}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+    });
+    return (await response.json()) as Record<string, unknown>;
+}
+
 describe("configured Cdb local mutation registry", () => {
     test("resolves two refs locally, validates synchronously, carries auth, and replays the exact result", async () => {
         const subscribed = await subscribe();
@@ -260,5 +278,72 @@ describe("configured Cdb local mutation registry", () => {
             error: { code: "CDB_UNSUPPORTED_FEATURE", retryable: false },
         });
         expect(await inspectAtomicState()).toEqual(before);
+    });
+
+    test("runs only active, intact registered query generations under fresh auth", async () => {
+        const inserted = await mutate({
+            operation: "put",
+            mutId: "registered-query-row",
+            args: { id: "registered-query-entry", value: 64 },
+        });
+        expect(inserted.body).toMatchObject({ ok: true });
+
+        const active = "query-active";
+        expect(await registeredProof("subscribe", { registrationId: active })).toMatchObject({
+            ok: true,
+            result: { subscription: { registrationId: active } },
+        });
+        expect(await registeredProof("query", { registrationId: active })).toEqual({
+            ok: true,
+            result: [
+                {
+                    id: "registered-query-entry",
+                    ownerId: "registry-user",
+                    value: 64,
+                    freshProbe: "fresh-query-auth",
+                },
+            ],
+        });
+        expect(await registeredProof("runs", { registrationId: active })).toEqual({ runs: 1 });
+
+        for (const forged of [
+            { registrationId: active, forgedIdentity: true },
+            { registrationId: active, forgedPrincipal: true },
+        ]) {
+            expect(await registeredProof("query", forged)).toMatchObject({
+                ok: false,
+                error: { code: "CDB_INVARIANT" },
+            });
+        }
+
+        await registeredProof("unsubscribe", { registrationId: active });
+        expect(await registeredProof("query", { registrationId: active })).toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT" },
+        });
+
+        for (const corruption of ["mismatch", "malformed", "mapping"] as const) {
+            const registrationId = `query-${corruption}`;
+            expect(await registeredProof("subscribe", { registrationId })).toMatchObject({ ok: true });
+            expect(await registeredProof("corrupt", { registrationId, corruption })).toEqual({ ok: true });
+            expect(await registeredProof("query", { registrationId })).toMatchObject({
+                ok: false,
+                error: { code: "CDB_INVARIANT" },
+            });
+        }
+        expect(await registeredProof("runs", { registrationId: active })).toEqual({ runs: 1 });
+    });
+
+    test("an unsubscribe-before-subscribe tombstone cannot reactivate", async () => {
+        const registrationId = "query-tombstone";
+        expect(await registeredProof("unsubscribe", { registrationId })).toEqual({ ok: true });
+        expect(await registeredProof("subscribe", { registrationId })).toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT" },
+        });
+        expect(await registeredProof("query", { registrationId })).toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT" },
+        });
     });
 });
