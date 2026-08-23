@@ -72,9 +72,9 @@ export function createCdbTable<TName extends string, TCols extends CdbColumnsInp
     // each column's `.name` field. We materialize a JS→SQL map at boot
     // and translate every reference (selfBy, tenantBy, partitionBy,
     // role-axis column lists, column-axis keys) into SQL names. The
-    // matrix + meta are SQL-keyed; row consumers read SQL keys (which
-    // is what raw `select()` returns), so the translation lives ENTIRELY
-    // at construction.
+    // matrix + meta are SQL-keyed. Storage and policy helpers use SQL keys;
+    // the full-row Drizzle select adapter translates JS-keyed result objects
+    // before and after column masking.
     const jsKeys: readonly string[] = Object.freeze(Object.keys(args.columns));
     const cols = getTableColumns(table) as Record<string, { readonly name: string }>;
     const jsToSql: Record<string, string> = {};

@@ -164,6 +164,19 @@ function forbiddenError(run: () => unknown): CdbError {
     return cdbError;
 }
 
+function forbiddenFeature(run: () => unknown): CdbError {
+    let caught: unknown;
+    try {
+        run();
+    } catch (error) {
+        caught = error;
+    }
+    expect(caught).toBeInstanceOf(CdbError);
+    const cdbError = caught as CdbError;
+    expect(cdbError.code).toBe("CDB_UNSUPPORTED_FEATURE");
+    return cdbError;
+}
+
 function renderSql(value: unknown) {
     return (value as SQL).toQuery({
         casing: { getColumnCasing: (column: { readonly name: string }) => column.name } as never,
@@ -793,5 +806,32 @@ describe("wrapDb / cdbTable delete authorization", () => {
         const { db, capturedDeletes } = makeStubDb();
         wrapDb(db, baseAuth).delete(raw).run();
         expect(capturedDeletes[0]?.where).toBeUndefined();
+    });
+});
+
+describe("wrapDb / select bypass guards", () => {
+    test("rejects relational query and $count at the common wrapper boundary", () => {
+        const raw = {
+            query: { records: { findMany: () => [] } },
+            $count: () => 0,
+        };
+        const wrapped = wrapDb(raw, baseAuth);
+        for (const read of [() => wrapped.query, () => wrapped.$count]) {
+            const error = forbiddenFeature(read);
+            expect(error.message).toContain("bypasses cdbTable select policy enforcement");
+        }
+    });
+
+    test("keeps non-cdbTable selects unchanged outside the shard query boundary", () => {
+        const rawTable = sqliteTable("raw_select_passthrough", { id: text("id").primaryKey() });
+        const result = [{ id: "raw-1" }];
+        const builder = {
+            from(table: SQLiteTable) {
+                expect(table).toBe(rawTable);
+                return result;
+            },
+        };
+        const rawDb = { select: () => builder };
+        expect(wrapDb(rawDb, baseAuth).select().from(rawTable)).toBe(result);
     });
 });

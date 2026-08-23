@@ -39,7 +39,7 @@
 import { getTableColumns } from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../errors.ts";
-import { assertColumnsWritable } from "./cdb-cls.ts";
+import { applyColumnMask, assertColumnsWritable } from "./cdb-cls.ts";
 import { compileCdbPolicies } from "./cdb-policy.ts";
 import { getCdbMeta } from "./cdb-table-registry.ts";
 import type { CdbTableMeta } from "./cdb-table-types.ts";
@@ -86,6 +86,40 @@ interface AutoFillPlan {
         readonly authority: "tenant" | "self";
     }>;
 }
+
+type PolicyPlan = Pick<AutoFillPlan, "table" | "auth" | "policies">;
+
+interface SelectRootPlan {
+    readonly auth: AuthCtx;
+    readonly fullRow: boolean;
+    readonly queryBoundary: boolean;
+}
+
+const UNSUPPORTED_SELECT_METHODS = new Set<PropertyKey>([
+    "leftJoin",
+    "rightJoin",
+    "innerJoin",
+    "fullJoin",
+    "crossJoin",
+    "having",
+    "groupBy",
+    "union",
+    "unionAll",
+    "intersect",
+    "intersectAll",
+    "except",
+    "exceptAll",
+    "values",
+    "run",
+    "prepare",
+    "_prepare",
+    "as",
+    "getSelectedFields",
+    "$dynamic",
+    "$withCache",
+]);
+
+const SAFE_SELECT_CHAIN_METHODS = new Set<PropertyKey>(["orderBy", "limit", "offset"]);
 
 function buildPlan(
     table: SQLiteTable,
@@ -263,6 +297,156 @@ function wrapUpdateBuilder(builder: unknown, plan: AutoFillPlan): unknown {
     });
 }
 
+function wrapSelectFromBuilder(builder: unknown, root: SelectRootPlan): unknown {
+    return new Proxy(builder as object, {
+        get(target, prop, receiver) {
+            const value = Reflect.get(target, prop, receiver);
+            if (prop !== "from" || typeof value !== "function") return value;
+            return (table: SQLiteTable) => {
+                const meta = getCdbMeta(table);
+                if (!meta) {
+                    if (root.queryBoundary) throw unsupportedSelect("query handlers may select only from cdbTable");
+                    return (value as (table: SQLiteTable) => unknown).call(target, table);
+                }
+                if (!root.fullRow) {
+                    throw unsupportedSelect("cdbTable projections are unavailable until projected masks are compiled");
+                }
+                const selected = (value as (table: SQLiteTable) => unknown).call(target, table);
+                return scopeSelectBuilder(selected, {
+                    table,
+                    auth: root.auth,
+                    policies: compileCdbPolicies(table),
+                });
+            };
+        },
+    });
+}
+
+function scopeSelectBuilder(builder: unknown, plan: PolicyPlan): unknown {
+    const where = Reflect.get(builder as object, "where");
+    if (typeof where !== "function") throw unsupportedSelect("select builder does not expose a WHERE stage");
+    const scoped = where.call(
+        builder,
+        applyPoliciesToWhere({
+            op: "select",
+            auth: plan.auth,
+            table: plan.table,
+            policies: plan.policies,
+        })
+    );
+    return wrapScopedSelectBuilder(scoped, plan);
+}
+
+function wrapScopedSelectBuilder(builder: unknown, plan: PolicyPlan): unknown {
+    const proxy = new Proxy(builder as object, {
+        get(target, prop, receiver) {
+            const value = Reflect.get(target, prop, receiver);
+            if (prop === "where" && typeof value === "function") {
+                return (userWhere: import("drizzle-orm").SQL) => {
+                    const combined = applyPoliciesToWhere({
+                        op: "select",
+                        auth: plan.auth,
+                        table: plan.table,
+                        userWhere,
+                        policies: plan.policies,
+                    });
+                    return wrapScopedSelectBuilder((value as (where: unknown) => unknown).call(target, combined), plan);
+                };
+            }
+            if (UNSUPPORTED_SELECT_METHODS.has(prop)) {
+                return (..._args: readonly unknown[]) => {
+                    throw unsupportedSelect(`select method "${String(prop)}" cannot be masked safely`);
+                };
+            }
+            if (SAFE_SELECT_CHAIN_METHODS.has(prop) && typeof value === "function") {
+                return (...args: readonly unknown[]) =>
+                    wrapScopedSelectBuilder(
+                        (value as (...args: readonly unknown[]) => unknown).call(target, ...args),
+                        plan
+                    );
+            }
+            if ((prop === "all" || prop === "execute") && typeof value === "function") {
+                return (...args: readonly unknown[]) =>
+                    mapMaybePromise((value as (...args: readonly unknown[]) => unknown).call(target, ...args), rows =>
+                        maskSelectRows(plan, rows)
+                    );
+            }
+            if (prop === "get" && typeof value === "function") {
+                return (...args: readonly unknown[]) =>
+                    mapMaybePromise((value as (...args: readonly unknown[]) => unknown).call(target, ...args), row =>
+                        maskSelectGet(plan, row)
+                    );
+            }
+            if (prop === "then" && typeof value === "function") {
+                return (onFulfilled?: (rows: unknown) => unknown, onRejected?: (error: unknown) => unknown) =>
+                    (value as (...args: readonly unknown[]) => unknown).call(
+                        target,
+                        (rows: unknown) => {
+                            const masked = maskSelectRows(plan, rows);
+                            return onFulfilled ? onFulfilled(masked) : masked;
+                        },
+                        onRejected
+                    );
+            }
+            if (prop === "catch" && typeof value === "function") {
+                return (onRejected?: (error: unknown) => unknown) =>
+                    (Reflect.get(target, "then") as (...args: readonly unknown[]) => unknown).call(
+                        target,
+                        (rows: unknown) => maskSelectRows(plan, rows),
+                        onRejected
+                    );
+            }
+            if (prop === "finally" && typeof value === "function") {
+                return (onFinally?: () => void) => Promise.resolve(proxy as PromiseLike<unknown>).finally(onFinally);
+            }
+            if (prop === "toSQL" || prop === "getSQL" || prop === "getUsedTables") {
+                return typeof value === "function" ? value.bind(target) : value;
+            }
+            if (typeof prop === "symbol") return value;
+            throw unsupportedSelect(`select property "${String(prop)}" is unavailable on a masked query`);
+        },
+    });
+    return proxy;
+}
+
+function mapMaybePromise<T>(value: unknown, map: (value: unknown) => T): T | Promise<T> {
+    if (value && typeof value === "object" && typeof (value as { then?: unknown }).then === "function") {
+        return Promise.resolve(value).then(map);
+    }
+    return map(value);
+}
+
+function maskSelectRows(plan: PolicyPlan, value: unknown): readonly Record<string, unknown>[] {
+    if (!Array.isArray(value)) throw unsupportedSelect("full-row select did not return an array");
+    return value.map(row => maskSelectRow(plan, row));
+}
+
+function maskSelectGet(plan: PolicyPlan, value: unknown): Record<string, unknown> | undefined {
+    if (value === undefined) return undefined;
+    return maskSelectRow(plan, value);
+}
+
+function maskSelectRow(plan: PolicyPlan, value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw unsupportedSelect("full-row select returned a non-object row");
+    }
+    const row = value as Record<string, unknown>;
+    const jsToSql = jsToSqlMap(plan.table);
+    const masked = applyColumnMask({
+        rows: [toSqlColumnNames(row, jsToSql)],
+        table: plan.table,
+        auth: plan.auth,
+    })[0];
+    if (!masked) throw unsupportedSelect("column mask did not return a row");
+    const out: Record<string, unknown> = {};
+    for (const [jsKey, sqlName] of jsToSql) out[jsKey] = masked[sqlName];
+    return out;
+}
+
+function unsupportedSelect(message: string): CdbError {
+    return new CdbError({ code: "CDB_UNSUPPORTED_FEATURE", message });
+}
+
 function scopePolicyBuilder(builder: unknown, plan: AutoFillPlan, operation: "update" | "delete"): unknown {
     const where = Reflect.get(builder as object, "where");
     if (typeof where !== "function") return builder;
@@ -353,10 +537,34 @@ function conflictingAuthority(authority: "tenant" | "self", column: string): Cdb
  * wrapped `tx` too.
  */
 export function wrapDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
+    return wrapDbInternal(db, auth, false);
+}
+
+export function wrapQueryDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
+    return wrapDbInternal(db, auth, true);
+}
+
+function wrapDbInternal<TDb extends object>(db: TDb, auth: AuthCtx, queryBoundary: boolean): TDb {
     return new Proxy(db, {
         get(target, prop, receiver) {
+            if (prop === "query" || prop === "$count") {
+                throw new CdbError({
+                    code: "CDB_UNSUPPORTED_FEATURE",
+                    message: `database property "${String(prop)}" bypasses cdbTable select policy enforcement`,
+                });
+            }
             const v = Reflect.get(target, prop, receiver);
             if (typeof v !== "function") return v;
+            if (prop === "select" || prop === "selectDistinct") {
+                return (...args: readonly unknown[]) => {
+                    const builder = (v as (...args: readonly unknown[]) => unknown).call(target, ...args);
+                    return wrapSelectFromBuilder(builder, {
+                        auth,
+                        fullRow: prop === "select" && args.length === 0,
+                        queryBoundary,
+                    });
+                };
+            }
             if (prop === "insert") {
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
@@ -383,7 +591,7 @@ export function wrapDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
             }
             if (prop === "transaction") {
                 return (callback: (tx: TDb) => Promise<unknown>, ...rest: readonly unknown[]) => {
-                    const wrapped = (tx: TDb) => callback(wrapDb(tx, auth));
+                    const wrapped = (tx: TDb) => callback(wrapDbInternal(tx, auth, queryBoundary));
                     return (v as (cb: (tx: TDb) => Promise<unknown>, ...r: readonly unknown[]) => unknown).call(
                         target,
                         wrapped,

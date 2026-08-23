@@ -40,6 +40,7 @@ export function applyColumnMask<TRow extends Record<string, unknown>>(args: {
     readonly auth: AuthCtx;
 }): TRow[] {
     const meta = resolveCdbMeta(args.table);
+    if (meta.publicRead) return [...args.rows];
     const callerRoleColumns = callerColumns(meta, args.auth, "read");
     const selfBy = meta.selfBy;
     const selfReadCols = selfColumns(meta, "read");

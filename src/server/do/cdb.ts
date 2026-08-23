@@ -25,6 +25,7 @@ import { type TableSpec, renderRowApply, renderTableTriggers } from "../../resha
 import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId } from "../../types.ts";
 import { rawJsonResult } from "../../util/raw_json.ts";
 import { executeAtomicMutation } from "../atomic-mutation.ts";
+import { wrapQueryDb } from "../cdb-db-proxy.ts";
 import { collectCdbTables } from "../cdb-table-registry.ts";
 import { resolveCdbMeta } from "../cdb-table.ts";
 import { type ChardbManifest, emptyManifest, resolveMutation, resolveQuery } from "../manifest.ts";
@@ -100,7 +101,7 @@ function domainSchemaMismatch(tableName: string): CdbError {
     });
 }
 
-const QUERY_DB_READ_PROPERTIES = new Set<PropertyKey>(["select", "selectDistinct", "query", "$count"]);
+const QUERY_DB_READ_PROPERTIES = new Set<PropertyKey>(["select"]);
 
 function readOnlyQueryDb<TDb extends object>(db: TDb): TDb {
     return new Proxy(db, {
@@ -324,7 +325,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     async query(request: CdbQueryRequest): Promise<CdbQueryResponse> {
         try {
             const descriptor = resolveQuery(this.mutationManifest(), request.ref);
-            const database = drizzle(this.ctx.storage, { schema: this.mutationSchema() });
+            const database = wrapQueryDb(drizzle(this.ctx.storage, { schema: this.mutationSchema() }), request.auth);
             const result = await descriptor.invoke({ db: readOnlyQueryDb(database), auth: request.auth }, request.args);
             return { ok: true, result: rawJsonResult(result, "query result") };
         } catch (error) {

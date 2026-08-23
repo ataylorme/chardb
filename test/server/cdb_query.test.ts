@@ -1,10 +1,10 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { eq, sql } from "drizzle-orm";
-import { integer, text } from "drizzle-orm/sqlite-core";
+import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
-import { globalScope } from "../../src/server/index.ts";
+import { forOrg } from "../../src/server/index.ts";
 import { manifestFromExports } from "../../src/server/manifest.ts";
 import type { CdbQueryRequest } from "../../src/server/rpc.ts";
 import { ChardbRef } from "../../src/types.ts";
@@ -47,21 +47,94 @@ function construct(CdbClass: typeof Cdb, db: Database): { readonly cdb: Cdb; rea
     return { cdb: new CdbClass(state, {}), ready };
 }
 
-const { cdbTable } = globalScope();
+const organization = sqliteTable("organization", { id: text("id").primaryKey() });
+const user = sqliteTable("user", { id: text("id").primaryKey() });
+const { cdbTable } = forOrg();
 const records = cdbTable(
     "query_records",
     {
         id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organization.id),
+        ownerId: text("owner_id")
+            .notNull()
+            .references(() => user.id),
         groupId: text("group_id").notNull(),
         value: integer("value").notNull(),
+        secretNote: text("secret_note"),
     },
-    { partitionBy: "groupId" }
+    {
+        selfBy: "ownerId",
+        roles: {
+            member: { read: { exclude: ["secretNote"] } },
+            self: { read: "*" },
+        },
+    }
 );
-const schema = { records };
+const privateRecords = cdbTable(
+    "query_private_records",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organization.id),
+    },
+    { roles: { member: { create: "*" } } }
+);
+const publicRecords = cdbTable(
+    "query_public_records",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organization.id),
+        displayName: text("display_name").notNull(),
+    },
+    { publicRead: true }
+);
+const joinTarget = sqliteTable("query_join_target", { id: text("id").primaryKey() });
+const schema = { organization, user, records, privateRecords, publicRecords };
 const api = createApi(schema);
 
 const listRecords = api.query(async function listRecordsHandler(ctx, args: { groupId: string }) {
     return ctx.db.select().from(records).where(eq(records.groupId, args.groupId)).orderBy(records.id).all();
+});
+const getRecord = api.query(async function getRecordHandler(ctx, args: { id: string }) {
+    return ctx.db.select().from(records).where(eq(records.id, args.id)).get();
+});
+const awaitRecords = api.query(async function awaitRecordsHandler(ctx) {
+    return await ctx.db.select().from(records).orderBy(records.id);
+});
+const listPrivateRecords = api.query(async function listPrivateRecordsHandler(ctx) {
+    return ctx.db.select().from(privateRecords).all();
+});
+const listPublicRecords = api.query(async function listPublicRecordsHandler(ctx) {
+    return ctx.db.select().from(publicRecords).orderBy(publicRecords.id).all();
+});
+const projectionAttempt = api.query(async function projectionAttemptHandler(ctx) {
+    return ctx.db.select({ id: records.id }).from(records).all();
+});
+const joinAttempt = api.query(async function joinAttemptHandler(ctx) {
+    return ctx.db.select().from(records).innerJoin(joinTarget, eq(joinTarget.id, records.id)).all();
+});
+const groupAttempt = api.query(async function groupAttemptHandler(ctx) {
+    return ctx.db.select().from(records).groupBy(records.groupId).all();
+});
+const setAttempt = api.query(async function setAttemptHandler(ctx) {
+    return ctx.db.select().from(records).union(ctx.db.select().from(records)).all();
+});
+const distinctAttempt = api.query(async function distinctAttemptHandler(ctx) {
+    return ctx.db.selectDistinct().from(records).all();
+});
+const relationalAttempt = api.query(async function relationalAttemptHandler(ctx) {
+    return (ctx.db.query as unknown as { records: { findMany(): Promise<unknown> } }).records.findMany();
+});
+const countAttempt = api.query(async function countAttemptHandler(ctx) {
+    return ctx.db.$count(records);
+});
+const nonCdbAttempt = api.query(async function nonCdbAttemptHandler(ctx) {
+    return ctx.db.select().from(organization).all();
 });
 const nonJsonResult = api.query(async function nonJsonResultHandler() {
     return new Date("2026-08-23T00:00:00Z");
@@ -92,6 +165,18 @@ const transactionAttempt = api.query(async function transactionAttemptHandler(ct
 
 const manifest = manifestFromExports({
     listRecords,
+    getRecord,
+    awaitRecords,
+    listPrivateRecords,
+    listPublicRecords,
+    projectionAttempt,
+    joinAttempt,
+    groupAttempt,
+    setAttempt,
+    distinctAttempt,
+    relationalAttempt,
+    countAttempt,
+    nonCdbAttempt,
     nonJsonResult,
     thrownQuery,
     insertAttempt,
@@ -101,7 +186,13 @@ const manifest = manifestFromExports({
     transactionAttempt,
 });
 const ConfiguredCdb = configureCdbRuntime({ schema: () => schema, manifest: () => manifest });
-const AUTH: CdbQueryRequest["auth"] = { userId: "user-1", roles: ["member"], claims: {} };
+const AUTH: CdbQueryRequest["auth"] = {
+    userId: "user-1",
+    tenantId: "org-a",
+    roles: ["member"],
+    claims: {},
+};
+const ANONYMOUS: CdbQueryRequest["auth"] = { userId: "", claims: {} };
 
 describe("Cdb registered query execution", () => {
     const databases: Database[] = [];
@@ -115,8 +206,22 @@ describe("Cdb registered query execution", () => {
         databases.push(db);
         const configured = construct(ConfiguredCdb, db);
         await configured.ready;
-        db.run("INSERT INTO query_records (id, group_id, value) VALUES ('record-1', 'group-a', 1)");
-        db.run("INSERT INTO query_records (id, group_id, value) VALUES ('record-2', 'group-a', 2)");
+        db.run(
+            "INSERT INTO query_records (id, organization_id, owner_id, group_id, value, secret_note) VALUES (?, ?, ?, ?, ?, ?)",
+            ["record-1", "org-a", "user-1", "group-a", 1, "mine"]
+        );
+        db.run(
+            "INSERT INTO query_records (id, organization_id, owner_id, group_id, value, secret_note) VALUES (?, ?, ?, ?, ?, ?)",
+            ["record-2", "org-a", "user-2", "group-a", 2, "theirs"]
+        );
+        db.run(
+            "INSERT INTO query_records (id, organization_id, owner_id, group_id, value, secret_note) VALUES (?, ?, ?, ?, ?, ?)",
+            ["record-other-tenant", "org-b", "user-1", "group-a", 3, "cross-tenant"]
+        );
+        db.run("INSERT INTO query_private_records (id, organization_id) VALUES ('private-1', 'org-a')");
+        db.run(
+            "INSERT INTO query_public_records (id, organization_id, display_name) VALUES ('public-a', 'org-a', 'Alpha'), ('public-b', 'org-b', 'Beta')"
+        );
         return { db, cdb: configured.cdb };
     }
 
@@ -127,13 +232,83 @@ describe("Cdb registered query execution", () => {
         ).resolves.toEqual({
             ok: true,
             result: [
-                { id: "record-1", groupId: "group-a", value: 1 },
-                { id: "record-2", groupId: "group-a", value: 2 },
+                {
+                    id: "record-1",
+                    organizationId: "org-a",
+                    ownerId: "user-1",
+                    groupId: "group-a",
+                    value: 1,
+                    secretNote: "mine",
+                },
+                {
+                    id: "record-2",
+                    organizationId: "org-a",
+                    ownerId: "user-2",
+                    groupId: "group-a",
+                    value: 2,
+                    secretNote: null,
+                },
             ],
         });
         await expect(
             cdb.query({ ref: listRecords.__chardbRef, args: { groupId: "missing" }, auth: AUTH })
         ).resolves.toEqual({ ok: true, result: [] });
+    });
+
+    test("masks get and awaited full-row results while preserving JS field names", async () => {
+        const { cdb } = await setup();
+        await expect(cdb.query({ ref: getRecord.__chardbRef, args: { id: "record-2" }, auth: AUTH })).resolves.toEqual({
+            ok: true,
+            result: {
+                id: "record-2",
+                organizationId: "org-a",
+                ownerId: "user-2",
+                groupId: "group-a",
+                value: 2,
+                secretNote: null,
+            },
+        });
+        await expect(cdb.query({ ref: awaitRecords.__chardbRef, args: {}, auth: AUTH })).resolves.toMatchObject({
+            ok: true,
+            result: [
+                { id: "record-1", secretNote: "mine" },
+                { id: "record-2", secretNote: null },
+            ],
+        });
+    });
+
+    test("default-denies private reads and permits anonymous publicRead", async () => {
+        const { cdb } = await setup();
+        await expect(cdb.query({ ref: listPrivateRecords.__chardbRef, args: {}, auth: AUTH })).resolves.toEqual({
+            ok: true,
+            result: [],
+        });
+        await expect(cdb.query({ ref: listPublicRecords.__chardbRef, args: {}, auth: ANONYMOUS })).resolves.toEqual({
+            ok: true,
+            result: [
+                { id: "public-a", organizationId: "org-a", displayName: "Alpha" },
+                { id: "public-b", organizationId: "org-b", displayName: "Beta" },
+            ],
+        });
+    });
+
+    test("rejects unmaskable select shapes and query-builder bypasses", async () => {
+        const { cdb } = await setup();
+        for (const ref of [
+            projectionAttempt.__chardbRef,
+            joinAttempt.__chardbRef,
+            groupAttempt.__chardbRef,
+            setAttempt.__chardbRef,
+            distinctAttempt.__chardbRef,
+            relationalAttempt.__chardbRef,
+            countAttempt.__chardbRef,
+            nonCdbAttempt.__chardbRef,
+        ]) {
+            await expect(cdb.query({ ref, args: {}, auth: AUTH })).resolves.toMatchObject({
+                ok: false,
+                error: { code: "CDB_UNSUPPORTED_FEATURE" },
+            });
+        }
     });
 
     test("returns typed failures for unknown refs, non-JSON results, and thrown handlers", async () => {
@@ -168,6 +343,7 @@ describe("Cdb registered query execution", () => {
             expect(db.query("SELECT id, value FROM query_records ORDER BY id").all()).toEqual([
                 { id: "record-1", value: 1 },
                 { id: "record-2", value: 2 },
+                { id: "record-other-tenant", value: 3 },
             ]);
         }
     });
