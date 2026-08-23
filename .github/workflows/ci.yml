@@ -64,8 +64,11 @@ jobs:
       - name: Build landing page
         run: bun run --cwd landing build
 
-      - name: Check package contents
-        run: npm pack --dry-run
+      - name: Pack and smoke-test package
+        shell: bash
+        run: |
+          tarball="$(npm pack --ignore-scripts)"
+          bun scripts/smoke-packed-package.mjs "${tarball}"
 
       - name: Install packed chat consumer
         working-directory: example/chat
