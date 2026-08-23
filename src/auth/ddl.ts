@@ -1,6 +1,6 @@
 import { SQL, getTableName, is } from "drizzle-orm";
 import { type AnySQLiteTable, SQLiteSyncDialect, getTableConfig } from "drizzle-orm/sqlite-core";
-import { CdbError } from "../errors.ts";
+import { CdbError, type CdbErrorCode } from "../errors.ts";
 
 export interface SqliteTableDdl {
     readonly tableName: string;
@@ -8,6 +8,19 @@ export interface SqliteTableDdl {
     readonly indexes: readonly string[];
     readonly indexNames: readonly string[];
     readonly signature: string;
+}
+
+export interface SqliteTableDdlOptions {
+    readonly errorCode?: CdbErrorCode;
+    readonly label?: string;
+    readonly hint?: string;
+    readonly includeForeignKey?: (reference: SqliteForeignKeyReference) => boolean;
+}
+
+export interface SqliteForeignKeyReference {
+    readonly columns: readonly string[];
+    readonly foreignColumns: readonly string[];
+    readonly foreignTableName: string;
 }
 
 const dialect = new SQLiteSyncDialect();
@@ -20,28 +33,39 @@ function quoteString(value: string): string {
     return `'${value.replaceAll("'", "''")}'`;
 }
 
-function unsupported(message: string): never {
+const AUTH_DDL_OPTIONS: Required<SqliteTableDdlOptions> = {
+    errorCode: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+    label: "auth DDL",
+    hint: "use SQLite-compatible static auth schema metadata",
+    includeForeignKey: () => true,
+};
+
+function normalizedOptions(options?: SqliteTableDdlOptions): Required<SqliteTableDdlOptions> {
+    return { ...AUTH_DDL_OPTIONS, ...options };
+}
+
+function unsupported(options: Required<SqliteTableDdlOptions>, message: string): never {
     throw new CdbError({
-        code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
-        message,
-        hint: "use SQLite-compatible static auth schema metadata",
+        code: options.errorCode,
+        message: `${options.label} ${message}`,
+        hint: options.hint,
     });
 }
 
-function renderSqlExpression(expression: SQL): string {
+function renderSqlExpression(expression: SQL, options: Required<SqliteTableDdlOptions>): string {
     const query = dialect.sqlToQuery(expression, "indexes");
     if (query.params.length > 0) {
-        return unsupported("auth DDL cannot render a parameterized SQL expression");
+        return unsupported(options, "cannot render a parameterized SQL expression");
     }
     return query.sql;
 }
 
-function renderDefault(value: unknown): string {
-    if (is(value, SQL)) return renderSqlExpression(value);
+function renderDefault(value: unknown, options: Required<SqliteTableDdlOptions>): string {
+    if (is(value, SQL)) return renderSqlExpression(value, options);
     if (value === null) return "NULL";
     if (typeof value === "string") return quoteString(value);
     if (typeof value === "number") {
-        if (!Number.isFinite(value)) return unsupported("auth DDL cannot render a non-finite numeric default");
+        if (!Number.isFinite(value)) return unsupported(options, "cannot render a non-finite numeric default");
         return String(value);
     }
     if (typeof value === "bigint") return value.toString();
@@ -51,29 +75,30 @@ function renderDefault(value: unknown): string {
         return `X'${Array.from(value, byte => byte.toString(16).padStart(2, "0")).join("")}'`;
     }
     if (typeof value === "object") return quoteString(JSON.stringify(value));
-    return unsupported(`auth DDL cannot render default value of type ${typeof value}`);
+    return unsupported(options, `cannot render default value of type ${typeof value}`);
 }
 
 function renderAction(action: string): string {
     return action.toUpperCase();
 }
 
-function renderIndexColumn(value: unknown): string {
-    if (is(value, SQL)) return renderSqlExpression(value);
+function renderIndexColumn(value: unknown, options: Required<SqliteTableDdlOptions>): string {
+    if (is(value, SQL)) return renderSqlExpression(value, options);
     if (typeof value === "object" && value !== null && "name" in value && typeof value.name === "string") {
         return quoteIdentifier(value.name);
     }
-    return unsupported("auth DDL encountered an unsupported SQLite index expression");
+    return unsupported(options, "encountered an unsupported SQLite index expression");
 }
 
 /** Render deterministic, executable SQLite DDL from a Drizzle table. */
-export function renderSqliteTableDdl(table: AnySQLiteTable): SqliteTableDdl {
+export function renderSqliteTableDdl(table: AnySQLiteTable, inputOptions?: SqliteTableDdlOptions): SqliteTableDdl {
+    const options = normalizedOptions(inputOptions);
     const config = getTableConfig(table);
     const definitions: string[] = [];
 
     for (const column of config.columns) {
         if (column.generated) {
-            return unsupported(`auth DDL does not support generated column ${config.name}.${column.name}`);
+            return unsupported(options, `does not support generated column ${config.name}.${column.name}`);
         }
         const parts = [quoteIdentifier(column.name), column.getSQLType()];
         if (column.primary) parts.push("PRIMARY KEY");
@@ -83,7 +108,7 @@ export function renderSqliteTableDdl(table: AnySQLiteTable): SqliteTableDdl {
             if (column.uniqueName) parts.push("CONSTRAINT", quoteIdentifier(column.uniqueName));
             parts.push("UNIQUE");
         }
-        if (column.default !== undefined) parts.push("DEFAULT", renderDefault(column.default));
+        if (column.default !== undefined) parts.push("DEFAULT", renderDefault(column.default, options));
         definitions.push(parts.join(" "));
     }
 
@@ -103,10 +128,17 @@ export function renderSqliteTableDdl(table: AnySQLiteTable): SqliteTableDdl {
     }
     for (const foreignKey of config.foreignKeys) {
         const reference = foreignKey.reference();
+        const foreignTableName = getTableName(reference.foreignTable);
+        const physicalReference: SqliteForeignKeyReference = {
+            columns: reference.columns.map(column => column.name),
+            foreignColumns: reference.foreignColumns.map(column => column.name),
+            foreignTableName,
+        };
+        if (!options.includeForeignKey(physicalReference)) continue;
         const clauses = [
             `CONSTRAINT ${quoteIdentifier(foreignKey.getName())}`,
             `FOREIGN KEY (${reference.columns.map(column => quoteIdentifier(column.name)).join(", ")})`,
-            `REFERENCES ${quoteIdentifier(getTableName(reference.foreignTable))} (${reference.foreignColumns
+            `REFERENCES ${quoteIdentifier(foreignTableName)} (${reference.foreignColumns
                 .map(column => quoteIdentifier(column.name))
                 .join(", ")})`,
         ];
@@ -115,15 +147,17 @@ export function renderSqliteTableDdl(table: AnySQLiteTable): SqliteTableDdl {
         definitions.push(clauses.join(" "));
     }
     for (const check of config.checks) {
-        definitions.push(`CONSTRAINT ${quoteIdentifier(check.name)} CHECK (${renderSqlExpression(check.value)})`);
+        definitions.push(
+            `CONSTRAINT ${quoteIdentifier(check.name)} CHECK (${renderSqlExpression(check.value, options)})`
+        );
     }
 
     const createTable = `CREATE TABLE ${quoteIdentifier(config.name)} (${definitions.join(", ")})`;
     const indexNames = config.indexes.map(index => index.config.name);
     const indexes = config.indexes.map(index => {
         const unique = index.config.unique ? "UNIQUE " : "";
-        const columns = index.config.columns.map(renderIndexColumn).join(", ");
-        const where = index.config.where ? ` WHERE ${renderSqlExpression(index.config.where)}` : "";
+        const columns = index.config.columns.map(column => renderIndexColumn(column, options)).join(", ");
+        const where = index.config.where ? ` WHERE ${renderSqlExpression(index.config.where, options)}` : "";
         return `CREATE ${unique}INDEX ${quoteIdentifier(index.config.name)} ON ${quoteIdentifier(config.name)} (${columns})${where}`;
     });
     return {

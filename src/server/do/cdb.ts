@@ -13,6 +13,7 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
+import { renderSqliteTableDdl } from "../../auth/ddl.ts";
 import { CdbError, isCdbError, isCdbErrorCode } from "../../errors.ts";
 import { type IntervalKey, IntervalMap, type IntervalSet } from "../../intervals.ts";
 import { intervalSetFromWire } from "../../intervals_wire.ts";
@@ -22,6 +23,8 @@ import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/rang
 import { type TableSpec, renderRowApply, renderTableTriggers } from "../../reshard/triggers.ts";
 import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId } from "../../types.ts";
 import { executeAtomicMutation } from "../atomic-mutation.ts";
+import { collectCdbTables } from "../cdb-table-registry.ts";
+import { resolveCdbMeta } from "../cdb-table.ts";
 import { type ChardbManifest, emptyManifest, resolveMutation } from "../manifest.ts";
 import type { CdbMutationRequest, CdbMutationResponse, CdbSubscriptionRequest, LiveSubscriptionId } from "../rpc.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
@@ -40,7 +43,7 @@ export interface CdbEnv {
 
 export type SubscribeArgs = CdbSubscriptionRequest;
 
-const SUBSCRIPTION_DDL = `
+const CDB_LOCAL_DDL = `
 CREATE TABLE IF NOT EXISTS _chardb_subscriptions (
   gateway_id TEXT NOT NULL,
   client_id TEXT NOT NULL,
@@ -51,6 +54,10 @@ CREATE TABLE IF NOT EXISTS _chardb_subscriptions (
   tables_json TEXT NOT NULL,
   intervals_json TEXT NOT NULL,
   PRIMARY KEY (gateway_id, client_id, sub_id)
+);
+CREATE TABLE IF NOT EXISTS _chardb_domain_schema (
+  table_name TEXT PRIMARY KEY,
+  signature TEXT NOT NULL
 );
 ` as const;
 
@@ -74,6 +81,14 @@ interface PreparedInterval {
 
 function subscriptionKey(subscription: LiveSubscriptionId): string {
     return JSON.stringify([subscription.gatewayId, subscription.clientId, subscription.subId]);
+}
+
+function domainSchemaMismatch(tableName: string): CdbError {
+    return new CdbError({
+        code: "CDB_PARTITION_CONTRACT_CHANGED",
+        message: `domain table "${tableName}" is unsigned or does not match the configured schema`,
+        hint: "add and run an explicit shard schema migration before deploying this schema",
+    });
 }
 
 export interface CdbRuntimeConfig<TSchema extends Record<string, unknown>> {
@@ -105,12 +120,14 @@ export class Cdb extends DurableObject<CdbEnv> {
     private async bootstrap(): Promise<void> {
         if (this.bootstrapped) return;
         const sql = adaptSqlStorage(this.ctx.storage.sql);
-        for (const stmt of `${SHARD_BOOTSTRAP_DDL}\n${SUBSCRIPTION_DDL}`
+        for (const stmt of `${SHARD_BOOTSTRAP_DDL}\n${CDB_LOCAL_DDL}`
             .split(";")
             .map(s => s.trim())
             .filter(Boolean)) {
             sql.exec(stmt);
         }
+        sql.exec("PRAGMA foreign_keys = ON");
+        this.ensureDomainTables();
         const cursor = this.ctx.storage.sql.exec<StoredSubscriptionRow>(
             `SELECT gateway_id, client_id, sub_id, principal_id, ref, args_json, tables_json, intervals_json
              FROM _chardb_subscriptions
@@ -132,6 +149,69 @@ export class Cdb extends DurableObject<CdbEnv> {
             this.installSubscription(request.subscription, this.prepareIntervals(request));
         }
         this.bootstrapped = true;
+    }
+
+    private ensureDomainTables(): void {
+        const tables = [...collectCdbTables(this.mutationSchema())].sort((a, b) =>
+            a.meta.name.localeCompare(b.meta.name)
+        );
+        const domainTableNames = new Set(tables.map(entry => entry.meta.name));
+        const rendered = tables.map(({ table }) => {
+            const meta = resolveCdbMeta(table);
+            const authorityColumns = new Set([meta.tenantBy, meta.selfBy].filter(column => column !== undefined));
+            return renderSqliteTableDdl(table, {
+                errorCode: "CDB_PARTITION_CONTRACT_CHANGED",
+                label: "domain DDL",
+                hint: "add and run an explicit shard schema migration before deploying this schema",
+                includeForeignKey: reference => {
+                    if (domainTableNames.has(reference.foreignTableName)) return true;
+                    if (reference.columns.some(column => authorityColumns.has(column))) return false;
+                    throw new CdbError({
+                        code: "CDB_NONLOCAL_FK",
+                        message: `domain table "${meta.name}" references non-cdbTable "${reference.foreignTableName}"`,
+                        hint: "make the referenced domain table a cdbTable or use a tenant/self authority column",
+                    });
+                },
+            });
+        });
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            for (const ddl of rendered) {
+                const existing = sql.one<{ sql: string }>(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    ddl.tableName
+                );
+                const recorded = sql.one<{ signature: string }>(
+                    "SELECT signature FROM _chardb_domain_schema WHERE table_name = ?",
+                    ddl.tableName
+                );
+                if (existing) {
+                    if (recorded?.signature !== ddl.signature || existing.sql !== ddl.createTable) {
+                        throw domainSchemaMismatch(ddl.tableName);
+                    }
+                    for (let index = 0; index < ddl.indexNames.length; index++) {
+                        const indexName = ddl.indexNames[index];
+                        const expectedSql = ddl.indexes[index];
+                        if (!indexName || !expectedSql) throw domainSchemaMismatch(ddl.tableName);
+                        const present = sql.one<{ sql: string }>(
+                            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?",
+                            indexName,
+                            ddl.tableName
+                        );
+                        if (present?.sql !== expectedSql) throw domainSchemaMismatch(ddl.tableName);
+                    }
+                    continue;
+                }
+                if (recorded) throw domainSchemaMismatch(ddl.tableName);
+                sql.exec(ddl.createTable);
+                for (const statement of ddl.indexes) sql.exec(statement);
+                sql.exec(
+                    "INSERT INTO _chardb_domain_schema (table_name, signature) VALUES (?, ?)",
+                    ddl.tableName,
+                    ddl.signature
+                );
+            }
+        });
     }
 
     private prepareIntervals(args: CdbSubscriptionRequest): PreparedInterval[] {
