@@ -19,7 +19,7 @@ export function OgImage() {
                     </h1>
 
                     <p className="mt-7 text-fg-muted" style={{ fontSize: 24, lineHeight: 1.5, maxWidth: 640 }}>
-                        A tested organization-mutation path derived from Drizzle. Public queries, live results, and
+                        Tested organization mutations and one-shot snapshots derived from Drizzle. Live delivery and
                         migrations remain unfinished.
                     </p>
 

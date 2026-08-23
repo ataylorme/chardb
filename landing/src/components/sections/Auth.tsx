@@ -7,17 +7,17 @@ export function Auth() {
         <Section id="auth" num="04" label="auth">
             <SectionHeading>Declare access beside the table.</SectionHeading>
             <SectionLead>
-                Better Auth models live in Catalog. For each declared organization mutation, Gateway re-derives
-                membership and roles from Catalog, then Cdb enforces schema-declared create, update, delete, row, and
-                column rules. Select policy runs only in isolated shard-local queries because public query routing is
-                unfinished.
+                Better Auth models live in Catalog. For each declared organization mutation or query, Gateway re-derives
+                membership and roles from Catalog. Cdb then enforces schema-declared write and select rules. The query
+                path returns one initial snapshot. It creates no server registration or live stream.
             </SectionLead>
 
             <BulletList
                 items={[
                     "Catalog-backed Better Auth models and signed Gateway identity",
                     "declared organization writes use current membership, roles, auth epochs, row predicates, and column rules",
-                    "public queries, snapshots, live results, and a full sign-in-to-read/write application test remain unfinished",
+                    "declared organization queries return a policy-filtered one-shot snapshot from one Cdb",
+                    "live registration, invalidation, replacement delivery, replay, and a full application test remain unfinished",
                 ]}
             />
 
@@ -174,11 +174,11 @@ export function Auth() {
             </div>
 
             <p className="mt-6 text-sm text-fg-muted">
-                Declared organization mutations execute through the policy wrapper in focused workerd tests. The package
-                remains experimental; do not use production data.
+                Declared organization mutations and one-shot queries execute through the policy wrapper in focused
+                workerd tests. The package remains experimental; do not use production data.
             </p>
 
-            <PullQuote>organization write enforcement exists. the public read path does not.</PullQuote>
+            <PullQuote>declared organization reads and writes enforce policy. live delivery does not exist.</PullQuote>
         </Section>
     );
 }

@@ -16,9 +16,9 @@ export function Hero() {
                         className="mt-6 text-fg-muted max-w-2xl"
                         style={{ fontSize: "clamp(16px, 1.4vw, 18px)", lineHeight: 1.6 }}
                     >
-                        Declare an organization boundary in Drizzle. Declared organization mutations now cross verified
-                        identity, Catalog membership, tenant routing, policy enforcement, and one shard-local
-                        transaction. Public queries, live results, and migrations are not connected yet.
+                        Declare an organization boundary in Drizzle. Declared mutations and one-shot queries now cross
+                        verified identity, Catalog membership, tenant routing, and policy enforcement. A query returns
+                        one snapshot. It does not register or update live yet.
                     </p>
 
                     <div className="mt-8 flex flex-col sm:flex-row sm:items-center gap-4">
