@@ -342,6 +342,120 @@ describe("createChardbClient — wire round-trip", () => {
         c.close();
     });
 
+    test("a duplicate snapshot does not notify or regress the connection cookie", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: unknown[][] = [];
+        c.subscribe("queries.ts#listMessages", {}, rows => seen.push([...rows]));
+        await flush();
+
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:1"),
+            rows: [{ id: "first" }],
+        });
+        ws.emit({ t: "poke", cookie: Cookie("c-1:2"), patches: [] });
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:1"),
+            rows: [{ id: "duplicate-must-not-apply" }],
+        });
+        await flush();
+
+        expect(seen).toEqual([[{ id: "first" }]]);
+        ws.close();
+        await new Promise(resolve => setTimeout(resolve, 350));
+        const reconnected = fakeWebSocket(1);
+        await flush();
+        const hello = reconnected.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "hello");
+        if (!hello || hello.t !== "hello") throw new Error("expected hello on reconnect");
+        expect(hello.resumeFromCookie).toBe(Cookie("c-1:2"));
+        c.close();
+    });
+
+    test("a duplicate snapshot preserves an optimistic row until a newer snapshot replaces it", async () => {
+        class TestBroadcastChannel {
+            static instance: TestBroadcastChannel | undefined;
+            onmessage: ((event: { data: unknown }) => void) | null = null;
+
+            constructor(_name: string) {
+                TestBroadcastChannel.instance = this;
+            }
+
+            postMessage(): void {}
+            close(): void {}
+            emit(data: unknown): void {
+                this.onmessage?.({ data });
+            }
+        }
+
+        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = TestBroadcastChannel;
+        try {
+            const c = createChardbClient({
+                endpoint: "wss://example.com/ws",
+                getJwt: async () => "jwt-stub",
+                clientId: "c-test",
+                logicalDb: "snapshot-dedupe",
+            });
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const seen: unknown[][] = [];
+            c.subscribe("queries.ts#listMessages", {}, rows => seen.push([...rows]));
+            await flush();
+
+            ws.emit({
+                t: "snapshot",
+                subId: SubId(1),
+                cookie: Cookie("c-1:1"),
+                rows: [{ id: "base" }],
+            });
+            ws.emit({
+                t: "snapshot",
+                subId: SubId(1),
+                cookie: Cookie("c-1:1"),
+                rows: [{ id: "duplicate-before-patch-must-not-apply" }],
+            });
+            await flush();
+            expect(seen).toEqual([[{ id: "base" }]]);
+
+            TestBroadcastChannel.instance?.emit({
+                kind: "optimistic",
+                patches: [{ op: "put", subId: SubId(1), rowKey: "local", row: { id: "optimistic" } }],
+            });
+            await flush();
+            expect(seen.at(-1)).toEqual([{ id: "base" }, { id: "optimistic", __key: "local" }]);
+
+            ws.emit({
+                t: "snapshot",
+                subId: SubId(1),
+                cookie: Cookie("c-1:1"),
+                rows: [{ id: "duplicate-must-not-apply" }],
+            });
+            await flush();
+            expect(seen).toHaveLength(2);
+            expect(seen.at(-1)).toEqual([{ id: "base" }, { id: "optimistic", __key: "local" }]);
+
+            ws.emit({
+                t: "snapshot",
+                subId: SubId(1),
+                cookie: Cookie("c-1:2"),
+                rows: [{ id: "replacement" }],
+            });
+            await flush();
+            expect(seen).toHaveLength(3);
+            expect(seen.at(-1)).toEqual([{ id: "replacement" }]);
+            c.close();
+        } finally {
+            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
+            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
+        }
+    });
+
     test("snapshot for an unknown subscription is ignored", async () => {
         const c = client();
         await flush();

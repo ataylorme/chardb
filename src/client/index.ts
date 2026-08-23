@@ -56,6 +56,7 @@ interface SubRecord {
     rows: RawJson[];
     listeners: Set<(rows: RawJson[]) => void>;
     optimisticPatches: RowPatch[];
+    lastSnapshotCookie?: Cookie;
 }
 
 interface PendingMutation {
@@ -230,9 +231,11 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             case "snapshot": {
                 const sub = subs.get(msg.subId);
                 if (!sub) return;
+                if (sub.lastSnapshotCookie === msg.cookie) return;
                 lastCookie = msg.cookie;
                 sub.rows = [...msg.rows];
                 sub.optimisticPatches = [];
+                sub.lastSnapshotCookie = msg.cookie;
                 sub.state = "live";
                 notify(sub);
                 return;
