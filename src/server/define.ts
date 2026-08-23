@@ -124,6 +124,9 @@ export type MutationFn<TDb, TArgs, TResult> = ((ctx: MutationCtx<TDb>, args: TAr
 export type QueryFn<TDb, TArgs, TResult> = ((ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>) & {
     readonly __chardbKind: "query";
     readonly __chardbRef: Brand<string, "ChardbRef">;
+    readonly __chardbAuthority?: MutationAuthority;
+    readonly __chardbPartitionKey?: (args: TArgs) => string | number | bigint | undefined;
+    readonly __chardbInvokeValidated?: (ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>;
     /** Server-only validator used before routing intent extraction. */
     readonly __chardbValidateArgs?: (args: unknown) => Promise<TArgs>;
     /**
@@ -354,11 +357,12 @@ function runValidatorSync<T>(schema: StandardSchemaV1<unknown, T>, value: unknow
  * Object form of `defineQuery`. Same validator-driven inference as
  * `MutationConfig`.
  */
-export interface QueryConfig<TDb, TArgs extends Record<string, unknown>, TResult> {
+interface QueryConfigBase<TDb, TArgs extends Record<string, unknown>, TResult> {
     /** Stable wire ref shared by browser and Worker builds. Must contain `#`. */
     readonly ref?: string;
     readonly args?: StandardSchemaV1<unknown, TArgs>;
     readonly handler: (ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>;
+    readonly partitionKey?: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
     /**
      * Optional server-owned `CdbIntent` extractor. When provided, the
      * returned `QueryFn` carries `__chardbIntent` for the configured Gateway
@@ -373,6 +377,15 @@ export interface QueryConfig<TDb, TArgs extends Record<string, unknown>, TResult
      */
     readonly intent?: (args: TArgs) => CdbIntent;
 }
+
+export type QueryConfig<TDb, TArgs extends Record<string, unknown>, TResult> =
+    | (QueryConfigBase<TDb, TArgs, TResult> & {
+          readonly authority: "organization";
+          readonly ref: string;
+          readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
+          readonly intent: (args: TArgs) => CdbIntent;
+      })
+    | (QueryConfigBase<TDb, TArgs, TResult> & { readonly authority?: undefined });
 
 /**
  * Read handler. Body executes against a read-only `Cdb` shard view; live-query
@@ -393,14 +406,31 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
     const handler = isConfig ? configOrHandler.handler : configOrHandler;
     const validator: StandardSchemaV1<unknown, TArgs> | undefined = isConfig ? configOrHandler.args : undefined;
     const intent = isConfig ? configOrHandler.intent : undefined;
+    const authority = isConfig ? configOrHandler.authority : undefined;
+    const partitionKey = isConfig ? configOrHandler.partitionKey : undefined;
+    const partitionKeyFn: ((args: TArgs) => string | number | bigint | undefined) | undefined =
+        typeof partitionKey === "string"
+            ? (args: TArgs) => {
+                  const value: unknown = args[partitionKey];
+                  return typeof value === "string" || typeof value === "number" || typeof value === "bigint"
+                      ? value
+                      : undefined;
+              }
+            : partitionKey;
     const explicitRef = isConfig ? configOrHandler.ref : undefined;
     if (explicitRef !== undefined && (explicitRef.length === 0 || !explicitRef.includes("#"))) {
         throw new TypeError("chardb: query ref must be a nonempty string containing #");
     }
+    if (authority === "organization" && explicitRef === undefined) {
+        throw new TypeError("chardb: organization queries require an explicit ref");
+    }
+    const invokeValidated = async (ctx: QueryCtx<TDb>, args: TArgs): Promise<TResult> => {
+        const wrappedCtx = wrapCtxDb(ctx) as QueryCtx<TDb>;
+        return handler(wrappedCtx, args);
+    };
     const fn = (async (ctx: QueryCtx<TDb>, args: TArgs) => {
         const validated = validator ? await runValidator(validator, args) : args;
-        const wrappedCtx = wrapCtxDb(ctx) as QueryCtx<TDb>;
-        return handler(wrappedCtx, validated);
+        return invokeValidated(ctx, validated);
     }) as QueryFn<TDb, TArgs, TResult>;
     if (handler.name && handler.name !== "fn") {
         Object.defineProperty(fn, "name", { value: handler.name, configurable: true });
@@ -415,6 +445,13 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
             configurable: false,
         });
     }
+    if (authority) {
+        Object.defineProperty(fn, "__chardbAuthority", { value: authority, enumerable: false });
+    }
+    if (partitionKeyFn) {
+        Object.defineProperty(fn, "__chardbPartitionKey", { value: partitionKeyFn, enumerable: false });
+    }
+    Object.defineProperty(fn, "__chardbInvokeValidated", { value: invokeValidated, enumerable: false });
     if (validator) {
         Object.defineProperty(fn, "__chardbValidateArgs", {
             value: (args: unknown) => runValidator(validator, args),

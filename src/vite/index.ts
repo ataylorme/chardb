@@ -359,8 +359,10 @@ function collectExports(code: string, id: string): FoundExport[] {
             organizationAuthority = authorityProperty.initializer.text === "organization";
         }
         if (!refProperty) {
-            if (kind === "defineMutation" && organizationAuthority) {
-                throw new Error(`[chardb/vite] Organization mutation ${exportName} requires a literal ref`);
+            if (organizationAuthority) {
+                throw new Error(
+                    `[chardb/vite] Organization ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires a literal ref`
+                );
             }
             return undefined;
         }
@@ -511,8 +513,10 @@ function regexExplicitConfigRef(
         if (!literalAuthority) throw new Error(`[chardb/vite] Authority for ${exportName} must be a string literal`);
     }
     if (!/\bref\s*:/.test(config)) {
-        if (kind === "defineMutation" && organizationAuthority) {
-            throw new Error(`[chardb/vite] Organization mutation ${exportName} requires a literal ref`);
+        if (organizationAuthority) {
+            throw new Error(
+                `[chardb/vite] Organization ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires a literal ref`
+            );
         }
         return undefined;
     }

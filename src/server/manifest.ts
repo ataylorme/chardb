@@ -60,6 +60,9 @@ interface QueryMarked extends RefMarked {
     readonly __chardbKind: "query";
     readonly __chardbIntent?: (args: RawJson) => CdbIntent;
     readonly __chardbValidateArgs?: (args: unknown) => Promise<RawJson>;
+    readonly __chardbAuthority?: MutationAuthority;
+    readonly __chardbPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
+    readonly __chardbInvokeValidated?: (ctx: unknown, args: RawJson) => Promise<unknown>;
 }
 
 interface CronMarked extends RefMarked {
@@ -80,12 +83,22 @@ export interface MutationDescriptor {
 export interface QueryDescriptor {
     readonly ref: ChardbRef;
     readonly invoke: (ctx: unknown, args: RawJson) => Promise<unknown>;
+    readonly invokeValidated: (ctx: unknown, args: RawJson) => Promise<unknown>;
     readonly validateArgs?: (args: unknown) => Promise<RawJson>;
     readonly extractIntent?: (args: RawJson) => CdbIntent;
+    readonly authority?: MutationAuthority;
+    readonly extractPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
 }
 
 export type QueryRouteResponse =
-    | { readonly ok: true; readonly args: RawJson; readonly intent: CdbIntent; readonly queryHash: string }
+    | {
+          readonly ok: true;
+          readonly args: RawJson;
+          readonly intent: CdbIntent;
+          readonly queryHash: string;
+          readonly authority: MutationAuthority | null;
+          readonly partitionKey: string | null;
+      }
     | { readonly ok: false; readonly error: ReturnType<CdbError["toJSON"]> };
 
 export interface CronDescriptor {
@@ -175,8 +188,11 @@ export function manifestFromExports(exports: Record<string, unknown>): ChardbMan
                 queries.set(ref, {
                     ref,
                     invoke: query,
+                    invokeValidated: query.__chardbInvokeValidated ?? query,
                     ...(query.__chardbValidateArgs ? { validateArgs: query.__chardbValidateArgs } : {}),
                     ...(query.__chardbIntent ? { extractIntent: query.__chardbIntent } : {}),
+                    ...(query.__chardbAuthority ? { authority: query.__chardbAuthority } : {}),
+                    ...(query.__chardbPartitionKey ? { extractPartitionKey: query.__chardbPartitionKey } : {}),
                 });
                 break;
             }
@@ -236,11 +252,20 @@ export async function routeQuery(
             "CDB_INVALID_ARGS"
         );
         const intent = descriptor.extractIntent(validatedArgs);
+        const key = descriptor.extractPartitionKey?.(validatedArgs);
+        if (descriptor.authority === "organization" && (typeof key !== "string" || key.length === 0)) {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: `organization query ${input.ref} requires a nonempty string partition key`,
+            });
+        }
         return {
             ok: true,
             args: validatedArgs,
             intent,
             queryHash: JSON.stringify({ ref: input.ref, args: validatedArgs, intent }),
+            authority: descriptor.authority ?? null,
+            partitionKey: key === undefined ? null : String(key),
         };
     } catch (error) {
         const cdb =

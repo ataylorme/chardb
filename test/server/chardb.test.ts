@@ -46,7 +46,10 @@ const routedMutation = defineMutation<unknown, RoutedArgs, null>(() => null, {
     partitionKey: args => args.organizationId,
 });
 const routedQuery = defineQuery<unknown, RoutedQueryArgs, readonly []>({
+    ref: "api/items#list",
     args: z.object({ organizationId: z.string(), limit: z.number().int().default(25) }),
+    authority: "organization",
+    partitionKey: "organizationId",
     handler: async () => [],
     intent: args => ({
         kind: "select",
@@ -125,6 +128,8 @@ describe("chardb({…})", () => {
             joinShape: "colocated",
         });
         expect(routed.args).toEqual({ organizationId: "org-7", limit: 25 });
+        expect(routed.authority).toBe("organization");
+        expect(routed.partitionKey).toBe("org-7");
         expect(routed.queryHash).toContain(routedQuery.__chardbRef);
         expect(routed.queryHash).toContain('"limit":25');
 

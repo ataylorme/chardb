@@ -328,7 +328,10 @@ export class Cdb extends DurableObject<CdbEnv> {
         try {
             const descriptor = resolveQuery(this.mutationManifest(), request.ref);
             const database = wrapQueryDb(drizzle(this.ctx.storage, { schema: this.mutationSchema() }), request.auth);
-            const result = await descriptor.invoke({ db: readOnlyQueryDb(database), auth: request.auth }, request.args);
+            const result = await descriptor.invokeValidated(
+                { db: readOnlyQueryDb(database), auth: request.auth },
+                request.args
+            );
             return { ok: true, result: rawJsonResult(result, "query result") };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };

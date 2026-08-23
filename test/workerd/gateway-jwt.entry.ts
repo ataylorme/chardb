@@ -1,16 +1,22 @@
 import { jwt } from "better-auth/plugins/jwt";
+import { and, eq } from "drizzle-orm";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { api, chardb, defineAuth, forOrg } from "../../src/server/index.ts";
 import { ClientId, SubId } from "../../src/types.ts";
+import { vshardOf } from "../../src/vshard.ts";
 import type { RowPatch } from "../../src/wire.ts";
 
 const ISSUER = "https://issuer.example";
 const AUDIENCE = "chardb-workerd";
 const USER_ID = "workerd-user";
 const ORGANIZATION_ID = "workerd-org";
+const OTHER_ORGANIZATION_ID = "workerd-org-b";
 const WRITE_REF = "test/workerd/gateway-jwt.entry.ts#writeOrganizationRow";
 const CLOSED_REF = "test/workerd/gateway-jwt.entry.ts#closedOrganizationWrite";
+const LIST_REF = "test/workerd/gateway-jwt.entry.ts#listOrganizationRows";
+const CLOSED_QUERY_REF = "test/workerd/gateway-jwt.entry.ts#closedOrganizationRows";
+const INVALID_QUERY_REF = "test/workerd/gateway-jwt.entry.ts#invalidOrganizationRows";
 
 const auth = defineAuth({
     appName: "gateway-workerd-test",
@@ -42,7 +48,7 @@ const gatewayWrites = cdbTable(
     },
     {
         selfBy: "authorId",
-        roles: { member: { create: ["id", "body", "createdAt"] } },
+        roles: { member: { create: ["id", "body", "createdAt"], read: "*" } },
     }
 );
 
@@ -77,14 +83,81 @@ const closedOrganizationWrite = api.mutation({
     handler: (_ctx, args: { organizationId: string }) => args.organizationId,
 });
 
+const listOrganizationRows = api.query({
+    ref: LIST_REF,
+    args: z.object({ organizationId: z.string(), body: z.string().optional() }),
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: args => ({
+        kind: "select",
+        tables: ["gateway_writes"],
+        partitionKey: { table: "gateway_writes", column: "organization_id", values: [args.organizationId] },
+        joinShape: "colocated",
+        intervals: [{ table: "gateway_writes", indexName: "organization_id", intervals: [{ kind: "full" }] }],
+    }),
+    handler: async (ctx, args) => {
+        if (args.body === "__throw") throw new Error("forced query failure");
+        const rows = await ctx.db
+            .select()
+            .from(gatewayWrites)
+            .where(
+                args.body === undefined
+                    ? eq(gatewayWrites.organizationId, args.organizationId)
+                    : and(eq(gatewayWrites.organizationId, args.organizationId), eq(gatewayWrites.body, args.body))
+            )
+            .orderBy(gatewayWrites.id)
+            .all();
+        return rows.map(row => ({ ...row, viewerId: ctx.auth.userId }));
+    },
+});
+
+const closedOrganizationRows = api.query({
+    ref: CLOSED_QUERY_REF,
+    args: z.object({ organizationId: z.string() }),
+    intent: args => ({
+        kind: "select",
+        tables: ["gateway_writes"],
+        partitionKey: { table: "gateway_writes", column: "organization_id", values: [args.organizationId] },
+    }),
+    handler: async () => [],
+});
+
+const invalidOrganizationRows = api.query({
+    ref: INVALID_QUERY_REF,
+    args: z.object({ organizationId: z.string(), mode: z.enum(["scatter", "cross", "mismatch"]) }),
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: args => ({
+        kind: "select",
+        tables: ["gateway_writes"],
+        ...(args.mode === "scatter"
+            ? {}
+            : {
+                  partitionKey: {
+                      table: "gateway_writes",
+                      column: "organization_id",
+                      values: [args.mode === "mismatch" ? OTHER_ORGANIZATION_ID : args.organizationId],
+                  },
+              }),
+        ...(args.mode === "cross" ? { joinShape: "cross-partition" as const } : {}),
+    }),
+    handler: async () => [],
+});
+
 const app = chardb({
     auth,
     schema: { gatewayWrites },
-    api: { writeOrganizationRow, closedOrganizationWrite },
+    api: {
+        writeOrganizationRow,
+        closedOrganizationWrite,
+        listOrganizationRows,
+        closedOrganizationRows,
+        invalidOrganizationRows,
+    },
 });
 export const { Cdb, Gateway } = app;
 
-type AuthorityFault = "none" | "throw" | "malformed" | "hold";
+type AuthorityFault = "none" | "throw" | "malformed" | "hold" | "hold-throw" | "route-throw" | "route-malformed";
 
 export class Catalog extends app.Catalog {
     private authorityFault: AuthorityFault = "none";
@@ -95,7 +168,7 @@ export class Catalog extends app.Catalog {
 
     setAuthorityFault(fault: AuthorityFault): void {
         this.authorityFault = fault;
-        if (fault === "hold") {
+        if (fault === "hold" || fault === "hold-throw") {
             this.authorityHold = new Promise(resolve => {
                 this.releaseAuthorityHold = resolve;
             });
@@ -120,18 +193,29 @@ export class Catalog extends app.Catalog {
     ): ReturnType<InstanceType<typeof app.Catalog>["resolveOrganizationAuthority"]> {
         if (this.authorityFault === "throw") throw new Error("forced authority failure");
         if (this.authorityFault === "malformed") return { principalId: 7 } as never;
-        if (this.authorityFault === "hold") {
+        if (this.authorityFault === "hold" || this.authorityFault === "hold-throw") {
+            const heldFault = this.authorityFault;
             this.markAuthorityEntered?.();
             this.markAuthorityEntered = undefined;
             await this.authorityHold;
+            if (heldFault === "hold-throw") throw new Error("forced held authority failure");
         }
         return super.resolveOrganizationAuthority(request);
+    }
+
+    override async route(
+        vshard: Parameters<InstanceType<typeof app.Catalog>["route"]>[0]
+    ): ReturnType<InstanceType<typeof app.Catalog>["route"]> {
+        if (this.authorityFault === "route-throw") throw new Error("forced route failure");
+        if (this.authorityFault === "route-malformed") return { shardId: 7 } as never;
+        return super.route(vshard);
     }
 }
 
 interface Env {
     readonly CDB_CATALOG: DurableObjectNamespace;
     readonly CDB_GATEWAY: DurableObjectNamespace;
+    readonly CDB_SHARD: DurableObjectNamespace;
 }
 
 export default {
@@ -147,6 +231,7 @@ export default {
                     readonly op: "create";
                     readonly payload: Record<string, unknown>;
                 }): Promise<unknown>;
+                route(vshard: number): Promise<{ readonly shardId: string }>;
             };
             await catalog.putJwk(body.kid, JSON.stringify(body.jwk), 60_000);
             const now = Date.parse("2026-08-23T00:00:00Z");
@@ -168,12 +253,45 @@ export default {
                 payload: { id: ORGANIZATION_ID, name: "Workerd Org", slug: "workerd-org", createdAt: now },
             });
             await catalog.mutateAuth({
+                model: "organization",
+                op: "create",
+                payload: {
+                    id: OTHER_ORGANIZATION_ID,
+                    name: "Workerd Org B",
+                    slug: "workerd-org-b",
+                    createdAt: now,
+                },
+            });
+            await catalog.mutateAuth({
                 model: "member",
                 op: "create",
                 payload: {
                     id: "workerd-member",
                     organizationId: ORGANIZATION_ID,
                     userId: USER_ID,
+                    role: "member",
+                    createdAt: now,
+                },
+            });
+            await catalog.mutateAuth({
+                model: "user",
+                op: "create",
+                payload: {
+                    id: "workerd-user-b",
+                    name: "Workerd User B",
+                    email: "workerd-b@example.com",
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+            await catalog.mutateAuth({
+                model: "member",
+                op: "create",
+                payload: {
+                    id: "workerd-member-b",
+                    organizationId: OTHER_ORGANIZATION_ID,
+                    userId: "workerd-user-b",
                     role: "member",
                     createdAt: now,
                 },
@@ -201,10 +319,17 @@ export default {
                     createdAt: now,
                 },
             });
+            const routeA = await catalog.route(Number(vshardOf([ORGANIZATION_ID])));
+            const routeB = await catalog.route(Number(vshardOf([OTHER_ORGANIZATION_ID])));
             return Response.json({
                 ok: true,
                 mutationRef: writeOrganizationRow.__chardbRef,
                 closedMutationRef: closedOrganizationWrite.__chardbRef,
+                queryRef: listOrganizationRows.__chardbRef,
+                closedQueryRef: closedOrganizationRows.__chardbRef,
+                invalidQueryRef: invalidOrganizationRows.__chardbRef,
+                shardA: routeA.shardId,
+                shardB: routeB.shardId,
             });
         }
         if (url.pathname === "/authority-fault") {

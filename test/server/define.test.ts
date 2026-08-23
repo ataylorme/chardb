@@ -118,6 +118,33 @@ describe("defineXxx — function-ref identity", () => {
                 handler: () => null,
             } as never)
         ).toThrow(/require an explicit ref/);
+        expect(() =>
+            defineQuery({
+                authority: "organization",
+                partitionKey: (_args: { organizationId: string }) => "org-1",
+                intent: () => ({ kind: "select", tables: [] }),
+                handler: async () => [],
+            } as never)
+        ).toThrow(/require an explicit ref/);
+    });
+
+    test("organization query authority and partition extraction are explicit metadata", () => {
+        const query = defineQuery({
+            ref: "api/items#organizationList",
+            args: z.object({ organizationId: z.string() }),
+            authority: "organization",
+            partitionKey: "organizationId",
+            intent: args => ({
+                kind: "select",
+                tables: ["items"],
+                partitionKey: { table: "items", column: "organization_id", values: [args.organizationId] },
+            }),
+            handler: async () => [],
+        });
+
+        expect(query.__chardbAuthority).toBe("organization");
+        expect(query.__chardbPartitionKey?.({ organizationId: "org-4" })).toBe("org-4");
+        expect(query.__chardbRef).toBe(ChardbRef("api/items#organizationList"));
     });
 
     test("explicit singlePartition: false beats the partitionKey-implied default", () => {

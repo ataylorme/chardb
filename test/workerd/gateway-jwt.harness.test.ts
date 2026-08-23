@@ -18,12 +18,16 @@ const ISSUER = "https://issuer.example";
 const AUDIENCE = "chardb-workerd";
 const WRITE_REF = "test/workerd/gateway-jwt.entry.ts#writeOrganizationRow";
 const CLOSED_REF = "test/workerd/gateway-jwt.entry.ts#closedOrganizationWrite";
+const LIST_REF = "test/workerd/gateway-jwt.entry.ts#listOrganizationRows";
 
 let mf: Miniflare | undefined;
 let workerdUrl: URL | undefined;
 let signToken: ((claims?: TokenOverrides) => Promise<string>) | undefined;
 let mutationRef: ChardbRef | undefined;
 let closedMutationRef: ChardbRef | undefined;
+let queryRef: ChardbRef | undefined;
+let closedQueryRef: ChardbRef | undefined;
+let invalidQueryRef: ChardbRef | undefined;
 
 interface TokenOverrides {
     readonly subject?: string;
@@ -72,7 +76,7 @@ async function buildWorker(): Promise<string> {
     }
 }
 
-async function buildBrowserMutationRefs(): Promise<readonly [ChardbRef, ChardbRef]> {
+async function buildBrowserRefs(): Promise<readonly [ChardbRef, ChardbRef, ChardbRef]> {
     const fixture = await mkdtemp(path.join(tmpdir(), "chardb-vite-browser-"));
     const entry = path.join(fixture, "api.ts");
     const serverModule = path.join(HERE, "../../src/server/define.ts");
@@ -83,6 +87,7 @@ async function buildBrowserMutationRefs(): Promise<readonly [ChardbRef, ChardbRe
 import { api } from "chardb/server";
 export const writeOrganizationRow = api.mutation({ ref: "${WRITE_REF}", handler: () => null });
 export const closedOrganizationWrite = api.mutation({ ref: "${CLOSED_REF}", handler: () => null });
+export const listOrganizationRows = api.query({ ref: "${LIST_REF}", handler: async () => [] });
 `
         );
         const built = await viteBuild({
@@ -102,10 +107,12 @@ export const closedOrganizationWrite = api.mutation({ ref: "${CLOSED_REF}", hand
         const emitted = (await import(pathToFileURL(emittedPath).href)) as {
             readonly writeOrganizationRow: { readonly __chardbRef?: unknown };
             readonly closedOrganizationWrite: { readonly __chardbRef?: unknown };
+            readonly listOrganizationRows: { readonly __chardbRef?: unknown };
         };
         return [
             ChardbRef(String(emitted.writeOrganizationRow.__chardbRef)),
             ChardbRef(String(emitted.closedOrganizationWrite.__chardbRef)),
+            ChardbRef(String(emitted.listOrganizationRows.__chardbRef)),
         ];
     } finally {
         await rm(fixture, { recursive: true, force: true });
@@ -113,14 +120,18 @@ export const closedOrganizationWrite = api.mutation({ ref: "${CLOSED_REF}", hand
 }
 
 beforeAll(async () => {
-    [mutationRef, closedMutationRef] = await buildBrowserMutationRefs();
-    expect([mutationRef, closedMutationRef]).toEqual([ChardbRef(WRITE_REF), ChardbRef(CLOSED_REF)]);
+    [mutationRef, closedMutationRef, queryRef] = await buildBrowserRefs();
+    expect([mutationRef, closedMutationRef, queryRef]).toEqual([
+        ChardbRef(WRITE_REF),
+        ChardbRef(CLOSED_REF),
+        ChardbRef(LIST_REF),
+    ]);
 
     const { privateKey, publicKey } = await generateKeyPair("ES256");
     const publicJwk = { ...(await exportJWK(publicKey)), kid: KID, alg: "ES256", use: "sig" };
     signToken = async (overrides = {}) => {
         const now = Math.floor(Date.now() / 1000);
-        return new SignJWT({ probe: "workerd" })
+        return new SignJWT({ probe: "workerd", tenantId: "workerd-org-b", role: "owner", roles: ["owner"] })
             .setProtectedHeader({ alg: "ES256", kid: KID })
             .setSubject(overrides.subject ?? "workerd-user")
             .setIssuer(overrides.issuer ?? ISSUER)
@@ -148,8 +159,18 @@ beforeAll(async () => {
         body: JSON.stringify({ kid: KID, jwk: publicJwk }),
     });
     if (!seeded.ok) throw new Error(`failed to seed Catalog JWK: ${seeded.status} ${await seeded.text()}`);
-    const seedResult = (await seeded.json()) as { mutationRef: ChardbRef; closedMutationRef: ChardbRef };
-    expect(seedResult).toMatchObject({ mutationRef, closedMutationRef });
+    const seedResult = (await seeded.json()) as {
+        mutationRef: ChardbRef;
+        closedMutationRef: ChardbRef;
+        queryRef: ChardbRef;
+        closedQueryRef: ChardbRef;
+        invalidQueryRef: ChardbRef;
+        shardA: string;
+        shardB: string;
+    };
+    ({ closedQueryRef, invalidQueryRef } = seedResult);
+    expect(seedResult).toMatchObject({ mutationRef, closedMutationRef, queryRef });
+    expect(seedResult.shardA).toBe(seedResult.shardB);
 });
 
 afterAll(async () => {
@@ -259,7 +280,9 @@ async function expectNoDown(socket: WebSocket): Promise<void> {
     expect(received).toBe(false);
 }
 
-async function setAuthorityFault(fault: "none" | "throw" | "malformed" | "hold"): Promise<void> {
+async function setAuthorityFault(
+    fault: "none" | "throw" | "malformed" | "hold" | "hold-throw" | "route-throw" | "route-malformed"
+): Promise<void> {
     if (!mf) throw new Error("miniflare not initialized");
     const response = await mf.dispatchFetch("http://example.com/authority-fault", {
         method: "POST",
@@ -330,10 +353,11 @@ describe("configured Gateway JWT handshake in real workerd", () => {
             mutResults: [{ mutId: "workerd-closed", ok: false, error: { code: "CDB_AUTH_NOT_BOUND" } }],
         });
 
+        if (!closedQueryRef) throw new Error("closed query ref was not seeded");
         const subscription = await sendAndReceive(socket, {
             t: "sub",
             subId: SubId(7),
-            ref: ChardbRef("queries.ts#list"),
+            ref: closedQueryRef,
             args: { organizationId: "workerd-org" },
         });
         expect(subscription).toMatchObject({
@@ -356,6 +380,388 @@ describe("configured Gateway JWT handshake in real workerd", () => {
             resumedFromCookie: mutation.cookie,
         });
         resumed.socket.close();
+    });
+
+    test("organization queries return initial and empty snapshots while other tenants stay closed", async () => {
+        if (!mutationRef || !queryRef) throw new Error("public refs were not seeded");
+        const otherTenant = await openSocket(await signed({ subject: "workerd-user-b" }));
+        await otherTenant.first;
+        const otherSeeded = await sendAndReceive(otherTenant.socket, {
+            t: "mut",
+            mutId: MutId("query-seed-b"),
+            ref: mutationRef,
+            args: {
+                id: "query-seed-row-b",
+                organizationId: "workerd-org-b",
+                body: "query-visible",
+                createdAt: 9,
+            },
+        });
+        expect(otherSeeded).toMatchObject({ t: "poke", mutResults: [{ ok: true }] });
+        const otherSnapshot = await sendAndReceive(otherTenant.socket, {
+            t: "sub",
+            subId: SubId(9),
+            ref: queryRef,
+            args: { organizationId: "workerd-org-b", body: "query-visible" },
+        });
+        expect(otherSnapshot).toMatchObject({
+            t: "snapshot",
+            subId: 9,
+            rows: [
+                {
+                    id: "query-seed-row-b",
+                    organizationId: "workerd-org-b",
+                    body: "query-visible",
+                    viewerId: "workerd-user-b",
+                },
+            ],
+        });
+        if (otherSnapshot.t !== "snapshot") throw new Error("expected org B snapshot");
+        expect(otherSnapshot.rows).toHaveLength(1);
+        otherTenant.socket.close();
+
+        const { socket, first } = await openSocket(await signed());
+        await first;
+
+        const seeded = await sendAndReceive(socket, {
+            t: "mut",
+            mutId: MutId("query-seed"),
+            ref: mutationRef,
+            args: {
+                id: "query-seed-row",
+                organizationId: "workerd-org",
+                body: "query-visible",
+                createdAt: 10,
+            },
+        });
+        expect(seeded).toMatchObject({ t: "poke", mutResults: [{ ok: true }] });
+
+        const snapshot = await sendAndReceive(socket, {
+            t: "sub",
+            subId: SubId(10),
+            ref: queryRef,
+            args: { organizationId: "workerd-org", body: "query-visible" },
+        });
+        expect(snapshot).toMatchObject({
+            t: "snapshot",
+            subId: 10,
+            rows: [
+                {
+                    id: "query-seed-row",
+                    organizationId: "workerd-org",
+                    body: "query-visible",
+                    viewerId: "workerd-user",
+                },
+            ],
+        });
+        if (snapshot.t !== "snapshot") throw new Error("expected org A snapshot");
+        expect(snapshot.rows).toHaveLength(1);
+
+        const empty = await sendAndReceive(socket, {
+            t: "sub",
+            subId: SubId(11),
+            ref: queryRef,
+            args: { organizationId: "workerd-org", body: "does-not-exist" },
+        });
+        expect(empty).toMatchObject({ t: "snapshot", subId: 11, rows: [] });
+
+        const forbidden = await sendAndReceive(socket, {
+            t: "sub",
+            subId: SubId(12),
+            ref: queryRef,
+            args: { organizationId: "workerd-org-b" },
+        });
+        expect(forbidden).toMatchObject({ t: "error", subId: 12, code: "CDB_FORBIDDEN" });
+        socket.close();
+    });
+
+    test("organization queries reject undeclared, scatter, cross-partition, and mismatched intents", async () => {
+        if (!closedQueryRef || !invalidQueryRef || !queryRef) throw new Error("query refs were not seeded");
+        const { socket, first } = await openSocket(await signed());
+        await first;
+
+        const undeclared = await sendAndReceive(socket, {
+            t: "sub",
+            subId: SubId(20),
+            ref: closedQueryRef,
+            args: { organizationId: "workerd-org" },
+        });
+        expect(undeclared).toMatchObject({ t: "error", subId: 20, code: "CDB_AUTH_NOT_BOUND" });
+
+        for (const [subId, mode] of [
+            [21, "scatter"],
+            [22, "cross"],
+            [23, "mismatch"],
+        ] as const) {
+            const rejected = await sendAndReceive(socket, {
+                t: "sub",
+                subId: SubId(subId),
+                ref: invalidQueryRef,
+                args: { organizationId: "workerd-org", mode },
+            });
+            expect(rejected).toMatchObject({ t: "error", subId, code: "CDB_CROSS_PARTITION" });
+        }
+        for (const [subId, fault] of [
+            [24, "route-malformed"],
+            [25, "route-throw"],
+        ] as const) {
+            await setAuthorityFault(fault);
+            const rejected = await sendAndReceive(socket, {
+                t: "sub",
+                subId: SubId(subId),
+                ref: queryRef,
+                args: { organizationId: "workerd-org", body: "does-not-exist" },
+            });
+            expect(rejected).toMatchObject({ t: "error", subId, code: "CDB_CATALOG_UNAVAILABLE" });
+        }
+        await setAuthorityFault("none");
+        socket.close();
+    });
+
+    test("query failures and pending unsubscribe do not produce a snapshot", async () => {
+        if (!queryRef) throw new Error("query ref was not seeded");
+        const { socket, first } = await openSocket(await signed());
+        await first;
+
+        const queryFailure = await sendAndReceive(socket, {
+            t: "sub",
+            subId: SubId(30),
+            ref: queryRef,
+            args: { organizationId: "workerd-org", body: "__throw" },
+        });
+        expect(queryFailure).toMatchObject({ t: "error", subId: 30 });
+
+        await setAuthorityFault("hold-throw");
+        socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(32),
+                ref: queryRef,
+                args: { organizationId: "workerd-org", body: "does-not-exist" },
+            })
+        );
+        await authorityControl("/authority-waiting");
+        socket.send(encodeWire({ t: "unsub", subId: SubId(32) }));
+        await authorityControl("/authority-release");
+        await expectNoDown(socket);
+        socket.close();
+    });
+
+    test("a concurrent duplicate subId is latest-wins without a stale snapshot", async () => {
+        if (!mutationRef || !queryRef) throw new Error("public refs were not seeded");
+        const clientId = "workerd-query-duplicate";
+        const { socket, first } = await openSocket(await signed(), { clientId });
+        await first;
+        for (const body of ["duplicate-first", "duplicate-second"] as const) {
+            const result = await sendAndReceive(socket, {
+                t: "mut",
+                mutId: MutId(body),
+                ref: mutationRef,
+                args: {
+                    id: `${body}-row`,
+                    organizationId: "workerd-org",
+                    body,
+                    createdAt: body === "duplicate-first" ? 12 : 13,
+                },
+            });
+            expect(result).toMatchObject({ t: "poke", mutResults: [{ ok: true }] });
+        }
+
+        await setAuthorityFault("hold-throw");
+        const snapshot = nextDown(socket);
+        socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(50),
+                ref: queryRef,
+                args: { organizationId: "workerd-org", body: "duplicate-first" },
+            })
+        );
+        await authorityControl("/authority-waiting");
+        socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(50),
+                ref: queryRef,
+                args: { organizationId: "workerd-org", body: "duplicate-second" },
+            })
+        );
+        await authorityControl("/authority-release");
+
+        await expect(snapshot).resolves.toMatchObject({
+            t: "snapshot",
+            subId: 50,
+            rows: [{ id: "duplicate-second-row", body: "duplicate-second" }],
+        });
+        await expectNoDown(socket);
+        const refresh = await sendAndReceive(socket, {
+            t: "updateAuth",
+            jwt: await signed({ subject: "workerd-user-2" }),
+        });
+        expect(refresh).toMatchObject({ t: "mustRefetch", subIds: [50], reason: "authChanged" });
+        socket.close();
+    });
+
+    test("a failed auth refresh rejects an admitted query before shard execution", async () => {
+        if (!queryRef) throw new Error("query ref was not seeded");
+        const { socket, first, closed } = await openSocket(await signed());
+        await first;
+        await setAuthorityFault("hold");
+        socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(60),
+                ref: queryRef,
+                args: { organizationId: "workerd-org", body: "does-not-exist" },
+            })
+        );
+        await authorityControl("/authority-waiting");
+
+        const rejection = nextDown(socket);
+        socket.send(encodeWire({ t: "updateAuth", jwt: "invalid.refresh.token" }));
+        await expect(rejection).resolves.toMatchObject({ t: "error", code: "CDB_FORBIDDEN" });
+        await authorityControl("/authority-release");
+        await closed;
+    });
+
+    test("closing a socket cancels an admitted initial query", async () => {
+        if (!queryRef) throw new Error("query ref was not seeded");
+        const clientId = "workerd-query-close";
+        const firstSocket = await openSocket(await signed(), { clientId });
+        await firstSocket.first;
+        await setAuthorityFault("hold");
+        firstSocket.socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(70),
+                ref: queryRef,
+                args: { organizationId: "workerd-org", body: "query-visible" },
+            })
+        );
+        await authorityControl("/authority-waiting");
+        firstSocket.socket.close();
+        await firstSocket.closed;
+        await authorityControl("/authority-release");
+
+        const replacement = await openSocket(await signed(), { clientId });
+        await replacement.first;
+        const snapshot = await sendAndReceive(replacement.socket, {
+            t: "sub",
+            subId: SubId(70),
+            ref: queryRef,
+            args: { organizationId: "workerd-org", body: "query-visible" },
+        });
+        expect(snapshot).toMatchObject({ t: "snapshot", subId: 70 });
+        replacement.socket.close();
+    });
+
+    test("unsubscribe removes a delivered snapshot from the auth-refresh refetch list", async () => {
+        if (!queryRef) throw new Error("query ref was not seeded");
+        const { socket, first } = await openSocket(await signed());
+        await first;
+        const snapshot = await sendAndReceive(socket, {
+            t: "sub",
+            subId: SubId(80),
+            ref: queryRef,
+            args: { organizationId: "workerd-org", body: "does-not-exist" },
+        });
+        expect(snapshot).toMatchObject({ t: "snapshot", subId: 80, rows: [] });
+
+        socket.send(encodeWire({ t: "unsub", subId: SubId(80) }));
+        const refresh = await sendAndReceive(socket, {
+            t: "updateAuth",
+            jwt: await signed({ subject: "workerd-user-2" }),
+        });
+        expect(refresh).toMatchObject({ t: "mustRefetch", subIds: [], reason: "authChanged" });
+        socket.close();
+    });
+
+    test("a connection caps delivered initial snapshots before the 65th query executes", async () => {
+        if (!queryRef) throw new Error("query ref was not seeded");
+        const { socket, first } = await openSocket(await signed());
+        await first;
+        for (let index = 0; index < 64; index++) {
+            const snapshot = await sendAndReceive(socket, {
+                t: "sub",
+                subId: SubId(1000 + index),
+                ref: queryRef,
+                args: { organizationId: "workerd-org", body: "does-not-exist" },
+            });
+            expect(snapshot).toMatchObject({ t: "snapshot", subId: 1000 + index, rows: [] });
+        }
+
+        const limited = await sendAndReceive(socket, {
+            t: "sub",
+            subId: SubId(1064),
+            ref: queryRef,
+            args: { organizationId: "workerd-org", body: "__throw" },
+        });
+        expect(limited).toMatchObject({ t: "error", subId: 1064, code: "CDB_RATE_LIMITED" });
+
+        socket.send(encodeWire({ t: "unsub", subId: SubId(1000) }));
+        const replacement = await sendAndReceive(socket, {
+            t: "sub",
+            subId: SubId(1064),
+            ref: queryRef,
+            args: { organizationId: "workerd-org", body: "does-not-exist" },
+        });
+        expect(replacement).toMatchObject({ t: "snapshot", subId: 1064, rows: [] });
+        socket.close();
+    });
+
+    test("updateAuth drains a query snapshot before switching subscription identity", async () => {
+        if (!mutationRef || !queryRef) throw new Error("public refs were not seeded");
+        const { socket, first } = await openSocket(await signed());
+        await first;
+        const seeded = await sendAndReceive(socket, {
+            t: "mut",
+            mutId: MutId("query-refresh-seed"),
+            ref: mutationRef,
+            args: {
+                id: "query-refresh-row",
+                organizationId: "workerd-org",
+                body: "query-refresh",
+                createdAt: 11,
+            },
+        });
+        expect(seeded).toMatchObject({ t: "poke", mutResults: [{ ok: true }] });
+
+        await setAuthorityFault("hold");
+        const ordered = nextDowns(socket, 3);
+        socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(40),
+                ref: queryRef,
+                args: { organizationId: "workerd-org", body: "query-refresh" },
+            })
+        );
+        await authorityControl("/authority-waiting");
+        socket.send(encodeWire({ t: "updateAuth", jwt: await signed({ subject: "workerd-user-2" }) }));
+        socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(41),
+                ref: queryRef,
+                args: { organizationId: "workerd-org", body: "query-refresh" },
+            })
+        );
+        await expectNoDown(socket);
+        await authorityControl("/authority-release");
+
+        const [before, refresh, after] = await ordered;
+        expect(before).toMatchObject({
+            t: "snapshot",
+            subId: 40,
+            rows: [{ id: "query-refresh-row", viewerId: "workerd-user" }],
+        });
+        expect(refresh).toMatchObject({ t: "mustRefetch", subIds: [40], reason: "authChanged" });
+        expect(after).toMatchObject({
+            t: "snapshot",
+            subId: 41,
+            rows: [{ id: "query-refresh-row", viewerId: "workerd-user-2" }],
+        });
+        socket.close();
     });
 
     test("concurrent completions keep the last delivered cookie for later failures", async () => {

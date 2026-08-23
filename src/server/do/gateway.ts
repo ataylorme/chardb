@@ -55,6 +55,8 @@ import type {
     CdbErrorWire,
     CdbMutationResponse,
     CdbMutationRpc,
+    CdbQueryResponse,
+    CdbQueryRpc,
     CdbSubscriptionRequest,
     CdbSubscriptionRpc,
     LiveSubscriptionId,
@@ -96,6 +98,7 @@ export const MAX_POKE_INTERVAL_MS = 250 as const;
 export const PRESENCE_FANOUT_CAP = 1024 as const;
 
 export const PRESENCE_TTL_DEFAULT_MS = 30_000 as const;
+export const MAX_INITIAL_SNAPSHOTS_PER_CONNECTION = 64 as const;
 
 interface PendingGwAttachment {
     readonly kind: "pending";
@@ -109,6 +112,13 @@ interface RejectedGwAttachment {
     readonly authOrigin: string;
 }
 
+interface PendingSubscription {
+    readonly connectionId: string;
+    readonly subId: SubId;
+    cancelled: boolean;
+    task: Promise<void>;
+}
+
 export interface VerifiedGwAttachment {
     readonly kind: "verified";
     readonly connectionId: string;
@@ -116,6 +126,7 @@ export interface VerifiedGwAttachment {
     readonly clientId: ClientId;
     readonly lastCookie?: Cookie;
     readonly presenceKeys?: readonly string[];
+    readonly snapshotSubIds?: readonly SubId[];
     /** Subject from a signature-verified token. */
     readonly principalId: PrincipalId;
     /** Required JWT expiry in epoch seconds. */
@@ -130,7 +141,7 @@ export interface GatewayEnv {
     readonly CDB_SHARD: DurableObjectNamespace;
 }
 
-type CdbRpc = CdbSubscriptionRpc;
+type CdbRpc = CdbSubscriptionRpc & CdbQueryRpc;
 
 export interface TrustedMutationDispatchDeps {
     readonly routeMutation: MutationRouteResolver;
@@ -158,7 +169,10 @@ interface CatalogJwksRpc extends CatalogMutationRpc {
     putJwk(kid: string, jwkJson: string, ttlMs: number): Promise<void>;
 }
 
-function mutationFailure(code: import("../../errors.ts").CdbErrorCode, message: string): CdbMutationResponse {
+function mutationFailure(
+    code: import("../../errors.ts").CdbErrorCode,
+    message: string
+): Extract<CdbMutationResponse, { readonly ok: false }> {
     return { ok: false, error: new CdbError({ code, message }).toJSON() };
 }
 
@@ -213,6 +227,33 @@ export function projectCdbMutationResponse(value: unknown): CdbMutationResponse 
         return { ok: false, error: wire as unknown as CdbErrorWire };
     }
     return mutationFailure("CDB_INVARIANT", "Cdb returned a malformed mutation response");
+}
+
+type CdbQueryRowsResponse =
+    | { readonly ok: true; readonly result: readonly RawJson[] }
+    | Extract<CdbQueryResponse, { readonly ok: false }>;
+
+function projectCdbQueryRows(value: unknown): CdbQueryRowsResponse {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return mutationFailure("CDB_INVARIANT", "Cdb returned a malformed query response");
+    }
+    const response = value as Record<string, unknown>;
+    if (response.ok === true) {
+        try {
+            const result = rawJsonResult(response.result, "Cdb query result");
+            if (!Array.isArray(result)) {
+                return mutationFailure("CDB_INVARIANT", "organization query result must be an array");
+            }
+            return { ok: true, result };
+        } catch {
+            return mutationFailure("CDB_INVARIANT", "Cdb returned a non-JSON query result");
+        }
+    }
+    if (response.ok === false) {
+        const projected = projectCdbMutationResponse(response);
+        return projected.ok ? mutationFailure("CDB_INVARIANT", "Cdb returned a malformed query failure") : projected;
+    }
+    return mutationFailure("CDB_INVARIANT", "Cdb returned a malformed query response");
 }
 
 type OrganizationAuthProjection =
@@ -486,7 +527,8 @@ export class Gateway extends DurableObject<GatewayEnv> {
     private coalesceTimer: ReturnType<typeof setTimeout> | null = null;
     private readonly pendingPatches = new Map<ClientId, RowPatch[]>();
     private readonly authRefreshBarriers = new Map<string, Promise<boolean>>();
-    private readonly activeMutations = new Map<string, Set<Promise<void>>>();
+    private readonly activeOperations = new Map<string, Set<Promise<void>>>();
+    private readonly pendingSubscriptions = new Map<string, PendingSubscription>();
 
     constructor(state: DurableObjectState, env: GatewayEnv) {
         super(state, env);
@@ -583,10 +625,13 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const attachment = ws.deserializeAttachment() as GwAttachment | null;
         if (attachment) {
             this.authRefreshBarriers.delete(attachment.connectionId);
-            this.activeMutations.delete(attachment.connectionId);
+            this.activeOperations.delete(attachment.connectionId);
+            for (const pending of this.pendingSubscriptions.values()) {
+                if (pending.connectionId === attachment.connectionId) pending.cancelled = true;
+            }
         }
-        // Subs persist in `_gw_subs` so a hibernated socket can resume with its
-        // last cookie after a wake-up without re-running the user's `useQuery`.
+        // Public initial-query attempts are in memory only. The isolated
+        // registration helpers retain their own `_gw_subs` state.
     }
 
     private async onHello(ws: WebSocket, msg: Extract<Up, { t: "hello" }>): Promise<void> {
@@ -666,7 +711,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         });
         if (!attachment) return false;
 
-        const active = this.activeMutations.get(connectionId);
+        const active = this.activeOperations.get(connectionId);
         if (active && active.size > 0) await Promise.allSettled([...active]);
 
         const latest = ws.deserializeAttachment() as GwAttachment | null;
@@ -682,14 +727,24 @@ export class Gateway extends DurableObject<GatewayEnv> {
             ...attachment,
             ...(latest.lastCookie !== undefined ? { lastCookie: latest.lastCookie } : {}),
             ...(latest.presenceKeys !== undefined ? { presenceKeys: latest.presenceKeys } : {}),
+            ...(latest.snapshotSubIds !== undefined ? { snapshotSubIds: latest.snapshotSubIds } : {}),
         } satisfies VerifiedGwAttachment);
         this.pendingPatches.delete(latest.clientId);
         try {
-            const { subIds, rpcFailed } = await this.invalidateClientSubscriptions(latest.clientId);
+            const { subIds: persistedSubIds, rpcFailed } = await this.invalidateClientSubscriptions(latest.clientId);
             if (rpcFailed) {
                 this.rejectConnection(ws, "CDB_SHARD_UNAVAILABLE", 1011, "subscription invalidation failed");
                 return false;
             }
+            const refreshed = ws.deserializeAttachment() as GwAttachment | null;
+            if (!isVerifiedAttachment(refreshed) || refreshed.connectionId !== connectionId) {
+                this.rejectAuth(ws, "CDB_FORBIDDEN");
+                return false;
+            }
+            const subIds = [...new Set([...(refreshed.snapshotSubIds ?? []), ...persistedSubIds])]
+                .sort((left, right) => left - right)
+                .map(SubId);
+            ws.serializeAttachment({ ...refreshed, snapshotSubIds: [] } satisfies VerifiedGwAttachment);
             this.send(ws, { t: "mustRefetch", subIds, reason: "authChanged" });
             return true;
         } catch {
@@ -741,22 +796,206 @@ export class Gateway extends DurableObject<GatewayEnv> {
         ws.close(closeCode, reason);
     }
 
-    private async onSub(ws: WebSocket, msg: Extract<Up, { t: "sub" }>): Promise<void> {
-        const att = ws.deserializeAttachment() as GwAttachment | null;
-        if (!isVerifiedAttachment(att) || !isCurrentVerifiedAttachment(att)) {
+    private onSub(ws: WebSocket, msg: Extract<Up, { t: "sub" }>): void {
+        const attachment = ws.deserializeAttachment() as GwAttachment | null;
+        if (!isVerifiedAttachment(attachment) || !isCurrentVerifiedAttachment(attachment)) {
             this.sendError(ws, "CDB_FORBIDDEN", msg.subId);
             return;
         }
-        // The client args may name a tenant, but verified identity alone does
-        // not establish membership in it. Registration remains closed until
-        // Catalog-derived membership is part of the attachment.
-        this.sendError(ws, "CDB_AUTH_NOT_BOUND", msg.subId);
+        const operationKey = `${attachment.connectionId}:${msg.subId}`;
+        const previous = this.pendingSubscriptions.get(operationKey);
+        const deliveredSubIds = new Set(attachment.snapshotSubIds ?? []);
+        if (!previous && !deliveredSubIds.has(msg.subId)) {
+            const reservedSubIds = new Set(
+                [...this.pendingSubscriptions.values()]
+                    .filter(
+                        pending =>
+                            pending.connectionId === attachment.connectionId &&
+                            !pending.cancelled &&
+                            !deliveredSubIds.has(pending.subId)
+                    )
+                    .map(pending => pending.subId)
+            );
+            if (deliveredSubIds.size + reservedSubIds.size >= MAX_INITIAL_SNAPSHOTS_PER_CONNECTION) {
+                this.sendError(ws, "CDB_RATE_LIMITED", msg.subId);
+                return;
+            }
+        }
+        if (previous) previous.cancelled = true;
+        const pending: PendingSubscription = {
+            connectionId: attachment.connectionId,
+            subId: msg.subId,
+            cancelled: false,
+            task: Promise.resolve(),
+        };
+        this.pendingSubscriptions.set(operationKey, pending);
+        const barrier = this.authRefreshBarriers.get(attachment.connectionId);
+        if (barrier || previous) {
+            void (previous?.task.catch(() => {}) ?? Promise.resolve())
+                .then(() => barrier ?? true)
+                .then(succeeded => {
+                    if (succeeded && !pending.cancelled) {
+                        this.admitSubscription(ws, msg, pending, operationKey);
+                    } else if (this.pendingSubscriptions.get(operationKey) === pending) {
+                        this.pendingSubscriptions.delete(operationKey);
+                    }
+                });
+            return;
+        }
+        this.admitSubscription(ws, msg, pending, operationKey);
+    }
+
+    private admitSubscription(
+        ws: WebSocket,
+        msg: Extract<Up, { t: "sub" }>,
+        pending: PendingSubscription,
+        operationKey: string
+    ): void {
+        const att = ws.deserializeAttachment() as GwAttachment | null;
+        if (!isVerifiedAttachment(att) || !isCurrentVerifiedAttachment(att)) {
+            if (!pending.cancelled) this.sendError(ws, "CDB_FORBIDDEN", msg.subId);
+            if (this.pendingSubscriptions.get(operationKey) === pending) {
+                this.pendingSubscriptions.delete(operationKey);
+            }
+            return;
+        }
+        const task = this.settleSubscription(ws, att, msg, pending);
+        pending.task = task;
+        let active = this.activeOperations.get(att.connectionId);
+        if (!active) {
+            active = new Set();
+            this.activeOperations.set(att.connectionId, active);
+        }
+        active.add(task);
+        void task
+            .catch(() => this.sendError(ws, "CDB_INVARIANT", msg.subId))
+            .finally(() => {
+                if (this.pendingSubscriptions.get(operationKey) === pending) {
+                    this.pendingSubscriptions.delete(operationKey);
+                }
+                active?.delete(task);
+                if (active?.size === 0) this.activeOperations.delete(att.connectionId);
+            });
+    }
+
+    private async settleSubscription(
+        ws: WebSocket,
+        att: VerifiedGwAttachment,
+        msg: Extract<Up, { t: "sub" }>,
+        pending: PendingSubscription
+    ): Promise<void> {
+        const routed = await this.routeQuery({ ref: msg.ref, args: msg.args });
+        if (pending.cancelled) return;
+        if (!routed.ok) {
+            this.sendError(ws, routed.error.code, msg.subId);
+            return;
+        }
+        if (routed.authority !== "organization") {
+            this.sendError(ws, "CDB_AUTH_NOT_BOUND", msg.subId);
+            return;
+        }
+        const organizationId = routed.partitionKey;
+        const partition = routed.intent.partitionKey;
+        if (
+            !organizationId ||
+            !partition ||
+            partition.values.length === 0 ||
+            routed.intent.joinShape === "cross-partition" ||
+            !partition.values.every(value => typeof value === "string" && value === organizationId)
+        ) {
+            this.sendError(ws, "CDB_CROSS_PARTITION", msg.subId);
+            return;
+        }
+
+        const vshards = new Set(partition.values.map(value => Number(vshardOf([value as string]))));
+        if (vshards.size !== 1) {
+            this.sendError(ws, "CDB_CROSS_PARTITION", msg.subId);
+            return;
+        }
+        const vshard = [...vshards][0];
+        if (vshard === undefined) {
+            this.sendError(ws, "CDB_CROSS_PARTITION", msg.subId);
+            return;
+        }
+
+        const catalog = this.catalog() as CatalogRoutingRpc & CatalogOrganizationAuthorityRpc;
+        let authority: Awaited<ReturnType<CatalogOrganizationAuthorityRpc["resolveOrganizationAuthority"]>>;
+        try {
+            authority = await catalog.resolveOrganizationAuthority({
+                principalId: att.principalId,
+                organizationId: TenantId(organizationId),
+            });
+        } catch {
+            if (pending.cancelled) return;
+            this.sendError(ws, "CDB_CATALOG_UNAVAILABLE", msg.subId);
+            return;
+        }
+        if (pending.cancelled) return;
+        const projected = projectOrganizationMutationAuth(authority, {
+            principalId: att.principalId,
+            organizationId: TenantId(organizationId),
+        });
+        if (!projected.ok) {
+            this.sendError(ws, projected.code, msg.subId);
+            return;
+        }
+
+        let shardId: string;
+        try {
+            const route = await catalog.route(vshard);
+            if (typeof route?.shardId !== "string" || route.shardId.length === 0) {
+                throw new TypeError("Catalog returned a malformed shard route");
+            }
+            shardId = route.shardId;
+        } catch {
+            if (pending.cancelled) return;
+            this.sendError(ws, "CDB_CATALOG_UNAVAILABLE", msg.subId);
+            return;
+        }
+        if (pending.cancelled) return;
+        const cdb = this.cdb(shardId);
+        let response: CdbQueryRowsResponse;
+        try {
+            response = projectCdbQueryRows(await cdb.query({ ref: msg.ref, args: routed.args, auth: projected.auth }));
+        } catch {
+            if (pending.cancelled) return;
+            this.sendError(ws, "CDB_SHARD_UNAVAILABLE", msg.subId);
+            return;
+        }
+        if (pending.cancelled) return;
+        if (!response.ok) {
+            this.sendError(ws, response.error.code, msg.subId);
+            return;
+        }
+
+        const current = ws.deserializeAttachment() as GwAttachment | null;
+        if (
+            pending.cancelled ||
+            !isVerifiedAttachment(current) ||
+            current.connectionId !== att.connectionId ||
+            current.principalId !== att.principalId
+        ) {
+            return;
+        }
+        const cookie = Cookie(`${att.clientId}:${Date.now()}:${crypto.randomUUID()}`);
+        const snapshotSubIds = [...new Set([...(current.snapshotSubIds ?? []), msg.subId])]
+            .sort((left, right) => left - right)
+            .map(SubId);
+        ws.serializeAttachment({ ...current, lastCookie: cookie, snapshotSubIds } satisfies VerifiedGwAttachment);
+        this.send(ws, { t: "snapshot", subId: msg.subId, cookie, rows: response.result });
     }
 
     private onUnsub(ws: WebSocket, msg: Extract<Up, { t: "unsub" }>): void {
         const att = ws.deserializeAttachment() as GwAttachment | null;
         if (!isVerifiedAttachment(att)) return;
-        void this.unsubscribeAcrossShards(att.clientId, msg.subId);
+        const pending = this.pendingSubscriptions.get(`${att.connectionId}:${msg.subId}`);
+        if (pending) pending.cancelled = true;
+        if (att.snapshotSubIds?.includes(msg.subId)) {
+            ws.serializeAttachment({
+                ...att,
+                snapshotSubIds: att.snapshotSubIds.filter(subId => subId !== msg.subId),
+            } satisfies VerifiedGwAttachment);
+        }
     }
 
     private onMut(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): void {
@@ -792,10 +1031,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
         }
         const trusted = trustedMutationAuthFromAttachment(att);
         const task = this.settleMut(ws, att, msg, trusted);
-        let active = this.activeMutations.get(att.connectionId);
+        let active = this.activeOperations.get(att.connectionId);
         if (!active) {
             active = new Set();
-            this.activeMutations.set(att.connectionId, active);
+            this.activeOperations.set(att.connectionId, active);
         }
         active.add(task);
         void task
@@ -805,7 +1044,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             })
             .finally(() => {
                 active?.delete(task);
-                if (active?.size === 0) this.activeMutations.delete(att.connectionId);
+                if (active?.size === 0) this.activeOperations.delete(att.connectionId);
             });
     }
 

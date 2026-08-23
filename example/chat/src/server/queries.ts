@@ -20,6 +20,8 @@ const listMessagesArgs = z.object({
 export const listMessages = api.query({
     ref: "src/server/queries.ts#listMessages",
     args: listMessagesArgs,
+    authority: "organization",
+    partitionKey: "organizationId",
     // The configured Gateway evaluates this extractor from its local
     // manifest; the browser sends only the handle ref and raw args. The shape
     // MUST match what

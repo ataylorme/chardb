@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { isCdbError } from "../../src/errors.ts";
 import { defineCron, defineMutation, defineQuery } from "../../src/server/define.ts";
-import { manifestFromExports, resolveMutation } from "../../src/server/manifest.ts";
+import { manifestFromExports, resolveMutation, resolveQuery } from "../../src/server/manifest.ts";
 import type { ChardbRef } from "../../src/types.ts";
 
 const createPost = defineMutation<unknown, { authorId: string; body: string }, { id: string }>(
@@ -10,6 +10,17 @@ const createPost = defineMutation<unknown, { authorId: string; body: string }, {
 );
 
 const listPosts = defineQuery<unknown, { authorId: string }, readonly { id: string }[]>(async () => []);
+const listOrganizationPosts = defineQuery({
+    ref: "api/posts#organizationList",
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: (args: { organizationId: string }) => ({
+        kind: "select" as const,
+        tables: ["posts"],
+        partitionKey: { table: "posts", column: "organization_id", values: [args.organizationId] },
+    }),
+    handler: async () => [],
+});
 
 const nightly = defineCron<unknown, Record<string, never>, void>("0 0 * * *", async () => {});
 
@@ -51,5 +62,12 @@ describe("manifestFromExports", () => {
         const mutation = defineMutation({ ref: "api/posts#shared", handler: () => null });
         const query = defineQuery({ ref: "api/posts#shared", handler: async () => null });
         expect(() => manifestFromExports({ mutation, query })).toThrow("duplicate ref across mutation and query");
+    });
+
+    test("preserves organization query authority and partition extraction", () => {
+        const manifest = manifestFromExports({ listOrganizationPosts });
+        const descriptor = resolveQuery(manifest, listOrganizationPosts.__chardbRef);
+        expect(descriptor.authority).toBe("organization");
+        expect(descriptor.extractPartitionKey?.({ organizationId: "org-1" })).toBe("org-1");
     });
 });

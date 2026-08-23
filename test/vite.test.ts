@@ -130,6 +130,24 @@ describe("@chardb/vite-plugin", () => {
         ).toThrow("Organization mutation save requires a literal ref");
     });
 
+    test("rejects an organization query without a literal ref", () => {
+        const p = makePlugin();
+        expect(() =>
+            p.transform(
+                `
+          import { api } from "chardb/server";
+          export const list = api.query({
+            authority: "organization",
+            partitionKey: "organizationId",
+            intent: () => ({ kind: "select", tables: [] }),
+            handler: async () => [],
+          });
+        `,
+                "/abs/proj/src/authority-query.ts"
+            )
+        ).toThrow("Organization query list requires a literal ref");
+    });
+
     test("rejects duplicate and nonliteral explicit refs", () => {
         const duplicate = makePlugin();
         expect(() =>
