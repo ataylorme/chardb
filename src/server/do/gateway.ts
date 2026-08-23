@@ -51,6 +51,9 @@ import type {
     CdbErrorWire,
     CdbMutationResponse,
     CdbMutationRpc,
+    CdbSubscriptionRequest,
+    CdbSubscriptionRpc,
+    LiveSubscriptionId,
     MutationRouteRequest,
     MutationRouteResolver,
     MutationRouteResponse,
@@ -115,24 +118,7 @@ export interface GatewayEnv {
     readonly CDB_SHARD: DurableObjectNamespace;
 }
 
-/** Minimal RPC surface the Gateway requires from each Cdb shard DO. */
-export interface CdbSubscriptionRequest {
-    readonly subId: number;
-    readonly principalId: PrincipalId;
-    readonly ref: ChardbRef;
-    readonly args: RawJson;
-    readonly tables: readonly string[];
-    readonly intervals: readonly {
-        readonly table: string;
-        readonly indexName: string;
-        readonly intervals: readonly import("../../wire.ts").WireInterval[];
-    }[];
-}
-
-interface CdbRpc {
-    subscribe(args: CdbSubscriptionRequest): Promise<{ subId: number }>;
-    unsubscribe(subId: number): Promise<void>;
-}
+type CdbRpc = CdbSubscriptionRpc;
 
 export interface TrustedMutationDispatchDeps {
     readonly routeMutation: MutationRouteResolver;
@@ -180,8 +166,15 @@ export function gatewayErrorEnvelope(
     };
 }
 
+/** Build a stable subscription identity from Gateway-owned values. */
+export function gatewaySubscriptionId(gatewayId: string, clientId: ClientId, subId: SubId): LiveSubscriptionId {
+    return { gatewayId, clientId, subId };
+}
+
 /** Build the serializable Cdb subscription RPC from server-owned routing data. */
 export function cdbSubscriptionRequest(input: {
+    readonly gatewayId: string;
+    readonly clientId: ClientId;
     readonly subId: SubId;
     readonly principalId: PrincipalId;
     readonly ref: ChardbRef;
@@ -189,7 +182,7 @@ export function cdbSubscriptionRequest(input: {
     readonly intent: CdbIntent;
 }): CdbSubscriptionRequest {
     return {
-        subId: input.subId,
+        subscription: gatewaySubscriptionId(input.gatewayId, input.clientId, input.subId),
         principalId: input.principalId,
         ref: input.ref,
         args: input.args,
@@ -680,7 +673,15 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 subId
             );
         }
-        const request = cdbSubscriptionRequest({ subId, principalId, ref, args, intent });
+        const request = cdbSubscriptionRequest({
+            gatewayId: this.ctx.id.toString(),
+            clientId,
+            subId,
+            principalId,
+            ref,
+            args,
+            intent,
+        });
         await Promise.all(
             shardIds.map(async shardId => {
                 const cdb = this.cdb(shardId);
@@ -702,7 +703,8 @@ export class Gateway extends DurableObject<GatewayEnv> {
         sql.exec("DELETE FROM _gw_shard_subs WHERE client_id = ? AND sub_id = ?", clientId, subId);
         await Promise.all(
             shards.map(async shardId => {
-                await this.cdb(shardId).unsubscribe(subId);
+                const subscription = gatewaySubscriptionId(this.ctx.id.toString(), clientId, subId);
+                await this.cdb(shardId).unsubscribe(subscription);
             })
         );
     }
@@ -809,7 +811,8 @@ export function configureGatewayRuntime(config: GatewayRuntimeConfig): typeof Ga
 }
 
 /** Re-export for downstream tests that want to drive subscription routing. */
-export type { CdbRpc as GatewayCdbRpc };
+export type { CdbSubscriptionRequest } from "../rpc.ts";
+export type { CdbSubscriptionRpc as GatewayCdbRpc } from "../rpc.ts";
 
 function toScalar(v: RawJson): string | number | bigint | Uint8Array {
     if (typeof v === "string" || typeof v === "number" || typeof v === "bigint") return v;

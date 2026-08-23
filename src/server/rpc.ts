@@ -1,5 +1,6 @@
 import type { CdbError } from "../errors.ts";
-import type { RawJson, ShardId } from "../types.ts";
+import type { ChardbRef, ClientId, PrincipalId, RawJson, ShardId, SubId } from "../types.ts";
+import type { WireInterval } from "../wire.ts";
 import type { AuthCtx } from "./define.ts";
 import type { RouteResult } from "./do/catalog.ts";
 
@@ -26,6 +27,31 @@ export interface CatalogMutationRpc {
 /** Catalog routing surface used by subscription placement. */
 export interface CatalogRoutingRpc extends CatalogMutationRpc {
     listShardIds(): Promise<readonly ShardId[]>;
+}
+
+/** Globally unique identity for one live subscription registration. */
+export interface LiveSubscriptionId {
+    readonly gatewayId: string;
+    readonly clientId: ClientId;
+    readonly subId: SubId;
+}
+
+export interface CdbSubscriptionRequest {
+    readonly subscription: LiveSubscriptionId;
+    readonly principalId: PrincipalId;
+    readonly ref: ChardbRef;
+    readonly args: RawJson;
+    readonly tables: readonly string[];
+    readonly intervals: readonly {
+        readonly table: string;
+        readonly indexName: string;
+        readonly intervals: readonly WireInterval[];
+    }[];
+}
+
+export interface CdbSubscriptionRpc {
+    subscribe(args: CdbSubscriptionRequest): Promise<{ subscription: LiveSubscriptionId }>;
+    unsubscribe(subscription: LiveSubscriptionId): Promise<void>;
 }
 
 export interface CdbMutationRequest {

@@ -7,7 +7,7 @@ import {
     gatewayErrorEnvelope,
 } from "../../src/server/do/gateway.ts";
 import type { CdbMutationRequest, TrustedMutationDispatchRequest } from "../../src/server/rpc.ts";
-import { ChardbRef, CorrelationId, PrincipalId, ShardId, SubId } from "../../src/types.ts";
+import { ChardbRef, ClientId, CorrelationId, PrincipalId, ShardId, SubId } from "../../src/types.ts";
 import { decodeWire, encodeWire } from "../../src/wire.ts";
 
 const request: TrustedMutationDispatchRequest = {
@@ -58,6 +58,8 @@ describe("trusted Gateway mutation dispatch", () => {
     test("builds the selected Cdb request from query ref, raw args, and server intent", () => {
         expect(
             cdbSubscriptionRequest({
+                gatewayId: "gateway-do-7",
+                clientId: ClientId("client-3"),
                 subId: SubId(4),
                 principalId: PrincipalId("user-1"),
                 ref: ChardbRef("queries.ts#listMessages"),
@@ -69,7 +71,11 @@ describe("trusted Gateway mutation dispatch", () => {
                 },
             })
         ).toEqual({
-            subId: 4,
+            subscription: {
+                gatewayId: "gateway-do-7",
+                clientId: ClientId("client-3"),
+                subId: SubId(4),
+            },
             principalId: PrincipalId("user-1"),
             ref: ChardbRef("queries.ts#listMessages"),
             args: { organizationId: "org-1", channelId: "channel-1" },

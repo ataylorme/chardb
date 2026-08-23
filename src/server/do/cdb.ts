@@ -20,10 +20,10 @@ import { SHARD_BOOTSTRAP_DDL } from "../../oplog/schema.ts";
 import { type JsonText, parseJsonColumn } from "../../oplog/wrapper.ts";
 import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/range.ts";
 import { type TableSpec, renderRowApply, renderTableTriggers } from "../../reshard/triggers.ts";
-import { type ChardbRef, type PrincipalId, type RawJson, SubId } from "../../types.ts";
+import { type ChardbRef, type RawJson, SubId } from "../../types.ts";
 import { executeAtomicMutation } from "../atomic-mutation.ts";
 import { type ChardbManifest, emptyManifest, resolveMutation } from "../manifest.ts";
-import type { CdbMutationRequest, CdbMutationResponse } from "../rpc.ts";
+import type { CdbMutationRequest, CdbMutationResponse, CdbSubscriptionRequest, LiveSubscriptionId } from "../rpc.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
 export type {
@@ -38,17 +38,10 @@ export interface CdbEnv {
     readonly CDB_VECTORIZE?: unknown;
 }
 
-export interface SubscribeArgs {
-    readonly subId: number;
-    readonly principalId: PrincipalId;
-    readonly ref: ChardbRef;
-    readonly args: RawJson;
-    readonly tables: readonly string[];
-    readonly intervals: readonly {
-        readonly table: string;
-        readonly indexName: string;
-        readonly intervals: readonly import("../../wire.ts").WireInterval[];
-    }[];
+export type SubscribeArgs = CdbSubscriptionRequest;
+
+function subscriptionKey(subscription: LiveSubscriptionId): string {
+    return JSON.stringify([subscription.gatewayId, subscription.clientId, subscription.subId]);
 }
 
 export interface CdbRuntimeConfig<TSchema extends Record<string, unknown>> {
@@ -60,7 +53,8 @@ export interface CdbRuntimeConfig<TSchema extends Record<string, unknown>> {
  * Cdb shard. Bound as `class_name = "Cdb"` in wrangler.jsonc.
  */
 export class Cdb extends DurableObject<CdbEnv> {
-    private readonly intervalMap = new IntervalMap<number>();
+    private readonly intervalMap = new IntervalMap<string>();
+    private readonly subscriptions = new Map<string, LiveSubscriptionId>();
     private bootstrapped = false;
 
     constructor(state: DurableObjectState, env: CdbEnv) {
@@ -90,16 +84,21 @@ export class Cdb extends DurableObject<CdbEnv> {
     /**
      * Register a live-query subscription on this shard. Caller is the Gateway DO.
      */
-    async subscribe(args: SubscribeArgs): Promise<{ subId: number }> {
+    async subscribe(args: SubscribeArgs): Promise<{ subscription: LiveSubscriptionId }> {
+        const key = subscriptionKey(args.subscription);
+        this.intervalMap.unregister(key);
         for (const block of args.intervals) {
             const set = intervalSetFromWire(block.intervals);
-            this.intervalMap.register(args.subId, block.table, block.indexName, set);
+            this.intervalMap.register(key, block.table, block.indexName, set);
         }
-        return { subId: args.subId };
+        this.subscriptions.set(key, args.subscription);
+        return { subscription: args.subscription };
     }
 
-    async unsubscribe(subId: number): Promise<void> {
-        this.intervalMap.unregister(subId);
+    async unsubscribe(subscription: LiveSubscriptionId): Promise<void> {
+        const key = subscriptionKey(subscription);
+        this.intervalMap.unregister(key);
+        this.subscriptions.delete(key);
     }
 
     /** Resolve and run a registered mutation entirely inside this shard isolate. */
@@ -121,14 +120,19 @@ export class Cdb extends DurableObject<CdbEnv> {
 
     /**
      * Project a committed row through every registered index and return the
-     * affected sub ids. Used by the Gateway to coalesce pokes.
+     * affected subscription identities. Used by the Gateway to coalesce pokes.
      */
-    matchSubsForRow(table: string, indexedKeys: { indexName: string; key: IntervalKey }[]): number[] {
-        const hits = new Set<number>();
+    matchSubsForRow(table: string, indexedKeys: { indexName: string; key: IntervalKey }[]): LiveSubscriptionId[] {
+        const hits = new Set<string>();
         for (const { indexName, key } of indexedKeys) {
             for (const sub of this.intervalMap.match(table, indexName, key)) hits.add(sub);
         }
-        return [...hits];
+        const subscriptions: LiveSubscriptionId[] = [];
+        for (const key of hits) {
+            const subscription = this.subscriptions.get(key);
+            if (subscription) subscriptions.push(subscription);
+        }
+        return subscriptions;
     }
 
     /**
