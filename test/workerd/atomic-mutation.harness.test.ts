@@ -46,7 +46,7 @@ afterAll(async () => {
 });
 
 async function execute(body: {
-    readonly mode: "commit" | "throw" | "async";
+    readonly mode: "commit" | "throw" | "async" | "forbidden";
     readonly mutId: string;
     readonly firstId: string;
     readonly secondId: string;
@@ -137,6 +137,22 @@ describe("atomic domain mutation on real Durable Object SqlStorage", () => {
         expect((await response.json()) as unknown).toEqual({
             code: "CDB_INTERACTIVE_TXN_UNSUPPORTED",
             message: "mutation handlers must be synchronous; Durable Object SQLite transactions cannot span await",
+        });
+        expect(await inspect()).toEqual(before);
+    });
+
+    test("a conflicting tenant insert rolls back earlier statements and the provisional op-log row", async () => {
+        const before = await inspect();
+        const response = await execute({
+            mode: "forbidden",
+            mutId: "forbidden-tenant",
+            firstId: "must-roll-back",
+            secondId: "must-not-insert",
+        });
+        expect(response.status).toBe(409);
+        expect((await response.json()) as unknown).toEqual({
+            code: "CDB_FORBIDDEN",
+            message: 'explicit tenant column "organizationId" conflicts with verified auth',
         });
         expect(await inspect()).toEqual(before);
     });

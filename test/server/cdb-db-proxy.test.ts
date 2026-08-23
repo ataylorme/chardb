@@ -10,12 +10,11 @@
  *   - convention column under `forOrg()` (`organizationId`) → filled
  *     even when no `tenantBy:` is set
  *   - `forUser()` → user FK column filled with `auth.userId`
- *   - explicit values from the caller win over auto-fill
+ *   - matching explicit identity values pass; conflicts fail closed
  *   - non-cdbTables pass through unchanged (the proxy never touches
  *     rows targeting a raw `sqliteTable(...)`)
- *   - missing auth field (e.g. `tenantId == null`) leaves the column
- *     missing instead of writing `null`
- *   - array `.values([...])` form is fan-out filled
+ *   - missing tenant/user authority rejects even caller-supplied values
+ *   - array `.values([...])` validates every row before forwarding
  *   - other builder methods (`returning`, `onConflictDoNothing`) pass
  *     through after `.values()` is wrapped
  */
@@ -23,6 +22,7 @@
 import { describe, expect, test } from "bun:test";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import type { BaseSQLiteDatabase, SQLiteTable } from "drizzle-orm/sqlite-core";
+import { CdbError } from "../../src/errors.ts";
 import type { AuthCtx } from "../../src/server/define.ts";
 import { forOrg, forUser, wrapDb } from "../../src/server/index.ts";
 
@@ -82,6 +82,17 @@ const baseAuth: AuthCtx = Object.freeze({
     claims: {},
 });
 
+function expectForbidden(run: () => unknown): void {
+    let caught: unknown;
+    try {
+        run();
+    } catch (error) {
+        caught = error;
+    }
+    expect(caught).toBeInstanceOf(CdbError);
+    expect((caught as CdbError).code).toBe("CDB_FORBIDDEN");
+}
+
 describe("wrapDb / cdbTable insert auto-fill", () => {
     test("explicit selfBy column is filled from auth.userId", () => {
         const { cdbTable } = forOrg();
@@ -102,6 +113,30 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
         expect(captured).toHaveLength(1);
         expect(captured[0]?.rows).toEqual({ id: "m1", body: "hi", authorId: "u-alice" });
+    });
+
+    test("selfBy accepts the verified user and rejects a conflicting explicit owner", () => {
+        const { cdbTable } = forOrg();
+        const messages = cdbTable(
+            "messages_self_explicit",
+            {
+                id: text("id").primaryKey(),
+                authorId: text("author_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { selfBy: "authorId", roles: { self: { create: "*" } } }
+        );
+
+        const matching = makeStubDb();
+        wrapDb(matching.db, baseAuth).insert(messages).values({ id: "m1", authorId: "u-alice" });
+        expect(matching.captured[0]?.rows).toEqual({ id: "m1", authorId: "u-alice" });
+
+        const conflicting = makeStubDb();
+        expectForbidden(() =>
+            wrapDb(conflicting.db, baseAuth).insert(messages).values({ id: "m2", authorId: "u-mallory" })
+        );
+        expect(conflicting.captured[0]?.rows).toBeUndefined();
     });
 
     test("forOrg() conventional `organizationId` is filled from auth.tenantId without explicit tenantBy", () => {
@@ -157,7 +192,29 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         expect(captured[0]?.rows).toEqual({ id: "n1", body: "todo", userId: "u-alice" });
     });
 
-    test("explicit values from the caller win over auto-fill", () => {
+    test("user tenancy rejects conflicting values and missing verified user authority", () => {
+        const { cdbTable } = forUser();
+        const notes = cdbTable("notes_user_authority", {
+            id: text("id").primaryKey(),
+            userId: text("user_id")
+                .notNull()
+                .references(() => userTable.id),
+        });
+
+        const conflicting = makeStubDb();
+        expectForbidden(() => wrapDb(conflicting.db, baseAuth).insert(notes).values({ id: "n1", userId: "u-mallory" }));
+        expect(conflicting.captured[0]?.rows).toBeUndefined();
+
+        const missing = makeStubDb();
+        expectForbidden(() =>
+            wrapDb(missing.db, { ...baseAuth, userId: "" })
+                .insert(notes)
+                .values({ id: "n2", userId: "u-alice" })
+        );
+        expect(missing.captured).toHaveLength(0);
+    });
+
+    test("org tenancy accepts a matching explicit value and rejects a conflict", () => {
         const { cdbTable } = forOrg();
         const channels = cdbTable("channels_explicit_wins", {
             id: text("id").primaryKey(),
@@ -167,17 +224,26 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
             name: text("name").notNull(),
         });
 
-        const { db, captured } = makeStubDb();
-        wrapDb(db, baseAuth).insert(channels).values({ id: "c1", organizationId: "org-other", name: "general" });
-
-        expect(captured[0]?.rows).toEqual({
+        const matching = makeStubDb();
+        wrapDb(matching.db, baseAuth)
+            .insert(channels)
+            .values({ id: "c1", organizationId: "org-acme", name: "general" });
+        expect(matching.captured[0]?.rows).toEqual({
             id: "c1",
-            organizationId: "org-other",
+            organizationId: "org-acme",
             name: "general",
         });
+
+        const conflicting = makeStubDb();
+        expectForbidden(() =>
+            wrapDb(conflicting.db, baseAuth)
+                .insert(channels)
+                .values({ id: "c2", organizationId: "org-other", name: "private" })
+        );
+        expect(conflicting.captured[0]?.rows).toBeUndefined();
     });
 
-    test("array .values([...]) form fans out auto-fill across rows", () => {
+    test("array .values([...]) validates every row before forwarding", () => {
         const { cdbTable } = forOrg();
         const channels = cdbTable("channels_batch", {
             id: text("id").primaryKey(),
@@ -187,18 +253,28 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
             name: text("name").notNull(),
         });
 
-        const { db, captured } = makeStubDb();
-        wrapDb(db, baseAuth)
+        const matching = makeStubDb();
+        wrapDb(matching.db, baseAuth)
             .insert(channels)
             .values([
                 { id: "c1", name: "general" },
-                { id: "c2", name: "random", organizationId: "org-override" },
+                { id: "c2", name: "random", organizationId: "org-acme" },
             ]);
-
-        expect(captured[0]?.rows).toEqual([
+        expect(matching.captured[0]?.rows).toEqual([
             { id: "c1", name: "general", organizationId: "org-acme" },
-            { id: "c2", name: "random", organizationId: "org-override" },
+            { id: "c2", name: "random", organizationId: "org-acme" },
         ]);
+
+        const conflicting = makeStubDb();
+        expectForbidden(() =>
+            wrapDb(conflicting.db, baseAuth)
+                .insert(channels)
+                .values([
+                    { id: "c3", name: "first" },
+                    { id: "c4", name: "second", organizationId: "org-other" },
+                ])
+        );
+        expect(conflicting.captured[0]?.rows).toBeUndefined();
     });
 
     test("non-cdbTables pass through unchanged", () => {
@@ -213,7 +289,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         expect(captured[0]?.rows).toEqual({ id: "r1", value: "noop" });
     });
 
-    test("missing auth.tenantId leaves convention column unfilled (so DB raises NOT NULL)", () => {
+    test("missing org authority rejects even an explicitly supplied tenant", () => {
         const { cdbTable } = forOrg();
         const channels = cdbTable("channels_no_tenant_id", {
             id: text("id").primaryKey(),
@@ -225,9 +301,10 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
         const anonAuth: AuthCtx = { ...baseAuth, tenantId: undefined };
         const { db, captured } = makeStubDb();
-        wrapDb(db, anonAuth).insert(channels).values({ id: "c1", name: "general" });
-
-        expect(captured[0]?.rows).toEqual({ id: "c1", name: "general" });
+        expectForbidden(() =>
+            wrapDb(db, anonAuth).insert(channels).values({ id: "c1", organizationId: "org-acme", name: "general" })
+        );
+        expect(captured).toHaveLength(0);
     });
 
     test("api.mutation handler receives a wrapped ctx.db (auto-fill happens end-to-end)", async () => {

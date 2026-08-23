@@ -1,8 +1,7 @@
 /**
  * `wrapDb(rawDb, auth)` — proxies a Drizzle SQLiteDatabase so any
  * `db.insert(table).values(row)` call against a `cdbTable` instance
- * fills in the table's tenant / self columns from `auth` whenever the
- * caller omits them.
+ * binds the table's tenant / self columns to verified `auth` values.
  *
  * This is the runtime half of chardb's INSERT auto-fill. The type-
  * level half lives in `cdb-table.ts`: every column chardb knows about
@@ -14,8 +13,9 @@
  * Anything that isn't an insert against a `cdbTable` passes through
  * unchanged. The proxy is intentionally a thin wrapper over the raw
  * `db` value the user's mutation context ships with: it does not
- * synthesize new query semantics, only intercepts `.values(...)` to
- * splice known auth-derived columns onto rows that omit them.
+ * synthesize new query semantics, only intercepts `.values(...)` to fill
+ * omitted identity columns and reject explicit values that disagree with the
+ * verified context.
  *
  * Auto-fill rules:
  *
@@ -26,16 +26,14 @@
  *   - Auto-discovered tenant column (FK chain to `auth.organization` /
  *     `auth.user`) → same fill rule, resolved via `resolveCdbMeta`.
  *
- * If an auth field is absent (`auth.tenantId == null` for an org-
- * tenanted table) and the row doesn't supply the column either, the
- * proxy leaves the column missing so Drizzle's NOT NULL guard surfaces
- * the missing-context as a clear DB error rather than silently writing
- * a wrong tenant. Callers needing a permissive policy should branch on
- * `ctx.auth.tenantId` themselves before the insert.
+ * Tenant-scoped inserts fail closed with `CDB_FORBIDDEN` when their required
+ * org/user authority is absent, even if the row supplies an identity value.
+ * A `selfBy` table likewise requires a verified user identity.
  */
 
 import { getTableColumns } from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
+import { CdbError } from "../errors.ts";
 import { getCdbMeta } from "./cdb-table-registry.ts";
 import type { CdbTableMeta } from "./cdb-table-types.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
@@ -71,17 +69,22 @@ function sqlToJsMap(table: SQLiteTable): ReadonlyMap<string, string> {
  * mutation's auth context.
  */
 interface AutoFillPlan {
-    readonly fills: ReadonlyArray<readonly [jsKey: string, value: unknown]>;
+    readonly bindings: ReadonlyArray<{
+        readonly jsKey: string;
+        readonly value: string;
+        readonly authority: "tenant" | "self";
+    }>;
 }
 
 function buildPlan(table: SQLiteTable, meta: CdbTableMeta, auth: AuthCtx): AutoFillPlan {
-    const fills: Array<readonly [string, unknown]> = [];
+    const bindings: Array<{ jsKey: string; value: string; authority: "tenant" | "self" }> = [];
     const sqlToJs = sqlToJsMap(table);
 
-    // selfBy → user id. Only resolves when the row actually has a user.
-    if (meta.selfBy && auth.userId) {
+    // selfBy → verified user id. Caller-supplied ownership is never authority.
+    if (meta.selfBy) {
+        if (!auth.userId) throw missingAuthority("self");
         const jsKey = sqlToJs.get(meta.selfBy);
-        if (jsKey !== undefined) fills.push([jsKey, auth.userId]);
+        if (jsKey !== undefined) bindings.push({ jsKey, value: auth.userId, authority: "self" });
     }
 
     // tenantBy: trust the resolved view (auto-discovered FK or explicit).
@@ -89,6 +92,8 @@ function buildPlan(table: SQLiteTable, meta: CdbTableMeta, auth: AuthCtx): AutoF
     // know nothing to fill and `resolveCdbMeta` would still succeed but
     // do nothing useful.
     if (meta.tenantKind !== "none") {
+        const value = meta.tenantKind === "org" ? auth.tenantId : auth.userId;
+        if (!value) throw missingAuthority("tenant");
         let tenantSqlCol: string | undefined = meta.tenantBy;
         if (!tenantSqlCol) {
             try {
@@ -103,20 +108,22 @@ function buildPlan(table: SQLiteTable, meta: CdbTableMeta, auth: AuthCtx): AutoF
         }
         if (tenantSqlCol) {
             const jsKey = sqlToJs.get(tenantSqlCol);
-            const value = meta.tenantKind === "org" ? auth.tenantId : auth.userId;
-            if (jsKey !== undefined && value) fills.push([jsKey, value]);
+            if (jsKey !== undefined) bindings.push({ jsKey, value, authority: "tenant" });
         }
     }
 
-    return { fills };
+    return { bindings };
 }
 
 function applyPlan<T extends Record<string, unknown>>(plan: AutoFillPlan, row: T): T {
-    if (plan.fills.length === 0) return row;
+    if (plan.bindings.length === 0) return row;
     let next: Record<string, unknown> | null = null;
-    for (const [jsKey, value] of plan.fills) {
+    for (const { jsKey, value, authority } of plan.bindings) {
         const present = Object.prototype.hasOwnProperty.call(row, jsKey) && row[jsKey] !== undefined;
-        if (present) continue;
+        if (present) {
+            if (row[jsKey] !== value) throw conflictingAuthority(authority, jsKey);
+            continue;
+        }
         if (next === null) next = { ...row };
         next[jsKey] = value;
     }
@@ -131,7 +138,7 @@ function applyPlan<T extends Record<string, unknown>>(plan: AutoFillPlan, row: T
  * `.values()` time so chained methods downstream see a complete row.
  */
 function wrapInsertBuilder(builder: unknown, plan: AutoFillPlan): unknown {
-    if (plan.fills.length === 0) return builder;
+    if (plan.bindings.length === 0) return builder;
     return new Proxy(builder as object, {
         get(target, prop, receiver) {
             const v = Reflect.get(target, prop, receiver);
@@ -143,6 +150,20 @@ function wrapInsertBuilder(builder: unknown, plan: AutoFillPlan): unknown {
                 return (v as (input: unknown) => unknown).call(target, filled);
             };
         },
+    });
+}
+
+function missingAuthority(authority: "tenant" | "self"): CdbError {
+    return new CdbError({
+        code: "CDB_FORBIDDEN",
+        message: `${authority} authority is required for this insert`,
+    });
+}
+
+function conflictingAuthority(authority: "tenant" | "self", column: string): CdbError {
+    return new CdbError({
+        code: "CDB_FORBIDDEN",
+        message: `explicit ${authority} column "${column}" conflicts with verified auth`,
     });
 }
 
@@ -164,10 +185,10 @@ export function wrapDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
             if (typeof v !== "function") return v;
             if (prop === "insert") {
                 return (table: SQLiteTable) => {
-                    const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
                     const meta = getCdbMeta(table);
-                    if (!meta) return builder;
-                    return wrapInsertBuilder(builder, buildPlan(table, meta, auth));
+                    const plan = meta ? buildPlan(table, meta, auth) : null;
+                    const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
+                    return plan ? wrapInsertBuilder(builder, plan) : builder;
                 };
             }
             if (prop === "transaction") {

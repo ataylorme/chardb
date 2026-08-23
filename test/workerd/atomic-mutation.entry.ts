@@ -3,6 +3,7 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { isCdbError } from "../../src/errors.ts";
 import { SHARD_BOOTSTRAP_DDL } from "../../src/oplog/schema.ts";
 import { executeAtomicMutation } from "../../src/server/atomic-mutation.ts";
+import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 
 const entries = sqliteTable("atomic_entries", {
@@ -12,8 +13,23 @@ const entries = sqliteTable("atomic_entries", {
 
 const schema = { entries };
 
+const organization = sqliteTable("atomic_organization", { id: text("id").primaryKey() });
+const { cdbTable } = forOrg();
+const securedEntries = cdbTable(
+    "atomic_secured_entries",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organization.id),
+    },
+    { tenantBy: "organizationId" }
+);
+
+const securedSchema = { entries, securedEntries };
+
 interface ExecuteArgs {
-    readonly mode: "commit" | "throw" | "async";
+    readonly mode: "commit" | "throw" | "async" | "forbidden";
     readonly mutId: string;
     readonly firstId: string;
     readonly secondId: string;
@@ -32,6 +48,9 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
                 sql.exec(statement);
             }
             sql.exec("CREATE TABLE IF NOT EXISTS atomic_entries (id TEXT PRIMARY KEY, sequence INTEGER NOT NULL)");
+            sql.exec(
+                "CREATE TABLE IF NOT EXISTS atomic_secured_entries (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL)"
+            );
         });
     }
 
@@ -74,15 +93,24 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
             }
         }
 
-        return executeAtomicMutation({
-            ...common,
-            handler: ({ db }) => {
-                db.insert(entries).values({ id: args.firstId, sequence: 1 }).run();
-                db.insert(entries).values({ id: args.secondId, sequence: 2 }).run();
-                if (args.mode === "throw") throw new Error("probe failure after second statement");
-                return { ids: [args.firstId, args.secondId] };
-            },
-        });
+        try {
+            return executeAtomicMutation({
+                ...common,
+                schema: args.mode === "forbidden" ? securedSchema : schema,
+                handler: ({ db }) => {
+                    db.insert(entries).values({ id: args.firstId, sequence: 1 }).run();
+                    if (args.mode === "forbidden") {
+                        db.insert(securedEntries).values({ id: args.secondId, organizationId: "unverified-org" }).run();
+                    }
+                    db.insert(entries).values({ id: args.secondId, sequence: 2 }).run();
+                    if (args.mode === "throw") throw new Error("probe failure after second statement");
+                    return { ids: [args.firstId, args.secondId] };
+                },
+            });
+        } catch (error) {
+            if (!isCdbError(error)) throw error;
+            return { error: { code: error.code, message: error.message } } as never;
+        }
     }
 
     inspect(): { readonly entries: readonly { id: string; sequence: number }[]; readonly opLogRows: number } {
