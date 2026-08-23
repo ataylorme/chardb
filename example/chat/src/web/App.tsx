@@ -5,7 +5,6 @@ import { useEffect, useState } from "react";
 import { ChannelList } from "./components/ChannelList.tsx";
 import { Composer } from "./components/Composer.tsx";
 import { MessageList } from "./components/MessageList.tsx";
-import { PresenceBar } from "./components/PresenceBar.tsx";
 import { useChatMessages } from "./hooks.ts";
 
 const CHANNELS = [
@@ -85,8 +84,7 @@ function Workspace() {
                     <span className={`status status--${state}`}>{state}</span>
                 </header>
                 <MessageList messages={data} state={state} currentUser={userLabel} />
-                <PresenceBar channelId={channelId} currentUser={userLabel} />
-                <Composer channelId={channelId} currentUser={userLabel} />
+                <Composer channelId={channelId} />
             </main>
         </div>
     );

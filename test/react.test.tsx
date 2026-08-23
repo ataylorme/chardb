@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 import * as React from "react";
 import * as TestRenderer from "react-test-renderer";
 import type { ChardbClient } from "../src/client/index.ts";
+import * as ChardbReact from "../src/react/index.ts";
 import { ChardbProvider, useMutation, useQuery } from "../src/react/index.ts";
 import type { CdbIntent, RawJson } from "../src/wire.ts";
 
@@ -47,6 +48,15 @@ function stubClient() {
 }
 
 describe("chardb/react — hook lifecycle", () => {
+    test("exports only supported hooks", () => {
+        for (const name of ["ChardbProvider", "useChardb", "useQuery", "useMutation", "useSession"]) {
+            expect(name in ChardbReact).toBe(true);
+        }
+        for (const name of ["usePresence", "useUpload", "useStream", "useVectorSearch"]) {
+            expect(name in ChardbReact).toBe(false);
+        }
+    });
+
     test("useQuery subscribes on mount, receives patches, unsubscribes on unmount", () => {
         const { client, subs } = stubClient();
         const intent: CdbIntent = { kind: "select", tables: ["t"] };

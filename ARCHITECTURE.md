@@ -106,7 +106,7 @@ The client opens one WebSocket, sends an intent plus its hash, and tracks the la
 
 Each selected Cdb registers the subscription's table, index, and intervals in an in-memory [`IntervalMap`](src/intervals.ts). `matchSubsForRow` can map a committed row's indexed keys back to affected subscription ids. Gateway code exists to coalesce patches before sending a `poke`.
 
-The missing steps are material: subscription registration does not execute the initial query, query descriptors are not invoked, and committed mutations do not generate row patches through this path. The React presence, upload, stream, and vector hooks are placeholders.
+The missing steps are material: subscription registration does not execute the initial query, query descriptors are not invoked, and committed mutations do not generate row patches through this path. React presence, upload, stream, and vector hooks are not exported until their client paths exist.
 
 ## Schema migration, snapshots, and range movement
 

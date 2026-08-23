@@ -221,7 +221,7 @@ The chat directory now consumes the packed package and passes compile-time check
 - [x] Wire the advertised `explain` command into command dispatch.
 - [x] Keep unfinished commands visible only when help labels them `not implemented`, and make invocation exit nonzero.
 - [ ] Remove reserved HTTP routes that only return 501.
-- [ ] Remove placeholder React hooks from public exports until implemented.
+- [x] Remove placeholder React hooks from public exports until implemented.
 - [x] Remove placeholder file and vector APIs from the main product description.
 - [x] Run each workerd harness in a separate sequential CI process to avoid shared Miniflare ports.
 - [ ] Add one command that starts the example locally with migrations applied.

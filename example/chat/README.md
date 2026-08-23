@@ -112,7 +112,7 @@ function Channel() {
 }
 ```
 
-The rest of this README is the org-tenanted chat schema, the React frontend, and the typing presence the example exercises.
+The rest of this README is the org-tenanted chat schema and React frontend.
 
 ## Layout
 
@@ -126,8 +126,8 @@ src/
   web/
     main.tsx                 createRoot + <StrictMode> + styles.css
     App.tsx                  createAuthClient + <ChardbProvider endpoint=/ws auth={authClient} crossTab>
-    hooks.ts                 useChatMessages / usePostMessage / useTypingPresence
-    components/              ChannelList / MessageList / Composer / PresenceBar
+    hooks.ts                 useChatMessages / usePostMessage
+    components/              ChannelList / MessageList / Composer
     styles.css
 
 index.html                   Vite entry → /src/web/main.tsx
@@ -200,9 +200,9 @@ If a domain table shadows a reserved name (`organization`, `user`, `member`, …
 - Mutation and query handles using the current exported package subpaths.
 - Synchronous mutation handlers compatible with Durable Object SQLite transactions.
 - A browser bundle that consumes the packed package instead of private source subpaths.
-- The intended React surface for auth, mutations, queries, and presence.
+- The intended React surface for auth, mutations, and queries.
 
-The last item is API design, not working runtime behavior. Gateway JWT verification, public mutation dispatch, initial query execution, live updates, and presence hooks remain incomplete. Migration commands also do not apply domain DDL to deployed shards.
+The last item is API design, not working runtime behavior. Gateway JWT verification, public mutation dispatch, initial query execution, and live updates remain incomplete. Presence has no React hook until its client path works. Migration commands also do not apply domain DDL to deployed shards.
 
 ## Running
 

@@ -1,15 +1,13 @@
-import { useMutation, usePresence, useQuery } from "chardb/react";
-import { useCallback, useEffect, useRef } from "react";
+import { useMutation, useQuery } from "chardb/react";
+import { useCallback } from "react";
 import { uuidv7 } from "uuidv7";
-import { postMessage, typing } from "../server/api.ts";
+import { postMessage } from "../server/api.ts";
 import { listMessages } from "../server/queries.ts";
 
 import type { InferRow } from "chardb/react";
 
 type MessageRow = InferRow<typeof listMessages>;
 export type { MessageRow };
-
-const PRESENCE_TTL_MS = 3_000;
 
 export interface ChatMessagesResult {
     readonly data: readonly MessageRow[];
@@ -49,29 +47,4 @@ export function usePostMessage(channelId: string): UsePostMessage {
         [mutate, channelId]
     );
     return { send };
-}
-
-export interface TypingPresence {
-    readonly states: ReadonlyMap<string, { state: { user: string; until: number }; ts: number }>;
-    setTyping(user: string): void;
-}
-
-export function useTypingPresence(channelId: string): TypingPresence {
-    const presence = usePresence<{ user: string; until: number }>(`typing:${channelId}`);
-    const lastPublishedAt = useRef<number>(0);
-    const setTyping = useCallback(
-        (user: string) => {
-            const now = Date.now();
-            if (now - lastPublishedAt.current < 1_000) return;
-            lastPublishedAt.current = now;
-            presence.publish({ user, until: now + PRESENCE_TTL_MS });
-        },
-        [presence]
-    );
-
-    useEffect(() => {
-        void typing(channelId);
-    }, [channelId]);
-
-    return { states: presence.states, setTyping };
 }

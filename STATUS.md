@@ -29,7 +29,7 @@ This status reflects the code in the repository, not the broader product describ
 | Initial query | Missing | A subscription registers intervals but never invokes its query descriptor or returns the initial row set. |
 | Live query update | Missing | Interval matching and patch batching exist, but committed writes do not produce row patches through the public runtime. |
 | WebSocket reconnect and cookies | Isolated | The client state machine is tested with a fake WebSocket. The full Worker, Gateway, and Cdb resume path is not tested together. |
-| Presence | Partial | Gateway publish and fan-out code exists. The React `usePresence` hook returns an empty map and a no-op publisher. |
+| Presence | Partial | Gateway publish and fan-out code exists. No React presence hook is exported because the client path is incomplete. |
 | Auth schema synthesis and SQL operations | Implemented | Core and plugin tables, placement rules, and SQL helpers have focused tests. |
 | Better-auth adapter | Partial | Partition-aware create, read, update, and delete RPCs exist. Adapter transactions are disabled and secondary lookups without the partition column fail. No full sign-in-to-domain-write test exists. |
 | JWT authentication | Partial | Signature, issuer, audience, expiry, and JWK resolution code exists and has unit tests. Gateway hello uses decode-only claims and does not call the verifier. |
@@ -38,8 +38,8 @@ This status reflects the code in the repository, not the broader product describ
 | Snapshot export and restore | Missing | Barrier bookmarks exist. Durable export, restore, and verification do not. |
 | Complete online resharding | Partial | The phase machine and shard RPCs exist, with focused tests and a TLA+ model. Automatic triggers, the entire Resharder RPC sequence, concurrent application writes, and recovery are not validated end to end. |
 | Cross-partition transaction | Isolated | A two-phase protocol and recovery tests exist. The default runtime has no bound participant implementation and raises `CDB_DT_NOT_IMPLEMENTED`. |
-| Files and uploads | Missing | Drizzle column types and validators exist. Runtime handles throw for upload and delete. The feature module exposes no runtime HTTP endpoint. |
-| Vector search and streams | Missing | Types and helper code exist. React hooks return empty placeholder results. The feature modules expose no runtime HTTP endpoints. |
+| Files and uploads | Missing | Drizzle column types and validators exist. Runtime handles throw for upload and delete. No React upload hook or runtime HTTP endpoint is exported. |
+| Vector search and streams | Missing | Types and helper code exist. No React stream or vector-search hooks and no runtime HTTP endpoints are exported. |
 | Operational CLI | Partial | Config rendering, Wrangler checks, explain logic, and deploy-plan helpers exist. Migration apply, shard operations, export, restore, and schedule operations are incomplete or placeholders. |
 
 Only `/ws` and `/_chardb/*` are reserved Chardb routes. `/q`, `/f`, `/p`, and `/s` are not feature endpoints; requests to those paths fall through to the application.

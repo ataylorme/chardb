@@ -259,33 +259,3 @@ export function useSession(): SessionShape {
     const tenantId = (session.data?.session?.activeOrganizationId as string | null | undefined) ?? null;
     return { userId, tenantId, isPending: session.isPending, raw: session.data };
 }
-
-export interface PresenceStates<T> {
-    readonly states: Map<string, { state: T; ts: number }>;
-    publish(state: T): void;
-}
-
-export function usePresence<T>(_key: string): PresenceStates<T> {
-    return {
-        states: new Map(),
-        publish() {
-            /* wired by chardb/server runtime */
-        },
-    };
-}
-
-export function useUpload(): { uploading: boolean } {
-    return { uploading: false };
-}
-
-export function useStream<TChunk>(): AsyncIterable<TChunk> {
-    return {
-        async *[Symbol.asyncIterator]() {
-            /* wired by chardb/server runtime */
-        },
-    };
-}
-
-export function useVectorSearch<T>(): { results: { row: T; score: number }[]; loading: boolean } {
-    return { results: [], loading: false };
-}

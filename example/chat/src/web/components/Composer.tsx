@@ -1,17 +1,15 @@
 import { useCallback, useState } from "react";
-import { usePostMessage, useTypingPresence } from "../hooks.ts";
+import { usePostMessage } from "../hooks.ts";
 
 export interface ComposerProps {
     readonly channelId: string;
-    readonly currentUser: string;
 }
 
-export function Composer({ channelId, currentUser }: ComposerProps) {
+export function Composer({ channelId }: ComposerProps) {
     const [body, setBody] = useState("");
     const [pending, setPending] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const { send } = usePostMessage(channelId);
-    const { setTyping } = useTypingPresence(channelId);
 
     const submit = useCallback(async () => {
         const trimmed = body.trim();
@@ -46,7 +44,6 @@ export function Composer({ channelId, currentUser }: ComposerProps) {
                 disabled={pending}
                 onChange={e => {
                     setBody(e.target.value);
-                    setTyping(currentUser);
                 }}
             />
             <button className="composer__send" type="submit" disabled={!body.trim() || pending}>
