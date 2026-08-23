@@ -43,6 +43,10 @@ export interface CatalogOrganizationAuthorityRpc {
 /** Globally unique identity for one live subscription registration. */
 export interface LiveSubscriptionId {
     readonly gatewayId: string;
+    /** Unique registration generation within one Gateway DO. */
+    readonly registrationId: string;
+    /** Gateway-owned socket generation that created this registration. */
+    readonly connectionId: string;
     readonly clientId: ClientId;
     readonly subId: SubId;
 }

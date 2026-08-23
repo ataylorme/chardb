@@ -23,6 +23,7 @@ import { type JsonText, parseJsonColumn } from "../../oplog/wrapper.ts";
 import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/range.ts";
 import { type TableSpec, renderRowApply, renderTableTriggers } from "../../reshard/triggers.ts";
 import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId } from "../../types.ts";
+import { stableHashHex } from "../../util/canonical.ts";
 import { rawJsonResult } from "../../util/raw_json.ts";
 import { executeAtomicMutation } from "../atomic-mutation.ts";
 import { wrapQueryDb } from "../cdb-db-proxy.ts";
@@ -54,16 +55,40 @@ export interface CdbEnv {
 export type SubscribeArgs = CdbSubscriptionRequest;
 
 const CDB_LOCAL_DDL = `
-CREATE TABLE IF NOT EXISTS _chardb_subscriptions (
+CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
   gateway_id TEXT NOT NULL,
+  registration_id TEXT NOT NULL,
+  connection_id TEXT NOT NULL,
   client_id TEXT NOT NULL,
   sub_id INTEGER NOT NULL,
-  principal_id TEXT NOT NULL,
-  ref TEXT NOT NULL,
-  args_json TEXT NOT NULL,
-  tables_json TEXT NOT NULL,
-  intervals_json TEXT NOT NULL,
-  PRIMARY KEY (gateway_id, client_id, sub_id)
+  state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+  payload_hash TEXT,
+  principal_id TEXT,
+  ref TEXT,
+  args_json TEXT,
+  tables_json TEXT,
+  intervals_json TEXT,
+  PRIMARY KEY (gateway_id, registration_id),
+  CHECK (
+    (
+      state = 'retired'
+      AND payload_hash IS NULL
+      AND principal_id IS NULL
+      AND ref IS NULL
+      AND args_json IS NULL
+      AND tables_json IS NULL
+      AND intervals_json IS NULL
+    )
+    OR (
+      state = 'active'
+      AND payload_hash IS NOT NULL
+      AND principal_id IS NOT NULL
+      AND ref IS NOT NULL
+      AND args_json IS NOT NULL
+      AND tables_json IS NOT NULL
+      AND intervals_json IS NOT NULL
+    )
+  )
 );
 CREATE TABLE IF NOT EXISTS _chardb_domain_schema (
   table_name TEXT PRIMARY KEY,
@@ -72,15 +97,19 @@ CREATE TABLE IF NOT EXISTS _chardb_domain_schema (
 ` as const;
 
 interface StoredSubscriptionRow {
-    readonly [column: string]: string | number;
+    readonly [column: string]: string | number | null;
     readonly gateway_id: string;
+    readonly registration_id: string;
+    readonly connection_id: string;
     readonly client_id: string;
     readonly sub_id: number;
-    readonly principal_id: string;
-    readonly ref: string;
-    readonly args_json: string;
-    readonly tables_json: string;
-    readonly intervals_json: string;
+    readonly state: "active" | "retired";
+    readonly payload_hash: string | null;
+    readonly principal_id: string | null;
+    readonly ref: string | null;
+    readonly args_json: string | null;
+    readonly tables_json: string | null;
+    readonly intervals_json: string | null;
 }
 
 interface PreparedInterval {
@@ -90,7 +119,34 @@ interface PreparedInterval {
 }
 
 function subscriptionKey(subscription: LiveSubscriptionId): string {
-    return JSON.stringify([subscription.gatewayId, subscription.clientId, subscription.subId]);
+    return JSON.stringify([subscription.gatewayId, subscription.registrationId]);
+}
+
+function subscriptionPayloadHash(args: CdbSubscriptionRequest): string {
+    return stableHashHex({
+        connectionId: args.subscription.connectionId,
+        clientId: args.subscription.clientId,
+        subId: args.subscription.subId,
+        principalId: args.principalId,
+        ref: args.ref,
+        args: args.args,
+        tables: args.tables,
+        intervals: args.intervals,
+    });
+}
+
+function subscriptionInvariant(message: string): CdbError {
+    return new CdbError({ code: "CDB_INVARIANT", message });
+}
+
+function sameSubscriptionIdentity(row: StoredSubscriptionRow, subscription: LiveSubscriptionId): boolean {
+    return (
+        row.gateway_id === subscription.gatewayId &&
+        row.registration_id === subscription.registrationId &&
+        row.connection_id === subscription.connectionId &&
+        row.client_id === subscription.clientId &&
+        row.sub_id === subscription.subId
+    );
 }
 
 function domainSchemaMismatch(tableName: string): CdbError {
@@ -156,14 +212,27 @@ export class Cdb extends DurableObject<CdbEnv> {
         sql.exec("PRAGMA foreign_keys = ON");
         this.ensureDomainTables();
         const cursor = this.ctx.storage.sql.exec<StoredSubscriptionRow>(
-            `SELECT gateway_id, client_id, sub_id, principal_id, ref, args_json, tables_json, intervals_json
-             FROM _chardb_subscriptions
-             ORDER BY gateway_id, client_id, sub_id`
+            `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+                    principal_id, ref, args_json, tables_json, intervals_json
+             FROM _chardb_live_subscriptions
+             WHERE state = 'active'
+             ORDER BY gateway_id, registration_id`
         );
         for (const row of cursor) {
+            if (
+                row.principal_id === null ||
+                row.ref === null ||
+                row.args_json === null ||
+                row.tables_json === null ||
+                row.intervals_json === null
+            ) {
+                throw subscriptionInvariant("active live subscription is missing its persisted payload");
+            }
             const request: CdbSubscriptionRequest = {
                 subscription: {
                     gatewayId: row.gateway_id,
+                    registrationId: row.registration_id,
+                    connectionId: row.connection_id,
                     clientId: ClientId(row.client_id),
                     subId: SubId(row.sub_id),
                 },
@@ -173,6 +242,11 @@ export class Cdb extends DurableObject<CdbEnv> {
                 tables: JSON.parse(row.tables_json) as readonly string[],
                 intervals: JSON.parse(row.intervals_json) as CdbSubscriptionRequest["intervals"],
             };
+            if (row.payload_hash !== subscriptionPayloadHash(request)) {
+                throw subscriptionInvariant(
+                    "active live subscription payload hash does not match its persisted payload"
+                );
+            }
             this.installSubscription(request.subscription, this.prepareIntervals(request));
         }
         this.bootstrapped = true;
@@ -263,21 +337,40 @@ export class Cdb extends DurableObject<CdbEnv> {
      */
     async subscribe(args: SubscribeArgs): Promise<{ subscription: LiveSubscriptionId }> {
         const intervals = this.prepareIntervals(args);
+        const payloadHash = subscriptionPayloadHash(args);
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
-            sql.exec(
-                `INSERT INTO _chardb_subscriptions
-                 (gateway_id, client_id, sub_id, principal_id, ref, args_json, tables_json, intervals_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(gateway_id, client_id, sub_id) DO UPDATE SET
-                   principal_id = excluded.principal_id,
-                   ref = excluded.ref,
-                   args_json = excluded.args_json,
-                   tables_json = excluded.tables_json,
-                   intervals_json = excluded.intervals_json`,
+            const existing = sql.one<StoredSubscriptionRow>(
+                `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+                        principal_id, ref, args_json, tables_json, intervals_json
+                 FROM _chardb_live_subscriptions
+                 WHERE gateway_id = ? AND registration_id = ?`,
                 args.subscription.gatewayId,
+                args.subscription.registrationId
+            );
+            if (existing) {
+                if (!sameSubscriptionIdentity(existing, args.subscription)) {
+                    throw subscriptionInvariant("live subscription registration identity changed across an RPC replay");
+                }
+                if (existing.state === "retired") {
+                    throw subscriptionInvariant("retired live subscription registration cannot be reactivated");
+                }
+                if (existing.payload_hash !== payloadHash) {
+                    throw subscriptionInvariant("live subscription registration payload changed across an RPC replay");
+                }
+                return;
+            }
+            sql.exec(
+                `INSERT INTO _chardb_live_subscriptions
+                 (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+                  principal_id, ref, args_json, tables_json, intervals_json)
+                 VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)`,
+                args.subscription.gatewayId,
+                args.subscription.registrationId,
+                args.subscription.connectionId,
                 args.subscription.clientId,
                 args.subscription.subId,
+                payloadHash,
                 args.principalId,
                 args.ref,
                 JSON.stringify(args.args),
@@ -293,9 +386,32 @@ export class Cdb extends DurableObject<CdbEnv> {
         const key = subscriptionKey(subscription);
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
-            sql.exec(
-                "DELETE FROM _chardb_subscriptions WHERE gateway_id = ? AND client_id = ? AND sub_id = ?",
+            const existing = sql.one<StoredSubscriptionRow>(
+                `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+                        principal_id, ref, args_json, tables_json, intervals_json
+                 FROM _chardb_live_subscriptions
+                 WHERE gateway_id = ? AND registration_id = ?`,
                 subscription.gatewayId,
+                subscription.registrationId
+            );
+            if (existing && !sameSubscriptionIdentity(existing, subscription)) {
+                throw subscriptionInvariant("live subscription unregister identity does not match its registration");
+            }
+            sql.exec(
+                `INSERT INTO _chardb_live_subscriptions
+                 (gateway_id, registration_id, connection_id, client_id, sub_id, state)
+                 VALUES (?, ?, ?, ?, ?, 'retired')
+                 ON CONFLICT(gateway_id, registration_id) DO UPDATE SET
+                   state = 'retired',
+                   payload_hash = NULL,
+                   principal_id = NULL,
+                   ref = NULL,
+                   args_json = NULL,
+                   tables_json = NULL,
+                   intervals_json = NULL`,
+                subscription.gatewayId,
+                subscription.registrationId,
+                subscription.connectionId,
                 subscription.clientId,
                 subscription.subId
             );

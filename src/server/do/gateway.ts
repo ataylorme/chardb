@@ -342,14 +342,22 @@ export function gatewayErrorEnvelope(
     };
 }
 
-/** Build a stable subscription identity from Gateway-owned values. */
-export function gatewaySubscriptionId(gatewayId: string, clientId: ClientId, subId: SubId): LiveSubscriptionId {
-    return { gatewayId, clientId, subId };
+/** Build a generation-specific subscription identity from Gateway-owned values. */
+export function gatewaySubscriptionId(
+    gatewayId: string,
+    registrationId: string,
+    connectionId: string,
+    clientId: ClientId,
+    subId: SubId
+): LiveSubscriptionId {
+    return { gatewayId, registrationId, connectionId, clientId, subId };
 }
 
 /** Build the serializable Cdb subscription RPC from server-owned routing data. */
 export function cdbSubscriptionRequest(input: {
     readonly gatewayId: string;
+    readonly registrationId: string;
+    readonly connectionId: string;
     readonly clientId: ClientId;
     readonly subId: SubId;
     readonly principalId: PrincipalId;
@@ -358,7 +366,13 @@ export function cdbSubscriptionRequest(input: {
     readonly intent: CdbIntent;
 }): CdbSubscriptionRequest {
     return {
-        subscription: gatewaySubscriptionId(input.gatewayId, input.clientId, input.subId),
+        subscription: gatewaySubscriptionId(
+            input.gatewayId,
+            input.registrationId,
+            input.connectionId,
+            input.clientId,
+            input.subId
+        ),
         principalId: input.principalId,
         ref: input.ref,
         args: input.args,
@@ -369,6 +383,27 @@ export function cdbSubscriptionRequest(input: {
             intervals: bundle.intervals,
         })),
     };
+}
+
+interface StoredCdbRegistration {
+    readonly registrationId: string;
+    readonly connectionId: string;
+}
+
+function parseStoredCdbRegistration(encoded: string): StoredCdbRegistration | null {
+    let value: unknown;
+    try {
+        value = JSON.parse(encoded);
+    } catch {
+        return null;
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const registration = (value as Record<string, unknown>).registration;
+    if (typeof registration !== "object" || registration === null || Array.isArray(registration)) return null;
+    const record = registration as Record<string, unknown>;
+    return typeof record.registrationId === "string" && typeof record.connectionId === "string"
+        ? { registrationId: record.registrationId, connectionId: record.connectionId }
+        : null;
 }
 
 export interface GatewayJwtVerificationRequest {
@@ -1148,7 +1183,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
         args: RawJson,
         queryHash: string,
         intent: CdbIntent,
-        principalId: PrincipalId
+        principalId: PrincipalId,
+        connectionId: string,
+        registrationId: string
     ): Promise<void> {
         const shardIds = await shardsForIntent(this.catalog(), intent);
         const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -1160,7 +1197,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             subId,
             queryHash,
             JSON.stringify([...shardIds]),
-            JSON.stringify({ ref, args, intent }),
+            JSON.stringify({ ref, args, intent, registration: { registrationId, connectionId } }),
             Date.now()
         );
         for (const shardId of shardIds) {
@@ -1173,6 +1210,8 @@ export class Gateway extends DurableObject<GatewayEnv> {
         }
         const request = cdbSubscriptionRequest({
             gatewayId: this.ctx.id.toString(),
+            registrationId,
+            connectionId,
             clientId,
             subId,
             principalId,
@@ -1197,11 +1236,24 @@ export class Gateway extends DurableObject<GatewayEnv> {
             subId
         );
         for (const r of cur) shards.push(r.shard_id);
+        const stored = sql.one<{ intent_blob: string }>(
+            "SELECT intent_blob FROM _gw_subs WHERE client_id = ? AND sub_id = ?",
+            clientId,
+            subId
+        );
+        const registration = stored ? parseStoredCdbRegistration(stored.intent_blob) : null;
         sql.exec("DELETE FROM _gw_subs WHERE client_id = ? AND sub_id = ?", clientId, subId);
         sql.exec("DELETE FROM _gw_shard_subs WHERE client_id = ? AND sub_id = ?", clientId, subId);
+        if (!registration) return;
         await Promise.all(
             shards.map(async shardId => {
-                const subscription = gatewaySubscriptionId(this.ctx.id.toString(), clientId, subId);
+                const subscription = gatewaySubscriptionId(
+                    this.ctx.id.toString(),
+                    registration.registrationId,
+                    registration.connectionId,
+                    clientId,
+                    subId
+                );
                 await this.cdb(shardId).unsubscribe(subscription);
             })
         );

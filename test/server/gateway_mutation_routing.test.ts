@@ -84,6 +84,8 @@ describe("trusted Gateway mutation dispatch", () => {
         expect(
             cdbSubscriptionRequest({
                 gatewayId: "gateway-do-7",
+                registrationId: "registration-9",
+                connectionId: "connection-5",
                 clientId: ClientId("client-3"),
                 subId: SubId(4),
                 principalId: PrincipalId("user-1"),
@@ -98,6 +100,8 @@ describe("trusted Gateway mutation dispatch", () => {
         ).toEqual({
             subscription: {
                 gatewayId: "gateway-do-7",
+                registrationId: "registration-9",
+                connectionId: "connection-5",
                 clientId: ClientId("client-3"),
                 subId: SubId(4),
             },
