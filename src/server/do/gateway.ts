@@ -97,8 +97,10 @@ CREATE TABLE IF NOT EXISTS _gw_registration_generations (
   delivered_version INTEGER NOT NULL CHECK (delivered_version >= 0 AND delivered_version <= dirty_version),
   run_token TEXT,
   run_target_version INTEGER CHECK (run_target_version IS NULL OR (run_target_version >= 0 AND run_target_version <= dirty_version)),
+  run_lease_expires_at INTEGER CHECK (run_lease_expires_at IS NULL OR run_lease_expires_at >= 0),
   run_version INTEGER NOT NULL CHECK (run_version >= 0),
   last_cookie TEXT,
+  last_snapshot_cookie TEXT,
   retry_count INTEGER NOT NULL CHECK (retry_count >= 0),
   retry_at INTEGER CHECK (retry_at IS NULL OR retry_at >= 0),
   retry_error TEXT,
@@ -117,6 +119,21 @@ CREATE TABLE IF NOT EXISTS _gw_registration_heads (
   UNIQUE (registration_id),
   FOREIGN KEY (registration_id) REFERENCES _gw_registration_generations(registration_id)
 );
+CREATE TABLE IF NOT EXISTS _gw_snapshot_outbox (
+  registration_id TEXT PRIMARY KEY,
+  cookie TEXT NOT NULL UNIQUE,
+  target_version INTEGER NOT NULL CHECK (target_version >= 0),
+  rows_json TEXT NOT NULL,
+  byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+  send_attempts INTEGER NOT NULL DEFAULT 0 CHECK (send_attempts >= 0),
+  next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
+  last_sent_at INTEGER CHECK (last_sent_at IS NULL OR last_sent_at >= 0),
+  last_error TEXT,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  FOREIGN KEY (registration_id) REFERENCES _gw_registration_generations(registration_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS _gw_snapshot_outbox_due
+  ON _gw_snapshot_outbox (next_attempt_at, registration_id);
 ` as const;
 
 const GW_DDL = `
@@ -536,7 +553,6 @@ export interface GatewayRegistrationAdvance extends GatewayRegistrationKey {
     readonly cdbState: GatewayRegistrationCdbState;
     readonly dirtyVersion: number;
     readonly deliveredVersion: number;
-    readonly runToken: string | null;
     readonly lastCookie: Cookie | null;
     readonly retryCount: number;
     readonly retryAt: number | null;
@@ -562,6 +578,60 @@ export interface GatewayInitialSnapshotSettle extends GatewayRegistrationKey {
     readonly connectionId: string;
     readonly runToken: string;
     readonly lastCookie: Cookie;
+    readonly nowMs: number;
+}
+
+export interface GatewayDirtyRunClaim extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly nowMs: number;
+    readonly leaseExpiresAt: number;
+}
+
+export interface GatewayDirtyRun {
+    readonly targetVersion: number;
+    readonly runToken: string;
+    readonly runVersion: number;
+    readonly leaseExpiresAt: number;
+    readonly reclaimed: boolean;
+}
+
+export interface GatewaySnapshotStage extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly runToken: string;
+    readonly runVersion: number;
+    readonly targetVersion: number;
+    readonly cookie: Cookie;
+    readonly rows: readonly RawJson[];
+    readonly authEpochs: {
+        readonly global: number;
+        readonly tenant: number;
+        readonly principal: number;
+    };
+    readonly nowMs: number;
+}
+
+export interface GatewaySnapshotSendClaim {
+    readonly nowMs: number;
+    readonly attemptExpiresAt: number;
+}
+
+export interface GatewaySnapshotSendAttempt extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly cookie: Cookie;
+    readonly targetVersion: number;
+    readonly rows: readonly RawJson[];
+    readonly byteSize: number;
+    readonly sendAttempts: number;
+    readonly nextAttemptAt: number;
+}
+
+export interface GatewaySnapshotAcknowledge extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly cookie: Cookie;
     readonly nowMs: number;
 }
 
@@ -610,10 +680,11 @@ export function installGatewayRegistration(
          (registration_id, principal_id, client_id, sub_id, connection_id, organization_id,
           ref, args_json, intent_json, query_hash, shard_id, source_cdb_id, schema_epoch,
           auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
-          lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_target_version, run_version,
+          lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_target_version,
+          run_lease_expires_at, run_version,
           last_cookie, retry_count, retry_at, retry_error, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 'installing', 'pending', 0, 0, NULL, NULL, 0, ?, 0, NULL, NULL, ?, ?)`,
+                 'installing', 'pending', 0, 0, NULL, NULL, NULL, 0, ?, 0, NULL, NULL, ?, ?)`,
         input.registrationId,
         input.principalId,
         input.clientId,
@@ -638,6 +709,7 @@ export function installGatewayRegistration(
         sql.exec(
             `UPDATE _gw_registration_generations
              SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
+                 run_lease_expires_at = NULL,
                  run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
              WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
             input.nowMs,
@@ -647,6 +719,7 @@ export function installGatewayRegistration(
             input.clientId,
             input.subId
         );
+        sql.exec("DELETE FROM _gw_snapshot_outbox WHERE registration_id = ?", previous.registration_id);
     }
     sql.exec(
         `INSERT INTO _gw_registration_heads
@@ -677,7 +750,8 @@ export function advanceGatewayRegistration(sql: SyncSql, input: GatewayRegistrat
     sql.exec(
         `UPDATE _gw_registration_generations
          SET lifecycle = ?, cdb_state = ?, dirty_version = ?, delivered_version = ?,
-             run_token = ?, run_target_version = NULL, run_version = run_version + 1, last_cookie = ?,
+             run_token = NULL, run_target_version = NULL, run_lease_expires_at = NULL,
+             run_version = run_version + 1, last_cookie = ?,
              retry_count = ?, retry_at = ?, retry_error = ?, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
            AND run_version = ?
@@ -690,7 +764,6 @@ export function advanceGatewayRegistration(sql: SyncSql, input: GatewayRegistrat
         input.cdbState,
         input.dirtyVersion,
         input.deliveredVersion,
-        input.runToken,
         input.lastCookie,
         input.retryCount,
         input.retryAt,
@@ -799,7 +872,8 @@ export function settleInitialGatewaySnapshot(sql: SyncSql, input: GatewayInitial
     sql.exec(
         `UPDATE _gw_registration_generations
          SET lifecycle = 'active', delivered_version = MAX(delivered_version, run_target_version),
-             run_token = NULL, run_target_version = NULL, run_version = run_version + 1,
+             run_token = NULL, run_target_version = NULL, run_lease_expires_at = NULL,
+             run_version = run_version + 1,
              last_cookie = ?, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
            AND connection_id = ? AND lifecycle = 'installing' AND cdb_state = 'active'
@@ -821,6 +895,337 @@ export function settleInitialGatewaySnapshot(sql: SyncSql, input: GatewayInitial
         input.runToken
     );
     return sql.changes() === 1;
+}
+
+/**
+ * Claim an exact current dirty generation. An expired owner may be replaced,
+ * but a staged snapshot blocks another query until its cookie is acknowledged.
+ * The caller must wrap the select and update in one transaction.
+ */
+export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyRunClaim): GatewayDirtyRun | null {
+    assertGatewayRegistrationIdentity(input);
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    assertNonnegativeSafeInteger(input.leaseExpiresAt, "leaseExpiresAt");
+    if (input.leaseExpiresAt <= input.nowMs) throw new TypeError("leaseExpiresAt must be later than nowMs");
+    const current = sql.one<{
+        dirty_version: number;
+        delivered_version: number;
+        run_token: string | null;
+        run_version: number;
+    }>(
+        `SELECT g.dirty_version, g.delivered_version, g.run_token, g.run_version
+         FROM _gw_registration_generations g
+         INNER JOIN _gw_registration_heads h
+           ON h.registration_id = g.registration_id
+          AND h.principal_id = g.principal_id
+          AND h.client_id = g.client_id
+          AND h.sub_id = g.sub_id
+         WHERE g.registration_id = ? AND g.principal_id = ? AND g.client_id = ? AND g.sub_id = ?
+           AND g.connection_id = ? AND g.lifecycle = 'active' AND g.cdb_state = 'active'
+           AND g.dirty_version > g.delivered_version
+           AND (g.retry_at IS NULL OR g.retry_at <= ?)
+           AND NOT EXISTS (
+             SELECT 1 FROM _gw_snapshot_outbox o WHERE o.registration_id = g.registration_id
+           )
+           AND (
+             (g.run_token IS NULL AND g.run_target_version IS NULL AND g.run_lease_expires_at IS NULL)
+             OR
+             (g.run_token IS NOT NULL AND g.run_target_version IS NOT NULL
+              AND g.run_lease_expires_at IS NOT NULL AND g.run_lease_expires_at <= ?)
+           )`,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId,
+        input.nowMs,
+        input.nowMs
+    );
+    if (!current) return null;
+
+    const runToken = crypto.randomUUID();
+    const runVersion = current.run_version + 1;
+    const targetVersion = current.dirty_version;
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET run_token = ?, run_target_version = ?, run_lease_expires_at = ?,
+             run_version = run_version + 1, updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND lifecycle = 'active' AND cdb_state = 'active'
+           AND dirty_version = ? AND delivered_version = ? AND run_version = ?
+           AND (retry_at IS NULL OR retry_at <= ?)
+           AND NOT EXISTS (
+             SELECT 1 FROM _gw_snapshot_outbox o
+             WHERE o.registration_id = _gw_registration_generations.registration_id
+           )
+           AND (
+             (run_token IS NULL AND run_target_version IS NULL AND run_lease_expires_at IS NULL)
+             OR
+             (run_token IS NOT NULL AND run_target_version IS NOT NULL
+              AND run_lease_expires_at IS NOT NULL AND run_lease_expires_at <= ?)
+           )
+           AND EXISTS (
+             SELECT 1 FROM _gw_registration_heads h
+             WHERE h.registration_id = _gw_registration_generations.registration_id
+               AND h.principal_id = _gw_registration_generations.principal_id
+               AND h.client_id = _gw_registration_generations.client_id
+               AND h.sub_id = _gw_registration_generations.sub_id
+           )`,
+        runToken,
+        targetVersion,
+        input.leaseExpiresAt,
+        input.nowMs,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId,
+        current.dirty_version,
+        current.delivered_version,
+        current.run_version,
+        input.nowMs,
+        input.nowMs
+    );
+    if (sql.changes() !== 1) return null;
+    return {
+        targetVersion,
+        runToken,
+        runVersion,
+        leaseExpiresAt: input.leaseExpiresAt,
+        reclaimed: current.run_token !== null,
+    };
+}
+
+/** Stage query rows durably without claiming client delivery. Wrap this helper in one transaction. */
+export function stageGatewaySnapshot(sql: SyncSql, input: GatewaySnapshotStage): boolean {
+    assertGatewayRegistrationIdentity(input);
+    if (input.runToken.length === 0) throw new TypeError("runToken must be nonempty");
+    if (input.cookie.length === 0) throw new TypeError("cookie must be nonempty");
+    assertNonnegativeSafeInteger(input.runVersion, "runVersion");
+    assertNonnegativeSafeInteger(input.targetVersion, "targetVersion");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    for (const [name, value] of [
+        ["authEpochs.global", input.authEpochs.global],
+        ["authEpochs.tenant", input.authEpochs.tenant],
+        ["authEpochs.principal", input.authEpochs.principal],
+    ] as const) {
+        assertNonnegativeSafeInteger(value, name);
+    }
+    if (!Array.isArray(input.rows)) throw new TypeError("rows must be a JSON array");
+    const rows = rawJsonResult(input.rows, "Gateway snapshot rows");
+    if (!Array.isArray(rows)) throw new TypeError("rows must be a JSON array");
+    const rowsJson = stableJson(rows);
+    const byteSize = new TextEncoder().encode(rowsJson).byteLength;
+
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET run_token = NULL, run_target_version = NULL, run_lease_expires_at = NULL,
+             run_version = run_version + 1,
+             auth_global_epoch = ?, auth_tenant_epoch = ?, auth_principal_epoch = ?,
+             retry_count = 0, retry_at = NULL, retry_error = NULL, updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND lifecycle = 'active' AND cdb_state = 'active'
+           AND run_token = ? AND run_target_version = ? AND run_version = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM _gw_snapshot_outbox o
+             WHERE o.registration_id = _gw_registration_generations.registration_id
+           )
+           AND EXISTS (
+             SELECT 1 FROM _gw_registration_heads h
+             WHERE h.registration_id = _gw_registration_generations.registration_id
+               AND h.principal_id = _gw_registration_generations.principal_id
+               AND h.client_id = _gw_registration_generations.client_id
+               AND h.sub_id = _gw_registration_generations.sub_id
+           )`,
+        input.authEpochs.global,
+        input.authEpochs.tenant,
+        input.authEpochs.principal,
+        input.nowMs,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId,
+        input.runToken,
+        input.targetVersion,
+        input.runVersion
+    );
+    if (sql.changes() !== 1) return false;
+    sql.exec(
+        `INSERT INTO _gw_snapshot_outbox
+         (registration_id, cookie, target_version, rows_json, byte_size,
+          send_attempts, next_attempt_at, last_sent_at, last_error, created_at)
+         VALUES (?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?)`,
+        input.registrationId,
+        input.cookie,
+        input.targetVersion,
+        rowsJson,
+        byteSize,
+        input.nowMs,
+        input.nowMs
+    );
+    return true;
+}
+
+/** Claim the oldest due staged snapshot and defer its next send attempt. The caller must use one transaction. */
+export function claimDueGatewaySnapshot(
+    sql: SyncSql,
+    input: GatewaySnapshotSendClaim
+): GatewaySnapshotSendAttempt | null {
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    assertNonnegativeSafeInteger(input.attemptExpiresAt, "attemptExpiresAt");
+    if (input.attemptExpiresAt <= input.nowMs) {
+        throw new TypeError("attemptExpiresAt must be later than nowMs");
+    }
+    const due = sql.one<{
+        registration_id: string;
+        principal_id: string;
+        client_id: string;
+        sub_id: number;
+        connection_id: string;
+        cookie: string;
+        target_version: number;
+        rows_json: string;
+        byte_size: number;
+        send_attempts: number;
+        next_attempt_at: number;
+    }>(
+        `SELECT o.registration_id, g.principal_id, g.client_id, g.sub_id, g.connection_id,
+                o.cookie, o.target_version, o.rows_json, o.byte_size, o.send_attempts, o.next_attempt_at
+         FROM _gw_snapshot_outbox o
+         INNER JOIN _gw_registration_generations g ON g.registration_id = o.registration_id
+         INNER JOIN _gw_registration_heads h
+           ON h.registration_id = g.registration_id
+          AND h.principal_id = g.principal_id
+          AND h.client_id = g.client_id
+          AND h.sub_id = g.sub_id
+         WHERE o.next_attempt_at <= ? AND g.lifecycle = 'active' AND g.cdb_state = 'active'
+         ORDER BY o.next_attempt_at, o.registration_id
+         LIMIT 1`,
+        input.nowMs
+    );
+    if (!due) return null;
+    sql.exec(
+        `UPDATE _gw_snapshot_outbox
+         SET send_attempts = send_attempts + 1, next_attempt_at = ?, last_sent_at = ?
+         WHERE registration_id = ? AND cookie = ? AND target_version = ?
+           AND send_attempts = ? AND next_attempt_at = ? AND next_attempt_at <= ?`,
+        input.attemptExpiresAt,
+        input.nowMs,
+        due.registration_id,
+        due.cookie,
+        due.target_version,
+        due.send_attempts,
+        due.next_attempt_at,
+        input.nowMs
+    );
+    if (sql.changes() !== 1) return null;
+    let decoded: unknown;
+    try {
+        decoded = JSON.parse(due.rows_json);
+    } catch (cause) {
+        throw gatewayInvalidationInvariant("staged Gateway snapshot rows are not valid JSON", cause);
+    }
+    const rows = rawJsonResult(decoded, "staged Gateway snapshot rows");
+    if (!Array.isArray(rows)) throw gatewayInvalidationInvariant("staged Gateway snapshot rows are not an array");
+    return {
+        principalId: PrincipalId(due.principal_id),
+        clientId: ClientId(due.client_id),
+        subId: SubId(due.sub_id),
+        registrationId: due.registration_id,
+        connectionId: due.connection_id,
+        cookie: Cookie(due.cookie),
+        targetVersion: due.target_version,
+        rows,
+        byteSize: due.byte_size,
+        sendAttempts: due.send_attempts + 1,
+        nextAttemptAt: input.attemptExpiresAt,
+    };
+}
+
+/** Advance delivery only to the version owned by one exact staged cookie. The caller must use one transaction. */
+export function acknowledgeGatewaySnapshot(sql: SyncSql, input: GatewaySnapshotAcknowledge): boolean {
+    assertGatewayRegistrationIdentity(input);
+    if (input.cookie.length === 0) throw new TypeError("cookie must be nonempty");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    const staged = sql.one<{ target_version: number }>(
+        `SELECT o.target_version
+         FROM _gw_snapshot_outbox o
+         INNER JOIN _gw_registration_generations g ON g.registration_id = o.registration_id
+         INNER JOIN _gw_registration_heads h
+           ON h.registration_id = g.registration_id
+          AND h.principal_id = g.principal_id
+          AND h.client_id = g.client_id
+          AND h.sub_id = g.sub_id
+         WHERE o.registration_id = ? AND o.cookie = ?
+           AND o.send_attempts > 0 AND o.last_sent_at IS NOT NULL
+           AND g.principal_id = ? AND g.client_id = ? AND g.sub_id = ? AND g.connection_id = ?
+           AND g.lifecycle = 'active' AND g.cdb_state = 'active'`,
+        input.registrationId,
+        input.cookie,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    if (!staged) {
+        return Boolean(
+            sql.one<{ registration_id: string }>(
+                `SELECT g.registration_id
+                 FROM _gw_registration_generations g
+                 INNER JOIN _gw_registration_heads h
+                   ON h.registration_id = g.registration_id
+                  AND h.principal_id = g.principal_id
+                  AND h.client_id = g.client_id
+                  AND h.sub_id = g.sub_id
+                 WHERE g.registration_id = ? AND g.principal_id = ? AND g.client_id = ? AND g.sub_id = ?
+                   AND g.connection_id = ? AND g.lifecycle = 'active' AND g.cdb_state = 'active'
+                   AND g.last_snapshot_cookie = ?`,
+                input.registrationId,
+                input.principalId,
+                input.clientId,
+                input.subId,
+                input.connectionId,
+                input.cookie
+            )
+        );
+    }
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET delivered_version = MAX(delivered_version, ?), last_cookie = ?, last_snapshot_cookie = ?, updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND lifecycle = 'active' AND cdb_state = 'active'
+           AND delivered_version <= ? AND dirty_version >= ?
+           AND EXISTS (
+             SELECT 1 FROM _gw_registration_heads h
+             WHERE h.registration_id = _gw_registration_generations.registration_id
+               AND h.principal_id = _gw_registration_generations.principal_id
+               AND h.client_id = _gw_registration_generations.client_id
+               AND h.sub_id = _gw_registration_generations.sub_id
+           )`,
+        staged.target_version,
+        input.cookie,
+        input.cookie,
+        input.nowMs,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId,
+        staged.target_version,
+        staged.target_version
+    );
+    if (sql.changes() !== 1) return false;
+    sql.exec(
+        "DELETE FROM _gw_snapshot_outbox WHERE registration_id = ? AND cookie = ? AND target_version = ?",
+        input.registrationId,
+        input.cookie,
+        staged.target_version
+    );
+    if (sql.changes() !== 1) {
+        throw gatewayInvalidationInvariant("staged Gateway snapshot disappeared during acknowledgement");
+    }
+    return true;
 }
 
 /** Return current, internally consistent generations owned by one socket generation. */
@@ -895,6 +1300,7 @@ export function retireCurrentGatewayRegistration(
     sql.exec(
         `UPDATE _gw_registration_generations
          SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
+             run_lease_expires_at = NULL,
              run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
            AND connection_id = ?`,
@@ -909,6 +1315,7 @@ export function retireCurrentGatewayRegistration(
     if (sql.changes() !== 1) {
         throw gatewayInvalidationInvariant("current Gateway registration disappeared during retirement");
     }
+    sql.exec("DELETE FROM _gw_snapshot_outbox WHERE registration_id = ?", current.registration_id);
     sql.exec(
         `DELETE FROM _gw_registration_heads
          WHERE principal_id = ? AND client_id = ? AND sub_id = ? AND registration_id = ?`,
@@ -975,6 +1382,7 @@ export function retireGatewayRegistration(
     sql.exec(
         `UPDATE _gw_registration_generations
          SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
+             run_lease_expires_at = NULL,
              run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
         nowMs,
@@ -984,6 +1392,7 @@ export function retireGatewayRegistration(
         key.clientId,
         key.subId
     );
+    sql.exec("DELETE FROM _gw_snapshot_outbox WHERE registration_id = ?", registrationId);
     return true;
 }
 
@@ -1075,6 +1484,28 @@ function ensureGatewayRegistrationColumns(sql: SyncSql): void {
              CHECK (run_target_version IS NULL OR (run_target_version >= 0 AND run_target_version <= dirty_version))`
         );
     }
+    if (!columns.has("run_lease_expires_at")) {
+        sql.exec(
+            `ALTER TABLE _gw_registration_generations
+             ADD COLUMN run_lease_expires_at INTEGER
+             CHECK (run_lease_expires_at IS NULL OR run_lease_expires_at >= 0)`
+        );
+    }
+    if (!columns.has("last_snapshot_cookie")) {
+        sql.exec("ALTER TABLE _gw_registration_generations ADD COLUMN last_snapshot_cookie TEXT");
+    }
+    // Run this after every restart. A crash after ALTER but before repair must
+    // not leave a partial run triple that no claimant can recover.
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET run_token = NULL, run_target_version = NULL,
+             run_lease_expires_at = NULL, run_version = run_version + 1
+         WHERE NOT (
+           (run_token IS NULL AND run_target_version IS NULL AND run_lease_expires_at IS NULL)
+           OR
+           (run_token IS NOT NULL AND run_target_version IS NOT NULL AND run_lease_expires_at IS NOT NULL)
+         )`
+    );
 }
 
 function gatewayInvalidationInvariant(message: string, cause?: unknown): CdbError {
