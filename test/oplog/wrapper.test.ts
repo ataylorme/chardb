@@ -157,4 +157,28 @@ describe("op-log wrapper — D3 idempotency", () => {
         expect(captured?.code).toBe("CDB_TXN_ABORTED_EVICTION");
         expect(captured?.toJSON().retryable).toBe(true);
     });
+
+    test("a non-JSON handler result raises a typed error and rolls back its provisional op-log row", () => {
+        let captured: CdbError | undefined;
+        try {
+            db.transaction(() =>
+                runWrappedMutation({
+                    sql,
+                    principalId: PRINCIPAL,
+                    mutId: MutId("invalid-result"),
+                    canonicalRequest: canonicalRequest("invalidResult", {}),
+                    schemaEpoch: 1,
+                    nowMs: 1_700_000_000_000,
+                    cookie: Cookie("c-invalid"),
+                    run: () => ({ status: "ok", result: 1n, rowsAffected: 0 }),
+                })
+            )();
+        } catch (error) {
+            if (error instanceof CdbError) captured = error;
+        }
+
+        expect(captured?.code).toBe("CDB_INVARIANT");
+        expect(captured?.message).toContain("mutation result is not JSON at $");
+        expect((db.prepare("SELECT COUNT(*) AS count FROM _chardb_op_log").get() as { count: number }).count).toBe(0);
+    });
 });

@@ -13,7 +13,7 @@ import { readRef } from "../../src/server/refs.ts";
 
 describe("defineXxx — function-ref identity", () => {
     test("defineMutation attaches __chardbRef and __chardbKind", async () => {
-        const fn = defineMutation(async ({ db: _ }: { db: unknown }, args: { x: number }) => args.x + 1);
+        const fn = defineMutation(({ db: _ }: { db: unknown }, args: { x: number }) => args.x + 1);
         expect(fn.__chardbKind).toBe("mutation");
         expect(typeof fn.__chardbRef).toBe("string");
         expect(readRef(fn)).toBeDefined();
@@ -48,7 +48,7 @@ describe("defineXxx — function-ref identity", () => {
 
     test("singlePartition: true ⇒ chardb defaults `__chardbIdempotencyTtl` to 24h", () => {
         const fn = defineMutation<unknown, { id: string }, { ok: boolean }>({
-            handler: async (_ctx: MutationCtx<unknown>, _args) => ({ ok: true }),
+            handler: (_ctx: MutationCtx<unknown>, _args) => ({ ok: true }),
             singlePartition: true,
             partitionKey: "id",
         });
@@ -57,7 +57,7 @@ describe("defineXxx — function-ref identity", () => {
 
     test("explicit idempotencyTtl wins over the singlePartition default", () => {
         const fn = defineMutation<unknown, { id: string }, { ok: boolean }>({
-            handler: async (_ctx: MutationCtx<unknown>, _args) => ({ ok: true }),
+            handler: (_ctx: MutationCtx<unknown>, _args) => ({ ok: true }),
             singlePartition: true,
             idempotencyTtl: "24h",
             partitionKey: "id",
@@ -70,14 +70,14 @@ describe("defineXxx — function-ref identity", () => {
 
     test("singlePartition: false ⇒ no idempotency horizon set by default", () => {
         const fn = defineMutation<unknown, { id: string }, { ok: boolean }>({
-            handler: async (_ctx: MutationCtx<unknown>, _args) => ({ ok: true }),
+            handler: (_ctx: MutationCtx<unknown>, _args) => ({ ok: true }),
         });
         expect((fn as unknown as { __chardbIdempotencyTtl?: string }).__chardbIdempotencyTtl).toBeUndefined();
     });
 
     test("declaring partitionKey implies singlePartition AND the 24h idempotency horizon", () => {
         const fn = defineMutation<unknown, { organizationId: string }, { ok: boolean }>({
-            handler: async (_ctx: MutationCtx<unknown>, _args) => ({ ok: true }),
+            handler: (_ctx: MutationCtx<unknown>, _args) => ({ ok: true }),
             partitionKey: "organizationId",
             // No `singlePartition`, no `idempotencyTtl` — chardb defaults both.
         });
@@ -93,7 +93,7 @@ describe("defineXxx — function-ref identity", () => {
 
     test("explicit singlePartition: false beats the partitionKey-implied default", () => {
         const fn = defineMutation<unknown, { organizationId: string }, { ok: boolean }>({
-            handler: async (_ctx: MutationCtx<unknown>, _args) => ({ ok: true }),
+            handler: (_ctx: MutationCtx<unknown>, _args) => ({ ok: true }),
             partitionKey: "organizationId",
             singlePartition: false,
         });

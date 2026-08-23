@@ -10,18 +10,18 @@ type PostArgs = { readonly orgId: string; readonly body: string } & {
 type BroadcastArgs = { readonly msg: string } & { readonly [k: string]: RawJson };
 
 const postMessage = defineMutation<unknown, PostArgs, { id: string }>(
-    async function postMessage(_ctx, _args) {
+    function postMessage(_ctx, _args) {
         return { id: "x" };
     },
     { singlePartition: true, partitionKey: a => a.orgId }
 );
 
-const broadcast = defineMutation<unknown, BroadcastArgs, void>(async function broadcast() {
+const broadcast = defineMutation<unknown, BroadcastArgs, void>(function broadcast() {
     return undefined;
 }, {});
 
 const singlePartitionWithoutKey = defineMutation<unknown, BroadcastArgs, void>(
-    async function singlePartitionWithoutKey() {
+    function singlePartitionWithoutKey() {
         return undefined;
     },
     { singlePartition: true }

@@ -7,6 +7,8 @@ export interface MutationReplayEnvelope {
     readonly v: 1;
     readonly status: "ok" | "user_error";
     readonly rowsAffected: number;
+    /** Exact JSON value returned by the domain mutation handler. */
+    readonly result?: RawJson;
     readonly lastInsertRowid?: number | null;
     readonly returning?: readonly RawJson[];
     readonly errorCode?: CdbErrorCode;

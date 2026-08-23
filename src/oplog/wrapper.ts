@@ -140,6 +140,7 @@ export type MutationOutcome<R> =
     | {
           readonly status: "ok";
           readonly result: R;
+          /** SQLite `changes()` for the handler's final data-modifying statement, not a sum across the handler. */
           readonly rowsAffected: number;
           readonly lastInsertRowid?: number | null | undefined;
           readonly returning?: readonly RawJson[] | undefined;
@@ -183,8 +184,8 @@ export function runWrappedMutation<R>(args: RunWrappedMutationArgs<R>): RunWrapp
 
     if (args.sql.changes() === 0) {
         const row = args.sql.one<{
-            payload_hash: Uint8Array;
-            payload_enc: Uint8Array;
+            payload_hash: Uint8Array | ArrayBuffer;
+            payload_enc: Uint8Array | ArrayBuffer;
         }>(
             "SELECT payload_hash, payload_enc FROM _chardb_op_log WHERE principal_id = ? AND mut_id = ?",
             args.principalId,
@@ -196,21 +197,23 @@ export function runWrappedMutation<R>(args: RunWrappedMutationArgs<R>): RunWrapp
                 message: "INSERT OR IGNORE reported 0 changes but no existing row found",
             });
         }
-        if (!bytesEq(row.payload_hash, incomingHashBytes)) {
+        const storedHash = asBytes(row.payload_hash);
+        const storedPayload = asBytes(row.payload_enc);
+        if (!bytesEq(storedHash, incomingHashBytes)) {
             throw new CdbError({
                 code: "CDB_MUT_ID_COLLISION",
                 message: `mutId=${args.mutId} matches an existing op-log row but payload_hash differs`,
                 hint: "regenerate mutId; client RNG is reusing values across distinct payloads",
             });
         }
-        if (row.payload_enc.length === 0) {
+        if (storedPayload.length === 0) {
             // Concurrent in-progress mutation lost a race; surface as transient.
             throw new CdbError({
                 code: "CDB_TXN_ABORTED_EVICTION",
                 message: "op-log row exists but payload not yet finalized (concurrent in-flight)",
             });
         }
-        const envelope = decodeEnvelope(TEXT_DECODER.decode(codec.decrypt(row.payload_enc)));
+        const envelope = decodeEnvelope(TEXT_DECODER.decode(codec.decrypt(storedPayload)));
         return { ran: false, envelope };
     }
 
@@ -221,6 +224,7 @@ export function runWrappedMutation<R>(args: RunWrappedMutationArgs<R>): RunWrapp
                   v: 1,
                   status: "ok",
                   rowsAffected: outcome.rowsAffected,
+                  result: toRawJsonResult(outcome.result),
                   ...(outcome.lastInsertRowid !== undefined ? { lastInsertRowid: outcome.lastInsertRowid } : {}),
                   ...(outcome.returning ? { returning: outcome.returning } : {}),
                   cookie: args.cookie,
@@ -256,6 +260,64 @@ function hexToBytes(hex: string): Uint8Array {
         out[i] = Number.parseInt(hex.substr(i * 2, 2), 16);
     }
     return out;
+}
+
+function asBytes(value: Uint8Array | ArrayBuffer): Uint8Array {
+    return value instanceof Uint8Array ? value : new Uint8Array(value);
+}
+
+function toRawJsonResult(value: unknown): RawJson {
+    const active = new WeakSet<object>();
+
+    const fail = (path: string, reason: string): never => {
+        throw new CdbError({
+            code: "CDB_INVARIANT",
+            message: `mutation result is not JSON at ${path}: ${reason}`,
+            hint: "return only null, booleans, finite numbers, strings, arrays, and plain objects",
+        });
+    };
+
+    const visit = (current: unknown, path: string): void => {
+        if (current === null || typeof current === "string" || typeof current === "boolean") return;
+        if (typeof current === "number") {
+            if (!Number.isFinite(current) || Object.is(current, -0)) {
+                fail(path, "numbers must be finite and must not be negative zero");
+            }
+            return;
+        }
+        if (typeof current !== "object") fail(path, `${typeof current} is unsupported`);
+        const objectValue = current as object;
+        if (active.has(objectValue)) fail(path, "cyclic references are unsupported");
+        active.add(objectValue);
+
+        if (Array.isArray(objectValue)) {
+            const ownKeys = Reflect.ownKeys(objectValue);
+            if (ownKeys.some(key => typeof key === "symbol")) fail(path, "symbol properties are unsupported");
+            if (ownKeys.length !== objectValue.length + 1)
+                fail(path, "arrays cannot be sparse or have extra properties");
+            for (let i = 0; i < objectValue.length; i++) {
+                if (!Object.hasOwn(objectValue, i)) fail(`${path}[${i}]`, "sparse array entries are unsupported");
+                visit(objectValue[i], `${path}[${i}]`);
+            }
+        } else {
+            const prototype = Object.getPrototypeOf(objectValue);
+            if (prototype !== Object.prototype && prototype !== null) fail(path, "objects must be plain objects");
+            for (const key of Reflect.ownKeys(objectValue)) {
+                if (typeof key !== "string") fail(path, "symbol properties are unsupported");
+                const stringKey = key as string;
+                const descriptor = Object.getOwnPropertyDescriptor(objectValue, stringKey);
+                if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+                    fail(`${path}.${stringKey}`, "properties must be enumerable data properties");
+                }
+                visit((descriptor as PropertyDescriptor & { value: unknown }).value, `${path}.${stringKey}`);
+            }
+        }
+
+        active.delete(objectValue);
+    };
+
+    visit(value, "$");
+    return value as RawJson;
 }
 
 /** Convenience: build a canonical request string for hashing. */

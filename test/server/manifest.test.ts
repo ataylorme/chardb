@@ -5,7 +5,7 @@ import { manifestFromExports, resolveMutation } from "../../src/server/manifest.
 import type { ChardbRef } from "../../src/types.ts";
 
 const createPost = defineMutation<unknown, { authorId: string; body: string }, { id: string }>(
-    async (_ctx, args) => ({ id: `post-${args.authorId}` }),
+    (_ctx, args) => ({ id: `post-${args.authorId}` }),
     { singlePartition: true, partitionKey: a => a.authorId }
 );
 

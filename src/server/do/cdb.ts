@@ -157,7 +157,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 r.envelope.status === "ok"
                     ? ({
                           status: "ok",
-                          result: r.envelope.returning?.[0] ?? null,
+                          result: (r.envelope.result ?? null) as R,
                           rowsAffected: r.envelope.rowsAffected,
                           ...(r.envelope.lastInsertRowid !== undefined
                               ? { lastInsertRowid: r.envelope.lastInsertRowid }

@@ -243,12 +243,12 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
         const { db, captured } = makeStubDb();
         const create = api.mutation({
-            handler: async (ctx, args: { id: string; name: string }) => {
-                await ctx.db.insert(channels).values({ id: args.id, name: args.name });
+            handler: (ctx, args: { id: string; name: string }) => {
+                ctx.db.insert(channels).values({ id: args.id, name: args.name });
                 return args.id;
             },
         });
-        const result = await create({ db, auth: baseAuth }, { id: "c-e2e", name: "general" });
+        const result = create({ db: db as never, auth: baseAuth }, { id: "c-e2e", name: "general" });
         expect(result).toBe("c-e2e");
         expect(captured[0]?.rows).toEqual({ id: "c-e2e", name: "general", organizationId: "org-acme" });
     });

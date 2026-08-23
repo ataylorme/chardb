@@ -87,6 +87,14 @@ export { resolveCdbMeta } from "./cdb-table.ts";
 export { compileCdbPolicies, TENANT_EPOCH_TABLES, PRINCIPAL_EPOCH_TABLES } from "./cdb-policy.ts";
 export { applyColumnMask, assertColumnsWritable } from "./cdb-cls.ts";
 export { wrapDb } from "./cdb-db-proxy.ts";
+export {
+    executeAtomicMutation,
+    type AtomicMutationDb,
+    type AtomicMutationHandler,
+    type AtomicMutationRequest,
+    type AtomicMutationResult,
+    type ExecuteAtomicMutationInput,
+} from "./atomic-mutation.ts";
 export { buildAccessControl, type BuiltAccessControl } from "./cdb-access.ts";
 export { createAccessControl, role } from "better-auth/plugins/access";
 export type { AccessControl, Role, Statements, Subset } from "better-auth/plugins/access";

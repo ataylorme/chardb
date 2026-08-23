@@ -101,7 +101,7 @@ export interface MutationOptions<TArgs = unknown> {
     readonly partitionKey?: (args: TArgs) => string | number | bigint | undefined;
 }
 
-export type MutationFn<TDb, TArgs, TResult> = ((ctx: MutationCtx<TDb>, args: TArgs) => Promise<TResult>) & {
+export type MutationFn<TDb, TArgs, TResult> = ((ctx: MutationCtx<TDb>, args: TArgs) => TResult) & {
     readonly __chardbKind: "mutation";
     readonly __chardbRef: Brand<string, "ChardbRef">;
 };
@@ -172,7 +172,7 @@ type PartitionKeyOf<TArgs> = {
 
 export interface MutationConfig<TDb, TArgs extends Record<string, unknown>, TResult> {
     readonly args?: StandardSchemaV1<unknown, TArgs>;
-    readonly handler: (ctx: MutationCtx<TDb>, args: TArgs) => Promise<TResult>;
+    readonly handler: (ctx: MutationCtx<TDb>, args: TArgs) => TResult;
     /**
      * Either a field name (typechecked against the args schema) or an
      * arbitrary extractor closure.
@@ -185,10 +185,10 @@ export interface MutationConfig<TDb, TArgs extends Record<string, unknown>, TRes
 
 /**
  * Mutation handler. The body runs inside the partition-owning `Cdb` shard DO,
- * inside `transactionSync`, with the full Drizzle `db.transaction(async tx)`
- * surface available against `durable-sqlite`. This is the single execution
- * venue for interactive transactions; the client-side `db.batch` and `db.tx`
- * APIs serialize closure-only statements onto the same shard.
+ * inside `transactionSync`, using Drizzle's synchronous `durable-sqlite`
+ * driver. A mutation handler must not be `async` and must not return a
+ * thenable: Durable Object SQLite cannot keep a transaction open across an
+ * `await` boundary.
  *
  * Two call shapes — both fully inferred:
  *
@@ -197,13 +197,13 @@ export interface MutationConfig<TDb, TArgs extends Record<string, unknown>, TRes
  * //    validator's output type, the handler is fully typed.
  * defineMutation({
  *   args: zod.object({ id: zod.string(), body: zod.string() }),
- *   handler: async (ctx, args) => { … },
+ *   handler: (ctx, args) => { … },
  *   partitionKey: (a) => a.id,
  * });
  *
  * // 2. Positional form with an inline annotation on the handler.
  * //    Use when you don't want a runtime validator.
- * defineMutation(async (ctx, args: { id: string; body: string }) => { … }, {
+ * defineMutation((ctx, args: { id: string; body: string }) => { … }, {
  *   partitionKey: (a) => a.id,
  * });
  * ```
@@ -212,11 +212,11 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
     config: MutationConfig<TDb, TArgs, TResult>
 ): MutationFn<TDb, TArgs, TResult>;
 export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResult>(
-    handler: (ctx: MutationCtx<TDb>, args: TArgs) => Promise<TResult>,
+    handler: (ctx: MutationCtx<TDb>, args: TArgs) => TResult,
     options?: MutationOptions<TArgs>
 ): MutationFn<TDb, TArgs, TResult>;
 export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResult>(
-    configOrHandler: MutationConfig<TDb, TArgs, TResult> | ((ctx: MutationCtx<TDb>, args: TArgs) => Promise<TResult>),
+    configOrHandler: MutationConfig<TDb, TArgs, TResult> | ((ctx: MutationCtx<TDb>, args: TArgs) => TResult),
     optionsArg?: MutationOptions<TArgs>
 ): MutationFn<TDb, TArgs, TResult> {
     const isConfig = typeof configOrHandler === "object";
@@ -256,8 +256,8 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
                   : {}),
           }
         : optionsArg;
-    const fn = (async (ctx: MutationCtx<TDb>, args: TArgs) => {
-        const validated = validator ? await runValidator(validator, args) : args;
+    const fn = ((ctx: MutationCtx<TDb>, args: TArgs) => {
+        const validated = validator ? runValidatorSync(validator, args) : args;
         const wrappedCtx = wrapCtxDb(ctx) as MutationCtx<TDb>;
         return handler(wrappedCtx, validated);
     }) as MutationFn<TDb, TArgs, TResult>;
@@ -283,6 +283,14 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
         Object.defineProperty(fn, "__chardbSinglePartition", { value: true, enumerable: false });
     }
     return attachRef(fn, "mutation") as MutationFn<TDb, TArgs, TResult>;
+}
+
+function runValidatorSync<T>(schema: StandardSchemaV1<unknown, T>, value: unknown): T {
+    const result = schema["~standard"].validate(value);
+    if (result instanceof Promise) {
+        throw new TypeError("chardb: mutation argument validators must be synchronous");
+    }
+    return valueFromValidationResult(result);
 }
 
 /**
@@ -367,6 +375,10 @@ function wrapCtxDb<TCtx extends { readonly db: unknown; readonly auth?: AuthCtx 
  */
 async function runValidator<T>(schema: StandardSchemaV1<unknown, T>, value: unknown): Promise<T> {
     const result = await schema["~standard"].validate(value);
+    return valueFromValidationResult(result);
+}
+
+function valueFromValidationResult<T>(result: StandardSchemaV1.Result<T>): T {
     if (result.issues) {
         const first = result.issues[0];
         const path = first?.path
@@ -390,7 +402,9 @@ async function runValidator<T>(schema: StandardSchemaV1<unknown, T>, value: unkn
  */
 export function defineCron<TDb, TArgs extends Record<string, unknown>, TResult>(
     cronExpr: string,
-    mutationOrHandler: MutationFn<TDb, TArgs, TResult> | ((ctx: MutationCtx<TDb>, args: TArgs) => Promise<TResult>),
+    mutationOrHandler:
+        | MutationFn<TDb, TArgs, TResult>
+        | ((ctx: MutationCtx<TDb>, args: TArgs) => TResult | Promise<TResult>),
     args: TArgs = {} as TArgs
 ): CronFn {
     // Whether the target was produced by `defineMutation` — informs whether
@@ -406,7 +420,7 @@ export function defineCron<TDb, TArgs extends Record<string, unknown>, TResult>(
             // partition. Mutation-targets here are invoked directly so the
             // entrypoint can later swap in a real shard-routed dispatch.
             const ctx = undefined as unknown as MutationCtx<TDb>;
-            const target = mutationOrHandler as (ctx: MutationCtx<TDb>, args: TArgs) => Promise<TResult>;
+            const target = mutationOrHandler as (ctx: MutationCtx<TDb>, args: TArgs) => TResult | Promise<TResult>;
             await target(ctx, args);
         } catch (err) {
             console.error(`[chardb] cron handler ${cronExpr} failed`, err);
@@ -485,12 +499,12 @@ export interface UserError {
  * `createApi<typeof schema>()` binds this for you so call sites never
  * have to spell out a `BaseSQLiteDatabase<...>` alias.
  */
-export type ChardbDb<TSchema extends Record<string, unknown>> = BaseSQLiteDatabase<"async", unknown, TSchema>;
+export type ChardbDb<TSchema extends Record<string, unknown>> = BaseSQLiteDatabase<"sync", unknown, TSchema>;
 
 /**
  * Typed `mutation` / `query` factories bound to a concrete schema. The
  * args type for each handler is inferred from the inline annotation
- * (`async (ctx, args: { … }) => { … }`) and the result from the return
+ * (`(ctx, args: { … }) => { … }`) and the result from the return
  * value — no `defineMutation<Db, Args, Result>` explicit-generic
  * triplet, no `& { [k: string]: RawJson }` intersection.
  */
@@ -499,7 +513,7 @@ export interface ChardbApi<TSchema extends Record<string, unknown>> {
         config: MutationConfig<ChardbDb<TSchema>, TArgs, TResult>
     ): MutationFn<ChardbDb<TSchema>, TArgs, TResult>;
     mutation<TArgs extends Record<string, unknown>, TResult>(
-        handler: (ctx: MutationCtx<ChardbDb<TSchema>>, args: TArgs) => Promise<TResult>,
+        handler: (ctx: MutationCtx<ChardbDb<TSchema>>, args: TArgs) => TResult,
         options?: MutationOptions<TArgs>
     ): MutationFn<ChardbDb<TSchema>, TArgs, TResult>;
     query<TArgs extends Record<string, unknown>, TResult>(
