@@ -19,7 +19,7 @@ import { CdbError, isCdbError, isCdbErrorCode } from "../../errors.ts";
 import { type IntervalKey, IntervalMap, type IntervalSet } from "../../intervals.ts";
 import { intervalSetFromWire } from "../../intervals_wire.ts";
 import { SHARD_BOOTSTRAP_DDL } from "../../oplog/schema.ts";
-import { type JsonText, parseJsonColumn } from "../../oplog/wrapper.ts";
+import { type JsonText, type SyncSql, parseJsonColumn } from "../../oplog/wrapper.ts";
 import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/range.ts";
 import { type TableSpec, renderRowApply, renderTableTriggers } from "../../reshard/triggers.ts";
 import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId } from "../../types.ts";
@@ -90,6 +90,31 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
     )
   )
 );
+CREATE TABLE IF NOT EXISTS _chardb_change_clock (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  change_seq INTEGER NOT NULL CHECK (change_seq >= 0)
+);
+INSERT OR IGNORE INTO _chardb_change_clock (singleton, change_seq) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS _chardb_live_subscription_tables (
+  gateway_id TEXT NOT NULL,
+  registration_id TEXT NOT NULL,
+  table_name TEXT NOT NULL,
+  PRIMARY KEY (gateway_id, registration_id, table_name),
+  FOREIGN KEY (gateway_id, registration_id)
+    REFERENCES _chardb_live_subscriptions (gateway_id, registration_id)
+    ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS _chardb_live_subscription_tables_by_table
+  ON _chardb_live_subscription_tables (table_name, gateway_id, registration_id);
+CREATE TABLE IF NOT EXISTS _chardb_invalidation_outbox (
+  gateway_id TEXT NOT NULL,
+  registration_id TEXT NOT NULL,
+  change_seq INTEGER NOT NULL CHECK (change_seq > 0),
+  PRIMARY KEY (gateway_id, registration_id),
+  FOREIGN KEY (gateway_id, registration_id)
+    REFERENCES _chardb_live_subscriptions (gateway_id, registration_id)
+    ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS _chardb_domain_schema (
   table_name TEXT PRIMARY KEY,
   signature TEXT NOT NULL
@@ -137,6 +162,77 @@ function subscriptionPayloadHash(args: CdbSubscriptionRequest): string {
 
 function subscriptionInvariant(message: string): CdbError {
     return new CdbError({ code: "CDB_INVARIANT", message });
+}
+
+function currentChangeSeq(sql: SyncSql): number {
+    const row = sql.one<{ change_seq: number }>("SELECT change_seq FROM _chardb_change_clock WHERE singleton = 1");
+    if (!row || !Number.isSafeInteger(row.change_seq) || row.change_seq < 0) {
+        throw subscriptionInvariant("Cdb change clock is missing or invalid");
+    }
+    return row.change_seq;
+}
+
+function storedSubscriptionTables(sql: SyncSql, subscription: LiveSubscriptionId): readonly string[] {
+    return sql
+        .all<{ table_name: string }>(
+            `SELECT table_name
+             FROM _chardb_live_subscription_tables
+             WHERE gateway_id = ? AND registration_id = ?
+             ORDER BY table_name`,
+            subscription.gatewayId,
+            subscription.registrationId
+        )
+        .map(row => row.table_name);
+}
+
+function assertSubscriptionTables(
+    sql: SyncSql,
+    subscription: LiveSubscriptionId,
+    expectedTables: readonly string[]
+): void {
+    const storedTables = storedSubscriptionTables(sql, subscription);
+    if (
+        storedTables.length !== expectedTables.length ||
+        storedTables.some((tableName, index) => tableName !== expectedTables[index])
+    ) {
+        throw subscriptionInvariant("active live subscription table mappings do not match its persisted payload");
+    }
+}
+
+function enqueueInvalidations(sql: SyncSql, touchedTables: readonly string[]): number {
+    sql.exec("UPDATE _chardb_change_clock SET change_seq = change_seq + 1 WHERE singleton = 1");
+    if (sql.changes() !== 1) throw subscriptionInvariant("Cdb change clock update did not affect one row");
+    const changeSeq = currentChangeSeq(sql);
+    const registrations = new Map<string, { gatewayId: string; registrationId: string }>();
+    for (const tableName of touchedTables) {
+        const rows = sql.all<{ gateway_id: string; registration_id: string }>(
+            `SELECT mappings.gateway_id, mappings.registration_id
+             FROM _chardb_live_subscription_tables AS mappings
+             INNER JOIN _chardb_live_subscriptions AS subscriptions
+               ON subscriptions.gateway_id = mappings.gateway_id
+              AND subscriptions.registration_id = mappings.registration_id
+             WHERE mappings.table_name = ? AND subscriptions.state = 'active'`,
+            tableName
+        );
+        for (const row of rows) {
+            registrations.set(JSON.stringify([row.gateway_id, row.registration_id]), {
+                gatewayId: row.gateway_id,
+                registrationId: row.registration_id,
+            });
+        }
+    }
+    for (const registration of registrations.values()) {
+        sql.exec(
+            `INSERT INTO _chardb_invalidation_outbox (gateway_id, registration_id, change_seq)
+             VALUES (?, ?, ?)
+             ON CONFLICT(gateway_id, registration_id) DO UPDATE SET
+               change_seq = MAX(change_seq, excluded.change_seq)`,
+            registration.gatewayId,
+            registration.registrationId,
+            changeSeq
+        );
+    }
+    return changeSeq;
 }
 
 function sameSubscriptionIdentity(row: StoredSubscriptionRow, subscription: LiveSubscriptionId): boolean {
@@ -247,6 +343,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                     "active live subscription payload hash does not match its persisted payload"
                 );
             }
+            assertSubscriptionTables(sql, request.subscription, [...new Set(request.tables)].sort());
             this.installSubscription(request.subscription, this.prepareIntervals(request));
         }
         this.bootstrapped = true;
@@ -335,9 +432,11 @@ export class Cdb extends DurableObject<CdbEnv> {
     /**
      * Register a live-query subscription on this shard. Caller is the Gateway DO.
      */
-    async subscribe(args: SubscribeArgs): Promise<{ subscription: LiveSubscriptionId }> {
+    async subscribe(args: SubscribeArgs): Promise<{ subscription: LiveSubscriptionId; changeSeq: number }> {
         const intervals = this.prepareIntervals(args);
         const payloadHash = subscriptionPayloadHash(args);
+        const tableNames = [...new Set(args.tables)].sort();
+        let changeSeq: number | undefined;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             const existing = sql.one<StoredSubscriptionRow>(
@@ -358,28 +457,41 @@ export class Cdb extends DurableObject<CdbEnv> {
                 if (existing.payload_hash !== payloadHash) {
                     throw subscriptionInvariant("live subscription registration payload changed across an RPC replay");
                 }
-                return;
+                assertSubscriptionTables(sql, args.subscription, tableNames);
+            } else {
+                sql.exec(
+                    `INSERT INTO _chardb_live_subscriptions
+                     (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+                      principal_id, ref, args_json, tables_json, intervals_json)
+                     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)`,
+                    args.subscription.gatewayId,
+                    args.subscription.registrationId,
+                    args.subscription.connectionId,
+                    args.subscription.clientId,
+                    args.subscription.subId,
+                    payloadHash,
+                    args.principalId,
+                    args.ref,
+                    JSON.stringify(args.args),
+                    JSON.stringify(args.tables),
+                    JSON.stringify(args.intervals)
+                );
+                for (const tableName of tableNames) {
+                    sql.exec(
+                        `INSERT INTO _chardb_live_subscription_tables
+                         (gateway_id, registration_id, table_name)
+                         VALUES (?, ?, ?)`,
+                        args.subscription.gatewayId,
+                        args.subscription.registrationId,
+                        tableName
+                    );
+                }
             }
-            sql.exec(
-                `INSERT INTO _chardb_live_subscriptions
-                 (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                  principal_id, ref, args_json, tables_json, intervals_json)
-                 VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)`,
-                args.subscription.gatewayId,
-                args.subscription.registrationId,
-                args.subscription.connectionId,
-                args.subscription.clientId,
-                args.subscription.subId,
-                payloadHash,
-                args.principalId,
-                args.ref,
-                JSON.stringify(args.args),
-                JSON.stringify(args.tables),
-                JSON.stringify(args.intervals)
-            );
+            changeSeq = currentChangeSeq(sql);
         });
+        if (changeSeq === undefined) throw subscriptionInvariant("subscription completed without a change clock");
         this.installSubscription(args.subscription, intervals);
-        return { subscription: args.subscription };
+        return { subscription: args.subscription, changeSeq };
     }
 
     async unsubscribe(subscription: LiveSubscriptionId): Promise<void> {
@@ -415,6 +527,18 @@ export class Cdb extends DurableObject<CdbEnv> {
                 subscription.clientId,
                 subscription.subId
             );
+            sql.exec(
+                `DELETE FROM _chardb_live_subscription_tables
+                 WHERE gateway_id = ? AND registration_id = ?`,
+                subscription.gatewayId,
+                subscription.registrationId
+            );
+            sql.exec(
+                `DELETE FROM _chardb_invalidation_outbox
+                 WHERE gateway_id = ? AND registration_id = ?`,
+                subscription.gatewayId,
+                subscription.registrationId
+            );
         });
         this.intervalMap.unregister(key);
         this.subscriptions.delete(key);
@@ -432,6 +556,9 @@ export class Cdb extends DurableObject<CdbEnv> {
                 // Gateway validates raw wire args and forwards this exact value.
                 handler: (ctx, args) => descriptor.invokeValidated(ctx, args),
                 cookie: `${this.ctx.id.toString()}:${Date.now()}:${crypto.randomUUID()}`,
+                onWriteSet: ({ touchedTables, sql }) => {
+                    enqueueInvalidations(sql, touchedTables);
+                },
             });
             return { ok: true, ...result };
         } catch (error) {

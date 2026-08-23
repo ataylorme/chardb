@@ -132,14 +132,14 @@ describe("Cdb live subscription identity", () => {
             args: { organizationId: "org-1", filter: { archived: false, channel: "general" } },
         });
 
-        await expect(cdb.subscribe(original)).resolves.toEqual({ subscription: identity });
+        await expect(cdb.subscribe(original)).resolves.toEqual({ subscription: identity, changeSeq: 0 });
         await expect(
             cdb.subscribe(
                 request(identity, {
                     args: { filter: { channel: "general", archived: false }, organizationId: "org-1" },
                 })
             )
-        ).resolves.toEqual({ subscription: identity });
+        ).resolves.toEqual({ subscription: identity, changeSeq: 0 });
         expect(
             db
                 .prepare(
@@ -149,11 +149,34 @@ describe("Cdb live subscription identity", () => {
                 )
                 .get(identity.gatewayId, identity.registrationId)
         ).toEqual({ count: 1 });
+        expect(
+            db
+                .prepare(
+                    `SELECT table_name
+                     FROM _chardb_live_subscription_tables
+                     WHERE gateway_id = ? AND registration_id = ?`
+                )
+                .all(identity.gatewayId, identity.registrationId)
+        ).toEqual([{ table_name: "messages" }]);
 
         await expect(cdb.subscribe(request(identity, { args: { organizationId: "org-2" } }))).rejects.toMatchObject({
             code: "CDB_INVARIANT",
         });
         expect(cdb.matchSubsForRow("messages", [{ indexName: "by_org", key: ["org-1"] }])).toEqual([identity]);
+    });
+
+    test("fails closed when an active replay has lost its normalized table mapping", async () => {
+        const identity = subscription("gateway-do-1", "client-1", "registration-mapping");
+        const original = request(identity, { tables: ["messages", "messages"] });
+        await cdb.subscribe(original);
+        db.prepare(
+            `DELETE FROM _chardb_live_subscription_tables
+             WHERE gateway_id = ? AND registration_id = ? AND table_name = ?`
+        ).run(identity.gatewayId, identity.registrationId, "messages");
+
+        await expect(cdb.subscribe(original)).rejects.toMatchObject({ code: "CDB_INVARIANT" });
+        cdb = new Cdb(state, {});
+        await expect(bootstrap).rejects.toMatchObject({ code: "CDB_INVARIANT" });
     });
 
     test("unsubscribe-before-subscribe leaves an irreversible tombstone", async () => {

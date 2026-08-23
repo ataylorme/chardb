@@ -5,6 +5,8 @@ import { createApi } from "../../src/server/define.ts";
 import type { CdbMutationRequest, CdbMutationResponse } from "../../src/server/do/cdb.ts";
 import { globalScope } from "../../src/server/index.ts";
 import { manifestFromExports, routeMutation } from "../../src/server/manifest.ts";
+import type { CdbSubscriptionRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
+import { ChardbRef, ClientId, PrincipalId, SubId } from "../../src/types.ts";
 
 const { cdbTable } = globalScope();
 const entries = cdbTable(
@@ -71,12 +73,37 @@ interface CountRow extends Record<string, SqlStorageValue> {
 }
 
 export class Cdb extends app.Cdb {
-    inspectAtomicState(): { readonly entries: readonly StoredEntry[]; readonly opLogRows: number } {
+    inspectAtomicState(): {
+        readonly entries: readonly StoredEntry[];
+        readonly opLogRows: number;
+        readonly changeSeq: number;
+        readonly mappings: readonly Record<string, SqlStorageValue>[];
+        readonly outbox: readonly Record<string, SqlStorageValue>[];
+    } {
         const entries = [
             ...this.ctx.storage.sql.exec<StoredEntry>("SELECT id, owner_id, value FROM registry_entries ORDER BY id"),
         ];
         const count = [...this.ctx.storage.sql.exec<CountRow>("SELECT COUNT(*) AS count FROM _chardb_op_log")][0];
-        return { entries, opLogRows: count?.count ?? 0 };
+        const clock = [
+            ...this.ctx.storage.sql.exec<{ change_seq: number }>(
+                "SELECT change_seq FROM _chardb_change_clock WHERE singleton = 1"
+            ),
+        ][0];
+        const mappings = [
+            ...this.ctx.storage.sql.exec<Record<string, SqlStorageValue>>(
+                `SELECT gateway_id, registration_id, table_name
+                 FROM _chardb_live_subscription_tables
+                 ORDER BY gateway_id, registration_id, table_name`
+            ),
+        ];
+        const outbox = [
+            ...this.ctx.storage.sql.exec<Record<string, SqlStorageValue>>(
+                `SELECT gateway_id, registration_id, change_seq
+                 FROM _chardb_invalidation_outbox
+                 ORDER BY gateway_id, registration_id`
+            ),
+        ];
+        return { entries, opLogRows: count?.count ?? 0, changeSeq: clock?.change_seq ?? -1, mappings, outbox };
     }
 }
 
@@ -94,14 +121,40 @@ const AUTH = {
     claims: { probe: "claim-ok" },
 } as const;
 
+const SUBSCRIPTION: LiveSubscriptionId = {
+    gatewayId: "registry-gateway",
+    registrationId: "registry-registration",
+    connectionId: "registry-connection",
+    clientId: ClientId("registry-client"),
+    subId: SubId(1),
+};
+
+const SUBSCRIBE_REQUEST: CdbSubscriptionRequest = {
+    subscription: SUBSCRIPTION,
+    principalId: PrincipalId(AUTH.userId),
+    ref: ChardbRef("queries.ts#registryEntries"),
+    args: {},
+    tables: ["registry_entries"],
+    intervals: [],
+};
+
 export default {
     async fetch(request: Request, env: { readonly CDB: DurableObjectNamespace }): Promise<Response> {
         const id = env.CDB.idFromName("configured-registry");
         const stub = env.CDB.get(id) as unknown as {
             mutate(input: CdbMutationRequest): Promise<CdbMutationResponse>;
             inspectAtomicState(): Promise<unknown>;
+            subscribe(input: CdbSubscriptionRequest): Promise<unknown>;
+            unsubscribe(input: LiveSubscriptionId): Promise<void>;
         };
         if (new URL(request.url).pathname === "/state") return Response.json(await stub.inspectAtomicState());
+        if (new URL(request.url).pathname === "/subscribe") {
+            return Response.json(await stub.subscribe(SUBSCRIBE_REQUEST));
+        }
+        if (new URL(request.url).pathname === "/unsubscribe") {
+            await stub.unsubscribe(SUBSCRIPTION);
+            return Response.json({ ok: true });
+        }
         const body = (await request.json()) as DispatchBody;
         const ref =
             body.operation === "put"

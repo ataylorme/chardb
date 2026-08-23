@@ -65,7 +65,7 @@ export interface CdbSubscriptionRequest {
 }
 
 export interface CdbSubscriptionRpc {
-    subscribe(args: CdbSubscriptionRequest): Promise<{ subscription: LiveSubscriptionId }>;
+    subscribe(args: CdbSubscriptionRequest): Promise<{ subscription: LiveSubscriptionId; changeSeq: number }>;
     unsubscribe(subscription: LiveSubscriptionId): Promise<void>;
 }
 

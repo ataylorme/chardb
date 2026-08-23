@@ -80,17 +80,34 @@ async function mutate(body: {
 async function inspectAtomicState(): Promise<{
     readonly entries: readonly { readonly id: string; readonly owner_id: string; readonly value: number }[];
     readonly opLogRows: number;
+    readonly changeSeq: number;
+    readonly mappings: readonly Record<string, unknown>[];
+    readonly outbox: readonly Record<string, unknown>[];
 }> {
     if (!mf) throw new Error("miniflare not initialized");
     const response = await mf.dispatchFetch("http://example.com/state");
     return (await response.json()) as {
         readonly entries: readonly { readonly id: string; readonly owner_id: string; readonly value: number }[];
         readonly opLogRows: number;
+        readonly changeSeq: number;
+        readonly mappings: readonly Record<string, unknown>[];
+        readonly outbox: readonly Record<string, unknown>[];
     };
+}
+
+async function subscribe(): Promise<Record<string, unknown>> {
+    if (!mf) throw new Error("miniflare not initialized");
+    const response = await mf.dispatchFetch("http://example.com/subscribe", { method: "POST" });
+    return (await response.json()) as Record<string, unknown>;
 }
 
 describe("configured Cdb local mutation registry", () => {
     test("resolves two refs locally, validates synchronously, carries auth, and replays the exact result", async () => {
+        expect(await subscribe()).toMatchObject({
+            changeSeq: 0,
+            subscription: { gatewayId: "registry-gateway", registrationId: "registry-registration" },
+        });
+        expect(await subscribe()).toMatchObject({ changeSeq: 0 });
         const request = {
             operation: "put" as const,
             mutId: "put-one",
@@ -116,6 +133,17 @@ describe("configured Cdb local mutation registry", () => {
 
         const replay = await mutate(request);
         expect(replay.body).toEqual({ ...first.body, ran: false, touchedTables: [] });
+        expect(await inspectAtomicState()).toMatchObject({
+            changeSeq: 1,
+            mappings: [
+                {
+                    gateway_id: "registry-gateway",
+                    registration_id: "registry-registration",
+                    table_name: "registry_entries",
+                },
+            ],
+            outbox: [{ gateway_id: "registry-gateway", registration_id: "registry-registration", change_seq: 1 }],
+        });
 
         const invalid = await mutate({
             operation: "put",
