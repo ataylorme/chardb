@@ -39,11 +39,11 @@ export function SectionLead({ children }: { children: ReactNode }) {
     );
 }
 
-export function BulletList({ items }: { items: ReactNode[] }) {
+export function BulletList({ items }: { items: readonly string[] }) {
     return (
         <ul className="mt-8 space-y-3 text-fg" style={{ fontSize: 16 }}>
-            {items.map((item, i) => (
-                <li key={i} className="flex gap-3">
+            {items.map(item => (
+                <li key={item} className="flex gap-3">
                     <span className="mt-2.5 h-1 w-3 bg-fg-dim/60 shrink-0" />
                     <span>{item}</span>
                 </li>

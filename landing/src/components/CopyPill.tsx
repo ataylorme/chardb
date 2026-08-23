@@ -73,13 +73,12 @@ export function CopyPill({ text = INSTALL_CMD }: Props) {
                     </svg>
                 )}
             </button>
-            <span
+            <output
                 className={`toast absolute -bottom-7 left-2 text-xs text-accent font-sans${copied ? " show" : ""}`}
-                role="status"
                 aria-live="polite"
             >
                 copied
-            </span>
+            </output>
         </div>
     );
 }

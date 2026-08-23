@@ -225,7 +225,7 @@ export function CoalShader() {
 
     return (
         <div ref={hostRef} className="ember relative w-full aspect-[460/420] sm:aspect-[460/420]" aria-hidden="true">
-            <canvas ref={canvasRef} className="ember-canvas" aria-hidden="true" />
+            <canvas ref={canvasRef} className="ember-canvas" />
         </div>
     );
 }

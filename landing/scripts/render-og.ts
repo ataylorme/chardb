@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
-import { chromium, type Page } from "playwright-core";
+import { type Page, chromium } from "playwright-core";
 import { createServer } from "vite";
 
 const ROOT = resolve(import.meta.dirname, "..");
