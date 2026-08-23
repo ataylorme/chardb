@@ -93,6 +93,12 @@ function jsonResponse(status: number, body: unknown): Response {
     });
 }
 
+function callAt(calls: ReadonlyArray<FetchCall>, index: number): FetchCall {
+    const call = calls[index];
+    if (!call) throw new Error(`expected fetch call at index ${index}`);
+    return call;
+}
+
 const samplePlan: DeployPlan = {
     version: 1,
     digest: "0".repeat(64),
@@ -133,11 +139,12 @@ describe("applyDeployPlan", () => {
         ]);
         expect(result.skipped).toEqual([]);
         expect(calls).toHaveLength(2);
-        expect(calls[0]!.url).toBe("https://api.cloudflare.com/client/v4/accounts/acc-1/logpush/jobs");
-        expect(calls[0]!.init.method).toBe("POST");
-        const auth = (calls[0]!.init.headers as Record<string, string>).Authorization;
+        const firstCall = callAt(calls, 0);
+        expect(firstCall.url).toBe("https://api.cloudflare.com/client/v4/accounts/acc-1/logpush/jobs");
+        expect(firstCall.init.method).toBe("POST");
+        const auth = (firstCall.init.headers as Record<string, string>).Authorization;
         expect(auth).toBe("Bearer tok-secret");
-        const body = JSON.parse(String(calls[0]!.init.body)) as { name: string };
+        const body = JSON.parse(String(firstCall.init.body)) as { name: string };
         expect(body.name).toBe("chardb_ledger_events");
     });
 
@@ -162,7 +169,7 @@ describe("applyDeployPlan", () => {
             () => jsonResponse(200, { success: true, result: { id: 22 } }),
         ]);
         const result = await applyDeployPlan(samplePlan, creds, { fetch });
-        expect(calls[0]!.init.method).toBe("GET");
+        expect(callAt(calls, 0).init.method).toBe("GET");
         expect(result.created.map(c => c.name)).toEqual(["chardb_ledger_audits"]);
     });
 
@@ -197,6 +204,6 @@ describe("applyDeployPlan", () => {
                 existingJobNames: new Set(),
             }
         );
-        expect(calls[0]!.url).toBe("https://api.test.example/accounts/acc-1/logpush/jobs");
+        expect(callAt(calls, 0).url).toBe("https://api.test.example/accounts/acc-1/logpush/jobs");
     });
 });

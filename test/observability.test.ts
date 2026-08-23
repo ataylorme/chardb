@@ -69,7 +69,9 @@ describe("observability tail", () => {
         const sink = consoleSink(l => lines.push(l));
         sink.ingest({ id: "i", ts: 1, correlationId: "c1", outcome: "ok", route: "/q" });
         expect(lines).toHaveLength(1);
-        const parsed = JSON.parse(lines[0]!) as { correlationId: string };
+        const line = lines[0];
+        if (line === undefined) throw new Error("expected one console sink line");
+        const parsed = JSON.parse(line) as { correlationId: string };
         expect(parsed.correlationId).toBe("c1");
     });
 
