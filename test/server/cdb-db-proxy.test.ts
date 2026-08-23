@@ -11,12 +11,10 @@
  *     even when no `tenantBy:` is set
  *   - `forUser()` → user FK column filled with `auth.userId`
  *   - matching explicit identity values pass; conflicts fail closed
- *   - non-cdbTables pass through unchanged (the proxy never touches
- *     rows targeting a raw `sqliteTable(...)`)
+ *   - non-cdbTables fail closed at the application boundary
  *   - missing tenant/user authority rejects even caller-supplied values
  *   - array `.values([...])` validates every row before forwarding
- *   - other builder methods (`returning`, `onConflictDoNothing`) pass
- *     through after `.values()` is wrapped
+ *   - the post-values builder exposes only safe execution and inspection
  */
 
 import { describe, expect, test } from "bun:test";
@@ -60,8 +58,7 @@ interface CapturedDelete {
 /**
  * Minimal stub for the surface the proxy actually inspects: an
  * `insert(table)` method that returns a builder whose `.values(rows)`
- * captures its argument and forwards a chainable `returning()` for the
- * "other methods pass through" case.
+ * captures its argument and exposes representative Drizzle chain methods.
  */
 function makeStubDb(): {
     db: StubDb;
@@ -86,6 +83,24 @@ function makeStubDb(): {
                 },
                 onConflictDoNothing() {
                     return builder;
+                },
+                onConflictDoUpdate() {
+                    return builder;
+                },
+                select() {
+                    return builder;
+                },
+                prepare() {
+                    return builder;
+                },
+                run() {
+                    return { changes: 1 };
+                },
+                toSQL() {
+                    return { sql: "insert", params: [] };
+                },
+                getSQL() {
+                    return "insert";
                 },
             };
             return builder;
@@ -490,16 +505,16 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         expect(denied.captured[0]?.rows).toBeUndefined();
     });
 
-    test("non-cdbTables pass through unchanged", () => {
+    test("rejects inserts into non-cdbTables before constructing a builder", () => {
         const raw = sqliteTable("raw_passthrough", {
             id: text("id").primaryKey(),
             value: text("value").notNull(),
         });
 
         const { db, captured } = makeStubDb();
-        wrapDb(db, baseAuth).insert(raw).values({ id: "r1", value: "noop" });
-
-        expect(captured[0]?.rows).toEqual({ id: "r1", value: "noop" });
+        const error = forbiddenFeature(() => wrapDb(db, baseAuth).insert(raw));
+        expect(error.message).toContain("plain table");
+        expect(captured).toHaveLength(0);
     });
 
     test("missing org authority rejects even an explicitly supplied tenant", () => {
@@ -551,7 +566,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         expect(captured[0]?.rows).toEqual({ id: "c-e2e", name: "general", organizationId: "org-acme" });
     });
 
-    test("other builder methods on the wrapped insert pass through (returning / onConflictDoNothing)", async () => {
+    test("allows execution while blocking returned rows and conflict oracles", async () => {
         const { cdbTable } = forOrg();
         const channels = cdbTable(
             "channels_chain",
@@ -566,12 +581,45 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         );
 
         const { db } = makeStubDb();
-        const inserted = wrapDb(db, baseAuth)
-            .insert(channels)
-            .values({ id: "c1", name: "general" })
-            .onConflictDoNothing()
-            .returning();
-        expect(await inserted).toEqual([]);
+        const inserted = wrapDb(db, baseAuth).insert(channels).values({ id: "c1", name: "general" }).run();
+        expect(await inserted).toEqual({ changes: 1 });
+
+        const returned = wrapDb(db, baseAuth).insert(channels).values({ id: "c2", name: "private" });
+        const error = forbiddenFeature(() => returned.returning());
+        expect(error.message).toContain('insert property "returning"');
+
+        const conflict = wrapDb(db, baseAuth).insert(channels).values({ id: "c3", name: "collision probe" });
+        const conflictError = forbiddenFeature(() => conflict.onConflictDoNothing());
+        expect(conflictError.message).toContain('insert property "onConflictDoNothing"');
+    });
+
+    test("blocks cross-tenant conflict updates and insert-select", () => {
+        const { cdbTable } = forOrg();
+        const channels = cdbTable(
+            "channels_insert_shapes",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                name: text("name").notNull(),
+            },
+            { roles: { member: { create: "*" } } }
+        );
+
+        const { db } = makeStubDb();
+        const valuesBuilder = wrapDb(db, baseAuth).insert(channels).values({ id: "c1", name: "general" });
+        const upsert = forbiddenFeature(() =>
+            valuesBuilder.onConflictDoUpdate({
+                target: channels.id,
+                set: { organizationId: "org-other", name: "hostile" },
+            })
+        );
+        expect(upsert.message).toContain('insert property "onConflictDoUpdate"');
+
+        const insertRoot = wrapDb(db, baseAuth).insert(channels);
+        const insertSelect = forbiddenFeature(() => Reflect.get(insertRoot, "select"));
+        expect(insertSelect.message).toContain('insert property "select"');
     });
 });
 
@@ -705,14 +753,29 @@ describe("wrapDb / cdbTable update authorization", () => {
         expect(denied.capturedUpdates[0]?.values).toBeUndefined();
     });
 
-    test("non-cdbTable updates remain passthrough", () => {
+    test("blocks returning and non-cdbTable updates", () => {
+        const profiles = profileTable("profiles_update_returning", {
+            member: { update: ["displayName"] },
+        });
+        const policyDb = makeStubDb();
+        const updateRoot = wrapDb(policyDb.db, baseAuth).update(profiles);
+        for (const property of ["session", "dialect", "_", "$dynamic"]) {
+            const preSet = forbiddenFeature(() => Reflect.get(updateRoot, property));
+            expect(preSet.message).toContain(`update property "${property}"`);
+        }
+        const returned = forbiddenFeature(() =>
+            wrapDb(policyDb.db, baseAuth).update(profiles).set({ displayName: "secret" }).returning()
+        );
+        expect(returned.message).toContain('update property "returning"');
+
         const raw = sqliteTable("raw_update_passthrough", {
             id: text("id").primaryKey(),
             value: text("value").notNull(),
         });
         const { db, capturedUpdates } = makeStubDb();
-        wrapDb(db, baseAuth).update(raw).set({ value: "changed" }).run();
-        expect(capturedUpdates[0]).toMatchObject({ values: { value: "changed" }, where: undefined });
+        const plain = forbiddenFeature(() => wrapDb(db, baseAuth).update(raw));
+        expect(plain.message).toContain("plain table");
+        expect(capturedUpdates).toHaveLength(0);
     });
 });
 
@@ -801,37 +864,98 @@ describe("wrapDb / cdbTable delete authorization", () => {
         expect(scoped.sql).toContain("owner_id");
     });
 
-    test("non-cdbTable deletes remain passthrough", () => {
+    test("blocks returning and non-cdbTable deletes", () => {
+        const rows = deletableTable("rows_delete_returning", { member: { delete: true } });
+        const policyDb = makeStubDb();
+        const returned = forbiddenFeature(() => wrapDb(policyDb.db, baseAuth).delete(rows).returning());
+        expect(returned.message).toContain('delete property "returning"');
+
         const raw = sqliteTable("raw_delete_passthrough", { id: text("id").primaryKey() });
         const { db, capturedDeletes } = makeStubDb();
-        wrapDb(db, baseAuth).delete(raw).run();
-        expect(capturedDeletes[0]?.where).toBeUndefined();
+        const plain = forbiddenFeature(() => wrapDb(db, baseAuth).delete(raw));
+        expect(plain.message).toContain("plain table");
+        expect(capturedDeletes).toHaveLength(0);
     });
 });
 
 describe("wrapDb / select bypass guards", () => {
-    test("rejects relational query and $count at the common wrapper boundary", () => {
-        const raw = {
+    test("rejects raw execution, relational, CTE, cache, and client/session escape hatches", () => {
+        const raw: Record<string, unknown> = {
             query: { records: { findMany: () => [] } },
             $count: () => 0,
+            run: () => undefined,
+            all: () => [],
+            get: () => undefined,
+            values: () => [],
+            execute: () => [],
+            exec: () => undefined,
+            prepare: () => undefined,
+            batch: () => undefined,
+            with: () => undefined,
+            $with: () => undefined,
+            $cache: { invalidate: () => undefined },
+            $client: { sql: {} },
+            session: { run: () => undefined },
+            dialect: {},
+            _: {},
+            resultKind: "sync",
+            $primary: {},
+            $replicas: [],
         };
         const wrapped = wrapDb(raw, baseAuth);
-        for (const read of [() => wrapped.query, () => wrapped.$count]) {
-            const error = forbiddenFeature(read);
-            expect(error.message).toContain("bypasses cdbTable select policy enforcement");
+        for (const property of Object.keys(raw)) {
+            const error = forbiddenFeature(() => Reflect.get(wrapped, property));
+            expect(error.message).toContain("use typed chardb builders");
         }
     });
 
-    test("keeps non-cdbTable selects unchanged outside the shard query boundary", () => {
+    test("preserves typed builders and raw blocking inside transaction callbacks", () => {
+        const nested = makeStubDb();
+        const { cdbTable } = forOrg();
+        const records = cdbTable(
+            "transaction_cdb_insert",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+            },
+            { roles: { member: { create: "*" } } }
+        );
+        const raw = {
+            transaction(callback: (tx: StubDb) => CdbError) {
+                return callback(nested.db);
+            },
+        };
+        const error = wrapDb(raw, baseAuth).transaction(tx => {
+            tx.insert(records).values({ id: "typed-inside-transaction" }).run();
+            return forbiddenFeature(() => Reflect.get(tx, "run"));
+        });
+        expect(nested.captured[0]?.rows).toEqual({
+            id: "typed-inside-transaction",
+            organizationId: "org-acme",
+        });
+        expect(error.code).toBe("CDB_UNSUPPORTED_FEATURE");
+    });
+
+    test("rejects non-cdbTable selects in application mutation wrappers", () => {
         const rawTable = sqliteTable("raw_select_passthrough", { id: text("id").primaryKey() });
-        const result = [{ id: "raw-1" }];
+        let selected = false;
         const builder = {
             from(table: SQLiteTable) {
                 expect(table).toBe(rawTable);
-                return result;
+                selected = true;
+                return [{ id: "raw-1" }];
             },
         };
         const rawDb = { select: () => builder };
-        expect(wrapDb(rawDb, baseAuth).select().from(rawTable)).toBe(result);
+        const selectRoot = wrapDb(rawDb, baseAuth).select();
+        for (const property of ["session", "dialect", "_", "$dynamic"]) {
+            const preFrom = forbiddenFeature(() => Reflect.get(selectRoot, property));
+            expect(preFrom.message).toContain(`select property "${property}"`);
+        }
+        const error = forbiddenFeature(() => selectRoot.from(rawTable));
+        expect(error.message).toContain("only from cdbTable");
+        expect(selected).toBe(false);
     });
 });

@@ -13,12 +13,9 @@
  * Drizzle reflects into `$inferInsert` as an optional field — so the
  * caller can simply omit it.
  *
- * Inserts, updates, and deletes against raw Drizzle tables pass through unchanged.
- * The proxy is intentionally a thin wrapper over the raw
- * `db` value the user's mutation context ships with: it does not
- * synthesize new query semantics, only intercepts `.values(...)` to fill
- * omitted identity columns and reject explicit values that disagree with the
- * verified context.
+ * Only registered `cdbTable` instances may cross the application wrapper.
+ * Plain Drizzle tables and raw/session/client APIs fail closed so handlers
+ * cannot bypass the schema-declared policy boundary.
  *
  * Auto-fill rules:
  *
@@ -121,6 +118,10 @@ const UNSUPPORTED_SELECT_METHODS = new Set<PropertyKey>([
 
 const SAFE_SELECT_CHAIN_METHODS = new Set<PropertyKey>(["orderBy", "limit", "offset"]);
 
+const SAFE_DB_METHODS = new Set<PropertyKey>(["select", "selectDistinct", "insert", "update", "delete", "transaction"]);
+
+const SAFE_WRITE_EXECUTION_METHODS = new Set<PropertyKey>(["run", "toSQL", "getSQL"]);
+
 function buildPlan(
     table: SQLiteTable,
     meta: CdbTableMeta,
@@ -182,23 +183,38 @@ function applyPlan<T extends Record<string, unknown>>(plan: AutoFillPlan, row: T
 }
 
 /**
- * Wrap a Drizzle insert builder so its `.values(row | rows)` call
- * splices auto-fill columns onto each row before forwarding to the
- * real builder. Other builder methods (`returning`, `onConflictDoNothing`,
- * `prepare`, …) pass through; the auto-fill happens exactly once at
- * `.values()` time so chained methods downstream see a complete row.
+ * Wrap a Drizzle insert builder so its `.values(row | rows)` call splices
+ * auto-fill columns onto each row before forwarding to the real builder.
+ * Insert-select and every other pre-values shape fail closed. After values,
+ * only execution and inspection are exposed. Returning rows requires read
+ * masking, and conflict methods can become cross-tenant existence oracles.
  */
 function wrapInsertBuilder(builder: unknown, plan: AutoFillPlan): unknown {
     return new Proxy(builder as object, {
         get(target, prop, receiver) {
+            if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+            if (prop !== "values") throw unsupportedWrite("insert", prop);
             const v = Reflect.get(target, prop, receiver);
-            if (prop !== "values" || typeof v !== "function") return v;
+            if (typeof v !== "function") throw unsupportedWrite("insert", prop);
             return (rows: unknown) => {
                 const filled = Array.isArray(rows)
                     ? rows.map(r => applyPlan(plan, r as Record<string, unknown>))
                     : applyPlan(plan, rows as Record<string, unknown>);
-                return (v as (input: unknown) => unknown).call(target, filled);
+                return wrapInsertResult((v as (input: unknown) => unknown).call(target, filled));
             };
+        },
+    });
+}
+
+function wrapInsertResult(builder: unknown): unknown {
+    return new Proxy(builder as object, {
+        get(target, prop, receiver) {
+            if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+            if (SAFE_WRITE_EXECUTION_METHODS.has(prop)) {
+                const value = Reflect.get(target, prop, receiver);
+                if (typeof value === "function") return value.bind(target);
+            }
+            throw unsupportedWrite("insert", prop);
         },
     });
 }
@@ -286,8 +302,10 @@ function assertUpdateAuthorized(plan: AutoFillPlan, values: Readonly<Record<stri
 function wrapUpdateBuilder(builder: unknown, plan: AutoFillPlan): unknown {
     return new Proxy(builder as object, {
         get(target, prop, receiver) {
+            if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+            if (prop !== "set") throw unsupportedWrite("update", prop);
             const value = Reflect.get(target, prop, receiver);
-            if (prop !== "set" || typeof value !== "function") return value;
+            if (typeof value !== "function") throw unsupportedWrite("update", prop);
             return (values: Readonly<Record<string, unknown>>) => {
                 assertUpdateAuthorized(plan, values);
                 const afterSet = (value as (input: unknown) => unknown).call(target, values);
@@ -300,13 +318,15 @@ function wrapUpdateBuilder(builder: unknown, plan: AutoFillPlan): unknown {
 function wrapSelectFromBuilder(builder: unknown, root: SelectRootPlan): unknown {
     return new Proxy(builder as object, {
         get(target, prop, receiver) {
+            if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+            if (prop !== "from")
+                throw unsupportedSelect(`select property "${String(prop)}" is unavailable before FROM`);
             const value = Reflect.get(target, prop, receiver);
-            if (prop !== "from" || typeof value !== "function") return value;
+            if (typeof value !== "function") throw unsupportedSelect("select builder does not expose a FROM stage");
             return (table: SQLiteTable) => {
                 const meta = getCdbMeta(table);
                 if (!meta) {
-                    if (root.queryBoundary) throw unsupportedSelect("query handlers may select only from cdbTable");
-                    return (value as (table: SQLiteTable) => unknown).call(target, table);
+                    throw unsupportedSelect("application handlers may select only from cdbTable");
                 }
                 if (!root.fullRow) {
                     throw unsupportedSelect("cdbTable projections are unavailable until projected masks are compiled");
@@ -447,9 +467,16 @@ function unsupportedSelect(message: string): CdbError {
     return new CdbError({ code: "CDB_UNSUPPORTED_FEATURE", message });
 }
 
+function unsupportedWrite(operation: "insert" | "update" | "delete", property: PropertyKey): CdbError {
+    return new CdbError({
+        code: "CDB_UNSUPPORTED_FEATURE",
+        message: `${operation} property "${String(property)}" is unavailable through the policy wrapper`,
+    });
+}
+
 function scopePolicyBuilder(builder: unknown, plan: AutoFillPlan, operation: "update" | "delete"): unknown {
     const where = Reflect.get(builder as object, "where");
-    if (typeof where !== "function") return builder;
+    if (typeof where !== "function") throw unsupportedWrite(operation, "where");
     const scoped = where.call(
         builder,
         applyPoliciesToWhere({
@@ -465,22 +492,30 @@ function scopePolicyBuilder(builder: unknown, plan: AutoFillPlan, operation: "up
 function wrapScopedPolicyBuilder(builder: unknown, plan: AutoFillPlan, operation: "update" | "delete"): unknown {
     return new Proxy(builder as object, {
         get(target, prop, receiver) {
-            const value = Reflect.get(target, prop, receiver);
-            if (prop !== "where" || typeof value !== "function") return value;
-            return (userWhere: import("drizzle-orm").SQL) => {
-                const combined = applyPoliciesToWhere({
-                    op: operation,
-                    auth: plan.auth,
-                    table: plan.table,
-                    userWhere,
-                    policies: plan.policies,
-                });
-                return wrapScopedPolicyBuilder(
-                    (value as (where: unknown) => unknown).call(target, combined),
-                    plan,
-                    operation
-                );
-            };
+            if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+            if (prop === "where") {
+                const value = Reflect.get(target, prop, receiver);
+                if (typeof value !== "function") throw unsupportedWrite(operation, prop);
+                return (userWhere: import("drizzle-orm").SQL) => {
+                    const combined = applyPoliciesToWhere({
+                        op: operation,
+                        auth: plan.auth,
+                        table: plan.table,
+                        userWhere,
+                        policies: plan.policies,
+                    });
+                    return wrapScopedPolicyBuilder(
+                        (value as (where: unknown) => unknown).call(target, combined),
+                        plan,
+                        operation
+                    );
+                };
+            }
+            if (SAFE_WRITE_EXECUTION_METHODS.has(prop)) {
+                const value = Reflect.get(target, prop, receiver);
+                if (typeof value === "function") return value.bind(target);
+            }
+            throw unsupportedWrite(operation, prop);
         },
     });
 }
@@ -530,11 +565,9 @@ function conflictingAuthority(authority: "tenant" | "self", column: string): Cdb
  * mutation/query handlers receive — accepts any Drizzle SQLite db
  * (BaseSQLiteDatabase, transaction handle, etc.) and proxies through.
  *
- * Implementation note: a Proxy on the db forwards every property
- * (`.select`, `.transaction`, `.run`, …) by default; `insert`, `update`,
- * and `delete` are intercepted. The wrap is recursive on the
- * transaction callback so `db.transaction(tx => …)` hands the user a
- * wrapped `tx` too.
+ * The root proxy exposes only typed select/insert/update/delete builders and
+ * transaction. Raw execution shortcuts and Drizzle's client/session objects
+ * fail closed. Transactions receive the same wrapper recursively.
  */
 export function wrapDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
     return wrapDbInternal(db, auth, false);
@@ -547,14 +580,20 @@ export function wrapQueryDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
 function wrapDbInternal<TDb extends object>(db: TDb, auth: AuthCtx, queryBoundary: boolean): TDb {
     return new Proxy(db, {
         get(target, prop, receiver) {
-            if (prop === "query" || prop === "$count") {
+            if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+            if (!SAFE_DB_METHODS.has(prop)) {
                 throw new CdbError({
                     code: "CDB_UNSUPPORTED_FEATURE",
-                    message: `database property "${String(prop)}" bypasses cdbTable select policy enforcement`,
+                    message: `database property "${String(prop)}" is unavailable; use typed chardb builders`,
                 });
             }
             const v = Reflect.get(target, prop, receiver);
-            if (typeof v !== "function") return v;
+            if (typeof v !== "function") {
+                throw new CdbError({
+                    code: "CDB_UNSUPPORTED_FEATURE",
+                    message: `database property "${String(prop)}" is not a callable typed builder`,
+                });
+            }
             if (prop === "select" || prop === "selectDistinct") {
                 return (...args: readonly unknown[]) => {
                     const builder = (v as (...args: readonly unknown[]) => unknown).call(target, ...args);
@@ -568,25 +607,28 @@ function wrapDbInternal<TDb extends object>(db: TDb, auth: AuthCtx, queryBoundar
             if (prop === "insert") {
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
-                    const plan = meta ? buildPlan(table, meta, auth) : null;
+                    if (!meta) throw unsupportedWrite("insert", "plain table");
+                    const plan = buildPlan(table, meta, auth);
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
-                    return plan ? wrapInsertBuilder(builder, plan) : builder;
+                    return wrapInsertBuilder(builder, plan);
                 };
             }
             if (prop === "update") {
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
-                    const plan = meta ? buildWritePlan(table, meta, auth, "update") : null;
+                    if (!meta) throw unsupportedWrite("update", "plain table");
+                    const plan = buildWritePlan(table, meta, auth, "update");
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
-                    return plan ? wrapUpdateBuilder(builder, plan) : builder;
+                    return wrapUpdateBuilder(builder, plan);
                 };
             }
             if (prop === "delete") {
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
-                    const plan = meta ? buildWritePlan(table, meta, auth, "delete") : null;
+                    if (!meta) throw unsupportedWrite("delete", "plain table");
+                    const plan = buildWritePlan(table, meta, auth, "delete");
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
-                    return plan ? scopePolicyBuilder(builder, plan, "delete") : builder;
+                    return scopePolicyBuilder(builder, plan, "delete");
                 };
             }
             if (prop === "transaction") {
