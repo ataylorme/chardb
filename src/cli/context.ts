@@ -1,5 +1,8 @@
 /** Plumbing for CLI commands so we can unit-test them without touching disk. */
 
+import { mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
+
 export interface CliContext {
     readonly cwd: string;
     readonly env: { readonly [k: string]: string | undefined };
@@ -23,6 +26,7 @@ export const REAL_CONTEXT: CliContext = {
         return await Bun.file(path).text();
     },
     async write(path, contents) {
+        await mkdir(dirname(path), { recursive: true });
         await Bun.write(path, contents);
     },
     async exists(path) {

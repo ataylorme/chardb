@@ -33,17 +33,20 @@ describe("renderWrangler / checkWrangler", () => {
         const text = renderWrangler({
             name: "myapp",
             compatibilityDate: "2026-05-10",
-            r2Bucket: "myapp-blobs",
-            vectorizeIndex: "myapp-embeddings",
-            gsiQueue: "myapp-gsi-tail",
             assetsDir: ".chardb/dashboard",
         });
         const r = checkWrangler(text);
         expect(r.ok).toBe(true);
         expect(r.errors).toEqual([]);
         expect(r.warnings).toEqual([]);
-        expect(JSON.parse(text).services).toBeUndefined();
-        expect(JSON.parse(text).assets.run_worker_first).toEqual(["/_chardb/*", "/ws"]);
+        const config = JSON.parse(text);
+        expect(config.services).toBeUndefined();
+        expect(config.r2_buckets).toBeUndefined();
+        expect(config.vectorize).toBeUndefined();
+        expect(config.queues).toBeUndefined();
+        expect(config.triggers).toBeUndefined();
+        expect(config.tail_consumers).toBeUndefined();
+        expect(config.assets.run_worker_first).toEqual(["/_chardb/*", "/ws"]);
     });
 
     test("checkWrangler reports each missing DO binding", () => {
@@ -57,9 +60,6 @@ describe("renderWrangler / checkWrangler", () => {
         const text = `${renderWrangler({
             name: "x",
             compatibilityDate: "2026-05-10",
-            r2Bucket: "b",
-            vectorizeIndex: "v",
-            gsiQueue: "q",
             assetsDir: ".chardb/dashboard",
         })}\n// trailing comment`;
         const r = checkWrangler(`// header\n${text}`);
@@ -71,9 +71,6 @@ describe("renderWrangler / checkWrangler", () => {
             renderWrangler({
                 name: "x",
                 compatibilityDate: "2026-05-10",
-                r2Bucket: "b",
-                vectorizeIndex: "v",
-                gsiQueue: "q",
                 assetsDir: ".chardb/dashboard",
             })
         );
@@ -92,10 +89,21 @@ describe("chardb init + doctor end-to-end", () => {
     test("init writes wrangler.jsonc + scaffolding; doctor passes", async () => {
         const { ctx, files } = fakeCtx();
         await runInit(ctx, { name: "myapp" });
+        expect(files.has("/tmp/proj/package.json")).toBe(true);
+        expect(files.has("/tmp/proj/tsconfig.json")).toBe(true);
+        expect(files.has("/tmp/proj/.gitignore")).toBe(true);
+        expect(files.has("/tmp/proj/README.md")).toBe(true);
         expect(files.has("/tmp/proj/wrangler.jsonc")).toBe(true);
         expect(files.has("/tmp/proj/src/schema.ts")).toBe(true);
         expect(files.has("/tmp/proj/src/api.ts")).toBe(true);
         expect(files.has("/tmp/proj/src/worker.ts")).toBe(true);
+        expect(files.has("/tmp/proj/public/index.html")).toBe(true);
+        expect(JSON.parse(files.get("/tmp/proj/package.json") ?? "")).toMatchObject({
+            packageManager: "bun@1.2.22",
+            dependencies: { chardb: "0.1.0" },
+            scripts: { typecheck: "tsc --noEmit", build: "wrangler deploy --dry-run --outdir dist" },
+        });
+        expect(JSON.parse(files.get("/tmp/proj/tsconfig.json") ?? "").compilerOptions).not.toHaveProperty("paths");
         // Worker template must be specialised to the app name.
         expect(files.get("/tmp/proj/src/worker.ts")).toContain('appName: "myapp"');
         expect(files.get("/tmp/proj/src/worker.ts")).not.toContain("ChardbWorker");
@@ -107,9 +115,18 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.get("/tmp/proj/src/api.ts")).toContain("}).run()");
         expect(files.get("/tmp/proj/src/api.ts")).not.toContain("handler: async");
         expect(files.get("/tmp/proj/src/api.ts")).not.toContain("tenantScope");
+        expect(files.get("/tmp/proj/README.md")).toContain("does not apply domain migrations");
 
         const r = await runDoctor(ctx, { which: "wrangler" });
         expect(r.ok).toBe(true);
+    });
+
+    test("escapes the application name in generated TypeScript", async () => {
+        const { ctx, files } = fakeCtx();
+
+        await runInit(ctx, { name: 'quoted"app' });
+
+        expect(files.get("/tmp/proj/src/worker.ts")).toContain('appName: "quoted\\"app"');
     });
 });
 

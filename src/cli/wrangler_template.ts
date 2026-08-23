@@ -3,9 +3,6 @@
 export interface WranglerTemplateInput {
     readonly name: string;
     readonly compatibilityDate: string;
-    readonly r2Bucket: string;
-    readonly vectorizeIndex: string;
-    readonly gsiQueue: string;
     readonly assetsDir: string;
 }
 
@@ -30,19 +27,11 @@ export function renderWrangler(input: WranglerTemplateInput): string {
                 new_sqlite_classes: ["Cdb", "Catalog", "Gateway", "BlobMeta", "Resharder", "GsiShard"],
             },
         ],
-        r2_buckets: [{ binding: "CDB_R2", bucket_name: input.r2Bucket }],
-        vectorize: [{ binding: "CDB_VECTORIZE", index_name: input.vectorizeIndex }],
-        queues: {
-            producers: [{ binding: "CDB_GSI_QUEUE", queue: input.gsiQueue }],
-            consumers: [{ queue: input.gsiQueue, max_batch_size: 100 }],
-        },
-        triggers: { crons: ["* * * * *"] },
         assets: {
             directory: input.assetsDir,
             binding: "CDB_DASHBOARD",
             run_worker_first: ["/_chardb/*", "/ws"],
         },
-        tail_consumers: [{ service: "chardb-tail" }],
         observability: {
             logs: { enabled: true },
             traces: { enabled: true },
