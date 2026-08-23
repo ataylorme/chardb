@@ -2,7 +2,15 @@
     "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
     "organizeImports": { "enabled": true },
     "files": {
-        "ignore": ["node_modules", "dist", ".chardb", "bun.lockb", "*.md", "landing/.tsbuild"]
+        "ignore": [
+            "node_modules",
+            "dist",
+            ".chardb",
+            "bun.lockb",
+            "*.md",
+            "landing/.tsbuild",
+            "test/workerd/.test-*.bundle.mjs"
+        ]
     },
     "formatter": {
         "enabled": true,
