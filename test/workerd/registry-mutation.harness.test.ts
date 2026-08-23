@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { rm } from "node:fs/promises";
 import * as path from "node:path";
 import { Miniflare } from "miniflare";
 
@@ -9,38 +10,42 @@ const BUNDLE = path.join(HERE, ".test-registry-mutation.bundle.mjs");
 let mf: Miniflare | undefined;
 
 async function buildWorker(): Promise<string> {
-    const proc = Bun.spawn(
-        [
-            "bun",
-            "build",
-            ENTRY,
-            "--target=browser",
-            "--format=esm",
-            "--external=cloudflare:workers",
-            "--outfile",
-            BUNDLE,
-        ],
-        { stdout: "pipe", stderr: "pipe" }
-    );
-    const exitCode = await proc.exited;
-    if (exitCode !== 0) {
-        const stderr = await new Response(proc.stderr).text();
-        throw new Error(`bundle failed (exit ${exitCode}):\n${stderr}`);
-    }
-    const bundled = await Bun.file(BUNDLE).text();
-    const workerdScript = bundled
-        .replace(
-            "await import(this.#props.path.join(this.#props.migrationFolder, fileName))",
-            'await Promise.reject(new Error("file migrations are unavailable in workerd"))'
-        )
-        .replace(
-            "await import(nodeSqlite)",
-            'await Promise.reject(new Error("node:sqlite is unavailable in workerd"))'
+    try {
+        const proc = Bun.spawn(
+            [
+                "bun",
+                "build",
+                ENTRY,
+                "--target=browser",
+                "--format=esm",
+                "--external=cloudflare:workers",
+                "--outfile",
+                BUNDLE,
+            ],
+            { stdout: "pipe", stderr: "pipe" }
         );
-    if (workerdScript.includes("import(")) {
-        throw new Error("bundle contains an unexpected dynamic import that workerd cannot parse");
+        const exitCode = await proc.exited;
+        if (exitCode !== 0) {
+            const stderr = await new Response(proc.stderr).text();
+            throw new Error(`bundle failed (exit ${exitCode}):\n${stderr}`);
+        }
+        const bundled = await Bun.file(BUNDLE).text();
+        const workerdScript = bundled
+            .replace(
+                "await import(this.#props.path.join(this.#props.migrationFolder, fileName))",
+                'await Promise.reject(new Error("file migrations are unavailable in workerd"))'
+            )
+            .replace(
+                "await import(nodeSqlite)",
+                'await Promise.reject(new Error("node:sqlite is unavailable in workerd"))'
+            );
+        if (workerdScript.includes("import(")) {
+            throw new Error("bundle contains an unexpected dynamic import that workerd cannot parse");
+        }
+        return workerdScript;
+    } finally {
+        await rm(BUNDLE, { force: true });
     }
-    return workerdScript;
 }
 
 beforeAll(async () => {
@@ -59,7 +64,7 @@ afterAll(async () => {
 });
 
 async function mutate(body: {
-    readonly operation: "put" | "inspect" | "unknown";
+    readonly operation: "put" | "inspect" | "raw" | "unknown";
     readonly mutId: string;
     readonly args: unknown;
 }): Promise<{ readonly status: number; readonly body: Record<string, unknown> }> {
@@ -70,6 +75,18 @@ async function mutate(body: {
         body: JSON.stringify(body),
     });
     return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+}
+
+async function inspectAtomicState(): Promise<{
+    readonly entries: readonly { readonly id: string; readonly owner_id: string; readonly value: number }[];
+    readonly opLogRows: number;
+}> {
+    if (!mf) throw new Error("miniflare not initialized");
+    const response = await mf.dispatchFetch("http://example.com/state");
+    return (await response.json()) as {
+        readonly entries: readonly { readonly id: string; readonly owner_id: string; readonly value: number }[];
+        readonly opLogRows: number;
+    };
 }
 
 describe("configured Cdb local mutation registry", () => {
@@ -170,5 +187,19 @@ describe("configured Cdb local mutation registry", () => {
                 rows: [{ id: "entry-1", ownerId: "registry-user", value: 41 }],
             },
         });
+    });
+
+    test("a raw root escape rolls back prior typed SQL and its provisional op-log row", async () => {
+        const before = await inspectAtomicState();
+        const attempted = await mutate({
+            operation: "raw",
+            mutId: "raw-after-typed",
+            args: { id: "raw-must-roll-back", value: 77 },
+        });
+        expect(attempted.body).toMatchObject({
+            ok: false,
+            error: { code: "CDB_UNSUPPORTED_FEATURE", retryable: false },
+        });
+        expect(await inspectAtomicState()).toEqual(before);
     });
 });
