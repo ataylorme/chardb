@@ -34,10 +34,13 @@
 import { getTableColumns } from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../errors.ts";
+import { assertColumnsWritable } from "./cdb-cls.ts";
+import { compileCdbPolicies } from "./cdb-policy.ts";
 import { getCdbMeta } from "./cdb-table-registry.ts";
 import type { CdbTableMeta } from "./cdb-table-types.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
 import type { AuthCtx } from "./define.ts";
+import { applyRowPolicies } from "./policy.ts";
 
 /**
  * Cache of (sqlColumnName → jsColumnKey) for each cdbTable. The map is
@@ -69,6 +72,8 @@ function sqlToJsMap(table: SQLiteTable): ReadonlyMap<string, string> {
  * mutation's auth context.
  */
 interface AutoFillPlan {
+    readonly table: SQLiteTable;
+    readonly auth: AuthCtx;
     readonly bindings: ReadonlyArray<{
         readonly jsKey: string;
         readonly value: string;
@@ -112,11 +117,10 @@ function buildPlan(table: SQLiteTable, meta: CdbTableMeta, auth: AuthCtx): AutoF
         }
     }
 
-    return { bindings };
+    return { table, auth, bindings };
 }
 
 function applyPlan<T extends Record<string, unknown>>(plan: AutoFillPlan, row: T): T {
-    if (plan.bindings.length === 0) return row;
     let next: Record<string, unknown> | null = null;
     for (const { jsKey, value, authority } of plan.bindings) {
         const present = Object.prototype.hasOwnProperty.call(row, jsKey) && row[jsKey] !== undefined;
@@ -127,7 +131,9 @@ function applyPlan<T extends Record<string, unknown>>(plan: AutoFillPlan, row: T
         if (next === null) next = { ...row };
         next[jsKey] = value;
     }
-    return (next ?? row) as T;
+    const filled = (next ?? row) as T;
+    assertCreateAuthorized(plan, filled);
+    return filled;
 }
 
 /**
@@ -138,7 +144,6 @@ function applyPlan<T extends Record<string, unknown>>(plan: AutoFillPlan, row: T
  * `.values()` time so chained methods downstream see a complete row.
  */
 function wrapInsertBuilder(builder: unknown, plan: AutoFillPlan): unknown {
-    if (plan.bindings.length === 0) return builder;
     return new Proxy(builder as object, {
         get(target, prop, receiver) {
             const v = Reflect.get(target, prop, receiver);
@@ -151,6 +156,46 @@ function wrapInsertBuilder(builder: unknown, plan: AutoFillPlan): unknown {
             };
         },
     });
+}
+
+function assertCreateAuthorized(plan: AutoFillPlan, row: Readonly<Record<string, unknown>>): void {
+    const jsToSql = new Map<string, string>();
+    for (const [sqlName, jsKey] of sqlToJsMap(plan.table)) jsToSql.set(jsKey, sqlName);
+    const policyRow: Record<string, unknown> = {};
+    for (const [jsKey, value] of Object.entries(row)) policyRow[jsToSql.get(jsKey) ?? jsKey] = value;
+    const policies = compileCdbPolicies(plan.table);
+    const authorized = applyRowPolicies({
+        op: "insert",
+        auth: plan.auth,
+        rows: [policyRow],
+        policies,
+    });
+    if (authorized.length === 0) {
+        const meta = getCdbMeta(plan.table);
+        throw new CdbError({
+            code: "CDB_FORBIDDEN",
+            message: `${meta?.name ?? "cdbTable"}: caller has no applicable create grant`,
+        });
+    }
+
+    try {
+        assertColumnsWritable({
+            values: policyRow,
+            table: plan.table,
+            auth: plan.auth,
+            verb: "create",
+            autoFilled: new Set(plan.bindings.map(binding => jsToSql.get(binding.jsKey) ?? binding.jsKey)),
+        });
+    } catch (error) {
+        if (error instanceof CdbError && error.code === "CDB_FORBIDDEN_COLUMN") {
+            throw new CdbError({
+                code: "CDB_FORBIDDEN",
+                message: error.message,
+                ...(error.hint !== undefined ? { hint: error.hint } : {}),
+            });
+        }
+        throw error;
+    }
 }
 
 function missingAuthority(authority: "tenant" | "self"): CdbError {

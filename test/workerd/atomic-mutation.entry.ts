@@ -22,14 +22,15 @@ const securedEntries = cdbTable(
         organizationId: text("organization_id")
             .notNull()
             .references(() => organization.id),
+        secretNote: text("secret_note"),
     },
-    { tenantBy: "organizationId" }
+    { tenantBy: "organizationId", roles: { member: { create: ["id"] } } }
 );
 
 const securedSchema = { entries, securedEntries };
 
 interface ExecuteArgs {
-    readonly mode: "commit" | "throw" | "async" | "forbidden";
+    readonly mode: "commit" | "throw" | "async" | "forbidden" | "policy";
     readonly mutId: string;
     readonly firstId: string;
     readonly secondId: string;
@@ -49,7 +50,7 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
             }
             sql.exec("CREATE TABLE IF NOT EXISTS atomic_entries (id TEXT PRIMARY KEY, sequence INTEGER NOT NULL)");
             sql.exec(
-                "CREATE TABLE IF NOT EXISTS atomic_secured_entries (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL)"
+                "CREATE TABLE IF NOT EXISTS atomic_secured_entries (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, secret_note TEXT)"
             );
         });
     }
@@ -68,7 +69,7 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
                 mutId: args.mutId,
                 ref: "src/probe.ts#writePair",
                 args: { firstId: args.firstId, secondId: args.secondId },
-                auth: { userId: "probe-user", tenantId: "probe-org", claims: {} },
+                auth: { userId: "probe-user", tenantId: "probe-org", role: "member", roles: ["member"], claims: {} },
                 schemaEpoch: 1,
             },
             cookie: `probe:${args.mutId}`,
@@ -96,11 +97,14 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
         try {
             return executeAtomicMutation({
                 ...common,
-                schema: args.mode === "forbidden" ? securedSchema : schema,
+                schema: args.mode === "forbidden" || args.mode === "policy" ? securedSchema : schema,
                 handler: ({ db }) => {
                     db.insert(entries).values({ id: args.firstId, sequence: 1 }).run();
                     if (args.mode === "forbidden") {
                         db.insert(securedEntries).values({ id: args.secondId, organizationId: "unverified-org" }).run();
+                    }
+                    if (args.mode === "policy") {
+                        db.insert(securedEntries).values({ id: args.secondId, secretNote: "forbidden" }).run();
                     }
                     db.insert(entries).values({ id: args.secondId, sequence: 2 }).run();
                     if (args.mode === "throw") throw new Error("probe failure after second statement");

@@ -93,6 +93,19 @@ function expectForbidden(run: () => unknown): void {
     expect((caught as CdbError).code).toBe("CDB_FORBIDDEN");
 }
 
+function forbiddenError(run: () => unknown): CdbError {
+    let caught: unknown;
+    try {
+        run();
+    } catch (error) {
+        caught = error;
+    }
+    expect(caught).toBeInstanceOf(CdbError);
+    const cdbError = caught as CdbError;
+    expect(cdbError.code).toBe("CDB_FORBIDDEN");
+    return cdbError;
+}
+
 describe("wrapDb / cdbTable insert auto-fill", () => {
     test("explicit selfBy column is filled from auth.userId", () => {
         const { cdbTable } = forOrg();
@@ -100,19 +113,27 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
             "messages_self_only",
             {
                 id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
                 authorId: text("author_id")
                     .notNull()
                     .references(() => userTable.id),
                 body: text("body").notNull(),
             },
-            { selfBy: "authorId", roles: { self: { read: "*" } } }
+            { selfBy: "authorId", roles: { self: { create: "*" } } }
         );
 
         const { db, captured } = makeStubDb();
         wrapDb(db, baseAuth).insert(messages).values({ id: "m1", body: "hi" });
 
         expect(captured).toHaveLength(1);
-        expect(captured[0]?.rows).toEqual({ id: "m1", body: "hi", authorId: "u-alice" });
+        expect(captured[0]?.rows).toEqual({
+            id: "m1",
+            body: "hi",
+            authorId: "u-alice",
+            organizationId: "org-acme",
+        });
     });
 
     test("selfBy accepts the verified user and rejects a conflicting explicit owner", () => {
@@ -121,6 +142,9 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
             "messages_self_explicit",
             {
                 id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
                 authorId: text("author_id")
                     .notNull()
                     .references(() => userTable.id),
@@ -130,7 +154,11 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
         const matching = makeStubDb();
         wrapDb(matching.db, baseAuth).insert(messages).values({ id: "m1", authorId: "u-alice" });
-        expect(matching.captured[0]?.rows).toEqual({ id: "m1", authorId: "u-alice" });
+        expect(matching.captured[0]?.rows).toEqual({
+            id: "m1",
+            authorId: "u-alice",
+            organizationId: "org-acme",
+        });
 
         const conflicting = makeStubDb();
         expectForbidden(() =>
@@ -141,13 +169,17 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
     test("forOrg() conventional `organizationId` is filled from auth.tenantId without explicit tenantBy", () => {
         const { cdbTable } = forOrg();
-        const channels = cdbTable("channels_conv", {
-            id: text("id").primaryKey(),
-            organizationId: text("organization_id")
-                .notNull()
-                .references(() => orgTable.id),
-            name: text("name").notNull(),
-        });
+        const channels = cdbTable(
+            "channels_conv",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                name: text("name").notNull(),
+            },
+            { roles: { member: { create: "*" } } }
+        );
 
         const { db, captured } = makeStubDb();
         wrapDb(db, baseAuth).insert(channels).values({ id: "c1", name: "general" });
@@ -167,7 +199,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
                 shadowOrgId: text("shadow_org_id").references(() => orgTable.id),
                 amount: integer("amount").notNull(),
             },
-            { tenantBy: "primaryOrgId" }
+            { tenantBy: "primaryOrgId", roles: { member: { create: "*" } } }
         );
 
         const { db, captured } = makeStubDb();
@@ -178,13 +210,17 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
     test("forUser(): user FK column is filled from auth.userId", () => {
         const { cdbTable } = forUser();
-        const notes = cdbTable("notes_user", {
-            id: text("id").primaryKey(),
-            userId: text("user_id")
-                .notNull()
-                .references(() => userTable.id),
-            body: text("body").notNull(),
-        });
+        const notes = cdbTable(
+            "notes_user",
+            {
+                id: text("id").primaryKey(),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
+                body: text("body").notNull(),
+            },
+            { roles: { member: { create: "*" } } }
+        );
 
         const { db, captured } = makeStubDb();
         wrapDb(db, baseAuth).insert(notes).values({ id: "n1", body: "todo" });
@@ -194,12 +230,16 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
     test("user tenancy rejects conflicting values and missing verified user authority", () => {
         const { cdbTable } = forUser();
-        const notes = cdbTable("notes_user_authority", {
-            id: text("id").primaryKey(),
-            userId: text("user_id")
-                .notNull()
-                .references(() => userTable.id),
-        });
+        const notes = cdbTable(
+            "notes_user_authority",
+            {
+                id: text("id").primaryKey(),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { roles: { member: { create: "*" } } }
+        );
 
         const conflicting = makeStubDb();
         expectForbidden(() => wrapDb(conflicting.db, baseAuth).insert(notes).values({ id: "n1", userId: "u-mallory" }));
@@ -216,13 +256,17 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
     test("org tenancy accepts a matching explicit value and rejects a conflict", () => {
         const { cdbTable } = forOrg();
-        const channels = cdbTable("channels_explicit_wins", {
-            id: text("id").primaryKey(),
-            organizationId: text("organization_id")
-                .notNull()
-                .references(() => orgTable.id),
-            name: text("name").notNull(),
-        });
+        const channels = cdbTable(
+            "channels_explicit_wins",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                name: text("name").notNull(),
+            },
+            { roles: { member: { create: "*" } } }
+        );
 
         const matching = makeStubDb();
         wrapDb(matching.db, baseAuth)
@@ -245,13 +289,17 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
     test("array .values([...]) validates every row before forwarding", () => {
         const { cdbTable } = forOrg();
-        const channels = cdbTable("channels_batch", {
-            id: text("id").primaryKey(),
-            organizationId: text("organization_id")
-                .notNull()
-                .references(() => orgTable.id),
-            name: text("name").notNull(),
-        });
+        const channels = cdbTable(
+            "channels_batch",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                name: text("name").notNull(),
+            },
+            { roles: { member: { create: "*" } } }
+        );
 
         const matching = makeStubDb();
         wrapDb(matching.db, baseAuth)
@@ -277,6 +325,89 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         expect(conflicting.captured[0]?.rows).toBeUndefined();
     });
 
+    test("denies create when no role or self grant applies", () => {
+        const { cdbTable } = forOrg();
+        const privateRows = cdbTable(
+            "private_rows_no_create",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+            },
+            { roles: { member: { read: "*" } } }
+        );
+        const denied = makeStubDb();
+        const error = forbiddenError(() => wrapDb(denied.db, baseAuth).insert(privateRows).values({ id: "p1" }));
+        expect(error.message).toBe("private_rows_no_create: caller has no applicable create grant");
+        expect(denied.captured[0]?.rows).toBeUndefined();
+    });
+
+    test("ORs alternative role grants and enforces snake_case create columns", () => {
+        const { cdbTable } = forOrg();
+        const profiles = cdbTable(
+            "profiles_create_columns",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                displayName: text("display_name").notNull(),
+                secretNote: text("secret_note"),
+            },
+            {
+                roles: {
+                    admin: { create: ["id", "secretNote"] },
+                    member: { create: ["id", "displayName"] },
+                },
+            }
+        );
+
+        const allowed = makeStubDb();
+        wrapDb(allowed.db, baseAuth).insert(profiles).values({ id: "profile-1", displayName: "Ada" });
+        expect(allowed.captured[0]?.rows).toEqual({
+            id: "profile-1",
+            displayName: "Ada",
+            organizationId: "org-acme",
+        });
+
+        const denied = makeStubDb();
+        const error = forbiddenError(() =>
+            wrapDb(denied.db, baseAuth)
+                .insert(profiles)
+                .values({ id: "profile-2", displayName: "Mallory", secretNote: "forbidden" })
+        );
+        expect(error.message).toBe('profiles_create_columns: caller is not authorized to create column "secret_note"');
+        expect(denied.captured[0]?.rows).toBeUndefined();
+    });
+
+    test("a forbidden column in any batch row rejects the whole values call", () => {
+        const { cdbTable } = forOrg();
+        const profiles = cdbTable(
+            "profiles_create_batch",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                displayName: text("display_name").notNull(),
+                secretNote: text("secret_note"),
+            },
+            { roles: { member: { create: ["id", "displayName"] } } }
+        );
+        const denied = makeStubDb();
+        const error = forbiddenError(() =>
+            wrapDb(denied.db, baseAuth)
+                .insert(profiles)
+                .values([
+                    { id: "profile-1", displayName: "Allowed" },
+                    { id: "profile-2", displayName: "Denied", secretNote: "forbidden" },
+                ])
+        );
+        expect(error.message).toBe('profiles_create_batch: caller is not authorized to create column "secret_note"');
+        expect(denied.captured[0]?.rows).toBeUndefined();
+    });
+
     test("non-cdbTables pass through unchanged", () => {
         const raw = sqliteTable("raw_passthrough", {
             id: text("id").primaryKey(),
@@ -291,13 +422,17 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
     test("missing org authority rejects even an explicitly supplied tenant", () => {
         const { cdbTable } = forOrg();
-        const channels = cdbTable("channels_no_tenant_id", {
-            id: text("id").primaryKey(),
-            organizationId: text("organization_id")
-                .notNull()
-                .references(() => orgTable.id),
-            name: text("name").notNull(),
-        });
+        const channels = cdbTable(
+            "channels_no_tenant_id",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                name: text("name").notNull(),
+            },
+            { roles: { member: { create: "*" } } }
+        );
 
         const anonAuth: AuthCtx = { ...baseAuth, tenantId: undefined };
         const { db, captured } = makeStubDb();
@@ -310,13 +445,17 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
     test("api.mutation handler receives a wrapped ctx.db (auto-fill happens end-to-end)", async () => {
         const { api } = await import("../../src/server/index.ts");
         const { cdbTable } = forOrg();
-        const channels = cdbTable("channels_e2e", {
-            id: text("id").primaryKey(),
-            organizationId: text("organization_id")
-                .notNull()
-                .references(() => orgTable.id),
-            name: text("name").notNull(),
-        });
+        const channels = cdbTable(
+            "channels_e2e",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                name: text("name").notNull(),
+            },
+            { roles: { member: { create: "*" } } }
+        );
 
         const { db, captured } = makeStubDb();
         const create = api.mutation({
@@ -332,13 +471,17 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
 
     test("other builder methods on the wrapped insert pass through (returning / onConflictDoNothing)", async () => {
         const { cdbTable } = forOrg();
-        const channels = cdbTable("channels_chain", {
-            id: text("id").primaryKey(),
-            organizationId: text("organization_id")
-                .notNull()
-                .references(() => orgTable.id),
-            name: text("name").notNull(),
-        });
+        const channels = cdbTable(
+            "channels_chain",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                name: text("name").notNull(),
+            },
+            { roles: { member: { create: "*" } } }
+        );
 
         const { db } = makeStubDb();
         const inserted = wrapDb(db, baseAuth)

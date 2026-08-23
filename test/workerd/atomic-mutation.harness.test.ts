@@ -46,7 +46,7 @@ afterAll(async () => {
 });
 
 async function execute(body: {
-    readonly mode: "commit" | "throw" | "async" | "forbidden";
+    readonly mode: "commit" | "throw" | "async" | "forbidden" | "policy";
     readonly mutId: string;
     readonly firstId: string;
     readonly secondId: string;
@@ -153,6 +153,22 @@ describe("atomic domain mutation on real Durable Object SqlStorage", () => {
         expect((await response.json()) as unknown).toEqual({
             code: "CDB_FORBIDDEN",
             message: 'explicit tenant column "organizationId" conflicts with verified auth',
+        });
+        expect(await inspect()).toEqual(before);
+    });
+
+    test("a forbidden create column rolls back earlier statements and the provisional op-log row", async () => {
+        const before = await inspect();
+        const response = await execute({
+            mode: "policy",
+            mutId: "forbidden-create-column",
+            firstId: "policy-must-roll-back",
+            secondId: "policy-must-not-insert",
+        });
+        expect(response.status).toBe(409);
+        expect((await response.json()) as unknown).toEqual({
+            code: "CDB_FORBIDDEN",
+            message: 'atomic_secured_entries: caller is not authorized to create column "secret_note"',
         });
         expect(await inspect()).toEqual(before);
     });

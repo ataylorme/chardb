@@ -53,7 +53,7 @@ function domainSchema() {
             slug: text("slug").notNull().unique(),
             priority: integer("priority").notNull().default(3),
         },
-        { partitionBy: "id" }
+        { partitionBy: "id", roles: { member: { create: ["id", "slug"] } } }
     );
     const tasks = cdbTable(
         "domain_tasks",
@@ -132,7 +132,7 @@ describe("configured Cdb domain schema", () => {
             mutId: "create-project-1",
             ref: createProject.__chardbRef,
             args: { id: "project-1", slug: "alpha" },
-            auth: { userId: "user-1", roles: [], claims: {} },
+            auth: { userId: "user-1", role: "member", roles: ["member"], claims: {} },
             schemaEpoch: 1,
         });
         expect(result).toMatchObject({ ok: true, ran: true, result: "project-1" });
