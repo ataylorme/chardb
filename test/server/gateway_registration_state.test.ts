@@ -6,9 +6,14 @@ import {
     type GatewayRegistrationAdvance,
     type GatewayRegistrationInstall,
     advanceGatewayRegistration,
+    beginInitialGatewayQuery,
     cleanupGatewayRegistration,
     installGatewayRegistration,
+    listCurrentGatewayRegistrationsForConnection,
+    retireCurrentGatewayRegistration,
+    retireCurrentGatewayRegistrationsForConnection,
     retireGatewayRegistration,
+    settleInitialGatewaySnapshot,
 } from "../../src/server/do/gateway.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 
@@ -248,5 +253,263 @@ describe("Gateway durable registration generations", () => {
         expect(
             db.query("SELECT registration_id FROM _gw_registration_generations ORDER BY registration_id").all()
         ).toEqual([{ registration_id: "registration-new" }]);
+    });
+
+    test("begins an initial query from the higher subscription or dirty baseline", () => {
+        const current = registration("registration-begin");
+        db.transaction(() => installGatewayRegistration(sql, current))();
+        db.query("UPDATE _gw_registration_generations SET dirty_version = 9 WHERE registration_id = ?").run(
+            current.registrationId
+        );
+
+        const run = db.transaction(() =>
+            beginInitialGatewayQuery(sql, {
+                ...current,
+                changeSeq: 5,
+                nowMs: 200,
+            })
+        )();
+        expect(run).toEqual({ baseline: 9, runToken: expect.any(String), runVersion: 1 });
+        expect(run?.runToken).not.toBe("");
+        expect(
+            db
+                .query(
+                    `SELECT lifecycle, cdb_state, dirty_version, delivered_version,
+                            run_token, run_version, updated_at
+                     FROM _gw_registration_generations WHERE registration_id = ?`
+                )
+                .get(current.registrationId)
+        ).toEqual({
+            lifecycle: "installing",
+            cdb_state: "active",
+            dirty_version: 9,
+            delivered_version: 9,
+            run_token: run?.runToken,
+            run_version: 1,
+            updated_at: 200,
+        });
+        expect(
+            db.transaction(() => beginInitialGatewayQuery(sql, { ...current, changeSeq: 20, nowMs: 300 }))()
+        ).toBeNull();
+
+        const subscriptionAhead = registration("registration-subscription-ahead", "principal-2", {
+            clientId: ClientId("client-2"),
+            subId: SubId(8),
+        });
+        db.transaction(() => installGatewayRegistration(sql, subscriptionAhead))();
+        expect(
+            db.transaction(() => beginInitialGatewayQuery(sql, { ...subscriptionAhead, changeSeq: 12, nowMs: 250 }))()
+        ).toMatchObject({ baseline: 12, runVersion: 1 });
+    });
+
+    test("settles only the token-owning current initial query without losing concurrent dirtiness", () => {
+        const current = registration("registration-settle");
+        db.transaction(() => installGatewayRegistration(sql, current))();
+        const run = db.transaction(() => beginInitialGatewayQuery(sql, { ...current, changeSeq: 6, nowMs: 200 }))();
+        if (!run) throw new Error("initial query did not begin");
+        db.query("UPDATE _gw_registration_generations SET dirty_version = 14 WHERE registration_id = ?").run(
+            current.registrationId
+        );
+
+        expect(
+            db.transaction(() =>
+                settleInitialGatewaySnapshot(sql, {
+                    ...current,
+                    runToken: "wrong-token",
+                    lastCookie: Cookie("cookie-wrong"),
+                    nowMs: 300,
+                })
+            )()
+        ).toBe(false);
+        expect(
+            db.transaction(() =>
+                settleInitialGatewaySnapshot(sql, {
+                    ...current,
+                    connectionId: "wrong-connection",
+                    runToken: run.runToken,
+                    lastCookie: Cookie("cookie-wrong"),
+                    nowMs: 300,
+                })
+            )()
+        ).toBe(false);
+        expect(
+            db.transaction(() =>
+                settleInitialGatewaySnapshot(sql, {
+                    ...current,
+                    runToken: run.runToken,
+                    lastCookie: Cookie("cookie-settled"),
+                    nowMs: 400,
+                })
+            )()
+        ).toBe(true);
+        expect(
+            db
+                .query(
+                    `SELECT lifecycle, cdb_state, dirty_version, delivered_version,
+                            run_token, run_version, last_cookie
+                     FROM _gw_registration_generations WHERE registration_id = ?`
+                )
+                .get(current.registrationId)
+        ).toEqual({
+            lifecycle: "active",
+            cdb_state: "active",
+            dirty_version: 14,
+            delivered_version: 6,
+            run_token: null,
+            run_version: 2,
+            last_cookie: "cookie-settled",
+        });
+        expect(
+            db.transaction(() =>
+                settleInitialGatewaySnapshot(sql, {
+                    ...current,
+                    runToken: run.runToken,
+                    lastCookie: Cookie("cookie-replayed"),
+                    nowMs: 500,
+                })
+            )()
+        ).toBe(false);
+    });
+
+    test("an old initial-query token cannot settle after head replacement", () => {
+        const old = registration("registration-cas-old");
+        db.transaction(() => installGatewayRegistration(sql, old))();
+        const run = db.transaction(() => beginInitialGatewayQuery(sql, { ...old, changeSeq: 2, nowMs: 200 }))();
+        if (!run) throw new Error("initial query did not begin");
+        const replacement = registration("registration-cas-new", "principal-1", { nowMs: 300 });
+        db.transaction(() => installGatewayRegistration(sql, replacement))();
+
+        expect(
+            db.transaction(() =>
+                settleInitialGatewaySnapshot(sql, {
+                    ...old,
+                    runToken: run.runToken,
+                    lastCookie: Cookie("cookie-stale"),
+                    nowMs: 400,
+                })
+            )()
+        ).toBe(false);
+        expect(
+            db
+                .query(
+                    "SELECT lifecycle, cdb_state, run_token FROM _gw_registration_generations WHERE registration_id = ?"
+                )
+                .get(old.registrationId)
+        ).toEqual({ lifecycle: "retiring", cdb_state: "retiring", run_token: null });
+        expect(
+            db.query("SELECT registration_id FROM _gw_registration_heads WHERE principal_id = ?").get(old.principalId)
+        ).toEqual({ registration_id: replacement.registrationId });
+    });
+
+    test("lists and retires only exact current generations for one connection", () => {
+        const first = registration("registration-connection-a1", "principal-1", {
+            connectionId: "connection-a",
+            subId: SubId(1),
+            shardId: "logical-a1",
+            sourceCdbId: "physical-a1",
+        });
+        const second = registration("registration-connection-a2", "principal-1", {
+            connectionId: "connection-a",
+            subId: SubId(2),
+            shardId: "logical-a2",
+            sourceCdbId: "physical-a2",
+        });
+        const other = registration("registration-connection-b", "principal-1", {
+            connectionId: "connection-b",
+            subId: SubId(3),
+            shardId: "logical-b",
+            sourceCdbId: "physical-b",
+        });
+        db.transaction(() => {
+            installGatewayRegistration(sql, first);
+            installGatewayRegistration(sql, second);
+            installGatewayRegistration(sql, other);
+        })();
+
+        expect(listCurrentGatewayRegistrationsForConnection(sql, "connection-a")).toEqual([
+            {
+                principalId: PrincipalId("principal-1"),
+                clientId: ClientId("client-shared"),
+                subId: SubId(1),
+                registrationId: "registration-connection-a1",
+                connectionId: "connection-a",
+                shardId: "logical-a1",
+                sourceCdbId: "physical-a1",
+            },
+            {
+                principalId: PrincipalId("principal-1"),
+                clientId: ClientId("client-shared"),
+                subId: SubId(2),
+                registrationId: "registration-connection-a2",
+                connectionId: "connection-a",
+                shardId: "logical-a2",
+                sourceCdbId: "physical-a2",
+            },
+        ]);
+        expect(
+            db.transaction(() =>
+                retireCurrentGatewayRegistration(sql, { ...first, connectionId: "wrong-connection", nowMs: 200 })
+            )()
+        ).toBeNull();
+        expect(
+            db.transaction(() => retireCurrentGatewayRegistrationsForConnection(sql, "connection-a", 300))()
+        ).toHaveLength(2);
+        expect(db.query("SELECT registration_id FROM _gw_registration_heads ORDER BY registration_id").all()).toEqual([
+            { registration_id: other.registrationId },
+        ]);
+        expect(
+            db
+                .query(
+                    `SELECT registration_id, lifecycle, cdb_state, run_version
+                     FROM _gw_registration_generations ORDER BY registration_id`
+                )
+                .all()
+        ).toEqual([
+            {
+                registration_id: first.registrationId,
+                lifecycle: "retiring",
+                cdb_state: "retiring",
+                run_version: 1,
+            },
+            {
+                registration_id: second.registrationId,
+                lifecycle: "retiring",
+                cdb_state: "retiring",
+                run_version: 1,
+            },
+            {
+                registration_id: other.registrationId,
+                lifecycle: "installing",
+                cdb_state: "pending",
+                run_version: 0,
+            },
+        ]);
+    });
+
+    test("fails closed for corrupt head identity and impossible generation state", () => {
+        const corruptHead = registration("registration-corrupt-head");
+        db.transaction(() => installGatewayRegistration(sql, corruptHead))();
+        db.query("UPDATE _gw_registration_heads SET principal_id = 'corrupt-principal' WHERE registration_id = ?").run(
+            corruptHead.registrationId
+        );
+
+        expect(
+            db.transaction(() => beginInitialGatewayQuery(sql, { ...corruptHead, changeSeq: 1, nowMs: 200 }))()
+        ).toBeNull();
+        expect(listCurrentGatewayRegistrationsForConnection(sql, corruptHead.connectionId)).toEqual([]);
+        expect(
+            db.transaction(() => retireCurrentGatewayRegistration(sql, { ...corruptHead, nowMs: 300 }))()
+        ).toBeNull();
+
+        const corruptGeneration = registration("registration-corrupt-generation", "principal-2", {
+            clientId: ClientId("client-2"),
+        });
+        db.transaction(() => installGatewayRegistration(sql, corruptGeneration))();
+        db.query("UPDATE _gw_registration_generations SET lifecycle = 'active' WHERE registration_id = ?").run(
+            corruptGeneration.registrationId
+        );
+        expect(
+            db.transaction(() => beginInitialGatewayQuery(sql, { ...corruptGeneration, changeSeq: 1, nowMs: 200 }))()
+        ).toBeNull();
     });
 });

@@ -534,6 +534,41 @@ export interface GatewayRegistrationAdvance extends GatewayRegistrationKey {
     readonly nowMs: number;
 }
 
+export interface GatewayInitialQueryBegin extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly changeSeq: number;
+    readonly nowMs: number;
+}
+
+export interface GatewayInitialQueryRun {
+    readonly baseline: number;
+    readonly runToken: string;
+    readonly runVersion: number;
+}
+
+export interface GatewayInitialSnapshotSettle extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly runToken: string;
+    readonly lastCookie: Cookie;
+    readonly nowMs: number;
+}
+
+export interface GatewayCurrentRegistration extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    /** Catalog's logical shard identifier. */
+    readonly shardId: string;
+    /** Physical Cdb Durable Object identifier used for unsubscribe cleanup. */
+    readonly sourceCdbId: string | null;
+}
+
+export interface GatewayCurrentRegistrationRetire extends GatewayRegistrationKey {
+    readonly connectionId: string;
+    readonly nowMs: number;
+}
+
 /**
  * Install a new durable generation. The caller must wrap this helper in the
  * Gateway storage transaction so the old generation and head move atomically.
@@ -653,6 +688,242 @@ export function advanceGatewayRegistration(sql: SyncSql, input: GatewayRegistrat
 }
 
 /**
+ * Baseline an initial query after Cdb subscription. The caller must wrap this
+ * helper in the Gateway storage transaction.
+ */
+export function beginInitialGatewayQuery(sql: SyncSql, input: GatewayInitialQueryBegin): GatewayInitialQueryRun | null {
+    assertGatewayRegistrationIdentity(input);
+    assertNonnegativeSafeInteger(input.changeSeq, "changeSeq");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    const current = sql.one<{ dirty_version: number; run_version: number }>(
+        `SELECT g.dirty_version, g.run_version
+         FROM _gw_registration_generations g
+         INNER JOIN _gw_registration_heads h
+           ON h.registration_id = g.registration_id
+          AND h.principal_id = g.principal_id
+          AND h.client_id = g.client_id
+          AND h.sub_id = g.sub_id
+         WHERE g.registration_id = ? AND g.principal_id = ? AND g.client_id = ? AND g.sub_id = ?
+           AND g.connection_id = ? AND g.lifecycle = 'installing' AND g.cdb_state = 'pending'`,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    if (!current) return null;
+
+    const baseline = Math.max(current.dirty_version, input.changeSeq);
+    const runToken = crypto.randomUUID();
+    const runVersion = current.run_version + 1;
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET cdb_state = 'active', dirty_version = ?, delivered_version = ?,
+             run_token = ?, run_version = run_version + 1, updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND lifecycle = 'installing' AND cdb_state = 'pending'
+           AND run_version = ?
+           AND EXISTS (
+             SELECT 1 FROM _gw_registration_heads h
+             WHERE h.registration_id = _gw_registration_generations.registration_id
+               AND h.principal_id = _gw_registration_generations.principal_id
+               AND h.client_id = _gw_registration_generations.client_id
+               AND h.sub_id = _gw_registration_generations.sub_id
+           )`,
+        baseline,
+        baseline,
+        runToken,
+        input.nowMs,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId,
+        current.run_version
+    );
+    if (sql.changes() !== 1) return null;
+    const stored = sql.one<{
+        dirty_version: number;
+        delivered_version: number;
+        run_token: string;
+        run_version: number;
+    }>(
+        `SELECT dirty_version, delivered_version, run_token, run_version
+         FROM _gw_registration_generations WHERE registration_id = ?`,
+        input.registrationId
+    );
+    if (
+        !stored ||
+        stored.dirty_version !== baseline ||
+        stored.delivered_version !== baseline ||
+        stored.run_token !== runToken ||
+        stored.run_version !== runVersion
+    ) {
+        throw gatewayInvalidationInvariant("initial Gateway query baseline was not stored atomically");
+    }
+    return { baseline, runToken, runVersion };
+}
+
+/** Complete one initial snapshot only when its run token still owns the current generation. */
+export function settleInitialGatewaySnapshot(sql: SyncSql, input: GatewayInitialSnapshotSettle): boolean {
+    assertGatewayRegistrationIdentity(input);
+    if (input.runToken.length === 0) throw new TypeError("runToken must be nonempty");
+    if (input.lastCookie.length === 0) throw new TypeError("lastCookie must be nonempty");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET lifecycle = 'active', run_token = NULL, run_version = run_version + 1,
+             last_cookie = ?, updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND lifecycle = 'installing' AND cdb_state = 'active'
+           AND run_token = ?
+           AND EXISTS (
+             SELECT 1 FROM _gw_registration_heads h
+             WHERE h.registration_id = _gw_registration_generations.registration_id
+               AND h.principal_id = _gw_registration_generations.principal_id
+               AND h.client_id = _gw_registration_generations.client_id
+               AND h.sub_id = _gw_registration_generations.sub_id
+           )`,
+        input.lastCookie,
+        input.nowMs,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId,
+        input.runToken
+    );
+    return sql.changes() === 1;
+}
+
+/** Return current, internally consistent generations owned by one socket generation. */
+export function listCurrentGatewayRegistrationsForConnection(
+    sql: SyncSql,
+    connectionId: string
+): readonly GatewayCurrentRegistration[] {
+    if (connectionId.length === 0) throw new TypeError("connectionId must be nonempty");
+    return sql
+        .all<{
+            principal_id: string;
+            client_id: string;
+            sub_id: number;
+            registration_id: string;
+            connection_id: string;
+            shard_id: string;
+            source_cdb_id: string | null;
+        }>(
+            `SELECT g.principal_id, g.client_id, g.sub_id, g.registration_id,
+                    g.connection_id, g.shard_id, g.source_cdb_id
+             FROM _gw_registration_generations g
+             INNER JOIN _gw_registration_heads h
+               ON h.registration_id = g.registration_id
+              AND h.principal_id = g.principal_id
+              AND h.client_id = g.client_id
+              AND h.sub_id = g.sub_id
+             WHERE g.connection_id = ?
+             ORDER BY g.principal_id, g.client_id, g.sub_id, g.registration_id`,
+            connectionId
+        )
+        .map(row => ({
+            principalId: PrincipalId(row.principal_id),
+            clientId: ClientId(row.client_id),
+            subId: SubId(row.sub_id),
+            registrationId: row.registration_id,
+            connectionId: row.connection_id,
+            shardId: row.shard_id,
+            sourceCdbId: row.source_cdb_id,
+        }));
+}
+
+/**
+ * Retire one exact current generation while retaining its cleanup row. The
+ * caller must wrap this multi-statement helper in the Gateway transaction.
+ */
+export function retireCurrentGatewayRegistration(
+    sql: SyncSql,
+    input: GatewayCurrentRegistrationRetire
+): GatewayCurrentRegistration | null {
+    assertGatewayRegistrationKey(input);
+    if (input.connectionId.length === 0) throw new TypeError("connectionId must be nonempty");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    const current = sql.one<{
+        registration_id: string;
+        shard_id: string;
+        source_cdb_id: string | null;
+    }>(
+        `SELECT g.registration_id, g.shard_id, g.source_cdb_id
+         FROM _gw_registration_generations g
+         INNER JOIN _gw_registration_heads h
+           ON h.registration_id = g.registration_id
+          AND h.principal_id = g.principal_id
+          AND h.client_id = g.client_id
+          AND h.sub_id = g.sub_id
+         WHERE g.principal_id = ? AND g.client_id = ? AND g.sub_id = ? AND g.connection_id = ?`,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    if (!current) return null;
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL,
+             run_version = run_version + 1, updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ?`,
+        input.nowMs,
+        current.registration_id,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    if (sql.changes() !== 1) {
+        throw gatewayInvalidationInvariant("current Gateway registration disappeared during retirement");
+    }
+    sql.exec(
+        `DELETE FROM _gw_registration_heads
+         WHERE principal_id = ? AND client_id = ? AND sub_id = ? AND registration_id = ?`,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        current.registration_id
+    );
+    if (sql.changes() !== 1) {
+        throw gatewayInvalidationInvariant("current Gateway registration head disappeared during retirement");
+    }
+    return {
+        principalId: input.principalId,
+        clientId: input.clientId,
+        subId: input.subId,
+        registrationId: current.registration_id,
+        connectionId: input.connectionId,
+        shardId: current.shard_id,
+        sourceCdbId: current.source_cdb_id,
+    };
+}
+
+/**
+ * Retire every internally consistent current generation owned by one socket
+ * generation. The caller must wrap this helper in the Gateway transaction.
+ */
+export function retireCurrentGatewayRegistrationsForConnection(
+    sql: SyncSql,
+    connectionId: string,
+    nowMs: number
+): readonly GatewayCurrentRegistration[] {
+    assertNonnegativeSafeInteger(nowMs, "nowMs");
+    const registrations = listCurrentGatewayRegistrationsForConnection(sql, connectionId);
+    for (const registration of registrations) {
+        const retired = retireCurrentGatewayRegistration(sql, { ...registration, nowMs });
+        if (!retired || retired.registrationId !== registration.registrationId) {
+            throw gatewayInvalidationInvariant("current Gateway registration changed during connection retirement");
+        }
+    }
+    return registrations;
+}
+
+/**
  * Remove a current logical head while retaining its generation for Cdb cleanup.
  * The caller must wrap the head deletion and generation update in one transaction.
  */
@@ -724,6 +995,32 @@ function assertGatewayRegistrationInstall(input: GatewayRegistrationInstall): vo
         ["queryHash", input.queryHash],
         ["shardId", input.shardId],
         ["sourceCdbId", input.sourceCdbId],
+    ] as const) {
+        if (value.length === 0) throw new TypeError(`${name} must be nonempty`);
+    }
+}
+
+function assertGatewayRegistrationIdentity(input: {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly principalId: PrincipalId;
+    readonly clientId: ClientId;
+    readonly subId: SubId;
+}): void {
+    assertGatewayRegistrationKey(input);
+    for (const [name, value] of [
+        ["registrationId", input.registrationId],
+        ["connectionId", input.connectionId],
+    ] as const) {
+        if (value.length === 0) throw new TypeError(`${name} must be nonempty`);
+    }
+}
+
+function assertGatewayRegistrationKey(input: GatewayRegistrationKey): void {
+    assertNonnegativeSafeInteger(input.subId, "subId");
+    for (const [name, value] of [
+        ["principalId", input.principalId],
+        ["clientId", input.clientId],
     ] as const) {
         if (value.length === 0) throw new TypeError(`${name} must be nonempty`);
     }
