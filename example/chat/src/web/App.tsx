@@ -1,6 +1,6 @@
 import { createAuthClient } from "better-auth/client";
 import { anonymousClient } from "better-auth/client/plugins";
-import { ChardbProvider, useSession } from "chardb/react/index.ts";
+import { ChardbProvider, useSession } from "chardb/react";
 import { useEffect, useState } from "react";
 import { ChannelList } from "./components/ChannelList.tsx";
 import { Composer } from "./components/Composer.tsx";

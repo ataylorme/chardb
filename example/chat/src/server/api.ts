@@ -9,21 +9,25 @@ import { messages } from "./schema.ts";
 export const postMessage = api.mutation({
     args: z.object({
         id: z.string(),
+        organizationId: z.string(),
         channelId: z.string(),
         body: z.string().min(1),
         clientCreatedAt: z.number(),
     }),
-    partitionKey: () => undefined,
-    handler: async (ctx, args) => {
-        if (!ctx.auth.userId || !ctx.auth.tenantId) {
-            throw new Error("CDB_FORBIDDEN: postMessage requires an authenticated session with an active org");
+    partitionKey: "organizationId",
+    handler: (ctx, args) => {
+        if (!ctx.auth.userId || !ctx.auth.tenantId || ctx.auth.tenantId !== args.organizationId) {
+            throw new Error("CDB_FORBIDDEN: active organization does not match the routed partition");
         }
-        await ctx.db.insert(messages).values({
-            id: args.id,
-            channelId: args.channelId,
-            body: args.body,
-            createdAt: args.clientCreatedAt,
-        });
+        ctx.db
+            .insert(messages)
+            .values({
+                id: args.id,
+                channelId: args.channelId,
+                body: args.body,
+                createdAt: args.clientCreatedAt,
+            })
+            .run();
         return { id: args.id };
     },
 });

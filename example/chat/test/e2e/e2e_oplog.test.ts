@@ -7,17 +7,15 @@
 
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { CdbError } from "chardb/errors.ts";
-import { OP_LOG_DDL } from "chardb/oplog/schema.ts";
+import { CdbError, Cookie, MutId, PrincipalId, vshardOf } from "../../../../src/index.ts";
+import { OP_LOG_DDL } from "../../../../src/oplog/schema.ts";
 import {
     type SqlParam,
     type SqlValue,
     type SyncSql,
     canonicalRequest,
     runWrappedMutation,
-} from "chardb/oplog/wrapper.ts";
-import { Cookie, MutId, PrincipalId } from "chardb/types.ts";
-import { vshardOf } from "chardb/vshard.ts";
+} from "../../../../src/oplog/wrapper.ts";
 
 const PARTITIONS = 50;
 const MUTS_PER_PARTITION = 20;

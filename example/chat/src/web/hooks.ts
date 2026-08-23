@@ -1,10 +1,10 @@
-import { useMutation, usePresence, useQuery } from "chardb/react/index.ts";
+import { useMutation, usePresence, useQuery } from "chardb/react";
 import { useCallback, useEffect, useRef } from "react";
 import { uuidv7 } from "uuidv7";
 import { postMessage, typing } from "../server/api.ts";
 import { listMessages } from "../server/queries.ts";
 
-import type { InferRow } from "chardb/react/index.ts";
+import type { InferRow } from "chardb/react";
 
 type MessageRow = InferRow<typeof listMessages>;
 export type { MessageRow };
@@ -41,6 +41,7 @@ export function usePostMessage(channelId: string): UsePostMessage {
         (input: { readonly body: string }) =>
             mutate({
                 id: uuidv7(),
+                organizationId: "demo-org",
                 channelId,
                 body: input.body,
                 clientCreatedAt: Date.now(),

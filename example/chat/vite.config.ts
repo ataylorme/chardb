@@ -1,28 +1,16 @@
 /**
  * Vite config for the chardb chat example.
  *
- * The chardb Vite plugin (`@chardb/vite-plugin`) walks every `defineMutation`
- * / `defineQuery` / `definePresenceKey` export under `src/server/**` and
- * stamps a deterministic wire id onto each, so the React frontend can pass
- * the function value to `useMutation(postMessage)` without the developer
- * ever typing a wire string.
- *
- * Install once (vite, @vitejs/plugin-react, react-dom are not part of the
- * chardb workspace install — they're only needed if you actually want to
- * spin the SPA up):
- *
- *   cd example/chat
- *   bun add -d vite @vitejs/plugin-react
- *   bun add react react-dom
- *
- * Run `bun run dev` to start the Vite dev server and `bun run build` to
- * produce static assets the wrangler `assets` binding can serve in front of
- * the chardb Worker.
+ * The chardb Vite plugin scans server exports and stamps their wire refs.
+ * This config consumes the plugin through the package's public `chardb/vite`
+ * export. The browser shim below is temporary: query handles still share a
+ * module graph with workerd-only server code.
  */
 
-import { defineConfig } from "vite";
+import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
-import { chardb as chardbVitePlugin } from "chardb/vite/index.ts";
+import { chardb as chardbVitePlugin } from "chardb/vite";
+import { defineConfig } from "vite";
 
 export default defineConfig({
     plugins: [
@@ -35,6 +23,18 @@ export default defineConfig({
     build: {
         outDir: "dist",
         emptyOutDir: true,
+    },
+    resolve: {
+        preserveSymlinks: true,
+        // Query handles currently share a module graph with the Worker. Vite
+        // needs a browser-safe stand-in for workerd's built-in module while it
+        // tree-shakes the server-only classes from the SPA build.
+        alias: [
+            {
+                find: "cloudflare:workers",
+                replacement: fileURLToPath(new URL("./src/web/cloudflare-workers-shim.ts", import.meta.url)),
+            },
+        ],
     },
     server: {
         port: 5173,

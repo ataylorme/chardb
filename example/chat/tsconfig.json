@@ -1,13 +1,22 @@
 {
-    "extends": "../../tsconfig.json",
     "compilerOptions": {
-        "composite": false,
-        "baseUrl": ".",
-        "paths": {
-            "chardb": ["../../src/index.ts"],
-            "chardb/*": ["../../src/*"]
-        }
+        "lib": ["ES2023", "DOM", "DOM.Iterable"],
+        "target": "ES2022",
+        "module": "ESNext",
+        "moduleResolution": "Bundler",
+        "moduleDetection": "force",
+        "allowImportingTsExtensions": true,
+        "verbatimModuleSyntax": true,
+        "noEmit": true,
+        "strict": true,
+        "exactOptionalPropertyTypes": true,
+        "noUncheckedIndexedAccess": true,
+        "skipLibCheck": true,
+        "isolatedModules": true,
+        "jsx": "react-jsx",
+        "types": ["@cloudflare/workers-types"],
+        "preserveSymlinks": true
     },
-    "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts"],
+    "include": ["src/**/*.ts", "src/**/*.tsx"],
     "exclude": ["node_modules", "dist", "vite.config.ts"]
 }

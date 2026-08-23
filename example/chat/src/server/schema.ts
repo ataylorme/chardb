@@ -1,5 +1,5 @@
-import { integer, text } from "drizzle-orm/sqlite-core";
 import { forOrg } from "chardb/server";
+import { integer, text } from "drizzle-orm/sqlite-core";
 import { auth } from "./worker.ts";
 
 // Every cdbTable in this file is org-tenanted. The tenant column is
@@ -46,7 +46,7 @@ export const messages = cdbTable(
             admin: "*",
             member: {
                 read: "*",
-                create: ["body", "channelId"],
+                create: ["id", "body", "channelId", "createdAt"],
             },
             self: {
                 read: "*",

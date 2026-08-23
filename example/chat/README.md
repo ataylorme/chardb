@@ -1,35 +1,25 @@
 # chardb chat example
 
-The Cloudflare-native database with **better-auth built in**. Drizzle is the data heart, better-auth options drive the plumbing, plugins extend the auth surface — and routes that don't touch the auth layer still get the database. The whole backend is one factory call:
+This is a compile-checked concept example for chardb's intended chat API: Drizzle tables, better-auth configuration, typed mutations and queries, and React hooks in one small application. It currently typechecks and produces a Vite build against a packed chardb package. It is not an end-to-end runnable demo: the public mutation, query, and live-subscription path still needs to be completed and verified against workerd.
+
+The intended backend surface is one factory call:
 
 ```ts
-// src/server/worker.ts — paste-ready, this is the whole Worker
+// src/server/worker.ts — abbreviated; see the source for the full concept
 import { anonymous } from "better-auth/plugins/anonymous";
 import { jwt } from "better-auth/plugins/jwt";
-import { organization } from "better-auth/plugins/organization";
-import { chardb, defineAuth, defineRoles } from "chardb/server";
+import { chardb, defineAuth } from "chardb/server";
 import * as api from "./api.ts";
 import * as queries from "./queries.ts";
 import * as domain from "./schema.ts";
 
 export const auth = defineAuth({
   appName: "chat",
-  plugins: [organization(), anonymous(), jwt()],
+  plugins: [anonymous(), jwt()],
   // Bootstrap a shared demo org on every sign-in. Production apps
   // gate org creation behind their own flow.
   databaseHooks: { /* see worker.ts for the full hook */ },
 });
-
-export const chatRoles = defineRoles(
-  {
-    messages: ["create", "update", "delete"],
-    channels: ["create", "rename", "delete"],
-  },
-  {
-    admin:  { channels: ["create", "rename"] },
-    member: { messages: ["create"] },
-  },
-);
 
 export const app = chardb({ auth, schema: domain, api: { ...api, ...queries } });
 
@@ -39,38 +29,32 @@ export default app;
 export const { BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;
 ```
 
-Auth, RBAC, the synthesized schema, the manifest, the Hono router, and the six Durable Object classes — **all visible top-to-bottom in one file**. The chardb-native better-auth adapter is wired automatically: every model write routes to the partition-owning Cdb shard (or the Catalog DO for replicated tables like `jwks`/`rateLimit`); every JWT-bearing request populates `ctx.auth.{userId, tenantId, role}` so policies + handlers read authenticated identity, not client-supplied args.
+The source shows the intended composition of auth, schema, API handles, routes, and Durable Object exports. Treat that composition as design evidence, not proof that the full public request path works today.
 
 Mutations and policies stay light:
 
 ```ts
 // src/server/api.ts
-import { api, ownerScope, requirePermission, tenantScope } from "chardb/server";
+import { api } from "chardb/server";
 import { z } from "zod";
 import { messages } from "./schema.ts";
-import { chatRoles } from "./worker.ts";
-
 export const postMessage = api.mutation({
-  args: z.object({ id: z.string(), channelId: z.string(), body: z.string().min(1), clientCreatedAt: z.number() }),
-  // organizationId + authorId come from ctx.auth — never from the client.
-  partitionKey: () => undefined,
-  handler: async (ctx, args) => {
-    if (!ctx.auth.userId || !ctx.auth.tenantId) throw new Error("CDB_FORBIDDEN");
-    await ctx.db.insert(messages).values({
+  args: z.object({ id: z.string(), organizationId: z.string(), channelId: z.string(), body: z.string().min(1), clientCreatedAt: z.number() }),
+  partitionKey: "organizationId",
+  handler: (ctx, args) => {
+    if (!ctx.auth.userId || !ctx.auth.tenantId || ctx.auth.tenantId !== args.organizationId) {
+      throw new Error("CDB_FORBIDDEN");
+    }
+    ctx.db.insert(messages).values({
       id: args.id, channelId: args.channelId, body: args.body,
-      organizationId: ctx.auth.tenantId, authorId: ctx.auth.userId,
       createdAt: args.clientCreatedAt,
-    });
+    }).run();
     return { id: args.id };
   },
 });
-
-export const orgIsolation     = tenantScope(() => messages);
-export const messageOwnerOnly = ownerScope(() => messages, { for: "all" });
-export const messageAdmins    = requirePermission(() => messages, () => chatRoles, {
-  messages: ["delete", "update"],
-});
 ```
+
+The tenant, row, and column policies live in `schema.ts` on the `forOrg()`-bound `cdbTable` definitions.
 
 Queries live in `queries.ts` so the React bundle can value-import them without dragging the worker module:
 
@@ -135,9 +119,9 @@ The rest of this README is the org-tenanted chat schema, the React frontend, and
 ```
 src/
   server/
-    worker.ts                defineAuth + defineRoles + chardb({ auth, schema, api }) + routes + DOs
+    worker.ts                defineAuth + chardb({ auth, schema, api }) + routes + DOs
     schema.ts                Drizzle domain tables (channels, messages)
-    api.ts                   api.mutation/presence + tenantScope/ownerScope/requirePermission
+    api.ts                   api.mutation + presence handles
     queries.ts               api.query handles + intent extractors (client-safe value imports)
   web/
     main.tsx                 createRoot + <StrictMode> + styles.css
@@ -148,7 +132,7 @@ src/
 
 index.html                   Vite entry → /src/web/main.tsx
 vite.config.ts               vite + @vitejs/plugin-react + chardb/vite plugin
-wrangler.template.jsonc      copy-pasteable wrangler.jsonc with assets binding
+    wrangler.template.jsonc      illustrative bindings for a future workerd demo
 test/e2e/                    bun:test + bun:sqlite stress tests for the pure layers
 ```
 
@@ -173,23 +157,9 @@ defineAuth({ plugins: [organization()] });
 
 The reserved chardb prefixes (`/ws`, `/_chardb/*`) and the optional `/api/auth/*` better-auth mount are claimed inside `chardb({…})` before user routes run; everything else falls through to Hono.
 
-### Authorization rides on better-auth — one-line policies
+### Authorization lives on the table
 
-chardb's row-level policies lift better-auth's `createAccessControl` / `role.authorize` primitives **verbatim** — the same `RolesMap` you hand to better-auth's `hasPermission` route gates chardb live-query reads and mutations. No parallel authorization model.
-
-Helpers take the table as their first arg, or a `() => table` thunk to dodge the api.ts ↔ schema.ts ESM cycle (same idiom as Drizzle's `.references(() => …)`). Names auto-derive from the table identifier; pass `options.name` only when one table is gated by multiple policies of the same kind.
-
-| Primitive                                 | What it does                                                                                                            |
-| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `tenantScope(table)`                      | `eq(table.organizationId, auth.tenantId)` + `authDependsOn` for tenant-keyed models. Name: `<table>_tenant`.            |
-| `ownerScope(table)`                       | `eq(table.authorId, auth.userId)` + `authDependsOn` for principal-keyed models. Name: `<table>_owner`.                  |
-| `requireRole(table, roles)`               | `auth.role` intersects `roles` (multi-role via comma split, matching better-auth). Name: `<table>_role`.                |
-| `requirePermission(table, roles, req)`    | `roles[auth.role].authorize(req).success` — the exact better-auth check. Name: `<table>_permission`.                    |
-| `publicRead(table)`                       | `to: "*"`, anonymous traffic admitted. Name: `<table>_public_read`.                                                     |
-
-`chatRoles` (declared in `worker.ts`) powers both chardb's row-level policies and better-auth's REST `/hasPermission` check — one source of truth.
-
-`defineRoles` ships with conventions that match better-auth's `organization()` plugin: `owner` and `admin` implicitly grant every action on every declared resource, `member` grants nothing. Per-role overrides are deltas — typically 1-2 lines per role. Custom role names (`billing`, `viewer`, …) get no defaults and must be specified explicitly.
+`forOrg()` binds every `cdbTable` in `schema.ts` to the active organization. Each table's `roles` block declares row verbs and writable or readable columns. `selfBy` binds the `self` role to a user foreign key. The runtime compiles this metadata into its row and column policy forms; there are no separate `tenantScope` or `ownerScope` exports to keep in sync.
 
 ### Validator-driven args, intent extractors, no per-mutation type aliases
 
@@ -224,76 +194,38 @@ The merged auth + domain schema is automatic: `chardb({ schema: domain, auth })`
 
 If a domain table shadows a reserved name (`organization`, `user`, `member`, …), `chardb({...})` raises `CDB_RESERVED_TABLE_NAME` at construction time with the conflicting names listed; rename the table or drop the plugin that owns the name.
 
-## What's chardb-shaped about it
+## What this example demonstrates
 
-- **Single-partition by organization.** `auth.organization` is the distribution root. `channels` and `messages` FK into it, so chardb's colocation algorithm pins the org subtree to one vshard (`vshardOf([organizationId])`). The Gateway routes the mutation to the owning shard without loading the closure.
-- **`ctx.auth` is authoritative.** `postMessage` reads `organizationId`/`authorId` from `ctx.auth.tenantId`/`ctx.auth.userId` — never from `args`. The Gateway threads JWT claims (`sub`, `activeOrganizationId`, `role`) into the mutation envelope so handlers and policies share the same vocabulary.
-- **chardb-native better-auth adapter.** `chardb({auth})` auto-mounts `/api/auth/*` against an adapter that routes every model write to the partition-owning Cdb shard. Per-tenant models (`organization`/`member`/`invitation`) hash on `organizationId`; per-principal models (`user`/`session`/`account`/`passkey`/`apiKey`) hash on `userId`/`id`. Replicated models (`jwks`, `rateLimit`) pin to the Catalog DO so every shard sees the same canonical copy.
-- **Better-auth `auth_epoch_*` bumps.** The adapter dispatches `bumpTenant(organizationId)` on writes to tenant-keyed models and `bumpPrincipal(userId)` on writes to principal-keyed ones, so tenant-scoped live queries re-validate on the next `poke`.
-- **Op-log idempotency.** `runWrappedMutation` wraps every mutation inside the same `transactionSync` as the user closure: `INSERT OR IGNORE` into `_chardb_op_log` first; if the row exists with the same payload hash, return the cached envelope and skip the closure. Different payload for the same `mutId` raises `CDB_MUT_ID_COLLISION`.
-- **Live queries via intent extractors.** `listMessages` declares an `intent: (args) => CdbIntent` extractor right next to its Drizzle handler; the React `useQuery(listMessages, args)` overload reads it. The extractor pins to one shard via the `partitionKey` field and narrows to one channel via an `intervals` block on `channel_id`.
-- **Row-level isolation.** `orgIsolation` is a `chardbPolicy` whose `usingSql` AND-s `messages.organization_id = auth.tenantId` into the query before the planner sees it; the rewritten AST is what hashes for live-query fan-in, so two tenants share zero subscriber state.
-- **Anonymous JWT flow.** `App.tsx` calls `authClient.signIn.anonymous()` then `ChardbProvider auth={authClient}` derives `getJwt` from `authClient.$fetch("/token")` — better-auth's `jwt()` plugin signs a JWT with the active session as `sub` and the active org as `activeOrganizationId`. The Gateway verifies it on every WS hello via the JWKS-backed `verifyJwt` resolver in the Catalog DO.
-- **Presence.** `typing` is a `definePresenceKey<{user, until}>` — best-effort, ephemeral, riding the same hibernated WebSocket as live queries but bypassing the IntervalMap pipeline. `useTypingPresence` debounces `publish` to once per second so a fast typist doesn't drown the channel.
+- Organization-rooted Drizzle tables built with `forOrg()` and `cdbTable`.
+- Mutation and query handles using the current exported package subpaths.
+- Synchronous mutation handlers compatible with Durable Object SQLite transactions.
+- A browser bundle that consumes the packed package instead of private source subpaths.
+- The intended React surface for auth, mutations, queries, and presence.
 
-## Platform schema generation + migrations
-
-`synthesizeAuthSchema(authOptions)` is the source of truth for the auth tables at runtime. For SQL migrations the same options object is the input that `bunx @better-auth/cli generate` consumes:
-
-1. `drizzle-kit generate` emits DDL files against the merged schema that `defineChardb({ auth, schema })` exposes via `Configured.schema`. Adding a plugin adds tables; removing one drops them.
-2. `chardb migrate` reads the `drizzle/_journal.json` produced by drizzle-kit and surfaces each pending DDL statement so the runtime applier can execute them. The applier itself (per-shard barrier, schema-epoch bump, `mustRefetch:schemaChanged` fan-out from `Catalog.cutover`) is on the roadmap; today the CLI emits the plan so your CI can pipe it.
-3. The colocation walker hashes `policyDigest(assignments)` at `defineChardb` time and the `Catalog` DO compares it against the deployed value. `chardb doctor schema` is a planned wrapper around this check; today the diff fires at construction time only.
-
-## How a write travels
-
-```
-client (Composer)      gateway DO              entrypoint Worker            Catalog DO            Cdb shard DO
-------------------     ----------              ----------------            ----------            ------------
-useMutation(postMessage)(args)
-   ─wire──▶
-                       Up.mut {ref, args, mutId}
-                       ────▶ runMutation(ref, args, mutId)
-                                                 manifest.resolveMutation(ref)
-                                                 vshardOf([ extractPartitionKey(args) ])
-                                                 ─────────────────────────▶ route(vshard) → ShardId
-                                                                                          ────────▶ Cdb.mutate
-                                                                                                       transactionSync:
-                                                                                                         _chardb_op_log INSERT OR IGNORE
-                                                                                                         (replay? return cached envelope)
-                                                                                                         user closure runs
-                                                                                                         _chardb_op_log UPDATE payload_enc
-                       ◀──── MutResult ──────────────────────────────────────────────────────────
-   ◀── poke(cookie, patches, mutResults)
-useQuery re-renders with the new row; <Composer> resolves its `await send(...)`.
-```
-
-Every response carries `cf-chardb-correlation-id` + `Server-Timing` so the trace joins on a single id across client, gateway, entrypoint, and tail worker.
+The last item is API design, not working runtime behavior. Gateway JWT verification, public mutation dispatch, initial query execution, live updates, and presence hooks remain incomplete. Migration commands also do not apply domain DDL to deployed shards.
 
 ## Running
 
 ```bash
-# 1) Pure-layer e2e tests (no install needed — workspace deps only).
+# 1) Build the package that the local file dependency will pack.
+bun run build
+
+# 2) Install the example's declared dependencies, then verify it.
 cd example/chat
+npm install
+npm run typecheck          # strict typecheck of server and web
+npm run build              # production Vite build
+
+# 3) Run the repository-only pure-layer test.
 bun test test/e2e/        # 5 files, deterministic, <300ms/test on a laptop
-bunx tsc --noEmit         # strict typecheck of both server and web
-
-# 2) Bring the React frontend up locally against a workerd-backed chardb.
-#    Install once (these deps are NOT part of the chardb workspace install).
-bun add -d vite @vitejs/plugin-react
-bun add react react-dom
-bun run dev               # http://localhost:5173 — Vite proxies /ws → wrangler
-
-#    In a second terminal:
-cp wrangler.template.jsonc wrangler.jsonc
-bunx wrangler@latest dev  # http://localhost:8787
 ```
 
-The example imports chardb directly from `../../src/*` via the tsconfig `paths` mapping; no install or build step is needed for the workspace typecheck / test path.
+These commands verify package consumption, TypeScript contracts, the browser bundle, and the pure-layer tests. They do not verify a browser-to-workerd mutation, query, or live-subscription round trip.
 
 ## E2E coverage
 
 - **e2e_oplog** — 1000 mutations × 50 partitions: deterministic vshard routing, op-log replay idempotency, `CDB_MUT_ID_COLLISION` on payload divergence, per-partition serial commit order.
 
-## Production wiring (out of scope for the tests)
+## Runtime wiring still required
 
-The `defineChardb` DO classes only run inside workerd. For a real deployment: copy `wrangler.template.jsonc` to `wrangler.jsonc`, run `chardb doctor` to confirm the binding shape, `vite build` to materialize the SPA into `./dist` (served by the `assets` binding), and `chardb deploy` to provision the tail consumer + Logpush jobs.
+Before this can be presented as a runnable demo, chardb needs a supported public path from the generated Worker entrypoint through mutation dispatch, query execution, and live subscriptions. That path then needs a workerd integration test covering one authenticated write and one subscribed read. The Wrangler file is only a template until that test passes.
