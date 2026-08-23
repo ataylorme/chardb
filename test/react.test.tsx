@@ -64,19 +64,21 @@ describe("chardb/react — hook lifecycle", () => {
         });
 
         expect(subs.length).toBe(1);
-        expect(subs[0]!.intent).toBe(intent);
+        const sub = subs[0];
+        if (!sub) throw new Error("expected useQuery to create a subscription");
+        expect(sub.intent).toBe(intent);
         expect(captured).toBeUndefined();
 
         TestRenderer.act(() => {
-            subs[0]!.listener([{ id: "r1" }]);
+            sub.listener([{ id: "r1" }]);
         });
         expect(captured).toEqual([{ id: "r1" }]);
 
-        expect(subs[0]!.unsubscribed).toBe(false);
+        expect(sub.unsubscribed).toBe(false);
         TestRenderer.act(() => {
             tree.unmount();
         });
-        expect(subs[0]!.unsubscribed).toBe(true);
+        expect(sub.unsubscribed).toBe(true);
     });
 
     test("useMutation invokes client.mutate with the function's __chardbRef", async () => {
@@ -93,7 +95,8 @@ describe("chardb/react — hook lifecycle", () => {
         TestRenderer.create(React.createElement(ChardbProvider, { client }, React.createElement(Probe)));
 
         expect(typeof invoke).toBe("function");
-        await invoke!({ body: "hi" });
+        if (!invoke) throw new Error("expected useMutation to expose an invoke function");
+        await invoke({ body: "hi" });
         expect(mutateCalls).toEqual([{ ref: "mutation#postMessage", args: { body: "hi" } }]);
     });
 

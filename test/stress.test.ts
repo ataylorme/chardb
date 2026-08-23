@@ -32,7 +32,8 @@ describe("vshardOf — distribution under load", () => {
         const buckets = new Uint32Array(VSHARD_COUNT);
         for (let i = 0; i < N; i++) {
             const key = `tenant-${Math.floor(r() * 1e9).toString(36)}-${i}`;
-            buckets[Number(vshardOf([key]))]! += 1;
+            const bucket = Number(vshardOf([key]));
+            buckets[bucket] = (buckets[bucket] ?? 0) + 1;
         }
         let nonempty = 0;
         let max = 0;
@@ -59,7 +60,8 @@ describe("VshardMap — split invariants under repeated random splits", () => {
         const r = rng(42);
         for (let i = 0; i < 200; i++) {
             const ranges = [...map.ranges_()];
-            const target = ranges[Math.floor(r() * ranges.length)]!;
+            const target = ranges[Math.floor(r() * ranges.length)];
+            if (!target) throw new Error("expected VshardMap to contain at least one range");
             if (target.hi <= target.lo) continue;
             const lo = target.lo + Math.floor(r() * (target.hi - target.lo));
             const hi = lo + 1 + Math.floor(r() * (target.hi - lo));
@@ -72,10 +74,16 @@ describe("VshardMap — split invariants under repeated random splits", () => {
             }
         }
         const ranges = [...map.ranges_()];
-        expect(ranges[0]!.lo).toBe(0);
-        expect(ranges[ranges.length - 1]!.hi).toBe(VSHARD_COUNT - 1);
+        const first = ranges[0];
+        const last = ranges[ranges.length - 1];
+        if (!first || !last) throw new Error("expected VshardMap to contain at least one range");
+        expect(first.lo).toBe(0);
+        expect(last.hi).toBe(VSHARD_COUNT - 1);
         for (let i = 1; i < ranges.length; i++) {
-            expect(ranges[i]!.lo).toBe(ranges[i - 1]!.hi + 1);
+            const current = ranges[i];
+            const previous = ranges[i - 1];
+            if (!current || !previous) throw new Error("expected adjacent VshardMap ranges");
+            expect(current.lo).toBe(previous.hi + 1);
         }
         for (let v = 0; v < VSHARD_COUNT; v += 137) {
             const owner = map.routeVshard(v as Vshard);

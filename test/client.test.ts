@@ -57,7 +57,7 @@ beforeEach(() => {
 
 afterEach(() => {
     (globalThis as { WebSocket: unknown }).WebSocket = realWS;
-    if (realBC === undefined) delete (globalThis as { BroadcastChannel?: unknown }).BroadcastChannel;
+    if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
 });
 
 function client() {
@@ -74,13 +74,21 @@ async function flush() {
     await new Promise<void>(r => queueMicrotask(r));
 }
 
+function fakeWebSocket(index = 0): FakeWS {
+    const ws = FakeWS.instances[index];
+    if (!ws) throw new Error(`expected fake WebSocket instance ${index}`);
+    return ws;
+}
+
 describe("createChardbClient — wire round-trip", () => {
     test("hello is sent on open with clientId and jwt", async () => {
         client();
         await flush();
-        const ws = FakeWS.instances[0]!;
+        const ws = fakeWebSocket();
         expect(ws.sent.length).toBe(1);
-        const sent = JSON.parse(ws.sent[0]!) as Up;
+        const rawSent = ws.sent[0];
+        if (!rawSent) throw new Error("expected the client to send a hello envelope");
+        const sent = JSON.parse(rawSent) as Up;
         expect(sent.t).toBe("hello");
         if (sent.t !== "hello") throw new Error("unreachable");
         expect(sent.clientId).toBe(ClientId("c-test"));
@@ -90,7 +98,7 @@ describe("createChardbClient — wire round-trip", () => {
     test("subscribe → server poke delivers rows to the listener", async () => {
         const c = client();
         await flush();
-        const ws = FakeWS.instances[0]!;
+        const ws = fakeWebSocket();
         const seen: unknown[][] = [];
         c.subscribe<{ id: string }>({ kind: "select", tables: ["messages"] }, rows => seen.push([...rows]));
         await flush();
@@ -112,7 +120,7 @@ describe("createChardbClient — wire round-trip", () => {
     test("mutate → server poke.mutResults ok=true resolves the promise with the result", async () => {
         const c = client();
         await flush();
-        const ws = FakeWS.instances[0]!;
+        const ws = fakeWebSocket();
         const promise = c.mutate<{ id: string }>("src/api.ts#post", { body: "hi" });
         await flush();
         const mutSent = ws.sent.map(r => JSON.parse(r) as Up).find(m => m.t === "mut");
@@ -130,7 +138,7 @@ describe("createChardbClient — wire round-trip", () => {
     test("mutate → mutResults ok=false rejects with a CdbError carrying the wire code", async () => {
         const c = client();
         await flush();
-        const ws = FakeWS.instances[0]!;
+        const ws = fakeWebSocket();
         const promise = c.mutate("src/api.ts#post", {});
         await flush();
         const mutSent = ws.sent.map(r => JSON.parse(r) as Up).find(m => m.t === "mut");
@@ -164,7 +172,7 @@ describe("createChardbClient — wire round-trip", () => {
     test("mustRefetch resets sub state and re-sends an Up.sub envelope", async () => {
         const c = client();
         await flush();
-        const ws = FakeWS.instances[0]!;
+        const ws = fakeWebSocket();
         const seen: unknown[][] = [];
         c.subscribe<{ id: string }>({ kind: "select", tables: ["messages"] }, rows => seen.push([...rows]));
         await flush();
@@ -193,7 +201,7 @@ describe("createChardbClient — wire round-trip", () => {
     test("reconnect within RYW window resumes from lastCookie via Up.hello.resumeFromCookie", async () => {
         const c = client();
         await flush();
-        const ws1 = FakeWS.instances[0]!;
+        const ws1 = fakeWebSocket();
         // Server welcome stamps the resume cookie.
         ws1.emit({ t: "welcome", baseCookie: Cookie("c-1:42"), region: "test" });
         await flush();
@@ -220,7 +228,7 @@ describe("createChardbClient — wire round-trip", () => {
         setSystemTime(t0);
         const c = client();
         await flush();
-        const ws1 = FakeWS.instances[0]!;
+        const ws1 = fakeWebSocket();
         ws1.emit({ t: "welcome", baseCookie: Cookie("c-1:42"), region: "test" });
         await flush();
         ws1.close();
@@ -242,7 +250,7 @@ describe("createChardbClient — wire round-trip", () => {
     test("close() halts further reconnect attempts and stops emitting messages", async () => {
         const c = client();
         await flush();
-        const ws = FakeWS.instances[0]!;
+        const ws = fakeWebSocket();
         c.close();
         await flush();
         // After close, the client state transitions to closed; sending should be a no-op.
