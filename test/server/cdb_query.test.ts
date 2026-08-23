@@ -6,8 +6,13 @@ import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { forOrg } from "../../src/server/index.ts";
 import { manifestFromExports } from "../../src/server/manifest.ts";
-import type { CdbQueryRequest } from "../../src/server/rpc.ts";
-import { ChardbRef } from "../../src/types.ts";
+import type {
+    CdbQueryRequest,
+    CdbRegisteredQueryRequest,
+    CdbSubscriptionRequest,
+    LiveSubscriptionId,
+} from "../../src/server/rpc.ts";
+import { ChardbRef, ClientId, PrincipalId, SubId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -106,6 +111,11 @@ const getRecord = api.query(async function getRecordHandler(ctx, args: { id: str
 const awaitRecords = api.query(async function awaitRecordsHandler(ctx) {
     return await ctx.db.select().from(records).orderBy(records.id);
 });
+let registeredProbeRuns = 0;
+const registeredListRecords = api.query(async function registeredListRecordsHandler(ctx, args: { groupId: string }) {
+    registeredProbeRuns++;
+    return ctx.db.select().from(records).where(eq(records.groupId, args.groupId)).orderBy(records.id).all();
+});
 const listPrivateRecords = api.query(async function listPrivateRecordsHandler(ctx) {
     return ctx.db.select().from(privateRecords).all();
 });
@@ -167,6 +177,7 @@ const manifest = manifestFromExports({
     listRecords,
     getRecord,
     awaitRecords,
+    registeredListRecords,
     listPrivateRecords,
     listPublicRecords,
     projectionAttempt,
@@ -194,6 +205,39 @@ const AUTH: CdbQueryRequest["auth"] = {
 };
 const ANONYMOUS: CdbQueryRequest["auth"] = { userId: "", claims: {} };
 
+function liveIdentity(overrides: Partial<LiveSubscriptionId> = {}): LiveSubscriptionId {
+    return {
+        gatewayId: "gateway-1",
+        registrationId: "registration-1",
+        connectionId: "connection-1",
+        clientId: ClientId("client-1"),
+        subId: SubId(1),
+        ...overrides,
+    };
+}
+
+function liveRequest(
+    subscription: LiveSubscriptionId,
+    ref: ChardbRef = registeredListRecords.__chardbRef,
+    args: CdbSubscriptionRequest["args"] = { groupId: "group-a" }
+): CdbSubscriptionRequest {
+    return {
+        subscription,
+        principalId: PrincipalId("user-1"),
+        ref,
+        args,
+        tables: ["query_records"],
+        intervals: [{ table: "query_records", indexName: "by_group", intervals: [{ kind: "full" }] }],
+    };
+}
+
+function registeredQuery(
+    subscription: LiveSubscriptionId,
+    auth: CdbRegisteredQueryRequest["auth"] = AUTH
+): CdbRegisteredQueryRequest {
+    return { subscription, auth };
+}
+
 describe("Cdb registered query execution", () => {
     const databases: Database[] = [];
 
@@ -202,6 +246,7 @@ describe("Cdb registered query execution", () => {
     });
 
     async function setup(): Promise<{ readonly db: Database; readonly cdb: Cdb }> {
+        registeredProbeRuns = 0;
         const db = new Database(":memory:");
         databases.push(db);
         const configured = construct(ConfiguredCdb, db);
@@ -224,6 +269,114 @@ describe("Cdb registered query execution", () => {
         );
         return { db, cdb: configured.cdb };
     }
+
+    test("runs the persisted query and arguments with fresh policy auth", async () => {
+        const { cdb } = await setup();
+        const subscription = liveIdentity();
+        await cdb.subscribe(liveRequest(subscription));
+
+        await expect(cdb.queryRegistered(registeredQuery(subscription))).resolves.toEqual({
+            ok: true,
+            result: [
+                {
+                    id: "record-1",
+                    organizationId: "org-a",
+                    ownerId: "user-1",
+                    groupId: "group-a",
+                    value: 1,
+                    secretNote: "mine",
+                },
+                {
+                    id: "record-2",
+                    organizationId: "org-a",
+                    ownerId: "user-2",
+                    groupId: "group-a",
+                    value: 2,
+                    secretNote: null,
+                },
+            ],
+        });
+        expect(registeredProbeRuns).toBe(1);
+    });
+
+    test("rejects missing, forged, principal-mismatched, and retired registrations before execution", async () => {
+        const { cdb } = await setup();
+        const subscription = liveIdentity();
+        await cdb.subscribe(liveRequest(subscription));
+
+        for (const request of [
+            registeredQuery(liveIdentity({ registrationId: "missing" })),
+            registeredQuery({ ...subscription, connectionId: "connection-forged" }),
+            registeredQuery(subscription, { ...AUTH, userId: "user-forged" }),
+        ]) {
+            await expect(cdb.queryRegistered(request)).resolves.toMatchObject({
+                ok: false,
+                error: { code: "CDB_INVARIANT" },
+            });
+        }
+        await cdb.unsubscribe(subscription);
+        await expect(cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT" },
+        });
+        expect(registeredProbeRuns).toBe(0);
+    });
+
+    test("rejects corrupt payloads and table mappings before execution", async () => {
+        const { cdb, db } = await setup();
+        const subscription = liveIdentity();
+        await cdb.subscribe(liveRequest(subscription));
+
+        db.run("DELETE FROM _chardb_live_subscription_tables WHERE gateway_id = ? AND registration_id = ?", [
+            subscription.gatewayId,
+            subscription.registrationId,
+        ]);
+        await expect(cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT" },
+        });
+        db.run(
+            "INSERT INTO _chardb_live_subscription_tables (gateway_id, registration_id, table_name) VALUES (?, ?, ?)",
+            [subscription.gatewayId, subscription.registrationId, "query_records"]
+        );
+        db.run("UPDATE _chardb_live_subscriptions SET args_json = ? WHERE gateway_id = ? AND registration_id = ?", [
+            '{"groupId":"different"}',
+            subscription.gatewayId,
+            subscription.registrationId,
+        ]);
+        await expect(cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT" },
+        });
+        db.run("UPDATE _chardb_live_subscriptions SET args_json = ? WHERE gateway_id = ? AND registration_id = ?", [
+            "{",
+            subscription.gatewayId,
+            subscription.registrationId,
+        ]);
+        await expect(cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT" },
+        });
+        expect(registeredProbeRuns).toBe(0);
+    });
+
+    test("returns typed failures for unknown refs and non-array or invalid results", async () => {
+        const cases = [
+            { ref: ChardbRef("queries.ts#missing"), args: {} },
+            { ref: getRecord.__chardbRef, args: { id: "record-1" } },
+            { ref: nonJsonResult.__chardbRef, args: {} },
+        ] as const;
+
+        for (const [index, testCase] of cases.entries()) {
+            const { cdb } = await setup();
+            const subscription = liveIdentity({ registrationId: `registration-result-${index}` });
+            await cdb.subscribe(liveRequest(subscription, testCase.ref, testCase.args));
+            await expect(cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject({
+                ok: false,
+                error: { code: index === 0 ? "CDB_REF_NOT_FOUND" : "CDB_INVARIANT" },
+            });
+        }
+    });
 
     test("reads persisted rows and returns an empty JSON array when nothing matches", async () => {
         const { cdb } = await setup();

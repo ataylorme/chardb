@@ -35,6 +35,7 @@ import type {
     CdbMutationResponse,
     CdbQueryRequest,
     CdbQueryResponse,
+    CdbRegisteredQueryRequest,
     CdbSubscriptionRequest,
     GatewayInvalidationAck,
     GatewayInvalidationRequest,
@@ -242,6 +243,58 @@ function assertSubscriptionTables(
     }
 }
 
+function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionRequest {
+    if (
+        row.state !== "active" ||
+        row.payload_hash === null ||
+        row.principal_id === null ||
+        row.ref === null ||
+        row.args_json === null ||
+        row.tables_json === null ||
+        row.intervals_json === null
+    ) {
+        throw subscriptionInvariant("active live subscription is missing its persisted payload");
+    }
+
+    let args: RawJson;
+    let tables: unknown;
+    let intervals: unknown;
+    try {
+        args = rawJsonResult(JSON.parse(row.args_json), "persisted live subscription arguments");
+        tables = JSON.parse(row.tables_json);
+        intervals = JSON.parse(row.intervals_json);
+    } catch (error) {
+        throw subscriptionInvariant(
+            `active live subscription payload is corrupt: ${error instanceof Error ? error.message : "invalid JSON"}`
+        );
+    }
+    if (!Array.isArray(tables) || tables.some(table => typeof table !== "string")) {
+        throw subscriptionInvariant("active live subscription tables payload is corrupt");
+    }
+    if (!Array.isArray(intervals)) {
+        throw subscriptionInvariant("active live subscription intervals payload is corrupt");
+    }
+
+    const request: CdbSubscriptionRequest = {
+        subscription: {
+            gatewayId: row.gateway_id,
+            registrationId: row.registration_id,
+            connectionId: row.connection_id,
+            clientId: ClientId(row.client_id),
+            subId: SubId(row.sub_id),
+        },
+        principalId: PrincipalId(row.principal_id),
+        ref: ChardbRef(row.ref),
+        args,
+        tables,
+        intervals: intervals as CdbSubscriptionRequest["intervals"],
+    };
+    if (row.payload_hash !== subscriptionPayloadHash(request)) {
+        throw subscriptionInvariant("active live subscription payload hash does not match its persisted payload");
+    }
+    return request;
+}
+
 function enqueueInvalidations(sql: SyncSql, touchedTables: readonly string[]): number {
     sql.exec("UPDATE _chardb_change_clock SET change_seq = change_seq + 1 WHERE singleton = 1");
     if (sql.changes() !== 1) throw subscriptionInvariant("Cdb change clock update did not affect one row");
@@ -418,34 +471,7 @@ export class Cdb extends DurableObject<CdbEnv> {
              ORDER BY gateway_id, registration_id`
         );
         for (const row of cursor) {
-            if (
-                row.principal_id === null ||
-                row.ref === null ||
-                row.args_json === null ||
-                row.tables_json === null ||
-                row.intervals_json === null
-            ) {
-                throw subscriptionInvariant("active live subscription is missing its persisted payload");
-            }
-            const request: CdbSubscriptionRequest = {
-                subscription: {
-                    gatewayId: row.gateway_id,
-                    registrationId: row.registration_id,
-                    connectionId: row.connection_id,
-                    clientId: ClientId(row.client_id),
-                    subId: SubId(row.sub_id),
-                },
-                principalId: PrincipalId(row.principal_id),
-                ref: ChardbRef(row.ref),
-                args: JSON.parse(row.args_json) as RawJson,
-                tables: JSON.parse(row.tables_json) as readonly string[],
-                intervals: JSON.parse(row.intervals_json) as CdbSubscriptionRequest["intervals"],
-            };
-            if (row.payload_hash !== subscriptionPayloadHash(request)) {
-                throw subscriptionInvariant(
-                    "active live subscription payload hash does not match its persisted payload"
-                );
-            }
+            const request = parseStoredSubscription(row);
             assertSubscriptionTables(sql, request.subscription, [...new Set(request.tables)].sort());
             this.installSubscription(request.subscription, this.prepareIntervals(request));
         }
@@ -850,6 +876,49 @@ export class Cdb extends DurableObject<CdbEnv> {
                 request.args
             );
             return { ok: true, result: rawJsonResult(result, "query result") };
+        } catch (error) {
+            return { ok: false, error: cdbRuntimeError(error).toJSON() };
+        }
+    }
+
+    /** Execute the query persisted for one active live registration. */
+    async queryRegistered(request: CdbRegisteredQueryRequest): Promise<CdbQueryResponse> {
+        try {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const row = sql.one<StoredSubscriptionRow>(
+                `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+                        principal_id, ref, args_json, tables_json, intervals_json
+                 FROM _chardb_live_subscriptions
+                 WHERE gateway_id = ? AND registration_id = ?`,
+                request.subscription.gatewayId,
+                request.subscription.registrationId
+            );
+            if (!row) throw subscriptionInvariant("registered query subscription does not exist");
+            if (!sameSubscriptionIdentity(row, request.subscription)) {
+                throw subscriptionInvariant("registered query identity does not match its subscription");
+            }
+            if (row.state !== "active") throw subscriptionInvariant("registered query subscription is retired");
+            if (row.principal_id !== request.auth.userId) {
+                throw subscriptionInvariant("registered query principal does not match fresh authorization");
+            }
+
+            const subscription = parseStoredSubscription(row);
+            assertSubscriptionTables(sql, subscription.subscription, [...new Set(subscription.tables)].sort());
+            this.prepareIntervals(subscription);
+
+            const descriptor = resolveQuery(this.mutationManifest(), subscription.ref);
+            const database = wrapQueryDb(drizzle(this.ctx.storage, { schema: this.mutationSchema() }), request.auth);
+            const result = rawJsonResult(
+                await descriptor.invokeValidated(
+                    { db: readOnlyQueryDb(database), auth: request.auth },
+                    subscription.args
+                ),
+                "registered query result"
+            );
+            if (!Array.isArray(result)) {
+                throw subscriptionInvariant("registered query result must be an array");
+            }
+            return { ok: true, result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
         }

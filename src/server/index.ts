@@ -118,6 +118,8 @@ export type {
     CdbMutationResponse,
     CdbMutationRpc,
     CdbMutationSuccess,
+    CdbRegisteredQueryRequest,
+    CdbRegisteredQueryRpc,
     CdbSubscriptionRequest,
     CdbSubscriptionRpc,
     LiveSubscriptionId,

@@ -141,6 +141,16 @@ export interface CdbQueryRpc {
     query(request: CdbQueryRequest): Promise<CdbQueryResponse>;
 }
 
+/** Re-run one persisted live-query generation with freshly authorized context. */
+export interface CdbRegisteredQueryRequest {
+    readonly subscription: LiveSubscriptionId;
+    readonly auth: AuthCtx;
+}
+
+export interface CdbRegisteredQueryRpc {
+    queryRegistered(request: CdbRegisteredQueryRequest): Promise<CdbQueryResponse>;
+}
+
 /** Auth accepted by dispatch only after a verifier has established it. */
 export interface TrustedMutationAuth {
     readonly principalId: PrincipalId;
