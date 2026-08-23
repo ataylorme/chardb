@@ -54,7 +54,11 @@ describe("CdbDialect — intent stash round-trip", () => {
     test("PASSTHROUGH_EXTRACTOR yields cross-partition intents for every kind", () => {
         for (const kind of ["select", "insert", "update", "delete"] as const) {
             const i = PASSTHROUGH_EXTRACTOR[
-                `for${kind[0]!.toUpperCase()}${kind.slice(1)}` as "forSelect" | "forInsert" | "forUpdate" | "forDelete"
+                `for${kind.charAt(0).toUpperCase()}${kind.slice(1)}` as
+                    | "forSelect"
+                    | "forInsert"
+                    | "forUpdate"
+                    | "forDelete"
             ]({ tables: ["t"] });
             expect(i.kind).toBe(kind);
             expect(i.joinShape).toBe("cross-partition");

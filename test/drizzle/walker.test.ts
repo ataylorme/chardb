@@ -193,7 +193,9 @@ describe("StaticIntentExtractor — unsupported operators fall back to cross-par
     });
 
     test("not(and(eq, eq)) → cross-partition fallback (de Morgan would expand to disjunction we don't reduce)", () => {
-        const intent = selectIntent({ where: not(and(eq(users.orgId, "o1"), eq(users.age, 5))!) });
+        const conjunction = and(eq(users.orgId, "o1"), eq(users.age, 5));
+        if (!conjunction) throw new Error("expected a conjunction from two defined conditions");
+        const intent = selectIntent({ where: not(conjunction) });
         expect(intent.joinShape).toBe("cross-partition");
         expect(intent.partitionKey).toBeUndefined();
     });
