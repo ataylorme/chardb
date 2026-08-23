@@ -2,8 +2,9 @@
  * `wrapDb(rawDb, auth)` — proxies a Drizzle SQLiteDatabase so any
  * `db.insert(table).values(row)` call against a `cdbTable` instance
  * binds the table's tenant / self columns to verified `auth` values.
- * Updates reject managed authority columns, enforce the caller's column
- * grants, and combine the caller's WHERE with the server row policy.
+ * Updates reject managed authority columns and enforce the caller's column
+ * grants. Updates and deletes combine the caller's WHERE with the server row
+ * policy.
  *
  * This is the runtime half of chardb's INSERT auto-fill. The type-
  * level half lives in `cdb-table.ts`: every column chardb knows about
@@ -12,7 +13,7 @@
  * Drizzle reflects into `$inferInsert` as an optional field — so the
  * caller can simply omit it.
  *
- * Inserts and updates against raw Drizzle tables pass through unchanged.
+ * Inserts, updates, and deletes against raw Drizzle tables pass through unchanged.
  * The proxy is intentionally a thin wrapper over the raw
  * `db` value the user's mutation context ships with: it does not
  * synthesize new query semantics, only intercepts `.values(...)` to fill
@@ -90,7 +91,7 @@ function buildPlan(
     table: SQLiteTable,
     meta: CdbTableMeta,
     auth: AuthCtx,
-    operation: "insert" | "update" = "insert"
+    operation: "insert" | "update" | "delete" = "insert"
 ): AutoFillPlan {
     const bindings: Array<{ jsKey: string; value: string; authority: "tenant" | "self" }> = [];
     const sqlToJs = sqlToJsMap(table);
@@ -198,13 +199,18 @@ function assertCreateAuthorized(plan: AutoFillPlan, row: Readonly<Record<string,
     }
 }
 
-function buildUpdatePlan(table: SQLiteTable, meta: CdbTableMeta, auth: AuthCtx): AutoFillPlan {
-    const plan = buildPlan(table, meta, auth, "update");
+function buildWritePlan(
+    table: SQLiteTable,
+    meta: CdbTableMeta,
+    auth: AuthCtx,
+    operation: "update" | "delete"
+): AutoFillPlan {
+    const plan = buildPlan(table, meta, auth, operation);
     const authorityRow: Record<string, unknown> = {};
     const jsToSql = jsToSqlMap(table);
     for (const binding of plan.bindings) authorityRow[jsToSql.get(binding.jsKey) ?? binding.jsKey] = binding.value;
     const authorized = applyRowPolicies({
-        op: "update",
+        op: operation,
         auth,
         rows: [authorityRow],
         policies: plan.policies,
@@ -212,7 +218,7 @@ function buildUpdatePlan(table: SQLiteTable, meta: CdbTableMeta, auth: AuthCtx):
     if (authorized.length === 0) {
         throw new CdbError({
             code: "CDB_FORBIDDEN",
-            message: `${meta.name}: caller has no applicable update grant`,
+            message: `${meta.name}: caller has no applicable ${operation} grant`,
         });
     }
     return plan;
@@ -251,41 +257,45 @@ function wrapUpdateBuilder(builder: unknown, plan: AutoFillPlan): unknown {
             return (values: Readonly<Record<string, unknown>>) => {
                 assertUpdateAuthorized(plan, values);
                 const afterSet = (value as (input: unknown) => unknown).call(target, values);
-                return scopeUpdateBuilder(afterSet, plan);
+                return scopePolicyBuilder(afterSet, plan, "update");
             };
         },
     });
 }
 
-function scopeUpdateBuilder(builder: unknown, plan: AutoFillPlan): unknown {
+function scopePolicyBuilder(builder: unknown, plan: AutoFillPlan, operation: "update" | "delete"): unknown {
     const where = Reflect.get(builder as object, "where");
     if (typeof where !== "function") return builder;
     const scoped = where.call(
         builder,
         applyPoliciesToWhere({
-            op: "update",
+            op: operation,
             auth: plan.auth,
             table: plan.table,
             policies: plan.policies,
         })
     );
-    return wrapScopedUpdateBuilder(scoped, plan);
+    return wrapScopedPolicyBuilder(scoped, plan, operation);
 }
 
-function wrapScopedUpdateBuilder(builder: unknown, plan: AutoFillPlan): unknown {
+function wrapScopedPolicyBuilder(builder: unknown, plan: AutoFillPlan, operation: "update" | "delete"): unknown {
     return new Proxy(builder as object, {
         get(target, prop, receiver) {
             const value = Reflect.get(target, prop, receiver);
             if (prop !== "where" || typeof value !== "function") return value;
             return (userWhere: import("drizzle-orm").SQL) => {
                 const combined = applyPoliciesToWhere({
-                    op: "update",
+                    op: operation,
                     auth: plan.auth,
                     table: plan.table,
                     userWhere,
                     policies: plan.policies,
                 });
-                return wrapScopedUpdateBuilder((value as (where: unknown) => unknown).call(target, combined), plan);
+                return wrapScopedPolicyBuilder(
+                    (value as (where: unknown) => unknown).call(target, combined),
+                    plan,
+                    operation
+                );
             };
         },
     });
@@ -317,7 +327,7 @@ function rethrowForbiddenColumn(error: unknown): never {
     throw error;
 }
 
-function missingAuthority(authority: "tenant" | "self", operation: "insert" | "update"): CdbError {
+function missingAuthority(authority: "tenant" | "self", operation: "insert" | "update" | "delete"): CdbError {
     return new CdbError({
         code: "CDB_FORBIDDEN",
         message: `${authority} authority is required for this ${operation}`,
@@ -337,8 +347,8 @@ function conflictingAuthority(authority: "tenant" | "self", column: string): Cdb
  * (BaseSQLiteDatabase, transaction handle, etc.) and proxies through.
  *
  * Implementation note: a Proxy on the db forwards every property
- * (`.select`, `.delete`, `.transaction`, `.run`, …) by default; `insert`
- * and `update` are intercepted. The wrap is recursive on the
+ * (`.select`, `.transaction`, `.run`, …) by default; `insert`, `update`,
+ * and `delete` are intercepted. The wrap is recursive on the
  * transaction callback so `db.transaction(tx => …)` hands the user a
  * wrapped `tx` too.
  */
@@ -358,9 +368,17 @@ export function wrapDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
             if (prop === "update") {
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
-                    const plan = meta ? buildUpdatePlan(table, meta, auth) : null;
+                    const plan = meta ? buildWritePlan(table, meta, auth, "update") : null;
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
                     return plan ? wrapUpdateBuilder(builder, plan) : builder;
+                };
+            }
+            if (prop === "delete") {
+                return (table: SQLiteTable) => {
+                    const meta = getCdbMeta(table);
+                    const plan = meta ? buildWritePlan(table, meta, auth, "delete") : null;
+                    const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
+                    return plan ? scopePolicyBuilder(builder, plan, "delete") : builder;
                 };
             }
             if (prop === "transaction") {

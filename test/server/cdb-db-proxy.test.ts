@@ -52,15 +52,26 @@ interface CapturedUpdate {
     where: unknown;
 }
 
+interface CapturedDelete {
+    readonly table: SQLiteTable;
+    where: unknown;
+}
+
 /**
  * Minimal stub for the surface the proxy actually inspects: an
  * `insert(table)` method that returns a builder whose `.values(rows)`
  * captures its argument and forwards a chainable `returning()` for the
  * "other methods pass through" case.
  */
-function makeStubDb(): { db: StubDb; captured: CapturedInsert[]; capturedUpdates: CapturedUpdate[] } {
+function makeStubDb(): {
+    db: StubDb;
+    captured: CapturedInsert[];
+    capturedUpdates: CapturedUpdate[];
+    capturedDeletes: CapturedDelete[];
+} {
     const captured: CapturedInsert[] = [];
     const capturedUpdates: CapturedUpdate[] = [];
+    const capturedDeletes: CapturedDelete[] = [];
     const db: unknown = {
         insert(table: SQLiteTable) {
             const entry: CapturedInsert = { table, rows: undefined };
@@ -100,8 +111,25 @@ function makeStubDb(): { db: StubDb; captured: CapturedInsert[]; capturedUpdates
             };
             return builder;
         },
+        delete(table: SQLiteTable) {
+            const entry: CapturedDelete = { table, where: undefined };
+            capturedDeletes.push(entry);
+            const builder = {
+                where(where: unknown) {
+                    entry.where = where;
+                    return builder;
+                },
+                returning() {
+                    return Promise.resolve([]);
+                },
+                run() {
+                    return { changes: 0 };
+                },
+            };
+            return builder;
+        },
     };
-    return { db: db as StubDb, captured, capturedUpdates };
+    return { db: db as StubDb, captured, capturedUpdates, capturedDeletes };
 }
 
 const baseAuth: AuthCtx = Object.freeze({
@@ -672,5 +700,98 @@ describe("wrapDb / cdbTable update authorization", () => {
         const { db, capturedUpdates } = makeStubDb();
         wrapDb(db, baseAuth).update(raw).set({ value: "changed" }).run();
         expect(capturedUpdates[0]).toMatchObject({ values: { value: "changed" }, where: undefined });
+    });
+});
+
+describe("wrapDb / cdbTable delete authorization", () => {
+    function deletableTable(
+        name: string,
+        roles: {
+            readonly admin?: RoleValue<{ readonly id: unknown; readonly organizationId: unknown }>;
+            readonly member?: RoleValue<{ readonly id: unknown; readonly organizationId: unknown }>;
+        }
+    ) {
+        const { cdbTable } = forOrg();
+        return cdbTable(
+            name,
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+            },
+            { roles }
+        );
+    }
+
+    test("denies delete when no applicable grant exists", () => {
+        const rows = deletableTable("rows_delete_denied", { member: { read: "*" } });
+        const { db, capturedDeletes } = makeStubDb();
+        const error = forbiddenError(() => wrapDb(db, baseAuth).delete(rows));
+        expect(error.message).toBe("rows_delete_denied: caller has no applicable delete grant");
+        expect(capturedDeletes).toHaveLength(0);
+    });
+
+    test("allows a member delete and protects the no-WHERE case", () => {
+        const rows = deletableTable("rows_delete_no_where", { member: { delete: true } });
+        const { db, capturedDeletes } = makeStubDb();
+        wrapDb(db, baseAuth).delete(rows).run();
+
+        const scoped = renderSql(capturedDeletes[0]?.where);
+        expect(scoped.params).toContain("org-acme");
+        expect(scoped.sql).toContain("organization_id");
+    });
+
+    test("ANDs a hostile tenant WHERE with the server tenant floor", () => {
+        const rows = deletableTable("rows_delete_tenant_floor", { member: { delete: true } });
+        const { db, capturedDeletes } = makeStubDb();
+        wrapDb(db, baseAuth).delete(rows).where(eq(rows.organizationId, "org-other")).run();
+
+        const scoped = renderSql(capturedDeletes[0]?.where);
+        expect(scoped.params).toContain("org-other");
+        expect(scoped.params).toContain("org-acme");
+        expect(scoped.sql.toLowerCase()).toContain(" and ");
+    });
+
+    test("ORs alternative role grants for delete", () => {
+        const rows = deletableTable("rows_delete_roles", {
+            admin: { delete: true },
+            member: { delete: true },
+        });
+        const { db, capturedDeletes } = makeStubDb();
+        wrapDb(db, baseAuth).delete(rows).run();
+        expect(renderSql(capturedDeletes[0]?.where).sql.toLowerCase()).toContain(" or ");
+    });
+
+    test("a self-only delete is scoped by both tenant and owner", () => {
+        const { cdbTable } = forOrg();
+        const rows = cdbTable(
+            "rows_delete_self",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                ownerId: text("owner_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { selfBy: "ownerId", roles: { self: { delete: true } } }
+        );
+        const { db, capturedDeletes } = makeStubDb();
+        wrapDb(db, baseAuth).delete(rows).run();
+
+        const scoped = renderSql(capturedDeletes[0]?.where);
+        expect(scoped.params).toContain("org-acme");
+        expect(scoped.params).toContain("u-alice");
+        expect(scoped.sql).toContain("organization_id");
+        expect(scoped.sql).toContain("owner_id");
+    });
+
+    test("non-cdbTable deletes remain passthrough", () => {
+        const raw = sqliteTable("raw_delete_passthrough", { id: text("id").primaryKey() });
+        const { db, capturedDeletes } = makeStubDb();
+        wrapDb(db, baseAuth).delete(raw).run();
+        expect(capturedDeletes[0]?.where).toBeUndefined();
     });
 });

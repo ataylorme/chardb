@@ -30,7 +30,7 @@ const securedEntries = cdbTable(
 const securedSchema = { entries, securedEntries };
 
 interface ExecuteArgs {
-    readonly mode: "commit" | "throw" | "async" | "forbidden" | "policy" | "updatePolicy";
+    readonly mode: "commit" | "throw" | "async" | "forbidden" | "policy" | "updatePolicy" | "deletePolicy";
     readonly mutId: string;
     readonly firstId: string;
     readonly secondId: string;
@@ -98,7 +98,10 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
             return executeAtomicMutation({
                 ...common,
                 schema:
-                    args.mode === "forbidden" || args.mode === "policy" || args.mode === "updatePolicy"
+                    args.mode === "forbidden" ||
+                    args.mode === "policy" ||
+                    args.mode === "updatePolicy" ||
+                    args.mode === "deletePolicy"
                         ? securedSchema
                         : schema,
                 handler: ({ db }) => {
@@ -111,6 +114,9 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
                     }
                     if (args.mode === "updatePolicy") {
                         db.update(securedEntries).set({ secretNote: "forbidden" }).run();
+                    }
+                    if (args.mode === "deletePolicy") {
+                        db.delete(securedEntries).run();
                     }
                     db.insert(entries).values({ id: args.secondId, sequence: 2 }).run();
                     if (args.mode === "throw") throw new Error("probe failure after second statement");

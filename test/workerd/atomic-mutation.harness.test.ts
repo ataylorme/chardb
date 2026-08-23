@@ -46,7 +46,7 @@ afterAll(async () => {
 });
 
 async function execute(body: {
-    readonly mode: "commit" | "throw" | "async" | "forbidden" | "policy" | "updatePolicy";
+    readonly mode: "commit" | "throw" | "async" | "forbidden" | "policy" | "updatePolicy" | "deletePolicy";
     readonly mutId: string;
     readonly firstId: string;
     readonly secondId: string;
@@ -185,6 +185,22 @@ describe("atomic domain mutation on real Durable Object SqlStorage", () => {
         expect((await response.json()) as unknown).toEqual({
             code: "CDB_FORBIDDEN",
             message: 'atomic_secured_entries: caller is not authorized to update column "secret_note"',
+        });
+        expect(await inspect()).toEqual(before);
+    });
+
+    test("a forbidden delete rolls back earlier statements and the provisional op-log row", async () => {
+        const before = await inspect();
+        const response = await execute({
+            mode: "deletePolicy",
+            mutId: "forbidden-delete",
+            firstId: "delete-policy-must-roll-back",
+            secondId: "unused",
+        });
+        expect(response.status).toBe(409);
+        expect((await response.json()) as unknown).toEqual({
+            code: "CDB_FORBIDDEN",
+            message: "atomic_secured_entries: caller has no applicable delete grant",
         });
         expect(await inspect()).toEqual(before);
     });
