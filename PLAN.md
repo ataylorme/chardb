@@ -6,7 +6,7 @@ Last reviewed: 2026-08-23
 
 Chardb should do one thing well: a developer marks an organization boundary in a Drizzle schema, and chardb routes that organization's data to a SQLite Durable Object with tenant isolation, atomic mutations, idempotent retries, initial queries, and live updates.
 
-The repository does not do that yet. A declared organization mutation now crosses the public Gateway, Catalog, and Cdb path in a focused workerd test. Full-row policy enforcement and isolated shard-local reads also work. The packed example, initial query delivery, and live-update path are still incomplete.
+The repository does not do that yet. A declared organization mutation now crosses the public Gateway, Catalog, and Cdb path in a focused workerd test. An explicit organization query can authorize and read one exact partition from one Cdb and return one initial snapshot, including an empty one. That path does not register the query, replay missed changes, or send live updates. The packed example and live-update path are still incomplete.
 
 Finish the organization-tenanted SQL path first. Stop presenting files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding as working product features. Keep that code as experimental work until the database path works.
 
@@ -100,18 +100,18 @@ The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lo
 
 ## 5. Make authentication a real trust boundary
 
-The configured Gateway verifies JWT signatures and registered claims during `hello` and `updateAuth`. Its attachment stores only the verified subject and time bounds. For each declared organization mutation, Gateway asks Catalog to derive current membership, role, roles, and auth epochs. Undeclared mutations, public subscriptions, queries, and presence remain fail-closed.
+The configured Gateway verifies JWT signatures and registered claims during `hello` and `updateAuth`. Its attachment stores only the verified subject and time bounds. For each declared organization mutation or exact-partition organization query, Gateway asks Catalog to derive current membership, role, roles, and auth epochs. Undeclared operations, mismatched or cross-partition queries, persistent subscriptions, and presence remain fail-closed.
 
 - [x] Verify the JWT signature before storing `principalId`; do not copy tenant, role, or custom claims into the verified attachment.
 - [x] Pin issuer, audience, and accepted algorithms from the configured Better Auth JWT plugin, with a bounded 30-second default clock tolerance.
 - [x] Resolve JWKS through the Catalog-backed resolver contract.
 - [ ] Prove outbound JWKS fetch, key rotation, and cache refresh through the configured Gateway path.
 - [x] Reject missing, malformed, tampered, expired, not-yet-valid, wrong-issuer, wrong-audience, and disallowed-algorithm tokens.
-- [x] Serialize `updateAuth` per server connection id, drain admitted mutations, replace the subject only after successful verification, invalidate subscriptions, and store a terminal rejected attachment on failure.
+- [x] Serialize `updateAuth` per server connection id, drain admitted mutations and initial queries, replace the subject only after successful verification, report delivered snapshot ids through `mustRefetch`, and store a terminal rejected attachment on failure.
 - [x] Recheck token time bounds before every mutation, subscription, and presence operation.
 - [x] Stop deriving a principal from `clientId` for protected requests.
-- [x] Derive organization membership, role, roles, and auth epochs from Catalog for each declared organization mutation. Treat the caller's validated organization only as the requested partition.
-- [x] Build mutation `ctx.auth` only after JWT verification and Catalog membership resolution.
+- [x] Derive organization membership, role, roles, and auth epochs from Catalog for each declared organization mutation and exact-partition organization query. Treat the caller's validated organization only as the requested partition.
+- [x] Build mutation and initial-query `ctx.auth` only after JWT verification and Catalog membership resolution.
 - [ ] Define the anonymous query behavior explicitly.
 - [x] Test real signed tokens, tampering, expiry, not-before, issuer, audience, algorithm, subject refresh, and the Catalog resolver contract.
 - [x] Test the configured Gateway WebSocket dispatch under workerd with real Catalog SQLite cache and ES256 tokens.
@@ -144,7 +144,7 @@ The database proxy now applies one explicit rule to registered-table inserts, up
 
 ## 7. Implement queries instead of subscription registration
 
-Protocol v3 subscriptions send a query reference and raw arguments. Gateway validates the arguments and derives routing intent from its local server manifest. Separately, Cdb can resolve and execute a query handler through an isolated shard-local RPC with a read-only Drizzle wrapper and JSON result validation. The public subscription path does not call that RPC or send its result.
+Protocol v3 subscription requests send a query reference and raw arguments. For an explicit organization query with a stable ref, partition key, and server-owned intent, Gateway validates the arguments, requires the partition and intent to resolve to the same exact organization and one virtual shard, derives current authority from Catalog, calls one Cdb read, and sends one snapshot. This path does not register the query or create replay or live-invalidation state.
 
 - [x] Change the wire protocol so `sub` carries the query reference and raw arguments.
 - [x] Increment the protocol version and enforce it during `hello` and `welcome`.
@@ -152,17 +152,18 @@ Protocol v3 subscriptions send a query reference and raw arguments. Gateway vali
 - [x] Resolve the query reference inside the Cdb isolate.
 - [x] Recompute the query intent on the server. Do not trust the client's intent or query hash.
 - [ ] Canonicalize query identity and include the query ref, validated arguments, verified principal, tenant, auth epoch, and policy epoch.
-- [ ] Route organization queries using the verified tenant and the server-computed intent.
+- [x] Route explicit organization queries only when the validated partition metadata and server-computed intent resolve to the same exact organization and one virtual shard.
 - [x] Enumerate distinct current Catalog shard ids for scatter routing instead of probing virtual shards.
 - [x] Construct `QueryCtx` with a read-only database and the auth carried by the internal request.
 - [x] Apply row predicates and readable-column masks during full-row single-`cdbTable` query execution. Keep projections and joins blocked.
 - [x] Execute the query handler inside Cdb and reject non-JSON results.
 - [x] Add an explicit protocol-v3 snapshot envelope, including empty row arrays, and replace client subscription state when it arrives.
-- [ ] Send an explicit initial snapshot, including an empty snapshot.
+- [x] Send an explicit initial snapshot, including an empty snapshot, for the exact-partition organization query path.
 - [x] Move the client subscription from `pending` to `live` when a valid snapshot arrives.
 - [ ] Define ordering and stable row keys for collection results.
-- [ ] Reject unsupported cross-partition queries instead of silently scattering them.
+- [x] Reject undeclared, mismatched, scatter, and cross-partition queries instead of silently routing them.
 - [ ] Remove the requirement that users manually keep a query handler and intent extractor equivalent, or verify that equivalence during the build.
+- [ ] Persist and register an authorized query before treating the one-shot snapshot as a subscription.
 
 ## 8. Implement live updates with simple invalidation first
 
@@ -200,7 +201,7 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 
 ## 10. Make one real example
 
-The chat directory now consumes the packed package and passes compile-time checks. Its mutation declares the public organization authority contract, but the packed example has not run a Better Auth sign-in, persisted mutation readback, initial query, or live update under workerd. Domain migrations are also incomplete.
+The chat directory now consumes the packed package and passes compile-time checks. Its mutation and query declare the public organization authority contract, but the packed example has not run a Better Auth sign-in, persisted mutation readback, initial query, or live update under workerd. Domain migrations are also incomplete.
 
 - [x] Install the package through npm's packed file-dependency path with a committed consumer lockfile.
 - [x] Declare every dependency used by the example.
@@ -211,7 +212,7 @@ The chat directory now consumes the packed package and passes compile-time check
 - [ ] Generate the example schema through real migrations.
 - [x] Add an idempotent auth hook that reuses the demo organization and user membership, tolerates confirmed concurrent creation, then sets the active organization.
 - [x] Give `postMessage` an explicit stable ref and organization authority, and call it through the public mutation hook.
-- [ ] Make opening a channel return a persisted initial query result.
+- [ ] Make opening a channel in the packed chat app return a persisted initial query result under workerd.
 - [ ] Make a second browser receive the live replacement result.
 - [ ] Add an organization switch and prove data isolation.
 - [x] Install, typecheck, and build the example against the packed package instead of TypeScript aliases or source imports.
