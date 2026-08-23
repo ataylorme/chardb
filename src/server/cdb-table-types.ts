@@ -70,7 +70,7 @@ export type VerbValue<TCols, _V extends Verb = Verb> =
 export type RoleValue<TCols> = "*" | readonly Verb[] | { readonly [V in Verb]?: VerbValue<TCols> };
 
 /** Column-axis CLS spec: one entry per column, listing which roles get each verb. */
-export type ColumnSpec<TCols, R extends string = RoleName> = {
+export type ColumnSpec<_TCols, R extends string = RoleName> = {
     readonly read?: readonly R[];
     readonly create?: readonly R[];
     readonly update?: readonly R[];

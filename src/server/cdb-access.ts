@@ -65,7 +65,6 @@ export function buildAccessControl(schema: Record<string, unknown>): BuiltAccess
     const userRoleNames = new Set<string>();
 
     // Gather grants per role per table per verb.
-    type Grant = { readonly [tableName: string]: readonly Verb[] };
     const orgGrants = new Map<string, Map<string, Set<Verb>>>();
     const userGrants = new Map<string, Map<string, Set<Verb>>>();
 

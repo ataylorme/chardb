@@ -36,10 +36,10 @@
 
 import { getTableColumns } from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
-import type { AuthCtx } from "./define.ts";
 import { getCdbMeta } from "./cdb-table-registry.ts";
-import { resolveCdbMeta } from "./cdb-table.ts";
 import type { CdbTableMeta } from "./cdb-table-types.ts";
+import { resolveCdbMeta } from "./cdb-table.ts";
+import type { AuthCtx } from "./define.ts";
 
 /**
  * Cache of (sqlColumnName → jsColumnKey) for each cdbTable. The map is

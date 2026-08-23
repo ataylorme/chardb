@@ -26,9 +26,9 @@
  */
 
 import type { SQLiteTableWithColumns } from "drizzle-orm/sqlite-core";
-import { sqliteTable } from "drizzle-orm/sqlite-core";
-import { type CdbColumnsInput, createCdbTable } from "./cdb-table.ts";
+import type { sqliteTable } from "drizzle-orm/sqlite-core";
 import type { AuthTargetKind, CdbTableConfig, TenantKind } from "./cdb-table-types.ts";
+import { type CdbColumnsInput, createCdbTable } from "./cdb-table.ts";
 
 /** The Drizzle table type `sqliteTable(name, cols)` produces, with column inference preserved. */
 type BuiltTable<TName extends string, TCols extends CdbColumnsInput> = SQLiteTableWithColumns<{

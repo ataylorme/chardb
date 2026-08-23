@@ -23,11 +23,12 @@ import type { ForeignKey, SQLiteColumnBuilderBase, SQLiteTable, SQLiteTableWithC
 import { getTableConfig, sqliteTable } from "drizzle-orm/sqlite-core";
 
 import { CdbError } from "../errors.ts";
+import { attachCdbMeta, getCdbMeta } from "./cdb-table-registry.ts";
 import {
     type AuthTargetKind,
+    COL_VERBS,
     type CdbTableConfig,
     type CdbTableMeta,
-    COL_VERBS,
     type ColVerb,
     type ColumnMatrix,
     type ColumnSpec,
@@ -37,7 +38,6 @@ import {
     type Verb,
     type VerbValue,
 } from "./cdb-table-types.ts";
-import { attachCdbMeta, getCdbMeta } from "./cdb-table-registry.ts";
 
 /**
  * Drizzle column-builder record shape. Mirrors the constraint Drizzle's
@@ -273,7 +273,7 @@ function columnsContainSelf(cols: { readonly [k: string]: ColumnSpec<Record<stri
     for (const spec of Object.values(cols)) {
         for (const verb of COL_VERBS) {
             const list = spec[verb];
-            if (list && list.includes("self" as RoleName)) return true;
+            if (list?.includes("self" as RoleName)) return true;
         }
     }
     return false;
@@ -365,7 +365,7 @@ function compileColumnMatrix<TCols extends CdbColumnsInput>(args: {
                 const excluded = (vv as { readonly exclude: readonly string[] }).exclude;
                 for (const colJs of excluded) {
                     const colSpec = args.rawColumns[colJs];
-                    if (colSpec && colSpec[verb] && colSpec[verb]?.includes(role as RoleName)) {
+                    if (colSpec?.[verb]?.includes(role as RoleName)) {
                         throw new CdbError({
                             code: "CDB_POLICY_CONFLICT",
                             message: `cdbTable("${args.tableName}"): role "${role}" verb "${verb}" excludes column "${colJs}" but the columns block grants it to "${role}"`,

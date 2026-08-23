@@ -20,10 +20,10 @@
 
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../errors.ts";
-import type { AuthCtx } from "./define.ts";
 import { callerColumns, isColumnAllowed, selfColumns } from "./cdb-policy.ts";
-import { resolveCdbMeta } from "./cdb-table.ts";
 import type { ColVerb } from "./cdb-table-types.ts";
+import { resolveCdbMeta } from "./cdb-table.ts";
+import type { AuthCtx } from "./define.ts";
 
 /**
  * Project every row through the read-mask: values for columns the caller

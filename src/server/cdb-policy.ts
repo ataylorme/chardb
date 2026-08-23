@@ -29,12 +29,12 @@
  * invalidate the same way pre/post migration.
  */
 
-import { eq, type SQL } from "drizzle-orm";
+import { type SQL, eq } from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
-import type { AuthCtx } from "./define.ts";
-import { chardbPolicy, type PolicyDefinition } from "./policy.ts";
-import { type CdbTableMeta, type ColVerb, COL_VERBS, type Verb } from "./cdb-table-types.ts";
+import { COL_VERBS, type CdbTableMeta, type ColVerb, type Verb } from "./cdb-table-types.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
+import type { AuthCtx } from "./define.ts";
+import { type PolicyDefinition, chardbPolicy } from "./policy.ts";
 
 /**
  * The four better-auth tables whose writes bump the tenant epoch.
@@ -147,7 +147,7 @@ export function compileCdbPolicies(table: SQLiteTable): readonly PolicyDefinitio
     //    already enforces self-equality so we omit a second policy unless
     //    the user explicitly listed `self` (in which case it widens the
     //    column matrix without altering the row predicate).
-    const selfRoles = meta.rawRoles["self"];
+    const selfRoles = meta.rawRoles.self;
     if (selfRoles && meta.tenantKind === "org" && meta.selfBy) {
         const selfBy = meta.selfBy;
         for (const verb of ["read", "create", "update", "delete"] as readonly Verb[]) {

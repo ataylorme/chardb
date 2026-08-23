@@ -129,7 +129,7 @@ export function openDt(
     );
     for (const sid of sortedParticipants) {
         store.sql.exec(
-            `INSERT INTO _chardb_dt_participant (dt_id, shard_id, vote, bookmark) VALUES (?, ?, NULL, NULL)`,
+            "INSERT INTO _chardb_dt_participant (dt_id, shard_id, vote, bookmark) VALUES (?, ?, NULL, NULL)",
             args.dtId,
             sid
         );
@@ -142,7 +142,7 @@ export function readDtState(
     dtId: string
 ): { state: DtState; participants: readonly string[]; payload: string } | null {
     const row = store.sql.one<{ state: DtState; partition_plan: string }>(
-        `SELECT state, partition_plan FROM _chardb_dt_state WHERE dt_id = ?`,
+        "SELECT state, partition_plan FROM _chardb_dt_state WHERE dt_id = ?",
         dtId
     );
     if (!row) return null;
@@ -164,7 +164,7 @@ export function recordVote(
     }
 ): void {
     store.sql.exec(
-        `UPDATE _chardb_dt_participant SET vote = ?, bookmark = ? WHERE dt_id = ? AND shard_id = ?`,
+        "UPDATE _chardb_dt_participant SET vote = ?, bookmark = ? WHERE dt_id = ? AND shard_id = ?",
         args.vote,
         args.bookmark,
         args.dtId,
@@ -174,7 +174,7 @@ export function recordVote(
 
 /** Atomically transition to a terminal state. Idempotent: a no-op if already terminal. */
 export function decideDt(store: CoordinatorStore, dtId: string, decision: "committed" | "aborted"): void {
-    const cur = store.sql.one<{ state: DtState }>(`SELECT state FROM _chardb_dt_state WHERE dt_id = ?`, dtId);
+    const cur = store.sql.one<{ state: DtState }>("SELECT state FROM _chardb_dt_state WHERE dt_id = ?", dtId);
     if (!cur) throw new CdbError({ code: "CDB_INVARIANT", message: `decideDt: unknown dtId ${dtId}` });
     if (cur.state === decision) return;
     if (cur.state !== "preparing") {
@@ -184,7 +184,7 @@ export function decideDt(store: CoordinatorStore, dtId: string, decision: "commi
         });
     }
     store.sql.exec(
-        `UPDATE _chardb_dt_state SET state = ?, decided_at = ? WHERE dt_id = ?`,
+        "UPDATE _chardb_dt_state SET state = ?, decided_at = ? WHERE dt_id = ?",
         decision,
         store.now(),
         dtId
@@ -337,8 +337,9 @@ export async function recoverCoordinator(args: {
             const decision: "committed" | "aborted" = recoveryVotes.every(v => v === "yes") ? "committed" : "aborted";
             args.transaction(() => {
                 for (let i = 0; i < sorted.length; i++) {
-                    const sid = sorted[i]!;
-                    const v = recoveryVotes[i]!;
+                    const sid = sorted[i];
+                    const v = recoveryVotes[i];
+                    if (!sid || !v) throw new Error("participant and recovery vote arrays must stay aligned");
                     recordVote(args.store, {
                         dtId: r.dt_id,
                         shardId: sid,
