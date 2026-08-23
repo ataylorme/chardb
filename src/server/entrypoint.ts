@@ -5,11 +5,6 @@
  *   - implements `fetch(req)` for the reserved-route prefix list:
  *       /ws         — hibernatable WebSocket to the Gateway DO (wired)
  *       /_chardb/*  — internal dashboard / admin routes (wired)
- *       /q /f /p /s — reserved for the live-query, file, presence, and
- *                     stream HTTP shims; currently return 501 with a
- *                     `not implemented in foundation` body. The prefix
- *                     is reserved so user routers won't shadow them
- *                     when these handlers land.
  *     Everything else falls through to the user's `app.fetch` via
  *     `mountChardb`.
  *   - implements `scheduled(event)` for Cron Triggers
@@ -91,11 +86,8 @@ export interface DefineChardbInput<TSchema = unknown> {
     readonly manifest?: ChardbManifest;
 }
 
-const RESERVED_PREFIXES = ["/q", "/ws", "/f", "/p", "/s", "/_chardb/"] as const;
-
 function isReserved(path: string): boolean {
-    for (const p of RESERVED_PREFIXES) if (path === p || path.startsWith(`${p}/`) || path.startsWith(p)) return true;
-    return false;
+    return path === "/ws" || path.startsWith("/ws/") || path.startsWith("/_chardb/");
 }
 
 const SERVER_VERSION = "0.1.0";
@@ -112,17 +104,10 @@ class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
         const start = Date.now();
         let response: Response;
         try {
-            if (url.pathname.startsWith("/ws")) {
+            if (url.pathname === "/ws" || url.pathname.startsWith("/ws/")) {
                 response = await this.handleWebSocket(request);
             } else if (url.pathname.startsWith("/_chardb/")) {
                 response = await this.handleDashboard(request);
-            } else if (
-                url.pathname.startsWith("/q") ||
-                url.pathname.startsWith("/f") ||
-                url.pathname.startsWith("/p") ||
-                url.pathname.startsWith("/s")
-            ) {
-                response = await this.handleApi(request, url, correlationId);
             } else {
                 response = new Response("not found", { status: 404 });
             }
@@ -141,13 +126,6 @@ class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
         const clientId = url.searchParams.get("clientId") ?? crypto.randomUUID();
         const id = this.env.CDB_GATEWAY.idFromName(clientId.slice(0, 12));
         return this.env.CDB_GATEWAY.get(id).fetch(request);
-    }
-
-    private async handleApi(_request: Request, _url: URL, correlationId: string): Promise<Response> {
-        return new Response(JSON.stringify({ ok: false, error: "not implemented in foundation", correlationId }), {
-            status: 501,
-            headers: { "content-type": "application/json" },
-        });
     }
 
     private async handleDashboard(request: Request): Promise<Response> {
@@ -350,9 +328,8 @@ function mergeAuthIntoSchema<TSchema>(schema: TSchema, auth: DefineChardbAuth | 
  * `mountChardb` routes any request whose path starts with the
  * better-auth basePath (default `/api/auth`) straight to it, so the
  * user never wires the better-auth router into their app manually.
- * Chardb's reserved prefixes (`/ws`, `/_chardb/*`, plus the prefix
- * list for the live-query / file / presence / stream HTTP shims) win
- * over the auth handler; everything else falls through to `app.fetch`.
+ * Chardb's reserved prefixes (`/ws`, `/_chardb/*`) win over the auth
+ * handler; everything else falls through to `app.fetch`.
  */
 export interface MountChardbOptions {
     /**

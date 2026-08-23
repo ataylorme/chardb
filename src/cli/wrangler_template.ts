@@ -40,7 +40,7 @@ export function renderWrangler(input: WranglerTemplateInput): string {
         assets: {
             directory: input.assetsDir,
             binding: "CDB_DASHBOARD",
-            run_worker_first: ["/_chardb/api/*", "/q", "/ws", "/f", "/p", "/s"],
+            run_worker_first: ["/_chardb/*", "/ws"],
         },
         tail_consumers: [{ service: "chardb-tail" }],
         observability: {
@@ -99,8 +99,12 @@ export function checkWrangler(rawJsonc: string): DoctorResult {
     if (cfg.observability?.traces?.enabled !== true) {
         warnings.push("observability.traces.enabled is not true (G19 region observability)");
     }
-    if (!cfg.assets?.run_worker_first?.includes("/q")) {
-        warnings.push("assets.run_worker_first should include reserved chardb routes (/q,/ws,/f,/p,/s)");
+    const runWorkerFirst = cfg.assets?.run_worker_first ?? [];
+    const missingReservedRoutes = ["/_chardb/*", "/ws"].filter(route => !runWorkerFirst.includes(route));
+    if (missingReservedRoutes.length > 0) {
+        warnings.push(
+            `assets.run_worker_first should include reserved chardb routes (${missingReservedRoutes.join(",")})`
+        );
     }
     return { ok: errors.length === 0, errors, warnings };
 }

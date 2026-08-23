@@ -7,11 +7,14 @@
     "compatibility_date": "2025-09-01",
 
     // Static assets binding — `vite build` writes the React SPA into ./dist,
-    // wrangler serves any file under there ahead of `app.fetch`. Reserved
-    // chardb prefixes (`/q`, `/ws`, `/f`, `/p`, `/s`, `/_chardb/`) are
-    // matched in the Worker before assets, so the WebSocket and live-query
-    // routes are never shadowed by an asset.
-    "assets": { "directory": "./dist", "binding": "ASSETS", "not_found_handling": "single-page-application" },
+    // wrangler serves any file under there ahead of `app.fetch`. The live
+    // chardb routes (`/ws` and `/_chardb/*`) run through the Worker first.
+    "assets": {
+        "directory": "./dist",
+        "binding": "ASSETS",
+        "not_found_handling": "single-page-application",
+        "run_worker_first": ["/ws", "/_chardb/*"]
+    },
 
     "durable_objects": {
         "bindings": [

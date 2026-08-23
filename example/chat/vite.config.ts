@@ -40,10 +40,6 @@ export default defineConfig({
         port: 5173,
         proxy: {
             "/ws": { target: "ws://localhost:8787", ws: true },
-            "/q": "http://localhost:8787",
-            "/p": "http://localhost:8787",
-            "/s": "http://localhost:8787",
-            "/f": "http://localhost:8787",
             "/_chardb": "http://localhost:8787",
             "/api": "http://localhost:8787",
         },

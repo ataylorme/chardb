@@ -38,9 +38,11 @@ This status reflects the code in the repository, not the broader product describ
 | Snapshot export and restore | Missing | Barrier bookmarks exist. Durable export, restore, and verification do not. |
 | Complete online resharding | Partial | The phase machine and shard RPCs exist, with focused tests and a TLA+ model. Automatic triggers, the entire Resharder RPC sequence, concurrent application writes, and recovery are not validated end to end. |
 | Cross-partition transaction | Isolated | A two-phase protocol and recovery tests exist. The default runtime has no bound participant implementation and raises `CDB_DT_NOT_IMPLEMENTED`. |
-| Files and uploads | Missing | Drizzle column types and validators exist. Runtime handles throw for upload and delete, and the HTTP endpoint returns 501. |
-| Vector search and streams | Missing | Types and helper code exist. React hooks return empty placeholder results, and the HTTP endpoints return 501. |
+| Files and uploads | Missing | Drizzle column types and validators exist. Runtime handles throw for upload and delete. The feature module exposes no runtime HTTP endpoint. |
+| Vector search and streams | Missing | Types and helper code exist. React hooks return empty placeholder results. The feature modules expose no runtime HTTP endpoints. |
 | Operational CLI | Partial | Config rendering, Wrangler checks, explain logic, and deploy-plan helpers exist. Migration apply, shard operations, export, restore, and schedule operations are incomplete or placeholders. |
+
+Only `/ws` and `/_chardb/*` are reserved Chardb routes. `/q`, `/f`, `/p`, and `/s` are not feature endpoints; requests to those paths fall through to the application.
 
 ## The missing application flow
 

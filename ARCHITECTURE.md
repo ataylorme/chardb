@@ -28,7 +28,7 @@ optional R2, Vectorize, queue, BlobMeta, GsiShard, and Resharder bindings
 
 The application Worker is assembled by [`chardb()`](src/server/chardb.ts). It combines a Hono application, the synthesized auth schema, a manifest, the reserved Chardb routes, and the Durable Object class exports required by Wrangler.
 
-[`mountChardb`](src/server/entrypoint.ts) sends `/ws`, `/q`, `/f`, `/p`, `/s`, and `/_chardb/*` to the Chardb entrypoint. It sends `/api/auth/*` to better-auth when auth is configured. Other requests fall through to the application.
+[`mountChardb`](src/server/entrypoint.ts) sends `/ws` and `/_chardb/*` to the Chardb entrypoint. It sends `/api/auth/*` to better-auth when auth is configured. Other requests fall through to the application. In particular, `/q`, `/f`, `/p`, and `/s` are not runtime feature endpoints and remain available to application routes.
 
 The Durable Objects have separate responsibilities:
 

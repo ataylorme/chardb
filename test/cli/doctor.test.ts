@@ -41,7 +41,9 @@ describe("renderWrangler / checkWrangler", () => {
         const r = checkWrangler(text);
         expect(r.ok).toBe(true);
         expect(r.errors).toEqual([]);
+        expect(r.warnings).toEqual([]);
         expect(JSON.parse(text).services).toBeUndefined();
+        expect(JSON.parse(text).assets.run_worker_first).toEqual(["/_chardb/*", "/ws"]);
     });
 
     test("checkWrangler reports each missing DO binding", () => {
@@ -62,6 +64,27 @@ describe("renderWrangler / checkWrangler", () => {
         })}\n// trailing comment`;
         const r = checkWrangler(`// header\n${text}`);
         expect(r.ok).toBe(true);
+    });
+
+    test("checkWrangler warns only about missing live reserved routes", () => {
+        const cfg = JSON.parse(
+            renderWrangler({
+                name: "x",
+                compatibilityDate: "2026-05-10",
+                r2Bucket: "b",
+                vectorizeIndex: "v",
+                gsiQueue: "q",
+                assetsDir: ".chardb/dashboard",
+            })
+        );
+        cfg.assets.run_worker_first = [];
+
+        const result = checkWrangler(JSON.stringify(cfg));
+
+        expect(result.warnings).toEqual([
+            "assets.run_worker_first should include reserved chardb routes (/_chardb/*,/ws)",
+        ]);
+        expect(result.warnings.join("")).not.toMatch(/\/q|\/f|\/p|\/s,/);
     });
 });
 

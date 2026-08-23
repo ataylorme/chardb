@@ -2,7 +2,7 @@
  * Coverage for `mountChardb`'s auth-handler routing.
  *
  * The framework already short-circuits chardb-reserved prefixes
- * (`/ws`, `/_chardb/*`, `/q`, `/f`, `/p`, `/s`) to the Chardb
+ * (`/ws`, `/_chardb/*`) to the Chardb
  * WorkerEntrypoint, then falls through to the user's `app.fetch` for
  * anything else. The new `options.authHandler` argument lets a
  * better-auth `auth.handler` claim `/api/auth/*` without the user
@@ -83,6 +83,24 @@ describe("mountChardb", () => {
             FAKE_CTX as unknown as ExecutionContext
         );
         expect(await res.text()).toBe("chardb-reserved");
+    });
+
+    test("former placeholder prefixes fall through to application routes", async () => {
+        const userApp = {
+            async fetch(req: Request): Promise<Response> {
+                return new Response(`user-app:${new URL(req.url).pathname}`, { status: 200 });
+            },
+        };
+        const mounted = mountChardb(StubChardb as never, userApp);
+
+        for (const path of ["/q", "/q/messages", "/f", "/p/typing", "/s/events"]) {
+            const res = await mounted.fetch(
+                new Request(`https://example.com${path}`),
+                FAKE_ENV,
+                FAKE_CTX as unknown as ExecutionContext
+            );
+            expect(await res.text()).toBe(`user-app:${path}`);
+        }
     });
 
     test("custom authBasePath is honoured", async () => {
