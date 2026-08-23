@@ -239,7 +239,7 @@ The chat directory now consumes the packed package and passes compile-time check
 - [x] Use `bun.lock` at the root and keep `package-lock.json` only for the npm consumer fixture.
 - [x] Stop tracking generated landing `.js`, `.d.ts`, and `.tsbuildinfo` files.
 - [x] Add `prepack` so a clean package build always produces `dist`.
-- [ ] Fail the package build on warnings.
+- [x] Fail the package build on warnings.
 - [ ] Stop publishing all of `src` unless there is a concrete consumer need.
 - [x] Include `LICENSE` and `README.md` in the tarball.
 - [ ] Include `STATUS.md`, `ARCHITECTURE.md`, `SECURITY.md`, and `CONTRIBUTING.md` in the tarball.

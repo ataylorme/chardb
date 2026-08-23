@@ -44,5 +44,5 @@ export default defineBuildConfig({
         "eslint",
         "@typescript-eslint/utils",
     ],
-    failOnWarn: false,
+    failOnWarn: true,
 });
