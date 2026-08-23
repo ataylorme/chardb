@@ -215,19 +215,32 @@ class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
  * ```
  */
 export function defineChardb<TSchema>(input: DefineChardbInput<TSchema>): typeof ChardbEntrypoint {
-    // Lazy construction. `defineChardb` is typically called at module init
-    // in the user's `worker.ts`, which often participates in an ESM
-    // cycle with their schema module (`schema.ts` references `auth` from
-    // `worker.ts`, `worker.ts` imports `* as domain from schema.ts`).
-    // Iterating `schema` at this point would force every binding to
-    // evaluate and crash with a TDZ on the partial namespace; deferring
-    // until first call works against fully-evaluated modules.
+    // Auth options do not depend on the domain-schema namespace, so bind
+    // their synthesized tables at module initialization. Every Worker and
+    // Durable Object isolate evaluates the application module separately;
+    // eager binding ensures a Catalog created for the first request has the
+    // model tables before its bootstrap runs.
+    const synthesizedAuth = input.auth
+        ? (synthesizeAuthSchema(
+              input.auth.options as unknown as Parameters<typeof synthesizeAuthSchema>[0]
+          ) as unknown as SynthesizedAuthSchema)
+        : undefined;
+    if (synthesizedAuth && input.auth) {
+        bindAuthRuntime({
+            schema: synthesizedAuth,
+            options: input.auth.options as { readonly [k: string]: unknown },
+        });
+    }
+
+    // Domain-schema construction remains lazy. `defineChardb` is usually
+    // called in a worker.ts ↔ schema.ts ESM cycle; iterating that namespace
+    // during module initialization can hit a partially evaluated binding.
     let cachedSchema: TSchema | null = null;
     let cachedManifest: ChardbManifest | null = null;
     let cachedPolicy: import("../colocation/types.ts").PolicyInput | undefined;
     function getSchema(): TSchema {
         if (cachedSchema !== null) return cachedSchema;
-        cachedSchema = mergeAuthIntoSchema(input.schema, input.auth);
+        cachedSchema = mergeAuthIntoSchema(input.schema, synthesizedAuth);
         return cachedSchema;
     }
     function getManifest(): ChardbManifest {
@@ -298,25 +311,13 @@ export function defineChardb<TSchema>(input: DefineChardbInput<TSchema>): typeof
     };
 }
 
-function mergeAuthIntoSchema<TSchema>(schema: TSchema, auth: DefineChardbAuth | undefined): TSchema {
-    if (!auth) return schema;
+function mergeAuthIntoSchema<TSchema>(schema: TSchema, synthesizedAuth: SynthesizedAuthSchema | undefined): TSchema {
+    if (!synthesizedAuth) return schema;
     if (!schema || typeof schema !== "object") return schema;
     const userNames: string[] = [];
     for (const k of Object.keys(schema)) userNames.push(k);
     assertNoReservedTableShadow(userNames);
-    // The runtime synthesizer accepts a `BetterAuthOptions` shape via its
-    // `AuthOptionsInput<...>` constraint; we cast through `unknown` because
-    // better-auth's `plugins?: BetterAuthPlugin[]` is mutable while the
-    // input expects `readonly`.
-    const synthesized = synthesizeAuthSchema(auth.options as unknown as Parameters<typeof synthesizeAuthSchema>[0]);
-    // Bind the synthesized schema into the module-level auth runtime so the
-    // chardb adapter (executing inside Cdb DOs) can resolve model→table
-    // and partition rules without a separate registration step.
-    bindAuthRuntime({
-        schema: synthesized as unknown as SynthesizedAuthSchema,
-        options: auth.options as { readonly [k: string]: unknown },
-    });
-    return { ...synthesized, ...schema } as TSchema;
+    return { ...synthesizedAuth, ...schema } as TSchema;
 }
 
 /**

@@ -82,11 +82,12 @@ Online schema changes can wait. A maintenance-mode migration is enough for the f
 
 ## 4. Simplify and fix auth storage
 
-The Better Auth adapter is not ready to back a session flow. Several ordinary lookups do not contain the configured partition column, and the generated table DDL loses constraints and indexes.
+The Better Auth adapter now keeps every synthesized model in Catalog, so ordinary lookups no longer depend on a shard partition column. It is still not ready to back a session flow because generated table DDL loses constraints and indexes, multi-write adapter transactions are disabled, and no complete sign-in flow has run through the public application path.
 
-- [ ] Put all Better Auth tables in Catalog for the first working version.
-- [ ] Remove auth sharding until normal sign-in, session lookup, organization membership, logout, and token issuance work across restarts.
-- [ ] Eagerly bind the auth schema before Cdb or Catalog bootstrap marks itself complete.
+- [x] Put all Better Auth tables in Catalog for the first working version.
+- [x] Remove auth sharding from the adapter and Cdb storage path.
+- [x] Bind the auth runtime during application-module initialization in every Worker and Durable Object isolate, and let Catalog retry auth-table bootstrap if it started before that binding.
+- [x] Test create and routine lookup by email, session token, provider/account key, and membership field, plus update, delete, and same-storage Catalog reconstruction in a Bun Durable Object harness.
 - [ ] Generate complete auth DDL from the synthesized schema.
 - [ ] Preserve unique constraints required for email, session token, provider account, membership, and plugin tables.
 - [ ] Preserve foreign keys and indexes.

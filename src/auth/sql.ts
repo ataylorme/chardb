@@ -5,7 +5,7 @@
  * only as a *schema* source (column names, table names) via
  * `getTableConfig`. We render parameterized SQL directly against the
  * `SyncSql` adapter so the work runs synchronously inside
- * `transactionSync` blocks on the Cdb shard DO.
+ * `transactionSync` blocks on the Catalog DO.
  *
  * Op semantics mirror better-auth's `DbAdapterContract`:
  *   - create  → `INSERT INTO t (cols...) VALUES (?...)`. Returns the
@@ -42,6 +42,7 @@ interface TableInfo {
     readonly name: string;
     /** Map model-key → SQL column name (handles renames via `column.name !== modelKey`). */
     readonly columns: ReadonlyMap<string, string>;
+    readonly dataTypes: ReadonlyMap<string, Column["dataType"]>;
 }
 
 const tableInfoCache = new WeakMap<AnySQLiteTable, TableInfo>();
@@ -50,16 +51,19 @@ function infoOf(table: AnySQLiteTable): TableInfo {
     const cached = tableInfoCache.get(table);
     if (cached) return cached;
     const columns = new Map<string, string>();
+    const dataTypes = new Map<string, Column["dataType"]>();
     for (const [key, col] of Object.entries(getTableColumns(table)) as [string, Column][]) {
         columns.set(key, col.name);
+        dataTypes.set(key, col.dataType);
     }
-    const info: TableInfo = { name: getTableName(table), columns };
+    const info: TableInfo = { name: getTableName(table), columns, dataTypes };
     tableInfoCache.set(table, info);
     return info;
 }
 
-function toSqlValue(v: RawJson): SqlValue {
+function toSqlValue(v: unknown): SqlValue {
     if (v === null || v === undefined) return null;
+    if (v instanceof Date) return v.getTime();
     if (typeof v === "string") return v;
     if (typeof v === "number") return Number.isFinite(v) ? v : null;
     if (typeof v === "boolean") return v ? 1 : 0;
@@ -72,8 +76,14 @@ function toSqlValue(v: RawJson): SqlValue {
     return JSON.stringify(v);
 }
 
-function fromSqlValue(raw: unknown): RawJson {
+function fromSqlValue(raw: unknown, dataType: Column["dataType"] | undefined): RawJson {
     if (raw === null || raw === undefined) return null;
+    if (dataType === "date" && (typeof raw === "number" || typeof raw === "string")) {
+        return new Date(Number(raw)) as unknown as RawJson;
+    }
+    if (dataType === "boolean" && (typeof raw === "number" || typeof raw === "bigint")) {
+        return (Number(raw) === 1) as RawJson;
+    }
     if (typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean") return raw;
     if (typeof raw === "bigint") return raw.toString();
     if (raw instanceof Uint8Array) return Array.from(raw) as unknown as RawJson;
@@ -83,7 +93,7 @@ function fromSqlValue(raw: unknown): RawJson {
 function projectRow(info: TableInfo, raw: Record<string, unknown>): Record<string, RawJson> {
     const out: Record<string, RawJson> = {};
     for (const [modelKey, sqlName] of info.columns) {
-        if (sqlName in raw) out[modelKey] = fromSqlValue(raw[sqlName]);
+        if (sqlName in raw) out[modelKey] = fromSqlValue(raw[sqlName], info.dataTypes.get(modelKey));
     }
     return out;
 }

@@ -16,12 +16,12 @@ application Worker ---- /api/auth/* ----> better-auth
 Gateway DO ---- routing lookup ----> Catalog DO
     |                                  |
     |                                  | range map, epochs, barriers,
-    |                                  | replicated auth data, JWKS cache
+    |                                  | all auth data, JWKS cache
     v                                  |
 Cdb shard DO <-------------------------+
     |
-    | SQLite data, op-log, subscription intervals,
-    | shard-local auth data, reshard copy and tail state
+    | SQLite domain data, op-log, subscription intervals,
+    | reshard copy and tail state
     v
 optional R2, Vectorize, queue, BlobMeta, GsiShard, and Resharder bindings
 ```
@@ -35,8 +35,8 @@ The Durable Objects have separate responsibilities:
 | Component | Responsibility |
 | --- | --- |
 | [`Gateway`](src/server/do/gateway.ts) | Owns hibernated WebSockets, persists subscription registrations, routes intents, handles presence messages, and batches outgoing patches. |
-| [`Catalog`](src/server/do/catalog.ts) | Owns the global virtual-shard range map, schema and auth epochs, snapshot barriers, cached JWKs, and replicated auth models. |
-| [`Cdb`](src/server/do/cdb.ts) | Owns SQLite data for one physical shard, the mutation op-log, interval registrations, shard-local auth models, and source or destination state for range movement. |
+| [`Catalog`](src/server/do/catalog.ts) | Owns the global virtual-shard range map, schema and auth epochs, snapshot barriers, cached JWKs, and all synthesized auth models. |
+| [`Cdb`](src/server/do/cdb.ts) | Owns SQLite domain data for one physical shard, the mutation op-log, interval registrations, and source or destination state for range movement. |
 | [`Resharder`](src/server/do/resharder.ts) | Persists and drives the multi-phase range-movement protocol by calling Catalog and Cdb RPCs. |
 | [`BlobMeta`](src/server/do/blobmeta.ts) | Stores blob lifecycle and reference-count metadata. |
 | [`GsiShard`](src/server/do/gsishard.ts) | Stores eventually consistent secondary-index entries. |
@@ -85,12 +85,12 @@ The typed Gateway dispatcher now performs local routing, reads the shard and sch
 
 [`defineAuth`](src/auth/synthesize.ts) synthesizes Drizzle tables for better-auth core models and configured plugins. `chardb()` mounts better-auth with [`chardbAuthAdapter`](src/auth/chardb_adapter.ts):
 
-- tenant and principal models route through Catalog to a Cdb shard;
-- replicated models such as JWKs live in Catalog;
+- every synthesized auth model lives in the singleton Catalog;
+- routine email, token, provider/account, and membership lookups query Catalog directly;
 - successful auth writes bump global, tenant, or principal auth epochs;
-- lookups without the model's partition column fail unless a secondary-index path exists.
+- Cdb and GsiShard do not store or index auth rows.
 
-The adapter currently reports `transaction: false`, so better-auth multi-write operations are sequential.
+The adapter currently reports `transaction: false`, so better-auth multi-write operations are sequential. The generated Catalog DDL still omits required unique constraints, foreign keys, and secondary indexes, and no full sign-in flow is verified.
 
 Table role and column rules compile through [`compileCdbPolicies`](src/server/cdb-policy.ts). [`wrapDb`](src/server/cdb-db-proxy.ts) can fill tenant and owner columns from `ctx.auth` on inserts. Column-mask and writable-column checks also exist as standalone helpers.
 

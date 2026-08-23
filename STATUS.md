@@ -30,8 +30,8 @@ This status reflects the code in the repository, not the broader product describ
 | Live query update | Missing | Interval matching and patch batching exist, but committed writes do not produce row patches through the public runtime. |
 | WebSocket reconnect and cookies | Isolated | The client state machine is tested with a fake WebSocket. The full Worker, Gateway, and Cdb resume path is not tested together. |
 | Presence | Partial | Gateway publish and fan-out code exists. No React presence hook is exported because the client path is incomplete. |
-| Auth schema synthesis and SQL operations | Implemented | Core and plugin tables, placement rules, and SQL helpers have focused tests. |
-| Better-auth adapter | Partial | Partition-aware create, read, update, and delete RPCs exist. Adapter transactions are disabled and secondary lookups without the partition column fail. No full sign-in-to-domain-write test exists. |
+| Auth schema synthesis and SQL operations | Implemented | Core and plugin tables, epoch-scope rules, and SQL helpers have focused tests. |
+| Better-auth adapter | Partial | All synthesized auth models use singleton Catalog storage. A focused Bun SQLite/Durable Object harness covers create and lookup by email, session token, provider/account key, and membership fields, plus update, delete, and same-storage Catalog reconstruction. Complete unique, foreign-key, and index DDL, adapter transactions, a real workerd restart test, and a full sign-in-to-domain-write test are still missing. |
 | JWT authentication | Partial | Signature, issuer, audience, expiry, and JWK resolution code exists and has unit tests. Gateway hello uses decode-only claims and does not call the verifier. |
 | Row and column authorization | Partial | Policy compilation, row predicates, column masks, writable-column checks, and insert auto-fill have focused tests. They are not applied by a complete query and mutation executor. |
 | Schema migration | Missing | The CLI prints migration SQL. It does not apply DDL across shards, coordinate a barrier, resume after failure, or roll back. |

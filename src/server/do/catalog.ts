@@ -37,9 +37,10 @@ CREATE TABLE IF NOT EXISTS catalog_ranges (
   PRIMARY KEY (lo)
 );
 CREATE TABLE IF NOT EXISTS catalog_epoch (
-  scope TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,
   scope_id TEXT NOT NULL,
-  epoch INTEGER NOT NULL
+  epoch INTEGER NOT NULL,
+  PRIMARY KEY (scope, scope_id)
 );
 CREATE TABLE IF NOT EXISTS catalog_jwks (
   kid TEXT PRIMARY KEY,
@@ -91,6 +92,7 @@ export interface RouteResult {
 
 export class Catalog extends DurableObject<CatalogEnv> {
     private bootstrapped = false;
+    private authTablesBootstrapped = false;
     private cachedMap: VshardMap | null = null;
 
     constructor(state: DurableObjectState, env: CatalogEnv) {
@@ -124,20 +126,19 @@ export class Catalog extends DurableObject<CatalogEnv> {
             "global",
             1
         );
-        this.ensureReplicatedAuthTables();
+        this.ensureAuthTables();
         this.bootstrapped = true;
     }
 
     /**
-     * Materialize the SQLite tables for every "replicated" auth model
-     * (`jwks`, `rateLimit`, plus anything else the user's auth profile
-     * marks as such via `PLUGIN_PARTITION_KEY_OVERRIDES`). These tables
-     * live on the Catalog DO instead of on a Cdb shard so every shard
-     * sees a single canonical copy without a fan-out write path. The
-     * DDL is rendered from the synthesized Drizzle schema so column
-     * additions in better-auth plugins flow through automatically.
+     * Materialize every synthesized auth table in the singleton Catalog.
+     * Central storage supports Better Auth's normal secondary lookups
+     * without cross-shard scans or auth-specific GSI maintenance. The DDL
+     * is rendered from the synthesized Drizzle schema so plugin tables and
+     * column additions flow through automatically.
      */
-    private ensureReplicatedAuthTables(): void {
+    private ensureAuthTables(): void {
+        if (this.authTablesBootstrapped) return;
         let runtime: ReturnType<typeof getAuthRuntime>;
         try {
             runtime = getAuthRuntime();
@@ -147,10 +148,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
             return;
         }
         const sql = adaptSqlStorage(this.ctx.storage.sql);
-        for (const [model, rule] of runtime.placement) {
-            if (rule.kind !== "replicated") continue;
-            const table = runtime.schema[model as keyof typeof runtime.schema];
-            if (!table) continue;
+        for (const table of Object.values(runtime.schema)) {
             const cfg = getTableConfig(table);
             const cols = cfg.columns
                 .map(c => {
@@ -162,9 +160,10 @@ export class Catalog extends DurableObject<CatalogEnv> {
                 .join(", ");
             sql.exec(`CREATE TABLE IF NOT EXISTS "${cfg.name}" (${cols})`);
         }
+        this.authTablesBootstrapped = true;
     }
 
-    /** Mirror of `Cdb.mutateAuth` for replicated models pinned to the Catalog DO. */
+    /** Run a Better Auth model write against Catalog-owned storage. */
     async mutateAuth(args: {
         readonly model: string;
         readonly op: "create" | "update" | "delete";
@@ -176,6 +175,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
         readonly affected?: number;
     }> {
         await this.bootstrap();
+        this.ensureAuthTables();
         const table = tableFor(args.model);
         let row: Record<string, RawJson> | null | undefined;
         let affected = 0;
@@ -205,13 +205,14 @@ export class Catalog extends DurableObject<CatalogEnv> {
         return { ok: true, row: row ?? null, affected };
     }
 
-    /** Mirror of `Cdb.queryAuth` for replicated models. */
+    /** Read Better Auth rows from Catalog-owned storage. */
     async queryAuth(args: {
         readonly model: string;
         readonly where: { readonly [k: string]: RawJson };
         readonly limit?: number;
     }): Promise<readonly Record<string, RawJson>[]> {
         await this.bootstrap();
+        this.ensureAuthTables();
         const table = tableFor(args.model);
         const sql = adaptSqlStorage(this.ctx.storage.sql);
         if (args.limit === 1) {

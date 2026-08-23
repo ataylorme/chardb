@@ -4,12 +4,11 @@
  * Implements the `CustomAdapter` contract from
  * `@better-auth/core/db/adapter` so it composes with
  * `createAdapterFactory({adapter, config})` and slots straight into
- * `betterAuth({database: chardbAuthAdapter(env)})`. Each model write is
- * routed to the partition-owning Cdb shard via the chardb Catalog DO,
- * or pinned to the Catalog itself for replicated models (jwks,
- * rateLimit). Reads on the partition column hit the owning shard
- * directly; cross-partition lookups fan out (a future patch routes
- * them through the GsiShard DO).
+ * `betterAuth({database: chardbAuthAdapter(env)})`. Every auth model is
+ * stored in the singleton Catalog DO. Better Auth routinely looks up rows
+ * by session token, email, provider/account key, and membership fields;
+ * central storage keeps those reads deterministic without shard fan-out or
+ * a second set of auth-specific indexes.
  *
  * Auth-epoch invalidation rides on top of every successful write — the
  * dispatcher passes `(model, row)` to `bumpAuthEpoch` so cached query
@@ -28,7 +27,6 @@ import type { BetterAuthOptions } from "better-auth";
 import { createAdapterFactory } from "better-auth/adapters";
 import { CdbError } from "../errors.ts";
 import type { RawJson } from "../types.ts";
-import { vshardOf } from "../vshard.ts";
 import type { AuthEpochDispatcher } from "./adapter.ts";
 import { placementFor } from "./runtime.ts";
 
@@ -37,11 +35,10 @@ import { placementFor } from "./runtime.ts";
  * `chardb({auth})` once the inbound `env` is known.
  */
 export interface ChardbAuthAdapterEnv {
-    readonly CDB_SHARD: DurableObjectNamespace;
     readonly CDB_CATALOG: DurableObjectNamespace;
 }
 
-interface CdbAuthRpc {
+interface CatalogRpc {
     mutateAuth(args: {
         model: string;
         op: "create" | "update" | "delete";
@@ -53,10 +50,6 @@ interface CdbAuthRpc {
         where: { [k: string]: RawJson };
         limit?: number;
     }): Promise<readonly Record<string, RawJson>[]>;
-}
-
-interface CatalogRpc extends CdbAuthRpc {
-    route(vshard: number): Promise<{ shardId: string }>;
     bumpAuthEpoch(scope: "global" | "tenant" | "principal", scopeId: string): Promise<number>;
 }
 
@@ -74,8 +67,6 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
     const { env } = opts;
     const catalog = (): CatalogRpc =>
         env.CDB_CATALOG.get(env.CDB_CATALOG.idFromName("global")) as unknown as CatalogRpc;
-    const shardFor = (shardId: string): CdbAuthRpc =>
-        env.CDB_SHARD.get(env.CDB_SHARD.idFromName(shardId)) as unknown as CdbAuthRpc;
 
     const dispatcher: AuthEpochDispatcher = opts.dispatcher ?? {
         async bumpGlobal() {
@@ -88,25 +79,6 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
             await catalog().bumpAuthEpoch("principal", principalId);
         },
     };
-
-    async function ownerFor(model: string, where: { [k: string]: RawJson }): Promise<CdbAuthRpc> {
-        const rule = placementFor(model);
-        if (rule.kind === "replicated") return catalog();
-        const partitionValue = where[rule.column];
-        if (partitionValue === undefined || partitionValue === null) {
-            // No partition key in where → caller wants a secondary lookup.
-            // Cross-partition lookups land on the GsiShard path in W1+;
-            // for now signal explicitly so the missing case is loud.
-            throw new CdbError({
-                code: "CDB_AUTH_GSI_MISS",
-                message: `auth lookup on ${model} requires partition column "${rule.column}" or a registered GSI`,
-                hint: "include the partition column in your where clause",
-            });
-        }
-        const vshard = vshardOf([String(partitionValue)]);
-        const { shardId } = await catalog().route(vshard);
-        return shardFor(shardId);
-    }
 
     async function maybeBump(model: string, row: Record<string, RawJson> | null | undefined): Promise<void> {
         if (!row) return;
@@ -135,64 +107,32 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
         adapter: () => ({
             async create({ model, data }) {
                 const payload = data as { [k: string]: RawJson };
-                const rule = placementFor(model);
-                let rpc: CdbAuthRpc;
-                if (rule.kind === "replicated") {
-                    rpc = catalog();
-                } else {
-                    const v = payload[rule.column];
-                    if (v === undefined || v === null) {
-                        throw new CdbError({
-                            code: "CDB_AUTH_GSI_MISS",
-                            message: `auth create on ${model} missing partition column "${rule.column}"`,
-                        });
-                    }
-                    const { shardId } = await catalog().route(vshardOf([String(v)]));
-                    rpc = shardFor(shardId);
-                }
-                const r = await rpc.mutateAuth({ model, op: "create", payload });
+                const r = await catalog().mutateAuth({ model, op: "create", payload });
                 await maybeBump(model, r.row ?? payload);
                 return (r.row ?? payload) as never;
             },
 
             async findOne({ model, where }) {
                 const flat = whereToFlat(where);
-                const rpc = await ownerFor(model, flat);
-                const rows = await rpc.queryAuth({ model, where: flat, limit: 1 });
+                const rows = await catalog().queryAuth({ model, where: flat, limit: 1 });
                 return (rows[0] ?? null) as never;
             },
 
             async findMany({ model, where, limit }) {
                 const flat = where ? whereToFlat(where) : {};
-                const rule = placementFor(model);
-                if (
-                    rule.kind === "replicated" ||
-                    flat[rule.kind === "tenant" ? rule.column : rule.column] !== undefined
-                ) {
-                    const rpc = await ownerFor(model, flat);
-                    const rows = await rpc.queryAuth({ model, where: flat, limit: limit ?? 100 });
-                    return rows as never;
-                }
-                // Cross-partition findMany: not supported in W1 minimum.
-                // The four core models always include a partition-key
-                // predicate via better-auth's own internal queries.
-                throw new CdbError({
-                    code: "CDB_AUTH_GSI_MISS",
-                    message: `auth findMany on ${model} requires partition column "${rule.column}"`,
-                });
+                const rows = await catalog().queryAuth({ model, where: flat, limit: limit ?? 100 });
+                return rows as never;
             },
 
             async count({ model, where }) {
                 const flat = where ? whereToFlat(where) : {};
-                const rpc = await ownerFor(model, flat);
-                const rows = await rpc.queryAuth({ model, where: flat });
+                const rows = await catalog().queryAuth({ model, where: flat });
                 return rows.length;
             },
 
             async update({ model, where, update }) {
                 const flat = whereToFlat(where);
-                const rpc = await ownerFor(model, flat);
-                const r = await rpc.mutateAuth({
+                const r = await catalog().mutateAuth({
                     model,
                     op: "update",
                     where: flat,
@@ -204,8 +144,7 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
 
             async updateMany({ model, where, update }) {
                 const flat = whereToFlat(where);
-                const rpc = await ownerFor(model, flat);
-                const r = await rpc.mutateAuth({
+                const r = await catalog().mutateAuth({
                     model,
                     op: "update",
                     where: flat,
@@ -219,17 +158,15 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                 const flat = whereToFlat(where);
                 // Read row first so we can bump the right epoch after
                 // the delete commits.
-                const rpc = await ownerFor(model, flat);
-                const before = (await rpc.queryAuth({ model, where: flat, limit: 1 }))[0];
-                await rpc.mutateAuth({ model, op: "delete", where: flat });
+                const before = (await catalog().queryAuth({ model, where: flat, limit: 1 }))[0];
+                await catalog().mutateAuth({ model, op: "delete", where: flat });
                 await maybeBump(model, before ?? null);
             },
 
             async deleteMany({ model, where }) {
                 const flat = whereToFlat(where);
-                const rpc = await ownerFor(model, flat);
-                const before = await rpc.queryAuth({ model, where: flat });
-                const r = await rpc.mutateAuth({ model, op: "delete", where: flat });
+                const before = await catalog().queryAuth({ model, where: flat });
+                const r = await catalog().mutateAuth({ model, op: "delete", where: flat });
                 for (const row of before) await maybeBump(model, row);
                 return r.affected ?? before.length;
             },

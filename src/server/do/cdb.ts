@@ -13,9 +13,6 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { getTableConfig } from "drizzle-orm/sqlite-core";
-import { getAuthRuntime, tableFor } from "../../auth/runtime.ts";
-import { authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
 import { CdbError, isCdbError, isCdbErrorCode } from "../../errors.ts";
 import { type IntervalKey, IntervalMap, type IntervalSet } from "../../intervals.ts";
 import { intervalSetFromWire } from "../../intervals_wire.ts";
@@ -85,41 +82,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             .filter(Boolean)) {
             sql.exec(stmt);
         }
-        this.ensureAuthTables();
         this.bootstrapped = true;
-    }
-
-    /**
-     * Materialize per-shard SQLite tables for every non-replicated auth
-     * model. Shard-pinned tables (`user`, `session`, `member`, …) carry
-     * only the rows whose partition column hashes into this shard's
-     * vshard range; the chardb adapter is responsible for routing each
-     * write to the right shard before invoking `mutateAuth`. Replicated
-     * models are skipped here — they live on the Catalog DO.
-     */
-    private ensureAuthTables(): void {
-        let runtime: ReturnType<typeof getAuthRuntime>;
-        try {
-            runtime = getAuthRuntime();
-        } catch {
-            return;
-        }
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        for (const [model, rule] of runtime.placement) {
-            if (rule.kind === "replicated") continue;
-            const table = runtime.schema[model as keyof typeof runtime.schema];
-            if (!table) continue;
-            const cfg = getTableConfig(table);
-            const cols = cfg.columns
-                .map(c => {
-                    const sqlType = renderColumnTypeForShard(c);
-                    const notNull = c.notNull ? " NOT NULL" : "";
-                    const pk = c.primary ? " PRIMARY KEY" : "";
-                    return `"${c.name}" ${sqlType}${pk}${notNull}`;
-                })
-                .join(", ");
-            sql.exec(`CREATE TABLE IF NOT EXISTS "${cfg.name}" (${cols})`);
-        }
     }
 
     /**
@@ -419,78 +382,6 @@ export class Cdb extends DurableObject<CdbEnv> {
         const row = sql.one<{ max_id: number | null }>("SELECT MAX(rowid) AS max_id FROM _chardb_op_log");
         return row?.max_id ?? 0;
     }
-
-    /**
-     * Run a chardb-native better-auth adapter write against the synthesized
-     * auth schema bound at module init. Wrapped in `transactionSync` so the
-     * row write and any side effects (op-log idempotency, in future patches
-     * also auth-epoch bumps) commit atomically.
-     *
-     * `op` switches over the four model-store ops the better-auth
-     * `DbAdapterContract` requires: create / update / delete / findOne.
-     * The `model` is the better-auth model name (e.g. `"session"`),
-     * resolved via `tableFor(model)` against the auth runtime binding.
-     */
-    async mutateAuth(args: {
-        readonly model: string;
-        readonly op: "create" | "update" | "delete";
-        readonly where?: { readonly [k: string]: RawJson };
-        readonly payload?: { readonly [k: string]: RawJson };
-    }): Promise<{
-        readonly ok: true;
-        readonly row?: Record<string, RawJson> | null;
-        readonly affected?: number;
-    }> {
-        await this.bootstrap();
-        const table = tableFor(args.model);
-        let row: Record<string, RawJson> | null | undefined;
-        let affected = 0;
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            switch (args.op) {
-                case "create":
-                    if (!args.payload) throw new Error("auth: create requires payload");
-                    row = authCreate(sql, table, args.payload);
-                    affected = 1;
-                    break;
-                case "update": {
-                    if (!args.where || !args.payload) {
-                        throw new Error("auth: update requires where and payload");
-                    }
-                    const r = authUpdate(sql, table, args.where, args.payload);
-                    row = r.row;
-                    affected = r.affected;
-                    break;
-                }
-                case "delete":
-                    if (!args.where) throw new Error("auth: delete requires where");
-                    affected = authDelete(sql, table, args.where).affected;
-                    break;
-            }
-        });
-        return { ok: true, row: row ?? null, affected };
-    }
-
-    /**
-     * Read auth-table rows. PK / unique-column lookups are routed by the
-     * adapter to the partition-owning shard; cross-shard secondary lookups
-     * go via the GsiShard DO instead. `limit: 1` short-circuits to a single
-     * `LIMIT 1` query.
-     */
-    async queryAuth(args: {
-        readonly model: string;
-        readonly where: { readonly [k: string]: RawJson };
-        readonly limit?: number;
-    }): Promise<readonly Record<string, RawJson>[]> {
-        await this.bootstrap();
-        const table = tableFor(args.model);
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        if (args.limit === 1) {
-            const one = authFindOne(sql, table, args.where);
-            return one ? [one] : [];
-        }
-        return authFindMany(sql, table, args.where, args.limit);
-    }
 }
 
 /** Bind one application schema and handler manifest into a shard-local DO class. */
@@ -538,20 +429,6 @@ const ALLOWED_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 function quoteIdent(raw: string): string {
     if (!ALLOWED_IDENT.test(raw)) throw new Error(`reshard: refusing identifier: ${raw}`);
     return `"${raw}"`;
-}
-
-function renderColumnTypeForShard(col: { dataType: string }): string {
-    switch (col.dataType) {
-        case "number":
-        case "boolean":
-        case "bigint":
-        case "date":
-            return "INTEGER";
-        case "buffer":
-            return "BLOB";
-        default:
-            return "TEXT";
-    }
 }
 
 function parseScalarPk(s: string): string | number {

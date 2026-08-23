@@ -1,8 +1,8 @@
 /**
  * Coverage for the `auth/runtime.ts` binding + `auth/sql.ts` rendering
- * path. The Cdb DO can't be exercised in bun without workerd, so these
- * tests run the SQL helpers against bun:sqlite via a `SyncSql`-shaped
- * adapter — verifying the SQL we'd emit on a real shard is correct.
+ * path. These tests run the SQL helpers against bun:sqlite via a
+ * `SyncSql`-shaped adapter and exercise the epoch-scope metadata that
+ * successful Catalog writes use for invalidation.
  */
 
 import { Database as BunSqlite } from "bun:sqlite";
@@ -51,8 +51,8 @@ function bootstrap(): { db: BunSqlite; sql: SyncSql } {
     return { db, sql: bunSyncSql(db) };
 }
 
-describe("auth/runtime — partition placement", () => {
-    test("core models route to their canonical partition", () => {
+describe("auth/runtime — epoch scope", () => {
+    test("core models identify their canonical principal scope", () => {
         resetAuthRuntime();
         bindAuthRuntime({
             schema: defineAuth({ plugins: [] }) as never,
@@ -64,7 +64,7 @@ describe("auth/runtime — partition placement", () => {
         expect(placementFor("verification")).toEqual({ kind: "principal", column: "userId" });
     });
 
-    test("organization plugin models route to tenant", () => {
+    test("organization plugin models identify their tenant scope", () => {
         resetAuthRuntime();
         bindAuthRuntime({
             schema: defineAuth({ plugins: [organization()] }) as never,

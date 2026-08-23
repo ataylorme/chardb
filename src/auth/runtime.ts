@@ -4,8 +4,8 @@
  *
  * The chardb-native better-auth adapter (see `src/auth/chardb_adapter.ts`)
  * needs to translate `{model, op, payload}` into Drizzle SQL against the
- * synthesized auth tables. The Cdb shard DO is the place where that SQL
- * actually executes — but DOs receive only `(state, env)` from the
+ * synthesized auth tables. The singleton Catalog DO is where that SQL
+ * executes, but DOs receive only `(state, env)` from the
  * Cloudflare runtime, so we can't pass the schema in via constructor
  * arguments.
  *
@@ -29,16 +29,16 @@ import { resolvePluginPartitionKey } from "./plugin_partition_keys.ts";
 import type { SynthesizedAuthSchema } from "./synthesize.ts";
 
 /**
- * Partition placement for an auth model. Resolved once per
+ * Auth-epoch invalidation scope for an auth model. Resolved once per
  * `bindAuthRuntime` call from the better-auth options + the
  * `PLUGIN_PARTITION_KEY_OVERRIDES` table.
  *
- *   - `tenant`     — `{column: "organizationId"}` for the model's row.
- *                    Routed via `vshardOf([row.organizationId])`.
- *   - `principal`  — `{column: "userId" | "id"}`. Routed via
- *                    `vshardOf([row.userId])` (or `row.id` for `user`).
- *   - `replicated` — pinned to the Catalog DO (no shard hop). Used for
- *                    `jwks` and `rateLimit`.
+ *   - `tenant`     — bump the tenant identified by the named row column.
+ *   - `principal`  — bump the principal identified by the named row column.
+ *   - `replicated` — bump the global auth epoch.
+ *
+ * The name is retained for API compatibility. It does not control auth
+ * storage; every synthesized auth model is stored in Catalog.
  */
 export type AuthPartitionRule =
     | { readonly kind: "tenant"; readonly column: string }
@@ -63,7 +63,7 @@ const PRINCIPAL_MODELS = new Set([
 interface BoundAuthRuntime {
     readonly schema: SynthesizedAuthSchema;
     readonly options: { readonly [k: string]: unknown };
-    /** Pre-resolved partition rule per model — saves recomputing on every adapter call. */
+    /** Pre-resolved epoch scope per model — saves recomputing on every adapter call. */
     readonly placement: ReadonlyMap<string, AuthPartitionRule>;
 }
 
@@ -140,7 +140,7 @@ function resolvePlacement(model: string, options: { readonly [k: string]: unknow
     const rule = resolvePluginPartitionKey(model, options);
     if (rule.replicated) return { kind: "replicated" };
     if (rule.column) return { kind: "principal", column: rule.column };
-    // Fallback: replicated. Better than scatter on a model we don't
-    // know about; the user can override via a plugin partition rule.
+    // Unknown plugin models invalidate globally unless the user supplies
+    // a plugin partition-key override that identifies a principal column.
     return { kind: "replicated" };
 }

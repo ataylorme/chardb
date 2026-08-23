@@ -210,10 +210,10 @@ export function chardb<
     // `organization()` and `admin()` plugin instances by
     // re-constructing them with `{ ac, roles }` before handing the
     // plugin list to betterAuth().
-    const getMergedSchemaForAc = (): Record<string, unknown> => ({
-        ...(auth as unknown as Record<string, unknown>),
-        ...(input.schema as Record<string, unknown>),
-    });
+    // The auth runtime was bound when defineChardb ran. Resolve the full
+    // schema lazily here only to build access-control metadata after the
+    // worker.ts ↔ schema.ts ESM cycle has completed.
+    const getMergedSchemaForAc = (): Record<string, unknown> => runtimeEntrypoint.schema;
     const authHandler =
         input.authHandler ?? buildDefaultAuthHandler(auth.options as BetterAuthOptions, getMergedSchemaForAc);
 
