@@ -90,26 +90,26 @@ function convertExpr(n: import("typescript").Node): unknown {
 
 describe("chardb/explain-strict", () => {
     test("flags defineMutation without partitionKey", () => {
-        const code = `defineMutation(async (ctx, args) => ({}));`;
+        const code = "defineMutation(async (ctx, args) => ({}));";
         const { reports } = runRule(rules["explain-strict"], code);
         expect(reports).toHaveLength(1);
         expect(reports[0]?.messageId).toBe("missingPartitionKey");
     });
 
     test("accepts defineMutation with partitionKey", () => {
-        const code = `defineMutation(async (ctx, args) => ({}), { partitionKey: (a) => a.id });`;
+        const code = "defineMutation(async (ctx, args) => ({}), { partitionKey: (a) => a.id });";
         const { reports } = runRule(rules["explain-strict"], code);
         expect(reports).toHaveLength(0);
     });
 
     test("flags defineQuery using db.execute(sql`...`)", () => {
-        const code = `defineQuery(async (ctx) => { return await ctx.db.execute(sql\`SELECT 1\`); });`;
+        const code = "defineQuery(async (ctx) => { return await ctx.db.execute(sql`SELECT 1`); });";
         const { reports } = runRule(rules["explain-strict"], code);
         expect(reports.some(r => r.messageId === "rawSqlInQuery")).toBe(true);
     });
 
     test("accepts defineQuery using Drizzle conditions only", () => {
-        const code = `defineQuery(async (ctx) => { return await ctx.db.select().from(users); });`;
+        const code = "defineQuery(async (ctx) => { return await ctx.db.select().from(users); });";
         const { reports } = runRule(rules["explain-strict"], code);
         expect(reports.some(r => r.messageId === "rawSqlInQuery")).toBe(false);
     });
