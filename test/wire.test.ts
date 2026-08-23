@@ -23,46 +23,28 @@ const CASES = {
     hello: {
         valid: {
             t: "hello",
+            protocolV: PROTOCOL_V,
             clientId: ClientId("client-1"),
             resume: Cookie("cookie-0"),
             resumeFromCookie: Cookie("cookie-1"),
             jwt: "jwt",
         },
         malformed: [
-            { t: "hello", clientId: "client-1" },
-            { t: "hello", clientId: [], jwt: "jwt" },
+            { t: "hello", protocolV: PROTOCOL_V, clientId: "client-1" },
+            { t: "hello", protocolV: PROTOCOL_V, clientId: [], jwt: "jwt" },
         ],
     },
     sub: {
         valid: {
             t: "sub",
             subId: SubId(1),
-            queryHash: "query-1",
+            ref: ChardbRef("queries.ts#listMessages"),
+            args: { organizationId: "org-1", channelId: "channel-1" },
             ttlMs: 1_000,
-            intent: {
-                kind: "select",
-                tables: ["messages"],
-                partitionKey: { table: "messages", column: "org_id", values: ["org-1"] },
-                joinShape: "colocated",
-                intervals: [
-                    {
-                        table: "messages",
-                        indexName: "messages_org",
-                        intervals: [
-                            {
-                                kind: "range",
-                                lo: { kind: "value", value: ["a"], inclusive: true },
-                                hi: { kind: "pos_inf" },
-                            },
-                        ],
-                    },
-                ],
-                relational: { plan: { with: "author" } },
-            },
         },
         malformed: [
-            { t: "sub", subId: 1.5, queryHash: "q", intent: { kind: "select", tables: [] } },
-            { t: "sub", subId: 1, queryHash: "q", intent: [] },
+            { t: "sub", subId: 1.5, ref: "queries.ts#list", args: {} },
+            { t: "sub", subId: 1, ref: "not-a-ref", args: {} },
         ],
     },
     unsub: {
@@ -118,14 +100,15 @@ const CASES = {
     welcome: {
         valid: {
             t: "welcome",
+            protocolV: PROTOCOL_V,
             baseCookie: Cookie("cookie-1"),
             region: "WNAM",
             colo: "SJC",
             resumedFromCookie: Cookie("cookie-0"),
         },
         malformed: [
-            { t: "welcome", baseCookie: "cookie-1" },
-            { t: "welcome", baseCookie: "cookie-1", region: "WNAM", colo: 7 },
+            { t: "welcome", protocolV: PROTOCOL_V, baseCookie: "cookie-1" },
+            { t: "welcome", protocolV: PROTOCOL_V, baseCookie: "cookie-1", region: "WNAM", colo: 7 },
         ],
     },
     poke: {
@@ -270,6 +253,7 @@ describe("wire envelope", () => {
     test("Up.hello round-trips", () => {
         const up: Up = {
             t: "hello",
+            protocolV: PROTOCOL_V,
             clientId: ClientId("c-1"),
             jwt: "jwt-token",
             resumeFromCookie: Cookie("c-1:42"),
@@ -279,14 +263,29 @@ describe("wire envelope", () => {
         expect((back as Extract<Up, { t: "hello" }>).clientId).toBe(ClientId("c-1"));
     });
 
-    test("Up.sub round-trips with intent", () => {
+    test("Up.sub round-trips with query ref and raw args", () => {
         const up: Up = {
             t: "sub",
             subId: SubId(7),
-            queryHash: "abc",
-            intent: { kind: "select", tables: ["messages"] },
+            ref: ChardbRef("queries.ts#listMessages"),
+            args: { organizationId: "org-1" },
         };
         expect(decodeWire(encodeWire(up))).toEqual(up);
+    });
+
+    test("Up.sub rejects client-supplied routing intent or hash", () => {
+        expect(() =>
+            decodeWire(
+                JSON.stringify({
+                    t: "sub",
+                    subId: 7,
+                    ref: "queries.ts#listMessages",
+                    args: { organizationId: "org-1" },
+                    queryHash: "forged",
+                    intent: { kind: "select", tables: ["secrets"], joinShape: "reference" },
+                })
+            )
+        ).toThrow(/must not be present/);
     });
 
     test("Down.poke shape preserved", () => {
@@ -320,7 +319,7 @@ describe("wire envelope", () => {
         expect(() => decodeWire('{"t":"ping","overflow":1e400}')).toThrow(/finite number/);
     });
 
-    test("normalizes additive mustRefetch reasons to lagged for protocol-v1 consumers", () => {
+    test("normalizes additive mustRefetch reasons to lagged for protocol-v2 consumers", () => {
         expect(decodeWire('{"t":"mustRefetch","subIds":[1],"reason":"futureReason"}')).toEqual({
             t: "mustRefetch",
             subIds: [SubId(1)],
@@ -340,7 +339,7 @@ describe("wire envelope", () => {
         });
     });
 
-    test("decodeWire rejects unknown tags (closed at protocolV=1)", () => {
+    test("decodeWire rejects unknown tags (closed at protocolV=2)", () => {
         expect(() => decodeWire(JSON.stringify({ t: "haxx" }))).toThrow(/unknown tag "haxx"/);
         expect(() => decodeWire(JSON.stringify({ t: "MUT" }))).toThrow(/unknown tag/);
     });
@@ -354,10 +353,10 @@ describe("wire envelope", () => {
         for (const t of UP_TAGS) expect(DOWN_TAGS as readonly string[]).not.toContain(t);
     });
 
-    test("checkProtocolV(1) accepts; mismatched versions emit mustRefetch:protocolMismatch", () => {
-        expect(checkProtocolV(1)).toBeNull();
-        expect(checkProtocolV(2)).toEqual({ t: "mustRefetch", subIds: [], reason: "protocolMismatch" });
-        expect(checkProtocolV("1")).toEqual({
+    test("checkProtocolV(2) accepts; mismatched versions emit mustRefetch:protocolMismatch", () => {
+        expect(checkProtocolV(2)).toBeNull();
+        expect(checkProtocolV(1)).toEqual({ t: "mustRefetch", subIds: [], reason: "protocolMismatch" });
+        expect(checkProtocolV("2")).toEqual({
             t: "mustRefetch",
             subIds: [],
             reason: "protocolMismatch",
@@ -369,7 +368,7 @@ describe("wire envelope", () => {
         });
     });
 
-    test("PROTOCOL_V is locked at 1", () => {
-        expect(PROTOCOL_V).toBe(1);
+    test("PROTOCOL_V is locked at 2", () => {
+        expect(PROTOCOL_V).toBe(2);
     });
 });

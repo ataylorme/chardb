@@ -2,11 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { CdbError } from "../../src/errors.ts";
 import {
     type TrustedMutationDispatchDeps,
+    cdbSubscriptionRequest,
     dispatchTrustedMutation,
     gatewayErrorEnvelope,
 } from "../../src/server/do/gateway.ts";
 import type { CdbMutationRequest, TrustedMutationDispatchRequest } from "../../src/server/rpc.ts";
-import { CorrelationId, ShardId, SubId } from "../../src/types.ts";
+import { ChardbRef, CorrelationId, PrincipalId, ShardId, SubId } from "../../src/types.ts";
 import { decodeWire, encodeWire } from "../../src/wire.ts";
 
 const request: TrustedMutationDispatchRequest = {
@@ -54,6 +55,29 @@ function workingDeps(): TrustedMutationDispatchDeps {
 }
 
 describe("trusted Gateway mutation dispatch", () => {
+    test("builds the selected Cdb request from query ref, raw args, and server intent", () => {
+        expect(
+            cdbSubscriptionRequest({
+                subId: SubId(4),
+                principalId: PrincipalId("user-1"),
+                ref: ChardbRef("queries.ts#listMessages"),
+                args: { organizationId: "org-1", channelId: "channel-1" },
+                intent: {
+                    kind: "select",
+                    tables: ["messages"],
+                    intervals: [{ table: "messages", indexName: "by_channel", intervals: [{ kind: "full" }] }],
+                },
+            })
+        ).toEqual({
+            subId: 4,
+            principalId: PrincipalId("user-1"),
+            ref: ChardbRef("queries.ts#listMessages"),
+            args: { organizationId: "org-1", channelId: "channel-1" },
+            tables: ["messages"],
+            intervals: [{ table: "messages", indexName: "by_channel", intervals: [{ kind: "full" }] }],
+        });
+    });
+
     test("Gateway error envelopes use locked retryability and pass strict decoding", () => {
         const retryable = gatewayErrorEnvelope("CDB_SHARD_UNAVAILABLE", CorrelationId("corr-1"), SubId(7));
         expect(retryable).toMatchObject({ retryable: true, docs: "https://chardb.dev/errors/cdb_shard_unavailable" });

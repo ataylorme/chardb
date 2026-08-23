@@ -1,5 +1,5 @@
 /**
- * Wire envelope at `protocolV: 1`.
+ * Wire envelope at `protocolV: 2`.
  *
  * The set of fields, the tag values for `Up` / `Down` messages, every error
  * `code` identifier, every `retryable` polarity and every `mustRefetch` reason
@@ -16,7 +16,7 @@ import type { ChardbRef, ClientId, Cookie, CorrelationId, MutId, RawJson, SubId 
 
 export type { RawJson } from "./types.ts";
 
-export const PROTOCOL_V = 1 as const;
+export const PROTOCOL_V = 2 as const;
 export type ProtocolV = typeof PROTOCOL_V;
 
 export const PRESENCE_V = 1 as const;
@@ -97,6 +97,7 @@ export type MutResult =
 export type Up =
     | {
           readonly t: "hello";
+          readonly protocolV: ProtocolV;
           readonly clientId: ClientId;
           readonly resume?: Cookie | undefined;
           readonly resumeFromCookie?: Cookie | undefined;
@@ -105,8 +106,8 @@ export type Up =
     | {
           readonly t: "sub";
           readonly subId: SubId;
-          readonly queryHash: string;
-          readonly intent: CdbIntent;
+          readonly ref: ChardbRef;
+          readonly args: RawJson;
           readonly ttlMs?: number | undefined;
       }
     | { readonly t: "unsub"; readonly subId: SubId }
@@ -132,6 +133,7 @@ export type Up =
 export type Down =
     | {
           readonly t: "welcome";
+          readonly protocolV: ProtocolV;
           readonly baseCookie: Cookie;
           readonly region: string;
           readonly colo?: string | undefined;
@@ -296,8 +298,6 @@ function rawJson(value: unknown, path: string, depth = 0): void {
     malformed(path, "be JSON-compatible");
 }
 
-const INTENT_KINDS = new Set<CdbIntent["kind"]>(["select", "insert", "update", "delete", "execute"]);
-const JOIN_SHAPES = new Set<NonNullable<CdbIntent["joinShape"]>>(["colocated", "reference", "cross-partition"]);
 const PATCH_OPS = new Set<RowPatchOp>(["put", "del", "edit"]);
 const REFETCH_REASONS = new Set<MustRefetchReason>([
     "lagged",
@@ -308,82 +308,6 @@ const REFETCH_REASONS = new Set<MustRefetchReason>([
     "pitrIdempotencyReset",
     "gsiLag",
 ]);
-
-function stringArray(value: unknown, path: string): void {
-    const values = arrayValue(value, path);
-    for (let index = 0; index < values.length; index++) stringValue(values[index], `${path}[${index}]`);
-}
-
-function rawJsonArray(value: unknown, path: string): void {
-    const values = arrayValue(value, path);
-    for (let index = 0; index < values.length; index++) rawJson(values[index], `${path}[${index}]`);
-}
-
-function validateEndpoint(value: unknown, path: string): void {
-    const endpoint = objectValue(value, path);
-    const kind = enumValue(required(endpoint, "kind", path), `${path}.kind`, new Set(["neg_inf", "pos_inf", "value"]));
-    if (kind !== "value") {
-        onlyKeys(endpoint, path, ["kind"]);
-        return;
-    }
-    onlyKeys(endpoint, path, ["kind", "value", "inclusive"]);
-    rawJsonArray(required(endpoint, "value", path), `${path}.value`);
-    booleanValue(required(endpoint, "inclusive", path), `${path}.inclusive`);
-}
-
-function validateInterval(value: unknown, path: string): void {
-    const interval = objectValue(value, path);
-    const kind = enumValue(required(interval, "kind", path), `${path}.kind`, new Set(["full", "range"]));
-    if (kind !== "range") {
-        onlyKeys(interval, path, ["kind"]);
-        return;
-    }
-    onlyKeys(interval, path, ["kind", "lo", "hi"]);
-    validateEndpoint(required(interval, "lo", path), `${path}.lo`);
-    validateEndpoint(required(interval, "hi", path), `${path}.hi`);
-}
-
-function validateIntent(value: unknown, path: string): void {
-    const intent = objectValue(value, path);
-    onlyKeys(intent, path, ["kind", "tables", "partitionKey", "joinShape", "intervals", "relational"]);
-    enumValue(required(intent, "kind", path), `${path}.kind`, INTENT_KINDS);
-    stringArray(required(intent, "tables", path), `${path}.tables`);
-
-    const partitionKey = optional(intent, "partitionKey");
-    if (partitionKey !== undefined) {
-        const partition = objectValue(partitionKey, `${path}.partitionKey`);
-        onlyKeys(partition, `${path}.partitionKey`, ["table", "column", "values"]);
-        stringValue(required(partition, "table", `${path}.partitionKey`), `${path}.partitionKey.table`);
-        stringValue(required(partition, "column", `${path}.partitionKey`), `${path}.partitionKey.column`);
-        rawJsonArray(required(partition, "values", `${path}.partitionKey`), `${path}.partitionKey.values`);
-    }
-
-    const joinShape = optional(intent, "joinShape");
-    if (joinShape !== undefined) enumValue(joinShape, `${path}.joinShape`, JOIN_SHAPES);
-
-    const intervals = optional(intent, "intervals");
-    if (intervals !== undefined) {
-        const blocks = arrayValue(intervals, `${path}.intervals`);
-        for (let index = 0; index < blocks.length; index++) {
-            const blockPath = `${path}.intervals[${index}]`;
-            const block = objectValue(blocks[index], blockPath);
-            onlyKeys(block, blockPath, ["table", "indexName", "intervals"]);
-            stringValue(required(block, "table", blockPath), `${blockPath}.table`);
-            stringValue(required(block, "indexName", blockPath), `${blockPath}.indexName`);
-            const wireIntervals = arrayValue(required(block, "intervals", blockPath), `${blockPath}.intervals`);
-            for (let inner = 0; inner < wireIntervals.length; inner++) {
-                validateInterval(wireIntervals[inner], `${blockPath}.intervals[${inner}]`);
-            }
-        }
-    }
-
-    const relational = optional(intent, "relational");
-    if (relational !== undefined) {
-        const relation = objectValue(relational, `${path}.relational`);
-        onlyKeys(relation, `${path}.relational`, ["plan"]);
-        rawJson(required(relation, "plan", `${path}.relational`), `${path}.relational.plan`);
-    }
-}
 
 function validateRowPatch(value: unknown, path: string): void {
     const patch = objectValue(value, path);
@@ -428,7 +352,8 @@ function validateMessage(message: WireObject, tag: string): void {
     const path = tag;
     switch (tag) {
         case "hello": {
-            onlyKeys(message, path, ["t", "clientId", "resume", "resumeFromCookie", "jwt"]);
+            onlyKeys(message, path, ["t", "protocolV", "clientId", "resume", "resumeFromCookie", "jwt"]);
+            integerId(required(message, "protocolV", path), `${path}.protocolV`);
             stringValue(required(message, "clientId", path), `${path}.clientId`);
             stringValue(required(message, "jwt", path), `${path}.jwt`);
             const resume = optional(message, "resume");
@@ -438,10 +363,10 @@ function validateMessage(message: WireObject, tag: string): void {
             return;
         }
         case "sub": {
-            onlyKeys(message, path, ["t", "subId", "queryHash", "intent", "ttlMs"]);
+            onlyKeys(message, path, ["t", "subId", "ref", "args", "ttlMs"]);
             integerId(required(message, "subId", path), `${path}.subId`);
-            stringValue(required(message, "queryHash", path), `${path}.queryHash`);
-            validateIntent(required(message, "intent", path), `${path}.intent`);
+            validateRef(required(message, "ref", path), `${path}.ref`);
+            rawJson(required(message, "args", path), `${path}.args`);
             const ttlMs = optional(message, "ttlMs");
             if (ttlMs !== undefined) nonnegativeNumber(ttlMs, `${path}.ttlMs`);
             return;
@@ -487,7 +412,8 @@ function validateMessage(message: WireObject, tag: string): void {
             onlyKeys(message, path, ["t"]);
             return;
         case "welcome": {
-            onlyKeys(message, path, ["t", "baseCookie", "region", "colo", "resumedFromCookie"]);
+            onlyKeys(message, path, ["t", "protocolV", "baseCookie", "region", "colo", "resumedFromCookie"]);
+            integerId(required(message, "protocolV", path), `${path}.protocolV`);
             stringValue(required(message, "baseCookie", path), `${path}.baseCookie`);
             stringValue(required(message, "region", path), `${path}.region`);
             const colo = optional(message, "colo");

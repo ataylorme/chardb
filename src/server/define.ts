@@ -109,12 +109,11 @@ export type MutationFn<TDb, TArgs, TResult> = ((ctx: MutationCtx<TDb>, args: TAr
 export type QueryFn<TDb, TArgs, TResult> = ((ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>) & {
     readonly __chardbKind: "query";
     readonly __chardbRef: Brand<string, "ChardbRef">;
+    /** Server-only validator used before routing intent extraction. */
+    readonly __chardbValidateArgs?: (args: unknown) => Promise<TArgs>;
     /**
-     * Wire-shape `CdbIntent` extractor. Stamped only when the user's
-     * `defineQuery({ intent: (args) => … })` declared one. The React
-     * `useQuery(handle, args)` overload reads this to produce the
-     * subscription intent without forcing the user to hand-write a
-     * literal that mirrors the server handler.
+     * Server-owned `CdbIntent` extractor. The configured Gateway reads this
+     * from its local manifest; clients send only the query ref and raw args.
      */
     readonly __chardbIntent?: (args: TArgs) => CdbIntent;
 };
@@ -301,10 +300,9 @@ export interface QueryConfig<TDb, TArgs extends Record<string, unknown>, TResult
     readonly args?: StandardSchemaV1<unknown, TArgs>;
     readonly handler: (ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>;
     /**
-     * Optional `CdbIntent` extractor. When provided, the returned
-     * `QueryFn` carries `__chardbIntent` so the React `useQuery(handle,
-     * args)` overload can subscribe without the user hand-writing a
-     * literal `CdbIntent` that mirrors `handler`'s filter shape.
+     * Optional server-owned `CdbIntent` extractor. When provided, the
+     * returned `QueryFn` carries `__chardbIntent` for the configured Gateway
+     * to resolve subscription routing from trusted code.
      *
      * The intent the user returns must be wire-equivalent to what the
      * Drizzle expression in `handler` would compile to via the
@@ -346,6 +344,13 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
     if (intent) {
         Object.defineProperty(fn, "__chardbIntent", {
             value: intent,
+            enumerable: false,
+            configurable: false,
+        });
+    }
+    if (validator) {
+        Object.defineProperty(fn, "__chardbValidateArgs", {
+            value: (args: unknown) => runValidator(validator, args),
             enumerable: false,
             configurable: false,
         });

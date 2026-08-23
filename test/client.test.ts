@@ -14,8 +14,8 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import { createChardbClient } from "../src/client/index.ts";
 import { CdbError } from "../src/errors.ts";
-import { ClientId, Cookie, MutId, SubId } from "../src/types.ts";
-import { type Down, type Up, encodeWire } from "../src/wire.ts";
+import { ChardbRef, ClientId, Cookie, MutId, SubId } from "../src/types.ts";
+import { type Down, PROTOCOL_V, type Up, encodeWire } from "../src/wire.ts";
 
 class FakeWS {
     static OPEN = 1 as const;
@@ -93,6 +93,19 @@ describe("createChardbClient — wire round-trip", () => {
         if (sent.t !== "hello") throw new Error("unreachable");
         expect(sent.clientId).toBe(ClientId("c-test"));
         expect(sent.jwt).toBe("jwt-stub");
+        expect(sent.protocolV).toBe(PROTOCOL_V);
+    });
+
+    test("a mismatched welcome protocol closes the client instead of entering the session", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        ws.onmessage?.({
+            data: JSON.stringify({ t: "welcome", protocolV: 1, baseCookie: "c-1:42", region: "test" }),
+        });
+        await flush();
+        expect(c.state).toBe("closed");
+        expect(ws.readyState).toBe(FakeWS.CLOSED);
     });
 
     test("subscribe → server poke delivers rows to the listener", async () => {
@@ -100,12 +113,16 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
         const ws = fakeWebSocket();
         const seen: unknown[][] = [];
-        c.subscribe<{ id: string }>({ kind: "select", tables: ["messages"] }, rows => seen.push([...rows]));
+        c.subscribe<{ id: string }>("queries.ts#listMessages", { organizationId: "org-1" }, rows =>
+            seen.push([...rows])
+        );
         await flush();
         // The client should have sent an Up.sub envelope.
         const subSent = ws.sent.map(r => JSON.parse(r) as Up).find(m => m.t === "sub");
         expect(subSent).toBeDefined();
         if (!subSent || subSent.t !== "sub") throw new Error("unreachable");
+        expect(subSent.ref).toBe(ChardbRef("queries.ts#listMessages"));
+        expect(subSent.args).toEqual({ organizationId: "org-1" });
         // Server pokes with one row patch.
         ws.emit({
             t: "poke",
@@ -174,7 +191,9 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
         const ws = fakeWebSocket();
         const seen: unknown[][] = [];
-        c.subscribe<{ id: string }>({ kind: "select", tables: ["messages"] }, rows => seen.push([...rows]));
+        c.subscribe<{ id: string }>("queries.ts#listMessages", { organizationId: "org-1" }, rows =>
+            seen.push([...rows])
+        );
         await flush();
         // Prime with a row, then issue mustRefetch and confirm the listener
         // sees the cleared state and the client re-sends `sub`.
@@ -196,6 +215,10 @@ describe("createChardbClient — wire round-trip", () => {
             .map(r => JSON.parse(r) as Up)
             .filter(m => m.t === "sub");
         expect(newSubs.length).toBe(1);
+        const resent = newSubs[0];
+        if (!resent || resent.t !== "sub") throw new Error("expected a re-sent query subscription");
+        expect(resent.ref).toBe(ChardbRef("queries.ts#listMessages"));
+        expect(resent.args).toEqual({ organizationId: "org-1" });
     });
 
     test("reconnect within RYW window resumes from lastCookie via Up.hello.resumeFromCookie", async () => {
@@ -203,7 +226,7 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
         const ws1 = fakeWebSocket();
         // Server welcome stamps the resume cookie.
-        ws1.emit({ t: "welcome", baseCookie: Cookie("c-1:42"), region: "test" });
+        ws1.emit({ t: "welcome", protocolV: PROTOCOL_V, baseCookie: Cookie("c-1:42"), region: "test" });
         await flush();
         // Drop the connection. The reconnect timer fires after RECONNECT_INITIAL_BACKOFF_MS (250ms)
         // and we want to land inside the 30s RYW window so lastCookie is preserved.
@@ -229,7 +252,7 @@ describe("createChardbClient — wire round-trip", () => {
         const c = client();
         await flush();
         const ws1 = fakeWebSocket();
-        ws1.emit({ t: "welcome", baseCookie: Cookie("c-1:42"), region: "test" });
+        ws1.emit({ t: "welcome", protocolV: PROTOCOL_V, baseCookie: Cookie("c-1:42"), region: "test" });
         await flush();
         ws1.close();
         // Let the onclose microtask run so `lastDisconnectAt` is stamped at t0,

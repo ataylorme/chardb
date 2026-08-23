@@ -19,9 +19,9 @@ const listMessagesArgs = z.object({
 
 export const listMessages = api.query({
     args: listMessagesArgs,
-    // The intent extractor lets the React `useQuery(listMessages, args)`
-    // call subscribe without the user hand-writing a `CdbIntent` literal
-    // that mirrors the Drizzle filter below. The shape MUST match what
+    // The configured Gateway evaluates this extractor from its local
+    // manifest; the browser sends only the handle ref and raw args. The shape
+    // MUST match what
     // the handler's `where` would compile to via `StaticIntentExtractor`
     // — partition values, intervals, table list — otherwise the
     // subscription and the read will return divergent rows.

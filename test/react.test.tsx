@@ -10,10 +10,11 @@ import * as TestRenderer from "react-test-renderer";
 import type { ChardbClient } from "../src/client/index.ts";
 import * as ChardbReact from "../src/react/index.ts";
 import { ChardbProvider, useMutation, useQuery } from "../src/react/index.ts";
-import type { CdbIntent, RawJson } from "../src/wire.ts";
+import type { RawJson } from "../src/wire.ts";
 
 interface SubInstance {
-    readonly intent: CdbIntent;
+    readonly ref: string;
+    readonly args: RawJson;
     readonly listener: (rows: RawJson[]) => void;
     unsubscribed: boolean;
 }
@@ -22,9 +23,10 @@ function stubClient() {
     const subs: SubInstance[] = [];
     const mutateCalls: { ref: string; args: RawJson }[] = [];
     const client: ChardbClient = {
-        subscribe<TRow>(intent: CdbIntent, onChange: (rows: TRow[]) => void) {
+        subscribe<TRow>(ref: string, args: RawJson, onChange: (rows: TRow[]) => void) {
             const inst: SubInstance = {
-                intent,
+                ref,
+                args,
                 listener: onChange as (rows: RawJson[]) => void,
                 unsubscribed: false,
             };
@@ -59,11 +61,14 @@ describe("chardb/react — hook lifecycle", () => {
 
     test("useQuery subscribes on mount, receives patches, unsubscribes on unmount", () => {
         const { client, subs } = stubClient();
-        const intent: CdbIntent = { kind: "select", tables: ["t"] };
+        const query = Object.assign(async (_ctx: never, _args: { organizationId: string }) => [{ id: "unused" }], {
+            __chardbRef: { toString: () => "queries.ts#listMessages" },
+        });
+        const args = { organizationId: "org-1" };
 
         let captured: RawJson[] | undefined;
         function Probe() {
-            const r = useQuery<{ id: string }>(intent);
+            const r = useQuery(query, args);
             captured = r.data as RawJson[] | undefined;
             return null;
         }
@@ -76,7 +81,8 @@ describe("chardb/react — hook lifecycle", () => {
         expect(subs.length).toBe(1);
         const sub = subs[0];
         if (!sub) throw new Error("expected useQuery to create a subscription");
-        expect(sub.intent).toBe(intent);
+        expect(sub.ref).toBe("queries.ts#listMessages");
+        expect(sub.args).toEqual(args);
         expect(captured).toBeUndefined();
 
         TestRenderer.act(() => {
@@ -89,6 +95,31 @@ describe("chardb/react — hook lifecycle", () => {
             tree.unmount();
         });
         expect(sub.unsubscribed).toBe(true);
+    });
+
+    test("useQuery keeps one subscription when inline args are recreated by a result render", () => {
+        const { client, subs } = stubClient();
+        const query = Object.assign(async (_ctx: never, _args: { organizationId: string }) => [], {
+            __chardbRef: { toString: () => "queries.ts#listMessages" },
+        });
+
+        function Probe() {
+            useQuery(query, { organizationId: "org-1" });
+            return null;
+        }
+
+        TestRenderer.act(() => {
+            TestRenderer.create(React.createElement(ChardbProvider, { client }, React.createElement(Probe)));
+        });
+        const sub = subs[0];
+        if (!sub) throw new Error("expected useQuery to create a subscription");
+
+        TestRenderer.act(() => {
+            sub.listener([{ id: "r1" }]);
+        });
+
+        expect(subs).toHaveLength(1);
+        expect(sub.unsubscribed).toBe(false);
     });
 
     test("useMutation invokes client.mutate with the function's __chardbRef", async () => {
@@ -111,8 +142,11 @@ describe("chardb/react — hook lifecycle", () => {
     });
 
     test("useQuery without a Provider throws a clear error", () => {
+        const query = Object.assign(async (_ctx: never, _args: Record<string, never>) => [], {
+            __chardbRef: { toString: () => "queries.ts#list" },
+        });
         function Bad() {
-            useQuery({ kind: "select", tables: ["t"] });
+            useQuery(query, {});
             return null;
         }
         expect(() => TestRenderer.create(React.createElement(Bad))).toThrow(

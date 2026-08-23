@@ -14,6 +14,7 @@ import { DurableObject } from "cloudflare:workers";
 import { decodeJwtClaims, principalIdFromJwt } from "../../auth/jwt.ts";
 import { CdbError, docsUrlFor, isCdbErrorCode, isRetryable } from "../../errors.ts";
 import {
+    type ChardbRef,
     type ClientId,
     Cookie,
     CorrelationId,
@@ -28,13 +29,21 @@ import {
     type CdbIntent,
     type Down,
     type MustRefetchReason,
+    PROTOCOL_V,
     type RowPatch,
     type Up,
     type WireMessage,
+    checkProtocolV,
     decodeWire,
     encodeWire,
 } from "../../wire.ts";
-import { type ChardbManifest, emptyManifest, routeMutation as resolveMutationRoute } from "../manifest.ts";
+import {
+    type ChardbManifest,
+    type QueryRouteResponse,
+    emptyManifest,
+    routeMutation as resolveMutationRoute,
+    routeQuery as resolveQueryRoute,
+} from "../manifest.ts";
 import type {
     CatalogMutationRpc,
     CdbErrorWire,
@@ -126,17 +135,21 @@ export interface GatewayEnv {
 }
 
 /** Minimal RPC surface the Gateway requires from each Cdb shard DO. */
+export interface CdbSubscriptionRequest {
+    readonly subId: number;
+    readonly principalId: PrincipalId;
+    readonly ref: ChardbRef;
+    readonly args: RawJson;
+    readonly tables: readonly string[];
+    readonly intervals: readonly {
+        readonly table: string;
+        readonly indexName: string;
+        readonly intervals: readonly import("../../wire.ts").WireInterval[];
+    }[];
+}
+
 interface CdbRpc {
-    subscribe(args: {
-        subId: number;
-        principalId: PrincipalId;
-        tables: readonly string[];
-        intervals: readonly {
-            readonly table: string;
-            readonly indexName: string;
-            readonly intervals: readonly import("../../wire.ts").WireInterval[];
-        }[];
-    }): Promise<{ subId: number }>;
+    subscribe(args: CdbSubscriptionRequest): Promise<{ subId: number }>;
     unsubscribe(subId: number): Promise<void>;
 }
 
@@ -167,6 +180,28 @@ export function gatewayErrorEnvelope(
         correlationId,
         docs: docsUrlFor(code),
         ...(subId !== undefined ? { subId } : {}),
+    };
+}
+
+/** Build the serializable Cdb subscription RPC from server-owned routing data. */
+export function cdbSubscriptionRequest(input: {
+    readonly subId: SubId;
+    readonly principalId: PrincipalId;
+    readonly ref: ChardbRef;
+    readonly args: RawJson;
+    readonly intent: CdbIntent;
+}): CdbSubscriptionRequest {
+    return {
+        subId: input.subId,
+        principalId: input.principalId,
+        ref: input.ref,
+        args: input.args,
+        tables: [...input.intent.tables],
+        intervals: (input.intent.intervals ?? []).map(bundle => ({
+            table: bundle.table,
+            indexName: bundle.indexName,
+            intervals: bundle.intervals,
+        })),
     };
 }
 
@@ -224,13 +259,18 @@ export class Gateway extends DurableObject<GatewayEnv> {
         state.blockConcurrencyWhile(async () => this.bootstrap());
     }
 
-    protected mutationManifest(): ChardbManifest {
+    protected runtimeManifest(): ChardbManifest {
         return emptyManifest();
     }
 
     /** Resolve the registered mutation inside this Gateway isolate. */
     routeMutation(request: MutationRouteRequest): MutationRouteResponse {
-        return resolveMutationRoute(this.mutationManifest(), request, vshardOf);
+        return resolveMutationRoute(this.runtimeManifest(), request, vshardOf);
+    }
+
+    /** Resolve query routing from the server manifest, never client hints. */
+    routeQuery(request: { readonly ref: string; readonly args: RawJson }): Promise<QueryRouteResponse> {
+        return resolveQueryRoute(this.runtimeManifest(), request);
     }
 
     private bootstrap(): void {
@@ -271,7 +311,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 this.onHello(ws, msg as Extract<Up, { t: "hello" }>);
                 break;
             case "sub":
-                this.onSub(ws, msg as Extract<Up, { t: "sub" }>);
+                void this.onSub(ws, msg as Extract<Up, { t: "sub" }>);
                 break;
             case "unsub":
                 this.onUnsub(ws, msg as Extract<Up, { t: "unsub" }>);
@@ -300,6 +340,12 @@ export class Gateway extends DurableObject<GatewayEnv> {
     }
 
     private onHello(ws: WebSocket, msg: Extract<Up, { t: "hello" }>): void {
+        const mismatch = checkProtocolV(msg.protocolV);
+        if (mismatch) {
+            this.send(ws, mismatch);
+            ws.close(1002, `unsupported chardb protocol ${msg.protocolV}`);
+            return;
+        }
         const decoded = decodeJwtClaims(msg.jwt);
         const principalId = principalIdFromJwt(msg.jwt);
         const tenantId =
@@ -326,6 +372,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         ws.serializeAttachment(attachment);
         const welcome: Down = {
             t: "welcome",
+            protocolV: PROTOCOL_V,
             baseCookie: Cookie(`${msg.clientId}:0`),
             region: "WNAM",
             ...(msg.resumeFromCookie ? { resumedFromCookie: msg.resumeFromCookie } : {}),
@@ -333,7 +380,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         this.send(ws, welcome);
     }
 
-    private onSub(ws: WebSocket, msg: Extract<Up, { t: "sub" }>): void {
+    private async onSub(ws: WebSocket, msg: Extract<Up, { t: "sub" }>): Promise<void> {
         const att = ws.deserializeAttachment() as GwAttachment | null;
         if (!att) return;
         // `att.principalId` is the JWT-derived `sub` claim from `hello`. When
@@ -341,12 +388,23 @@ export class Gateway extends DurableObject<GatewayEnv> {
         // deterministic projection of `clientId` so cross-shard subs still
         // share a stable bucket key — write paths re-validate authority.
         const principalId = att.principalId ?? (att.clientId as unknown as PrincipalId);
-        void this.subscribeAcrossShards(att.clientId, msg.subId, msg.queryHash, msg.intent, principalId).catch(
-            (e: unknown) => {
-                const code = errorCodeFrom(e);
-                this.sendError(ws, code, msg.subId);
-            }
-        );
+        const routed = await this.routeQuery({ ref: msg.ref, args: msg.args });
+        if (!routed.ok) {
+            this.sendError(ws, routed.error.code, msg.subId);
+            return;
+        }
+        void this.subscribeAcrossShards(
+            att.clientId,
+            msg.subId,
+            msg.ref,
+            routed.args,
+            routed.queryHash,
+            routed.intent,
+            principalId
+        ).catch((e: unknown) => {
+            const code = errorCodeFrom(e);
+            this.sendError(ws, code, msg.subId);
+        });
     }
 
     private onUnsub(ws: WebSocket, msg: Extract<Up, { t: "unsub" }>): void {
@@ -477,6 +535,8 @@ export class Gateway extends DurableObject<GatewayEnv> {
     private async subscribeAcrossShards(
         clientId: ClientId,
         subId: SubId,
+        ref: ChardbRef,
+        args: RawJson,
         queryHash: string,
         intent: CdbIntent,
         principalId: PrincipalId
@@ -491,7 +551,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             subId,
             queryHash,
             JSON.stringify([...shardIds]),
-            JSON.stringify(intent),
+            JSON.stringify({ ref, args, intent }),
             Date.now()
         );
         for (const shardId of shardIds) {
@@ -502,20 +562,11 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 subId
             );
         }
-        const intervals = (intent.intervals ?? []).map(b => ({
-            table: b.table,
-            indexName: b.indexName,
-            intervals: b.intervals,
-        }));
+        const request = cdbSubscriptionRequest({ subId, principalId, ref, args, intent });
         await Promise.all(
             shardIds.map(async shardId => {
                 const cdb = this.cdb(shardId);
-                await cdb.subscribe({
-                    subId,
-                    principalId,
-                    tables: [...intent.tables],
-                    intervals,
-                });
+                await cdb.subscribe(request);
             })
         );
     }
@@ -648,7 +699,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
 /** Bind the bundler-built manifest into each Gateway isolate. */
 export function configureGatewayRuntime(config: GatewayRuntimeConfig): typeof Gateway {
     return class ConfiguredGateway extends Gateway {
-        protected override mutationManifest(): ChardbManifest {
+        protected override runtimeManifest(): ChardbManifest {
             return config.manifest();
         }
     };

@@ -15,8 +15,8 @@ export interface ChatMessagesResult {
 }
 
 /**
- * Live-subscribe to a channel's messages. The intent extractor lives
- * with the server query in `queries.ts` (`defineQuery({intent: ...})`),
+ * Live-subscribe to a channel's messages. The server-owned intent extractor
+ * lives with the query in `queries.ts` (`defineQuery({intent: ...})`),
  * so we only pass `(handle, args)` here — no hand-written `CdbIntent`.
  *
  * The organizationId is read from the session's active org by the

@@ -17,7 +17,8 @@ import {
 } from "react";
 import type { ChardbClient, ChardbClientOptions } from "../client/index.ts";
 import { createChardbClient } from "../client/index.ts";
-import type { CdbIntent, RawJson } from "../wire.ts";
+import { stableJson } from "../util/canonical.ts";
+import type { RawJson } from "../wire.ts";
 
 /**
  * Infer the wire-shape arguments of a `defineMutation` / `defineQuery`
@@ -168,7 +169,8 @@ export interface UseQueryResult<T> {
  */
 export interface QueryHandleStamp<TArgs> {
     readonly __chardbRef: { toString(): string };
-    readonly __chardbIntent?: (args: TArgs) => CdbIntent;
+    /** Type-only anchor for the handle's argument shape. */
+    readonly __chardbArgs?: TArgs;
 }
 
 /**
@@ -180,34 +182,19 @@ type RowOf<F> = F extends (...args: never[]) => Promise<infer R> ? (R extends re
 
 type ArgsOf<F> = F extends (ctx: never, args: infer A) => unknown ? A : never;
 
-export function useQuery<T = RawJson>(intent: CdbIntent): UseQueryResult<T>;
 export function useQuery<F extends (...args: never[]) => Promise<unknown>>(
     handle: F & QueryHandleStamp<ArgsOf<F>>,
     args: ArgsOf<F>
-): UseQueryResult<RowOf<F>>;
-export function useQuery(
-    intentOrHandle: CdbIntent | (((...args: never[]) => unknown) & QueryHandleStamp<unknown>),
-    args?: unknown
-): UseQueryResult<unknown> {
+): UseQueryResult<RowOf<F>> {
     const client = useChardb();
-    const intent = useMemo<CdbIntent>(() => {
-        if (isHandle(intentOrHandle)) {
-            const extractor = intentOrHandle.__chardbIntent;
-            if (!extractor) {
-                throw new Error(
-                    "useQuery(handle, args) requires defineQuery({ intent: (args) => CdbIntent }); " +
-                        "the handle was defined without an `intent` extractor."
-                );
-            }
-            return extractor(args);
-        }
-        return intentOrHandle;
-    }, [intentOrHandle, args]);
-    const [data, setData] = useState<unknown[] | undefined>(undefined);
+    if (!isHandle(handle)) throw new TypeError("useQuery requires a defineQuery handle and raw JSON args");
+    const [data, setData] = useState<RowOf<F>[] | undefined>(undefined);
+    const argsIdentity = stableJson(args as RawJson);
+    const stableArgs = useMemo(() => JSON.parse(argsIdentity) as RawJson, [argsIdentity]);
     useEffect(() => {
-        const sub = client.subscribe<unknown>(intent, rows => setData(rows));
+        const sub = client.subscribe<RowOf<F>>(handle.__chardbRef.toString(), stableArgs, rows => setData(rows));
         return sub.unsubscribe;
-    }, [client, intent]);
+    }, [client, handle, stableArgs]);
     return { data, state: data === undefined ? "pending" : "live" };
 }
 

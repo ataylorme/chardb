@@ -15,11 +15,12 @@ import { uuidv7 } from "uuidv7";
 import { CdbError, type CdbErrorCode, isCdbError } from "../errors.ts";
 import { ChardbRef, ClientId, type Cookie, type CorrelationId, MutId, type RawJson, SubId } from "../types.ts";
 import {
-    type CdbIntent,
     type Down,
     type MustRefetchReason,
+    PROTOCOL_V,
     type RowPatch,
     type Up,
+    checkProtocolV,
     decodeWire,
     encodeWire,
 } from "../wire.ts";
@@ -48,8 +49,8 @@ type SubState = "pending" | "live" | "refetching" | "error" | "closed";
  */
 interface SubRecord {
     readonly subId: SubId;
-    readonly intent: CdbIntent;
-    readonly queryHash: string;
+    readonly ref: ChardbRef;
+    readonly args: RawJson;
     state: SubState;
     rows: RawJson[];
     listeners: Set<(rows: RawJson[]) => void>;
@@ -68,7 +69,11 @@ interface PendingMutation {
 
 export interface ChardbClient {
     /** Open a live subscription; returns a disposer. */
-    subscribe<TRow = RawJson>(intent: CdbIntent, onChange: (rows: TRow[]) => void): { unsubscribe: () => void };
+    subscribe<TRow = RawJson>(
+        ref: string,
+        args: RawJson,
+        onChange: (rows: TRow[]) => void
+    ): { unsubscribe: () => void };
     /** Issue a mutation; resolves with server result after canonical state arrives. */
     mutate<TResult = RawJson>(ref: string, args: RawJson): Promise<TResult>;
     close(): void;
@@ -116,6 +121,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             state = "open";
             const hello: Up = {
                 t: "hello",
+                protocolV: PROTOCOL_V,
                 clientId,
                 ...(lastCookie ? { resumeFromCookie: lastCookie } : {}),
                 jwt,
@@ -126,8 +132,8 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 const upSub: Up = {
                     t: "sub",
                     subId: sub.subId,
-                    queryHash: sub.queryHash,
-                    intent: sub.intent,
+                    ref: sub.ref,
+                    args: sub.args,
                 };
                 ws?.send(encodeWire(upSub));
             }
@@ -167,6 +173,15 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         const msg = decodeWire(raw) as Down;
         switch (msg.t) {
             case "welcome":
+                if (checkProtocolV(msg.protocolV)) {
+                    state = "closed";
+                    for (const sub of subs.values()) {
+                        sub.state = "error";
+                        notify(sub);
+                    }
+                    ws?.close();
+                    return;
+                }
                 lastCookie = msg.baseCookie;
                 return;
             case "poke":
@@ -201,8 +216,8 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                     const up: Up = {
                         t: "sub",
                         subId: sub.subId,
-                        queryHash: sub.queryHash,
-                        intent: sub.intent,
+                        ref: sub.ref,
+                        args: sub.args,
                     };
                     ws?.send(encodeWire(up));
                 }
@@ -253,16 +268,17 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     }
 
     function subscribe<TRow = RawJson>(
-        intent: CdbIntent,
+        ref: string,
+        args: RawJson,
         onChange: (rows: TRow[]) => void
     ): { unsubscribe: () => void } {
         const subId = SubId(nextSubId++);
-        const queryHash = hashIntent(intent);
+        const queryRef = ChardbRef(ref);
         const widenedListener: (rows: RawJson[]) => void = rows => onChange(rows as readonly RawJson[] as TRow[]);
         const rec: SubRecord = {
             subId,
-            intent,
-            queryHash,
+            ref: queryRef,
+            args,
             state: "pending",
             rows: [],
             listeners: new Set([widenedListener]),
@@ -270,7 +286,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         };
         subs.set(subId, rec);
         if (ws && state === "open") {
-            const up: Up = { t: "sub", subId, queryHash, intent };
+            const up: Up = { t: "sub", subId, ref: queryRef, args };
             ws.send(encodeWire(up));
         }
         return {
@@ -322,8 +338,4 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             return state;
         },
     };
-}
-
-function hashIntent(intent: CdbIntent): string {
-    return JSON.stringify(intent);
 }

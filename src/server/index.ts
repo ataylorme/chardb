@@ -139,11 +139,14 @@ export {
     emptyManifest,
     manifestFromExports,
     resolveMutation,
+    resolveQuery,
+    routeQuery,
     type ChardbManifest,
     type CronDescriptor,
     type LedgerDescriptor,
     type MutationDescriptor,
     type QueryDescriptor,
+    type QueryRouteResponse,
 } from "./manifest.ts";
 export {
     cosineSimilarity,

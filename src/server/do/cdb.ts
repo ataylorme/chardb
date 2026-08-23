@@ -41,6 +41,8 @@ export interface CdbEnv {
 export interface SubscribeArgs {
     readonly subId: number;
     readonly principalId: PrincipalId;
+    readonly ref: ChardbRef;
+    readonly args: RawJson;
     readonly tables: readonly string[];
     readonly intervals: readonly {
         readonly table: string;

@@ -18,9 +18,10 @@
 import { describe, expect, test } from "bun:test";
 import { organization } from "better-auth/plugins/organization";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { z } from "zod";
 import { defineAuth } from "../../src/auth/synthesize.ts";
 import { chardb } from "../../src/server/chardb.ts";
-import { defineMutation } from "../../src/server/define.ts";
+import { defineMutation, defineQuery } from "../../src/server/define.ts";
 import { Cdb } from "../../src/server/do/cdb.ts";
 import { Gateway } from "../../src/server/do/gateway.ts";
 import type { RawJson } from "../../src/types.ts";
@@ -37,10 +38,22 @@ const auth = defineAuth({
 });
 
 type RoutedArgs = { readonly organizationId: string } & { readonly [key: string]: RawJson };
+type RoutedQueryArgs = { readonly organizationId: string; readonly limit: number };
 const routedMutation = defineMutation<unknown, RoutedArgs, null>(() => null, {
     singlePartition: true,
     partitionKey: args => args.organizationId,
 });
+const routedQuery = defineQuery<unknown, RoutedQueryArgs, readonly []>({
+    args: z.object({ organizationId: z.string(), limit: z.number().int().default(25) }),
+    handler: async () => [],
+    intent: args => ({
+        kind: "select",
+        tables: ["items"],
+        partitionKey: { table: "items", column: "organization_id", values: [args.organizationId] },
+        joinShape: "colocated",
+    }),
+});
+const queryWithoutIntent = defineQuery<unknown, RoutedArgs, readonly []>(async (): Promise<readonly []> => []);
 
 describe("chardb({…})", () => {
     test("returns a Hono instance the user can chain routes on", async () => {
@@ -80,6 +93,34 @@ describe("chardb({…})", () => {
         const missing = gateway.routeMutation({ ref: "api.ts#missing", args: {} });
         expect(missing.ok).toBe(false);
         if (!missing.ok) expect(missing.error.code).toBe("CDB_REF_NOT_FOUND");
+    });
+
+    test("the configured Gateway validates args, derives query intent, and fails closed without an extractor", async () => {
+        const app = chardb({ auth, schema: { items }, api: { routedQuery, queryWithoutIntent } });
+        const gateway = Object.create(app.Gateway.prototype) as InstanceType<typeof app.Gateway>;
+        const routed = await gateway.routeQuery({ ref: routedQuery.__chardbRef, args: { organizationId: "org-7" } });
+        expect(routed.ok).toBe(true);
+        if (!routed.ok) throw new Error("expected query routing to succeed");
+        expect(routed.intent).toEqual({
+            kind: "select",
+            tables: ["items"],
+            partitionKey: { table: "items", column: "organization_id", values: ["org-7"] },
+            joinShape: "colocated",
+        });
+        expect(routed.args).toEqual({ organizationId: "org-7", limit: 25 });
+        expect(routed.queryHash).toContain(routedQuery.__chardbRef);
+        expect(routed.queryHash).toContain('"limit":25');
+
+        const invalid = await gateway.routeQuery({ ref: routedQuery.__chardbRef, args: { organizationId: 7 } });
+        expect(invalid.ok).toBe(false);
+        if (!invalid.ok) expect(invalid.error.code).toBe("CDB_INVALID_ARGS");
+
+        const closed = await gateway.routeQuery({
+            ref: queryWithoutIntent.__chardbRef,
+            args: { organizationId: "org-7" },
+        });
+        expect(closed.ok).toBe(false);
+        if (!closed.ok) expect(closed.error.code).toBe("CDB_NO_INTENT_FOR_RAW_SQL");
     });
 
     test("`auth` is the pre-built bundle when supplied", () => {

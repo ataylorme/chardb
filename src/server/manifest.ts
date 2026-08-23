@@ -5,12 +5,12 @@
  * `src/server/refs.ts`). The Vite plugin walks the user's worker entry, pulls
  * each named export through `manifestFromExports`, and the result is supplied
  * to `defineChardb({ manifest })`. The configured Cdb class retains this
- * registry in its own isolate and resolves mutation refs locally. The Worker
- * entrypoint uses the same manifest for partition extraction, while
- * `scheduled()` invokes user `defineCron` callbacks.
+ * registry in its own isolate and resolves mutation refs locally. The
+ * configured Gateway retains the same manifest for mutation and query
+ * routing, while `scheduled()` invokes user `defineCron` callbacks.
  *
- * The manifest contains functions and Maps and must never cross RPC. Only the
- * serializable mutation request crosses into Cdb.
+ * The manifest contains functions and Maps and must never cross RPC. Only
+ * serializable mutation and subscription requests cross into Cdb.
  *
  * ### Wire boundary: TArgs is `RawJson`
  *
@@ -18,9 +18,9 @@
  * shape so the user-side handler stays statically checked. The descriptor
  * stored in the manifest, however, deliberately erases that generic to
  * `RawJson`. This is the wire contract: an `Up.mut` envelope carries
- * `args: RawJson` after `decodeWire`, and the Gateway's local route resolver
- * passes that value into a manifest descriptor with the same erased argument
- * shape. Mutation results
+ * `args: RawJson` after `decodeWire`; `Up.sub` carries the same pair for
+ * queries. The Gateway's local route resolvers pass those values into manifest
+ * descriptors with the same erased argument shape. Mutation results
  * remain `unknown` until the op-log wrapper verifies they are JSON.
  *
  * A phantom-map alternative (parallel `WeakMap<ChardbRef, TArgs>`) was
@@ -31,12 +31,13 @@
  * (Zod / TypeBox / Valibot / ArkType) lives one level up in the user's
  * handler — `chardb/files/{zod,…}` is wired so the user can refine `args`
  * before calling into business logic. See `src/server/define.ts` for the
- * forward direction (typed → erased) and `routeMutation` in this file for
- * the only consumer that needs the erased shape.
+ * forward direction (typed → erased) and the routing functions in this file
+ * for the consumers that need the erased shape.
  */
 
 import { CdbError } from "../errors.ts";
 import type { Brand, ChardbRef, RawJson } from "../types.ts";
+import type { CdbIntent } from "../wire.ts";
 import type { ChardbFunctionKind } from "./refs.ts";
 
 interface RefMarked {
@@ -48,6 +49,12 @@ interface MutationMarked extends RefMarked {
     readonly __chardbKind: "mutation";
     readonly __chardbPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
     readonly __chardbSinglePartition?: boolean;
+}
+
+interface QueryMarked extends RefMarked {
+    readonly __chardbKind: "query";
+    readonly __chardbIntent?: (args: RawJson) => CdbIntent;
+    readonly __chardbValidateArgs?: (args: unknown) => Promise<RawJson>;
 }
 
 interface CronMarked extends RefMarked {
@@ -65,7 +72,13 @@ export interface MutationDescriptor {
 export interface QueryDescriptor {
     readonly ref: ChardbRef;
     readonly invoke: (ctx: unknown, args: RawJson) => Promise<unknown>;
+    readonly validateArgs?: (args: unknown) => Promise<RawJson>;
+    readonly extractIntent?: (args: RawJson) => CdbIntent;
 }
+
+export type QueryRouteResponse =
+    | { readonly ok: true; readonly args: RawJson; readonly intent: CdbIntent; readonly queryHash: string }
+    | { readonly ok: false; readonly error: ReturnType<CdbError["toJSON"]> };
 
 export interface CronDescriptor {
     readonly ref: ChardbRef;
@@ -129,9 +142,12 @@ export function manifestFromExports(exports: Record<string, unknown>): ChardbMan
                 break;
             }
             case "query": {
+                const query = value as QueryMarked & ((ctx: unknown, args: RawJson) => Promise<unknown>);
                 queries.set(ref, {
                     ref,
-                    invoke: value as unknown as (ctx: unknown, args: RawJson) => Promise<unknown>,
+                    invoke: query,
+                    ...(query.__chardbValidateArgs ? { validateArgs: query.__chardbValidateArgs } : {}),
+                    ...(query.__chardbIntent ? { extractIntent: query.__chardbIntent } : {}),
                 });
                 break;
             }
@@ -162,6 +178,44 @@ export function resolveMutation(manifest: ChardbManifest, ref: ChardbRef): Mutat
         throw new CdbError({ code: "CDB_REF_NOT_FOUND", message: `unknown mutation ref: ${ref}` });
     }
     return desc;
+}
+
+export function resolveQuery(manifest: ChardbManifest, ref: ChardbRef): QueryDescriptor {
+    const descriptor = manifest.queries.get(ref);
+    if (!descriptor) {
+        throw new CdbError({ code: "CDB_REF_NOT_FOUND", message: `unknown query ref: ${ref}` });
+    }
+    return descriptor;
+}
+
+/** Resolve server-owned query routing metadata without executing the query. */
+export async function routeQuery(
+    manifest: ChardbManifest,
+    input: { readonly ref: string; readonly args: RawJson }
+): Promise<QueryRouteResponse> {
+    try {
+        const descriptor = resolveQuery(manifest, input.ref as ChardbRef);
+        if (!descriptor.extractIntent) {
+            throw new CdbError({
+                code: "CDB_NO_INTENT_FOR_RAW_SQL",
+                message: `query ${input.ref} has no server intent extractor`,
+            });
+        }
+        const validatedArgs = descriptor.validateArgs ? await descriptor.validateArgs(input.args) : input.args;
+        const intent = descriptor.extractIntent(validatedArgs);
+        return {
+            ok: true,
+            args: validatedArgs,
+            intent,
+            queryHash: JSON.stringify({ ref: input.ref, args: validatedArgs, intent }),
+        };
+    } catch (error) {
+        const cdb =
+            error instanceof CdbError
+                ? error
+                : new CdbError({ code: "CDB_INVARIANT", message: "query intent extraction failed", cause: error });
+        return { ok: false, error: cdb.toJSON() };
+    }
 }
 
 /**
