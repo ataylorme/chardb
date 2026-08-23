@@ -1,5 +1,5 @@
 import type { CdbError } from "../errors.ts";
-import type { RawJson } from "../types.ts";
+import type { RawJson, ShardId } from "../types.ts";
 import type { AuthCtx } from "./define.ts";
 import type { RouteResult } from "./do/catalog.ts";
 
@@ -21,6 +21,11 @@ export type MutationRouteResolver = (request: MutationRouteRequest) => MutationR
 /** RPC surface used to map a logical vshard to a physical Cdb DO. */
 export interface CatalogMutationRpc {
     route(vshard: number): Promise<RouteResult>;
+}
+
+/** Catalog routing surface used by subscription placement. */
+export interface CatalogRoutingRpc extends CatalogMutationRpc {
+    listShardIds(): Promise<readonly ShardId[]>;
 }
 
 export interface CdbMutationRequest {

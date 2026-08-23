@@ -109,6 +109,7 @@ export { chardb, type ChardbApp, type ChardbFactoryInput } from "./chardb.ts";
 export { Cdb } from "./do/cdb.ts";
 export type {
     CatalogMutationRpc,
+    CatalogRoutingRpc,
     CdbErrorWire,
     CdbMutationFailure,
     CdbMutationRequest,

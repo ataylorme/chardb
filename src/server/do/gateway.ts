@@ -47,6 +47,7 @@ import {
 } from "../manifest.ts";
 import type {
     CatalogMutationRpc,
+    CatalogRoutingRpc,
     CdbErrorWire,
     CdbMutationResponse,
     CdbMutationRpc,
@@ -307,6 +308,25 @@ export async function dispatchTrustedMutation(
     }
 }
 
+/** Resolve the physical shards needed for one server-derived query intent. */
+export async function shardsForIntent(catalog: CatalogRoutingRpc, intent: CdbIntent): Promise<string[]> {
+    const shards = new Set<string>();
+    const pk = intent.partitionKey;
+    if (pk && pk.values.length > 0 && intent.joinShape !== "cross-partition") {
+        for (const value of pk.values) {
+            const vshard = vshardOf([toScalar(value)]) as Vshard;
+            const route = await catalog.route(vshard);
+            shards.add(route.shardId);
+        }
+        return [...shards];
+    }
+    if (intent.joinShape === "reference") {
+        const route = await catalog.route(0 as Vshard);
+        return [route.shardId];
+    }
+    return [...(await catalog.listShardIds())];
+}
+
 export class Gateway extends DurableObject<GatewayEnv> {
     private bootstrapped = false;
     private coalesceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -478,7 +498,11 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return null;
         }
         try {
-            return await verifyGatewayJwt({ ...request, config, catalog: this.catalog() as CatalogJwksRpc });
+            return await verifyGatewayJwt({
+                ...request,
+                config,
+                catalog: this.catalog() as unknown as CatalogJwksRpc,
+            });
         } catch (error) {
             this.rejectAuth(ws, error instanceof CdbError ? error.code : "CDB_CATALOG_UNAVAILABLE");
             return null;
@@ -635,7 +659,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         intent: CdbIntent,
         principalId: PrincipalId
     ): Promise<void> {
-        const shardIds = await this.shardsForIntent(intent);
+        const shardIds = await shardsForIntent(this.catalog(), intent);
         const sql = adaptSqlStorage(this.ctx.storage.sql);
         sql.exec(
             `INSERT OR REPLACE INTO _gw_subs
@@ -696,41 +720,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
         return { subIds, rpcFailed: results.some(result => result.status === "rejected") };
     }
 
-    /**
-     * Resolve which shards own a given intent. Single-partition queries hit
-     * exactly one vshard via `xxhash64(canonical_concat(values))`; reference
-     * tables hit a single canonical replica; cross-partition fans out to
-     * every shard currently in the catalog's range table.
-     */
-    private async shardsForIntent(intent: CdbIntent): Promise<string[]> {
-        const catalog = this.catalog();
-        const shards = new Set<string>();
-        const pk = intent.partitionKey;
-        if (pk && pk.values.length > 0 && intent.joinShape !== "cross-partition") {
-            for (const v of pk.values) {
-                const vsh = vshardOf([toScalar(v)]) as Vshard;
-                const r = await catalog.route(vsh);
-                shards.add(r.shardId);
-            }
-            return [...shards];
-        }
-        if (intent.joinShape === "reference") {
-            const r = await catalog.route(0 as Vshard);
-            return [r.shardId];
-        }
-        // Scatter: probe a representative vshard from each contiguous range.
-        // The Catalog will report unique shard ids by routing every bucket;
-        // we sample buckets in steps of 256 to keep the round-trip count bounded.
-        for (let v = 0; v < 16384; v += 256) {
-            const r = await catalog.route(v);
-            shards.add(r.shardId);
-        }
-        return [...shards];
-    }
-
-    private catalog(): CatalogMutationRpc {
+    private catalog(): CatalogRoutingRpc {
         const id = this.env.CDB_CATALOG.idFromName("global");
-        return this.env.CDB_CATALOG.get(id) as unknown as CatalogMutationRpc;
+        return this.env.CDB_CATALOG.get(id) as unknown as CatalogRoutingRpc;
     }
 
     private cdb(shardId: string): CdbRpc {

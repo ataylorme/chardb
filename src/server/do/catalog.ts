@@ -309,6 +309,16 @@ export class Catalog extends DurableObject<CatalogEnv> {
         };
     }
 
+    /** Return each physical shard that owns at least one current vshard range. */
+    async listShardIds(): Promise<readonly ShardId[]> {
+        const shardIds: ShardId[] = [];
+        const cursor = this.ctx.storage.sql.exec<{ shard_id: string }>(
+            "SELECT DISTINCT shard_id FROM catalog_ranges ORDER BY shard_id ASC"
+        );
+        for (const row of cursor) shardIds.push(ShardId(row.shard_id));
+        return shardIds;
+    }
+
     /**
      * Atomic cutover for a vshard range. Combines (a) the range-table edit that
      * reassigns `[lo, hi]` from `fromShard` to `toShard`, (b) a schema-epoch
