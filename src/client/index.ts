@@ -39,6 +39,7 @@ export interface ChardbClientOptions {
 }
 
 type SubState = "pending" | "live" | "refetching" | "error" | "closed";
+type TerminalSubState = Extract<SubState, "error" | "closed">;
 
 /**
  * A subscription record. Rows always travel as `RawJson` over the wire;
@@ -89,6 +90,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     let lastCookie: Cookie | undefined;
     let ws: WebSocket | null = null;
     let state: ChardbClient["state"] = "connecting";
+    let terminated = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectBackoff = RECONNECT_INITIAL_BACKOFF_MS;
     let lastDisconnectAt = 0;
@@ -111,8 +113,10 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     }
 
     async function connect(): Promise<void> {
+        if (terminated) return;
         state = "connecting";
         const jwt = await opts.getJwt();
+        if (terminated) return;
         const url = new URL(opts.endpoint);
         url.searchParams.set("clientId", clientId);
         ws = new WebSocket(url.toString());
@@ -127,9 +131,15 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             };
             ws?.send(encodeWire(hello));
         };
-        ws.onmessage = ev => onWire(ev.data as string);
+        ws.onmessage = ev => receiveWire(ev.data as string);
         ws.onclose = () => onClose();
         ws.onerror = () => ws?.close();
+    }
+
+    function startConnect(): void {
+        void connect().catch(() => {
+            failSession("CDB_INVARIANT", "failed to establish Chardb client session");
+        });
     }
 
     function sendSessionState(): void {
@@ -167,8 +177,20 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                     lastCookie = undefined;
                 }
                 reconnectBackoff = Math.min(reconnectBackoff * 2, RECONNECT_MAX_BACKOFF_MS);
-                void connect();
+                startConnect();
             }, reconnectBackoff);
+        }
+    }
+
+    function receiveWire(raw: string): void {
+        try {
+            onWire(raw);
+        } catch {
+            const message =
+                state === "connecting"
+                    ? "server sent an invalid Chardb handshake message"
+                    : "server sent an invalid Chardb session message";
+            failSession("CDB_INVARIANT", message);
         }
     }
 
@@ -177,12 +199,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         switch (msg.t) {
             case "welcome":
                 if (checkProtocolV(msg.protocolV)) {
-                    state = "closed";
-                    for (const sub of subs.values()) {
-                        sub.state = "error";
-                        notify(sub);
-                    }
-                    ws?.close();
+                    failSession("CDB_UNSUPPORTED_FEATURE", "server selected an unsupported Chardb protocol version");
                     return;
                 }
                 lastCookie = msg.baseCookie;
@@ -232,10 +249,11 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 }
                 return;
             case "error":
-                applyError(msg.code, msg.subId, msg.correlationId);
                 if (state === "connecting" && !msg.retryable) {
                     failSession(msg.code, `authentication failed: ${msg.code}`);
+                    return;
                 }
+                applyError(msg.code, msg.subId, msg.correlationId);
                 return;
             case "presence":
             case "streamChunk":
@@ -275,17 +293,24 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         void code;
     }
 
-    function failSession(code: CdbErrorCode, message: string): void {
+    function failSession(code: CdbErrorCode, message: string, subState: TerminalSubState = "error"): void {
+        if (terminated) return;
+        terminated = true;
         state = "closed";
+        if (reconnectTimer !== null) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
         for (const sub of subs.values()) {
-            sub.state = "error";
+            sub.state = subState;
             notify(sub);
         }
-        for (const mutation of pending.values()) {
-            mutation.reject(new CdbError({ code, message }));
-        }
+        const mutations = [...pending.values()];
         pending.clear();
+        const error = new CdbError({ code, message });
+        for (const mutation of mutations) mutation.reject(error);
         ws?.close();
+        bc?.close();
     }
 
     function notify(sub: SubRecord): void {
@@ -346,13 +371,10 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     }
 
     function close(): void {
-        state = "closed";
-        if (reconnectTimer !== null) clearTimeout(reconnectTimer);
-        ws?.close();
-        bc?.close();
+        failSession("CDB_STREAM_ABORTED", "Chardb client closed before pending work settled", "closed");
     }
 
-    void connect();
+    startConnect();
     void isCdbError;
 
     return {

@@ -14,7 +14,7 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import { createChardbClient } from "../src/client/index.ts";
 import { CdbError } from "../src/errors.ts";
-import { ChardbRef, ClientId, Cookie, MutId, SubId } from "../src/types.ts";
+import { ChardbRef, ClientId, Cookie, SubId } from "../src/types.ts";
 import { type Down, PROTOCOL_V, type Up, encodeWire } from "../src/wire.ts";
 
 class FakeWS {
@@ -101,16 +101,37 @@ describe("createChardbClient — wire round-trip", () => {
         expect(sent.protocolV).toBe(PROTOCOL_V);
     });
 
-    test("a mismatched welcome protocol closes the client instead of entering the session", async () => {
+    test("a mismatched welcome protocol terminates every queued operation once", async () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
+        let subscriptionNotifications = 0;
+        c.subscribe("queries.ts#listMessages", {}, () => subscriptionNotifications++);
+        let rejectionCount = 0;
+        const mutationErrors = [c.mutate("src/api.ts#one", {}), c.mutate("src/api.ts#two", {})].map(promise =>
+            promise.catch(error => {
+                rejectionCount++;
+                return error;
+            })
+        );
         ws.onmessage?.({
             data: JSON.stringify({ t: "welcome", protocolV: 1, baseCookie: "c-1:42", region: "test" }),
         });
         await flush();
         expect(c.state).toBe("closed");
         expect(ws.readyState).toBe(FakeWS.CLOSED);
+        expect(subscriptionNotifications).toBe(1);
+        expect(rejectionCount).toBe(2);
+        for (const error of await Promise.all(mutationErrors)) {
+            expect(error).toMatchObject({
+                code: "CDB_UNSUPPORTED_FEATURE",
+                message: "server selected an unsupported Chardb protocol version",
+            });
+        }
+        c.close();
+        await flush();
+        expect(subscriptionNotifications).toBe(1);
+        expect(rejectionCount).toBe(2);
     });
 
     test("queues protected operations until the verified welcome arrives", async () => {
@@ -118,13 +139,99 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
         const ws = fakeWebSocket();
         c.subscribe("queries.ts#listMessages", { organizationId: "org-1" }, () => {});
-        void c.mutate("src/api.ts#post", { body: "hi" });
+        const mutation = c.mutate("src/api.ts#post", { body: "hi" });
         await flush();
         expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
 
         await welcome(ws);
         expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello", "sub", "mut"]);
+        const rejection = mutation.catch(error => error);
         c.close();
+        await expect(rejection).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
+    });
+
+    test("getJwt rejection terminates queued work without opening a socket", async () => {
+        let rejectJwt: ((reason: unknown) => void) | undefined;
+        const jwt = new Promise<string>((_resolve, reject) => {
+            rejectJwt = reject;
+        });
+        const c = createChardbClient({
+            endpoint: "wss://example.com/ws",
+            getJwt: () => jwt,
+            clientId: "c-jwt-failure",
+            crossTab: false,
+        });
+        let subscriptionNotifications = 0;
+        c.subscribe("queries.ts#listMessages", {}, () => subscriptionNotifications++);
+        const mutationError = c.mutate("src/api.ts#post", {}).catch(error => error);
+        if (!rejectJwt) throw new Error("expected getJwt to start during client construction");
+        rejectJwt(new Error("token endpoint unavailable"));
+        await flush();
+
+        expect(c.state).toBe("closed");
+        expect(FakeWS.instances).toHaveLength(0);
+        expect(subscriptionNotifications).toBe(1);
+        await expect(mutationError).resolves.toMatchObject({
+            code: "CDB_INVARIANT",
+            message: "failed to establish Chardb client session",
+        });
+    });
+
+    test("invalid connection setup terminates queued work without retrying", async () => {
+        const c = createChardbClient({
+            endpoint: "not a websocket URL",
+            getJwt: async () => "jwt-stub",
+            clientId: "c-setup-failure",
+            crossTab: false,
+        });
+        const mutationError = c.mutate("src/api.ts#post", {}).catch(error => error);
+        await flush();
+
+        expect(c.state).toBe("closed");
+        expect(FakeWS.instances).toHaveLength(0);
+        await expect(mutationError).resolves.toMatchObject({
+            code: "CDB_INVARIANT",
+            message: "failed to establish Chardb client session",
+        });
+        await new Promise(resolve => setTimeout(resolve, 300));
+        expect(FakeWS.instances).toHaveLength(0);
+    });
+
+    test("a malformed pre-welcome message terminates queued work", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        let subscriptionNotifications = 0;
+        c.subscribe("queries.ts#listMessages", {}, () => subscriptionNotifications++);
+        const mutationError = c.mutate("src/api.ts#post", {}).catch(error => error);
+        ws.onmessage?.({ data: "{" });
+        await flush();
+
+        expect(c.state).toBe("closed");
+        expect(subscriptionNotifications).toBe(1);
+        await expect(mutationError).resolves.toMatchObject({
+            code: "CDB_INVARIANT",
+            message: "server sent an invalid Chardb handshake message",
+        });
+    });
+
+    test("a malformed established-session message settles in-flight work instead of escaping the callback", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        let subscriptionNotifications = 0;
+        c.subscribe("queries.ts#listMessages", {}, () => subscriptionNotifications++);
+        const mutationError = c.mutate("src/api.ts#post", {}).catch(error => error);
+        ws.onmessage?.({ data: "{" });
+        await flush();
+
+        expect(c.state).toBe("closed");
+        expect(subscriptionNotifications).toBe(1);
+        await expect(mutationError).resolves.toMatchObject({
+            code: "CDB_INVARIANT",
+            message: "server sent an invalid Chardb session message",
+        });
     });
 
     test("a terminal auth error before welcome closes without entering a reconnect loop", async () => {
@@ -327,15 +434,29 @@ describe("createChardbClient — wire round-trip", () => {
         c.close();
     });
 
-    test("close() halts further reconnect attempts and stops emitting messages", async () => {
+    test("close() settles queued work once and halts reconnect attempts", async () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
+        let subscriptionNotifications = 0;
+        c.subscribe("queries.ts#listMessages", {}, () => subscriptionNotifications++);
+        let rejectionCount = 0;
+        const mutationError = c.mutate("src/api.ts#post", {}).catch(error => {
+            rejectionCount++;
+            return error;
+        });
+        c.close();
         c.close();
         await flush();
-        // After close, the client state transitions to closed; sending should be a no-op.
         expect(c.state).toBe("closed");
-        void ws;
-        void MutId; // unused-import guard for static helpers brought in for clarity
+        expect(ws.readyState).toBe(FakeWS.CLOSED);
+        expect(subscriptionNotifications).toBe(1);
+        expect(rejectionCount).toBe(1);
+        await expect(mutationError).resolves.toMatchObject({
+            code: "CDB_STREAM_ABORTED",
+            message: "Chardb client closed before pending work settled",
+        });
+        await new Promise(resolve => setTimeout(resolve, 300));
+        expect(FakeWS.instances).toHaveLength(1);
     });
 });
