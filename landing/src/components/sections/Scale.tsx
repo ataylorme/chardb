@@ -10,17 +10,18 @@ export function Scale() {
                     </p>
                     <SectionHeading>Separate tenant placement from physical shards.</SectionHeading>
                     <SectionLead>
-                        The router maps tenant keys into 16,384 logical ranges. Catalog can move a range between Durable
-                        Objects without changing application keys. Automatic production resharding is not wired yet.
+                        Organization keys map deterministically into 16,384 virtual shards, and Catalog stores the
+                        current physical range map. Split, copy, tail, and phase logic are tested in isolation;
+                        automatic end-to-end resharding and recovery are not.
                     </SectionLead>
                     <BulletList
                         items={[
-                            "16,384 vshards, range-routed",
-                            "Catalog owns the physical range map",
-                            "resharding helpers and state machines are tested in isolation",
+                            "16,384 virtual shards with deterministic organization routing",
+                            "Catalog stores current physical range ownership",
+                            "reshard copy, tail, and phase logic are isolated, not an automated production path",
                         ]}
                     />
-                    <PullQuote>routing is implemented. automation is unfinished.</PullQuote>
+                    <PullQuote>routing is implemented. live resharding is not.</PullQuote>
                 </div>
 
                 <div className="lg:col-span-5">
@@ -120,7 +121,7 @@ export function Scale() {
                                 fontSize="10"
                                 fill="#5A5A5A"
                             >
-                                grow → split a range, move it to a new shard
+                                design target: split a range and move ownership
                             </text>
                         </svg>
                     </div>

@@ -16,8 +16,9 @@ export function Hero() {
                         className="mt-6 text-fg-muted max-w-2xl"
                         style={{ fontSize: "clamp(16px, 1.4vw, 18px)", lineHeight: 1.6 }}
                     >
-                        Declare an organization boundary in Drizzle, then derive placement, transactions, policy, and
-                        live-query routing on Cloudflare Durable Objects. The runtime is still under construction.
+                        Declare an organization boundary in Drizzle. Declared organization mutations now cross verified
+                        identity, Catalog membership, tenant routing, policy enforcement, and one shard-local
+                        transaction. Public queries, live results, and migrations are not connected yet.
                     </p>
 
                     <div className="mt-8 flex flex-col sm:flex-row sm:items-center gap-4">

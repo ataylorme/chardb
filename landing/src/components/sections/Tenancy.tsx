@@ -7,10 +7,10 @@ export function Tenancy() {
         <Section id="tenancy" num="03" label="tenancy">
             <SectionHeading>Put the tenant boundary in the schema.</SectionHeading>
             <SectionLead>
-                Per-tenant ACID, declared in the schema. <InlineCode>forOrg()</InlineCode>,{" "}
-                <InlineCode>forUser()</InlineCode>, and <InlineCode>globalScope()</InlineCode> from{" "}
-                <InlineCode>chardb/server</InlineCode> mark the intended boundary. The colocation compiler already
-                derives placement from it. Runtime enforcement is the main unfinished work.
+                For declared organization mutations, <InlineCode>forOrg()</InlineCode> supplies the colocation, routing,
+                and policy boundary for one shard-local transaction. <InlineCode>forUser()</InlineCode> and{" "}
+                <InlineCode>globalScope()</InlineCode> are available schema primitives, but they do not have equally
+                complete public runtime paths.
             </SectionLead>
 
             <div className="mt-10">
@@ -34,7 +34,7 @@ export function Tenancy() {
                     <Fn>primaryKey</Fn>
                     <P>(),</P>
                     {"\n  "}
-                    <Cmt>{"// intended tenant and placement key"}</Cmt>
+                    <Cmt>{"// organization placement and policy key"}</Cmt>
                     {"\n  "}
                     <Id>organizationId</Id>
                     <P>:</P> <Fn>text</Fn>
@@ -65,7 +65,7 @@ export function Tenancy() {
                 </CodeCard>
             </div>
 
-            <PullQuote>the schema is the boundary.</PullQuote>
+            <PullQuote>organization mutations use the schema as the boundary.</PullQuote>
         </Section>
     );
 }

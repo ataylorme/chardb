@@ -7,15 +7,17 @@ export function Auth() {
         <Section id="auth" num="04" label="auth">
             <SectionHeading>Declare access beside the table.</SectionHeading>
             <SectionLead>
-                Better Auth tables and row and column rules compile from the same schema. The compiler exists. The read
-                and write executors still need to enforce its output.
+                Better Auth models live in Catalog. For each declared organization mutation, Gateway re-derives
+                membership and roles from Catalog, then Cdb enforces schema-declared create, update, delete, row, and
+                column rules. Select policy runs only in isolated shard-local queries because public query routing is
+                unfinished.
             </SectionLead>
 
             <BulletList
                 items={[
-                    "Better Auth schema synthesis",
-                    "role and column matrices checked at startup",
-                    "default-deny runtime enforcement still in progress",
+                    "Catalog-backed Better Auth models and signed Gateway identity",
+                    "declared organization writes use current membership, roles, auth epochs, row predicates, and column rules",
+                    "public queries, snapshots, live results, and a full sign-in-to-read/write application test remain unfinished",
                 ]}
             />
 
@@ -172,10 +174,11 @@ export function Auth() {
             </div>
 
             <p className="mt-6 text-sm text-fg-muted">
-                Policy declarations compile today. Do not rely on them in production.
+                Declared organization mutations execute through the policy wrapper in focused workerd tests. The package
+                remains experimental; do not use production data.
             </p>
 
-            <PullQuote>the declaration is real. enforcement comes next.</PullQuote>
+            <PullQuote>organization write enforcement exists. the public read path does not.</PullQuote>
         </Section>
     );
 }

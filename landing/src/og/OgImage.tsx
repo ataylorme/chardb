@@ -19,8 +19,8 @@ export function OgImage() {
                     </h1>
 
                     <p className="mt-7 text-fg-muted" style={{ fontSize: 24, lineHeight: 1.5, maxWidth: 640 }}>
-                        Derive tenant placement, transactions, and access rules from a Drizzle schema. Runtime work is
-                        in progress.
+                        A tested organization-mutation path derived from Drizzle. Public queries, live results, and
+                        migrations remain unfinished.
                     </p>
 
                     <div className="mt-10 inline-flex items-center rounded-full border border-line2 bg-ink-850 px-6 py-2.5 font-mono">

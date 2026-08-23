@@ -13,7 +13,7 @@ export function Closing() {
                         maxWidth: "18ch",
                     }}
                 >
-                    Does tenant-as-transaction-boundary fit your app?
+                    Does a schema-declared organization boundary fit your app?
                 </h2>
 
                 <div className="mt-10 flex flex-col sm:flex-row items-center justify-center gap-5">
