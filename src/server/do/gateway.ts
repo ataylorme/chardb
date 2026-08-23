@@ -61,6 +61,9 @@ import type {
     CdbQueryRpc,
     CdbSubscriptionRequest,
     CdbSubscriptionRpc,
+    GatewayInvalidationAck,
+    GatewayInvalidationRequest,
+    GatewayInvalidationResponse,
     LiveSubscriptionId,
     MutationRouteRequest,
     MutationRouteResolver,
@@ -83,6 +86,7 @@ CREATE TABLE IF NOT EXISTS _gw_registration_generations (
   intent_json TEXT NOT NULL,
   query_hash TEXT NOT NULL,
   shard_id TEXT NOT NULL,
+  source_cdb_id TEXT NOT NULL,
   schema_epoch INTEGER NOT NULL CHECK (schema_epoch >= 0),
   auth_global_epoch INTEGER NOT NULL CHECK (auth_global_epoch >= 0),
   auth_tenant_epoch INTEGER NOT NULL CHECK (auth_tenant_epoch >= 0),
@@ -146,6 +150,7 @@ export const PRESENCE_FANOUT_CAP = 1024 as const;
 
 export const PRESENCE_TTL_DEFAULT_MS = 30_000 as const;
 export const MAX_INITIAL_SNAPSHOTS_PER_CONNECTION = 64 as const;
+export const MAX_GATEWAY_INVALIDATIONS_PER_REQUEST = 64 as const;
 
 interface PendingGwAttachment {
     readonly kind: "pending";
@@ -500,7 +505,10 @@ export interface GatewayRegistrationInstall extends GatewayRegistrationKey {
     readonly args: RawJson;
     readonly intent: CdbIntent;
     readonly queryHash: string;
+    /** Catalog's logical shard identifier. */
     readonly shardId: string;
+    /** Physical Cdb Durable Object identifier that emits invalidations. */
+    readonly sourceCdbId: string;
     readonly schemaEpoch: number;
     readonly authEpochs: {
         readonly global: number;
@@ -545,11 +553,11 @@ export function installGatewayRegistration(
     sql.exec(
         `INSERT INTO _gw_registration_generations
          (registration_id, principal_id, client_id, sub_id, connection_id, organization_id,
-          ref, args_json, intent_json, query_hash, shard_id, schema_epoch,
+          ref, args_json, intent_json, query_hash, shard_id, source_cdb_id, schema_epoch,
           auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
           lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_version,
           last_cookie, retry_count, retry_at, retry_error, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                  'installing', 'pending', 0, 0, NULL, 0, ?, 0, NULL, NULL, ?, ?)`,
         input.registrationId,
         input.principalId,
@@ -562,6 +570,7 @@ export function installGatewayRegistration(
         stableJson(input.intent),
         input.queryHash,
         input.shardId,
+        input.sourceCdbId,
         input.schemaEpoch,
         input.authEpochs.global,
         input.authEpochs.tenant,
@@ -714,6 +723,7 @@ function assertGatewayRegistrationInstall(input: GatewayRegistrationInstall): vo
         ["ref", input.ref],
         ["queryHash", input.queryHash],
         ["shardId", input.shardId],
+        ["sourceCdbId", input.sourceCdbId],
     ] as const) {
         if (value.length === 0) throw new TypeError(`${name} must be nonempty`);
     }
@@ -721,6 +731,86 @@ function assertGatewayRegistrationInstall(input: GatewayRegistrationInstall): vo
 
 function assertNonnegativeSafeInteger(value: number, name: string): void {
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a nonnegative safe integer`);
+}
+
+function ensureGatewayRegistrationColumns(sql: SyncSql): void {
+    const columns = new Set(
+        sql.all<{ name: string }>("PRAGMA table_info('_gw_registration_generations')").map(column => column.name)
+    );
+    if (!columns.has("source_cdb_id")) {
+        // Existing generations predate physical Cdb identity. A null source is
+        // intentionally stale until that logical subscription is replaced.
+        sql.exec("ALTER TABLE _gw_registration_generations ADD COLUMN source_cdb_id TEXT");
+    }
+}
+
+function gatewayInvalidationInvariant(message: string, cause?: unknown): CdbError {
+    return new CdbError({ code: "CDB_INVARIANT", message, ...(cause === undefined ? {} : { cause }) });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+    const actual = Object.keys(value).sort();
+    const expected = [...keys].sort();
+    return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function isBoundedIdentity(value: unknown): value is string {
+    return (
+        typeof value === "string" &&
+        value.length > 0 &&
+        value.length <= 512 &&
+        value.trim() === value &&
+        !hasAsciiControlCharacter(value)
+    );
+}
+
+function validateGatewayInvalidationRequest(value: unknown, expectedGatewayId: string): GatewayInvalidationRequest {
+    if (!isRecord(value) || !hasExactKeys(value, ["sourceCdbId", "gatewayId", "invalidations"])) {
+        throw gatewayInvalidationInvariant("Gateway invalidation request has an unexpected shape");
+    }
+    if (
+        !isBoundedIdentity(value.sourceCdbId) ||
+        !isBoundedIdentity(value.gatewayId) ||
+        value.gatewayId !== expectedGatewayId ||
+        !Array.isArray(value.invalidations) ||
+        value.invalidations.length === 0 ||
+        value.invalidations.length > MAX_GATEWAY_INVALIDATIONS_PER_REQUEST
+    ) {
+        throw gatewayInvalidationInvariant("Gateway invalidation request is malformed or misrouted");
+    }
+
+    const seen = new Set<string>();
+    for (const item of value.invalidations) {
+        if (!isRecord(item) || !hasExactKeys(item, ["subscription", "changeSeq"])) {
+            throw gatewayInvalidationInvariant("Gateway invalidation item has an unexpected shape");
+        }
+        const subscription = item.subscription;
+        if (
+            !isRecord(subscription) ||
+            !hasExactKeys(subscription, ["gatewayId", "registrationId", "connectionId", "clientId", "subId"])
+        ) {
+            throw gatewayInvalidationInvariant("Gateway invalidation subscription has an unexpected shape");
+        }
+        if (
+            subscription.gatewayId !== expectedGatewayId ||
+            !isBoundedIdentity(subscription.registrationId) ||
+            !isBoundedIdentity(subscription.connectionId) ||
+            !isBoundedIdentity(subscription.clientId) ||
+            !Number.isSafeInteger(subscription.subId) ||
+            (subscription.subId as number) < 0 ||
+            !Number.isSafeInteger(item.changeSeq) ||
+            (item.changeSeq as number) <= 0 ||
+            seen.has(subscription.registrationId)
+        ) {
+            throw gatewayInvalidationInvariant("Gateway invalidation identity, sequence, or uniqueness is invalid");
+        }
+        seen.add(subscription.registrationId);
+    }
+    return value as unknown as GatewayInvalidationRequest;
 }
 
 export interface GatewayJwtVerificationRequest {
@@ -913,7 +1003,62 @@ export class Gateway extends DurableObject<GatewayEnv> {
             .map(s => s.trim())
             .filter(Boolean))
             sql.exec(stmt);
+        ensureGatewayRegistrationColumns(sql);
         this.bootstrapped = true;
+    }
+
+    /**
+     * Accept Cdb invalidations only for the exact generation that still owns
+     * its logical head. Dirty versions remain durable for the later runner.
+     */
+    async invalidateSubscriptions(request: GatewayInvalidationRequest): Promise<GatewayInvalidationResponse> {
+        const gatewayId = this.ctx.id.toString();
+        const validated = validateGatewayInvalidationRequest(request, gatewayId);
+        const updatedAt = Date.now();
+        const acknowledgements = this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            return validated.invalidations.map(({ subscription, changeSeq }): GatewayInvalidationAck => {
+                sql.exec(
+                    `UPDATE _gw_registration_generations
+                     SET dirty_version = MAX(dirty_version, ?), updated_at = ?
+                     WHERE registration_id = ? AND connection_id = ? AND client_id = ? AND sub_id = ?
+                       AND source_cdb_id = ?
+                       AND lifecycle <> 'retiring' AND cdb_state <> 'retiring'
+                       AND EXISTS (
+                         SELECT 1 FROM _gw_registration_heads h
+                         WHERE h.registration_id = _gw_registration_generations.registration_id
+                           AND h.principal_id = _gw_registration_generations.principal_id
+                           AND h.client_id = _gw_registration_generations.client_id
+                           AND h.sub_id = _gw_registration_generations.sub_id
+                       )`,
+                    changeSeq,
+                    updatedAt,
+                    subscription.registrationId,
+                    subscription.connectionId,
+                    subscription.clientId,
+                    subscription.subId,
+                    validated.sourceCdbId
+                );
+                return {
+                    registrationId: subscription.registrationId,
+                    changeSeq,
+                    status: sql.changes() === 1 ? "accepted" : "stale",
+                };
+            });
+        });
+
+        if (acknowledgements.some(acknowledgement => acknowledgement.status === "accepted")) {
+            try {
+                await this.ctx.storage.setAlarm(updatedAt + 1);
+            } catch (error) {
+                throw new CdbError({
+                    code: "CDB_SHARD_UNAVAILABLE",
+                    message: "Gateway could not durably schedule invalidation work",
+                    cause: error,
+                });
+            }
+        }
+        return { gatewayId, acknowledgements };
     }
 
     /**

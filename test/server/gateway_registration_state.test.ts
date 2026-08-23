@@ -50,6 +50,7 @@ function registration(
         },
         queryHash: "query-hash-1",
         shardId: "shard-1",
+        sourceCdbId: "cdb-object-1",
         schemaEpoch: 4,
         authEpochs: { global: 5, tenant: 6, principal: 7 },
         lastCookie: Cookie("cookie-0"),
@@ -105,6 +106,7 @@ describe("Gateway durable registration generations", () => {
             db
                 .query(
                     `SELECT connection_id, organization_id, ref, args_json, intent_json, query_hash, shard_id,
+                            source_cdb_id,
                             schema_epoch, auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
                             lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_version,
                             last_cookie, retry_count, retry_at, retry_error
@@ -120,6 +122,7 @@ describe("Gateway durable registration generations", () => {
                 '{"kind":"select","partitionKey":{"column":"organization_id","table":"messages","values":["org-1"]},"tables":["messages"]}',
             query_hash: "query-hash-1",
             shard_id: "shard-1",
+            source_cdb_id: "cdb-object-1",
             schema_epoch: 4,
             auth_global_epoch: 5,
             auth_tenant_epoch: 6,
