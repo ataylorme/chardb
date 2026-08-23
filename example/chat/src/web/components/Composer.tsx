@@ -28,7 +28,7 @@ export function Composer({ channelId, currentUser }: ComposerProps) {
         } finally {
             setPending(false);
         }
-    }, [body, currentUser, pending, send]);
+    }, [body, pending, send]);
 
     return (
         <form

@@ -103,7 +103,7 @@ describe("workerd reshard harness", () => {
                 op: "_exec",
                 target,
                 body: {
-                    sql: `CREATE TABLE messages (id TEXT PRIMARY KEY, org_id TEXT, body TEXT)`,
+                    sql: "CREATE TABLE messages (id TEXT PRIMARY KEY, org_id TEXT, body TEXT)",
                 },
             });
         }
@@ -114,7 +114,7 @@ describe("workerd reshard harness", () => {
                 op: "_exec",
                 target: "src",
                 body: {
-                    sql: `INSERT INTO messages VALUES (?, ?, ?)`,
+                    sql: "INSERT INTO messages VALUES (?, ?, ?)",
                     params: [`m-${i}`, orgInRange, `body-${i}`],
                 },
             });
@@ -123,7 +123,7 @@ describe("workerd reshard harness", () => {
             op: "_exec",
             target: "src",
             body: {
-                sql: `INSERT INTO messages VALUES (?, ?, ?)`,
+                sql: "INSERT INTO messages VALUES (?, ?, ?)",
                 params: ["m-out", orgOutOfRange, "out-of-range"],
             },
         });
@@ -151,7 +151,7 @@ describe("workerd reshard harness", () => {
                 op: "_exec",
                 target: "src",
                 body: {
-                    sql: `INSERT INTO messages VALUES (?, ?, ?)`,
+                    sql: "INSERT INTO messages VALUES (?, ?, ?)",
                     params: [`m-${i}`, orgInRange, `body-${i}`],
                 },
             });
@@ -161,7 +161,7 @@ describe("workerd reshard harness", () => {
             op: "_exec",
             target: "src",
             body: {
-                sql: `UPDATE messages SET body = ? WHERE id = ?`,
+                sql: "UPDATE messages SET body = ? WHERE id = ?",
                 params: ["body-0-edited", "m-0"],
             },
         });
@@ -255,7 +255,7 @@ describe("workerd reshard harness", () => {
         await rpc({
             op: "_exec",
             target: "dst",
-            body: { sql: `CREATE TABLE messages_iso (id TEXT PRIMARY KEY, org_id TEXT, body TEXT)` },
+            body: { sql: "CREATE TABLE messages_iso (id TEXT PRIMARY KEY, org_id TEXT, body TEXT)" },
         });
         // Range [0,0] only — only org_ids whose vshard hashes to 0 land. We
         // pass a batch with mixed orgs and assert applied < total.
