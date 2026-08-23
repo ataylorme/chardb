@@ -113,7 +113,8 @@ describe("Gateway durable registration generations", () => {
                     `SELECT connection_id, organization_id, ref, args_json, intent_json, query_hash, shard_id,
                             source_cdb_id,
                             schema_epoch, auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
-                            lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_version,
+                            lifecycle, cdb_state, dirty_version, delivered_version,
+                            run_token, run_target_version, run_version,
                             last_cookie, retry_count, retry_at, retry_error
                      FROM _gw_registration_generations WHERE registration_id = ?`
                 )
@@ -137,6 +138,7 @@ describe("Gateway durable registration generations", () => {
             dirty_version: 0,
             delivered_version: 0,
             run_token: null,
+            run_target_version: null,
             run_version: 0,
             last_cookie: "cookie-0",
             retry_count: 0,
@@ -153,10 +155,17 @@ describe("Gateway durable registration generations", () => {
         expect(
             db
                 .query(
-                    "SELECT lifecycle, cdb_state, run_token, run_version FROM _gw_registration_generations WHERE registration_id = ?"
+                    `SELECT lifecycle, cdb_state, run_token, run_target_version, run_version
+                     FROM _gw_registration_generations WHERE registration_id = ?`
                 )
                 .get(first.registrationId)
-        ).toEqual({ lifecycle: "retiring", cdb_state: "retiring", run_token: null, run_version: 2 });
+        ).toEqual({
+            lifecycle: "retiring",
+            cdb_state: "retiring",
+            run_token: null,
+            run_target_version: null,
+            run_version: 2,
+        });
         expect(
             db
                 .query(
@@ -200,16 +209,27 @@ describe("Gateway durable registration generations", () => {
     test("explicit retire removes the head and retains a cleanup row", () => {
         const current = registration("registration-retire");
         db.transaction(() => installGatewayRegistration(sql, current))();
+        expect(
+            db.transaction(() => beginInitialGatewayQuery(sql, { ...current, changeSeq: 3, nowMs: 200 }))()
+        ).toMatchObject({ baseline: 3, runVersion: 1 });
 
         expect(db.transaction(() => retireGatewayRegistration(sql, current, current.registrationId, 250))()).toBe(true);
         expect(db.query("SELECT * FROM _gw_registration_heads").all()).toEqual([]);
         expect(
             db
                 .query(
-                    "SELECT lifecycle, cdb_state, run_version FROM _gw_registration_generations WHERE registration_id = ?"
+                    `SELECT lifecycle, cdb_state, delivered_version, run_token, run_target_version, run_version
+                     FROM _gw_registration_generations WHERE registration_id = ?`
                 )
                 .get(current.registrationId)
-        ).toEqual({ lifecycle: "retiring", cdb_state: "retiring", run_version: 1 });
+        ).toEqual({
+            lifecycle: "retiring",
+            cdb_state: "retiring",
+            delivered_version: 0,
+            run_token: null,
+            run_target_version: null,
+            run_version: 2,
+        });
     });
 
     test("isolates equal client and sub ids by principal", () => {
@@ -255,7 +275,7 @@ describe("Gateway durable registration generations", () => {
         ).toEqual([{ registration_id: "registration-new" }]);
     });
 
-    test("begins an initial query from the higher subscription or dirty baseline", () => {
+    test("begins an initial query without claiming delivery before snapshot settlement", () => {
         const current = registration("registration-begin");
         db.transaction(() => installGatewayRegistration(sql, current))();
         db.query("UPDATE _gw_registration_generations SET dirty_version = 9 WHERE registration_id = ?").run(
@@ -275,7 +295,7 @@ describe("Gateway durable registration generations", () => {
             db
                 .query(
                     `SELECT lifecycle, cdb_state, dirty_version, delivered_version,
-                            run_token, run_version, updated_at
+                            run_token, run_target_version, run_version, updated_at
                      FROM _gw_registration_generations WHERE registration_id = ?`
                 )
                 .get(current.registrationId)
@@ -283,8 +303,9 @@ describe("Gateway durable registration generations", () => {
             lifecycle: "installing",
             cdb_state: "active",
             dirty_version: 9,
-            delivered_version: 9,
+            delivered_version: 0,
             run_token: run?.runToken,
+            run_target_version: 9,
             run_version: 1,
             updated_at: 200,
         });
@@ -322,6 +343,20 @@ describe("Gateway durable registration generations", () => {
             )()
         ).toBe(false);
         expect(
+            db
+                .query(
+                    `SELECT lifecycle, dirty_version, delivered_version, run_token, run_target_version
+                     FROM _gw_registration_generations WHERE registration_id = ?`
+                )
+                .get(current.registrationId)
+        ).toEqual({
+            lifecycle: "installing",
+            dirty_version: 14,
+            delivered_version: 0,
+            run_token: run.runToken,
+            run_target_version: 6,
+        });
+        expect(
             db.transaction(() =>
                 settleInitialGatewaySnapshot(sql, {
                     ...current,
@@ -346,7 +381,7 @@ describe("Gateway durable registration generations", () => {
             db
                 .query(
                     `SELECT lifecycle, cdb_state, dirty_version, delivered_version,
-                            run_token, run_version, last_cookie
+                            run_token, run_target_version, run_version, last_cookie
                      FROM _gw_registration_generations WHERE registration_id = ?`
                 )
                 .get(current.registrationId)
@@ -356,6 +391,7 @@ describe("Gateway durable registration generations", () => {
             dirty_version: 14,
             delivered_version: 6,
             run_token: null,
+            run_target_version: null,
             run_version: 2,
             last_cookie: "cookie-settled",
         });
@@ -392,10 +428,11 @@ describe("Gateway durable registration generations", () => {
         expect(
             db
                 .query(
-                    "SELECT lifecycle, cdb_state, run_token FROM _gw_registration_generations WHERE registration_id = ?"
+                    `SELECT lifecycle, cdb_state, run_token, run_target_version
+                     FROM _gw_registration_generations WHERE registration_id = ?`
                 )
                 .get(old.registrationId)
-        ).toEqual({ lifecycle: "retiring", cdb_state: "retiring", run_token: null });
+        ).toEqual({ lifecycle: "retiring", cdb_state: "retiring", run_token: null, run_target_version: null });
         expect(
             db.query("SELECT registration_id FROM _gw_registration_heads WHERE principal_id = ?").get(old.principalId)
         ).toEqual({ registration_id: replacement.registrationId });

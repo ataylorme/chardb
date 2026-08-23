@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS _gw_registration_generations (
   dirty_version INTEGER NOT NULL CHECK (dirty_version >= 0),
   delivered_version INTEGER NOT NULL CHECK (delivered_version >= 0 AND delivered_version <= dirty_version),
   run_token TEXT,
+  run_target_version INTEGER CHECK (run_target_version IS NULL OR (run_target_version >= 0 AND run_target_version <= dirty_version)),
   run_version INTEGER NOT NULL CHECK (run_version >= 0),
   last_cookie TEXT,
   retry_count INTEGER NOT NULL CHECK (retry_count >= 0),
@@ -590,10 +591,10 @@ export function installGatewayRegistration(
          (registration_id, principal_id, client_id, sub_id, connection_id, organization_id,
           ref, args_json, intent_json, query_hash, shard_id, source_cdb_id, schema_epoch,
           auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
-          lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_version,
+          lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_target_version, run_version,
           last_cookie, retry_count, retry_at, retry_error, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 'installing', 'pending', 0, 0, NULL, 0, ?, 0, NULL, NULL, ?, ?)`,
+                 'installing', 'pending', 0, 0, NULL, NULL, 0, ?, 0, NULL, NULL, ?, ?)`,
         input.registrationId,
         input.principalId,
         input.clientId,
@@ -617,7 +618,7 @@ export function installGatewayRegistration(
     if (previous) {
         sql.exec(
             `UPDATE _gw_registration_generations
-             SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL,
+             SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
                  run_version = run_version + 1, updated_at = ?
              WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
             input.nowMs,
@@ -656,7 +657,7 @@ export function advanceGatewayRegistration(sql: SyncSql, input: GatewayRegistrat
     sql.exec(
         `UPDATE _gw_registration_generations
          SET lifecycle = ?, cdb_state = ?, dirty_version = ?, delivered_version = ?,
-             run_token = ?, run_version = run_version + 1, last_cookie = ?,
+             run_token = ?, run_target_version = NULL, run_version = run_version + 1, last_cookie = ?,
              retry_count = ?, retry_at = ?, retry_error = ?, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
            AND run_version = ?
@@ -695,8 +696,8 @@ export function beginInitialGatewayQuery(sql: SyncSql, input: GatewayInitialQuer
     assertGatewayRegistrationIdentity(input);
     assertNonnegativeSafeInteger(input.changeSeq, "changeSeq");
     assertNonnegativeSafeInteger(input.nowMs, "nowMs");
-    const current = sql.one<{ dirty_version: number; run_version: number }>(
-        `SELECT g.dirty_version, g.run_version
+    const current = sql.one<{ dirty_version: number; delivered_version: number; run_version: number }>(
+        `SELECT g.dirty_version, g.delivered_version, g.run_version
          FROM _gw_registration_generations g
          INNER JOIN _gw_registration_heads h
            ON h.registration_id = g.registration_id
@@ -718,7 +719,7 @@ export function beginInitialGatewayQuery(sql: SyncSql, input: GatewayInitialQuer
     const runVersion = current.run_version + 1;
     sql.exec(
         `UPDATE _gw_registration_generations
-         SET cdb_state = 'active', dirty_version = ?, delivered_version = ?,
+         SET cdb_state = 'active', dirty_version = ?, run_target_version = ?,
              run_token = ?, run_version = run_version + 1, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
            AND connection_id = ? AND lifecycle = 'installing' AND cdb_state = 'pending'
@@ -746,17 +747,19 @@ export function beginInitialGatewayQuery(sql: SyncSql, input: GatewayInitialQuer
         dirty_version: number;
         delivered_version: number;
         run_token: string;
+        run_target_version: number;
         run_version: number;
     }>(
-        `SELECT dirty_version, delivered_version, run_token, run_version
+        `SELECT dirty_version, delivered_version, run_token, run_target_version, run_version
          FROM _gw_registration_generations WHERE registration_id = ?`,
         input.registrationId
     );
     if (
         !stored ||
         stored.dirty_version !== baseline ||
-        stored.delivered_version !== baseline ||
+        stored.delivered_version !== current.delivered_version ||
         stored.run_token !== runToken ||
+        stored.run_target_version !== baseline ||
         stored.run_version !== runVersion
     ) {
         throw gatewayInvalidationInvariant("initial Gateway query baseline was not stored atomically");
@@ -764,7 +767,10 @@ export function beginInitialGatewayQuery(sql: SyncSql, input: GatewayInitialQuer
     return { baseline, runToken, runVersion };
 }
 
-/** Complete one initial snapshot only when its run token still owns the current generation. */
+/**
+ * Claim delivery only after the caller sent or durably staged the snapshot.
+ * The stored run target, not the latest dirty version, is what this run owns.
+ */
 export function settleInitialGatewaySnapshot(sql: SyncSql, input: GatewayInitialSnapshotSettle): boolean {
     assertGatewayRegistrationIdentity(input);
     if (input.runToken.length === 0) throw new TypeError("runToken must be nonempty");
@@ -772,11 +778,12 @@ export function settleInitialGatewaySnapshot(sql: SyncSql, input: GatewayInitial
     assertNonnegativeSafeInteger(input.nowMs, "nowMs");
     sql.exec(
         `UPDATE _gw_registration_generations
-         SET lifecycle = 'active', run_token = NULL, run_version = run_version + 1,
+         SET lifecycle = 'active', delivered_version = MAX(delivered_version, run_target_version),
+             run_token = NULL, run_target_version = NULL, run_version = run_version + 1,
              last_cookie = ?, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
            AND connection_id = ? AND lifecycle = 'installing' AND cdb_state = 'active'
-           AND run_token = ?
+           AND run_token = ? AND run_target_version IS NOT NULL
            AND EXISTS (
              SELECT 1 FROM _gw_registration_heads h
              WHERE h.registration_id = _gw_registration_generations.registration_id
@@ -867,7 +874,7 @@ export function retireCurrentGatewayRegistration(
     if (!current) return null;
     sql.exec(
         `UPDATE _gw_registration_generations
-         SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL,
+         SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
              run_version = run_version + 1, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
            AND connection_id = ?`,
@@ -946,7 +953,7 @@ export function retireGatewayRegistration(
     if (!removedHead) return false;
     sql.exec(
         `UPDATE _gw_registration_generations
-         SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL,
+         SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
              run_version = run_version + 1, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
         nowMs,
@@ -1038,6 +1045,13 @@ function ensureGatewayRegistrationColumns(sql: SyncSql): void {
         // Existing generations predate physical Cdb identity. A null source is
         // intentionally stale until that logical subscription is replaced.
         sql.exec("ALTER TABLE _gw_registration_generations ADD COLUMN source_cdb_id TEXT");
+    }
+    if (!columns.has("run_target_version")) {
+        sql.exec(
+            `ALTER TABLE _gw_registration_generations
+             ADD COLUMN run_target_version INTEGER
+             CHECK (run_target_version IS NULL OR (run_target_version >= 0 AND run_target_version <= dirty_version))`
+        );
     }
 }
 
