@@ -4,7 +4,7 @@ Experimental tenant-sharded SQLite for Cloudflare Durable Objects.
 
 Chardb explores one idea: mark an organization boundary in a Drizzle schema, then derive data placement, per-tenant transactions, authorization, and live-query routing from that declaration.
 
-The repository is public engineering work, not a database you should deploy yet. The routing, colocation, op-log, policy compilation, and resharding pieces have substantial tests. The domain mutation and query paths are not connected end to end.
+This is engineering work intended for public review, not a database you should deploy yet. The routing, colocation, op-log, policy compilation, and resharding pieces have substantial tests. The domain mutation and query paths are not connected end to end.
 
 ## Current state
 
@@ -15,21 +15,37 @@ Implemented and tested in isolation:
 - SQLite mutation deduplication through an operation log
 - Catalog routing, snapshot barriers, and resharding state machines
 - Hibernated WebSocket bookkeeping
-- Better Auth schema synthesis and SQL adapter helpers
+- Strict protocol-v2 decoding and server-owned query routing metadata
+- Better Auth schema synthesis with all auth rows stored in Catalog
+- Constraint-complete Catalog auth DDL with exact `auth_ddl_v1` compatibility checks
+- Atomic Catalog auth mutations with directly derivable old and new epoch bumps
+- Gateway JWT signature and registered-claim verification
 - Schema-first row and column policy compilation
 - TLA+ models for snapshot barriers and resharding
+- Packed-package import checks and a standalone `chardb init` scaffold
 
 Still missing from the application path:
 
-- Verifying WebSocket auth so public mutations can reach the owning Durable Object
-- Constructing the handler's auth context from verified identity and membership
+- Resolving tenant membership, role, and policy authority after Gateway verifies identity
+- Constructing the handler's auth context from verified identity and server-owned authority
 - Applying row and column policies during real reads and writes
 - Executing an initial query for a subscription
 - Sending live results after a committed mutation
 - Applying domain migrations across shards
-- Production JWT verification in the Gateway
+- Replacing sampled scatter probes with Catalog range enumeration
+- Using composite Gateway, client, and subscription identities on Cdb shards
+- Canonicalizing query identity with verified auth and policy epochs
+- Adding versioned auth-schema upgrades and proving restart behavior in workerd
 
 Files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding remain experiments. They are not supported product features.
+
+The WebSocket protocol does not trust client routing metadata. Protocol v2 subscriptions carry a server-stamped query ref and raw arguments. Gateway verifies JWT signatures, subject, time bounds, issuer, audience, and allowed algorithms through a Catalog-backed JWK resolver. It stores verified identity but no tenant or role authority. Mutations, subscriptions, and presence therefore fail closed with `CDB_AUTH_NOT_BOUND` until membership and policy resolution exist.
+
+The JWT tests use real signatures and the Catalog resolver contract. A Miniflare workerd test drives the configured Gateway Durable Object and WebSocket with ES256 tokens and a real Catalog SQLite cache. It seeds `Catalog.putJwk` through a test-only HTTP route, so outbound JWKS fetch, cache refresh, and key rotation remain untested. Catalog auth DDL preserves constraints and indexes for new storage. Existing tables need exact matching `auth_ddl_v1` signatures; no versioned upgrade path exists.
+
+Each auth mutation commits with every directly derivable old and new global, tenant, or principal epoch bump. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. Bulk updates and deletes preload matched rows to derive epoch scopes. Indirect plugin relationships without placement metadata or conventional `organizationId` or `userId` fields may lack a secondary scope. These cases have Bun fake-Durable-Object coverage, not workerd coverage.
+
+Placeholder `/q`, `/f`, `/p`, and `/s` handlers were removed, and those paths fall through to the application. Placeholder React presence, upload, stream, and vector hooks are not exported.
 
 See [STATUS.md](./STATUS.md) for current capability boundaries, [ARCHITECTURE.md](./ARCHITECTURE.md) for the runtime design, and [PLAN.md](./PLAN.md) for the ordered implementation work.
 
@@ -102,6 +118,8 @@ bun run build
 - `spec` contains the TLA+ models.
 - `example/chat` is a concept application. It does not yet prove the complete runtime path.
 - `landing` contains the project site.
+
+The npm tarball contains built `dist` files and the public documents. It does not contain `src`. CI also runs `chardb init` from that tarball in a temporary project, installs its pinned dependencies without workspace aliases, typechecks it, and runs a Wrangler dry-run build. The generated README warns that domain migrations and the authenticated mutation, query, and live-update path are unfinished.
 
 ## License
 

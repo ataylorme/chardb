@@ -12,14 +12,7 @@ Finish the organization-tenanted SQL path first. Stop presenting files, vectors,
 
 ## 1. Settle how mutations execute
 
-The current design cannot work as written:
-
-- [`Gateway.routeMut`](src/server/do/gateway.ts) calls `Cdb.mutate` over RPC with one serializable argument.
-- [`Cdb.mutate`](src/server/do/cdb.ts) requires a second argument containing a local runner closure. RPC cannot transport that closure.
-- [`defineMutation`](src/server/define.ts) now requires synchronous handlers, but the public RPC path does not invoke them.
-- [`executeAtomicMutation`](src/server/atomic-mutation.ts) constructs the Drizzle database and commits handler SQL with the op-log, but Gateway and Cdb are not connected to it.
-
-Do this work before touching the higher-level features:
+The trusted mutation dispatcher now resolves the server manifest, routes through Catalog, and sends one serializable request to Cdb. Cdb resolves the handler and commits its SQL with the op-log inside one synchronous transaction. Gateway verifies WebSocket identity, but it cannot construct the trusted mutation request until Catalog-derived membership, role, and policy authority are connected. Client promise settlement also needs failure coverage.
 
 - [x] Write a small workerd test that runs two domain SQL statements in one Durable Object mutation and throws after the second statement.
 - [x] Prove that the failed mutation rolls back both statements and its op-log entry.
@@ -64,7 +57,7 @@ Stable references also need repair:
 
 ## 3. Create and migrate domain tables
 
-Cdb currently creates internal tables and partial auth tables. It never creates the user's domain tables. The migration command only prints or loops over caller-supplied SQL.
+Cdb creates its internal tables but never creates the user's domain tables. Auth rows now live in Catalog, which bootstraps synthesized auth tables but has no versioned migration path. The migration command only prints or loops over caller-supplied SQL.
 
 - [ ] Pick one migration input format. The sensible choice is the Drizzle migration journal and SQL files.
 - [ ] Make the Vite plugin or CLI package the migration journal with the Worker build.
@@ -73,7 +66,7 @@ Cdb currently creates internal tables and partial auth tables. It never creates 
 - [ ] Apply pending migrations to existing shards.
 - [ ] Record migration progress per shard so retries do not repeat completed work.
 - [ ] Refuse queries and mutations when a shard's schema epoch does not match the routed request.
-- [ ] Preserve primary keys, unique constraints, foreign keys, indexes, defaults, and column types. The current auth DDL drops most of these.
+- [ ] Preserve primary keys, unique constraints, foreign keys, indexes, defaults, and column types in the domain-table migration path.
 - [ ] Replace `chardb migrate` output that says "would apply" with real execution and a nonzero exit on failure.
 - [ ] Add a fresh-database test that starts with no domain tables, applies migrations, restarts the Durable Objects, and reads the migrated schema.
 - [ ] Add an upgrade test that applies a second migration without losing existing rows.
@@ -82,35 +75,42 @@ Online schema changes can wait. A maintenance-mode migration is enough for the f
 
 ## 4. Simplify and fix auth storage
 
-The Better Auth adapter now keeps every synthesized model in Catalog, so ordinary lookups no longer depend on a shard partition column. It is still not ready to back a session flow because generated table DDL loses constraints and indexes, multi-write adapter transactions are disabled, and no complete sign-in flow has run through the public application path.
+The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lookups no longer depend on a shard partition column. Catalog now renders constraint-complete table and index DDL from the synthesized schema. Existing tables must carry the matching `auth_ddl_v1` signature; there is no versioned upgrade path. Each auth mutation and every directly derivable old and new global, tenant, or principal epoch bump commit in one Catalog transaction. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`, and no complete sign-in flow has run through the public application path.
 
 - [x] Put all Better Auth tables in Catalog for the first working version.
 - [x] Remove auth sharding from the adapter and Cdb storage path.
 - [x] Bind the auth runtime during application-module initialization in every Worker and Durable Object isolate, and let Catalog retry auth-table bootstrap if it started before that binding.
-- [x] Test create and routine lookup by email, session token, provider/account key, and membership field, plus update, delete, and same-storage Catalog reconstruction in a Bun Durable Object harness.
-- [ ] Generate complete auth DDL from the synthesized schema.
-- [ ] Preserve unique constraints required for email, session token, provider account, membership, and plugin tables.
-- [ ] Preserve foreign keys and indexes.
-- [ ] Make date serialization agree with the adapter's `supportsDates` claim.
+- [x] Test create and routine lookup by email, session token, provider/account key, and membership field, plus update, delete, rollback, and same-storage Catalog reconstruction in a Bun fake-Durable-Object harness.
+- [x] Generate auth table and index DDL from the synthesized Drizzle schema, preserving keys, uniqueness, foreign keys, indexes, defaults, nullability, and SQLite types.
+- [x] Reject existing auth tables without matching `auth_ddl_v1` signatures instead of treating `CREATE TABLE IF NOT EXISTS` as an upgrade.
+- [ ] Add a versioned upgrade path for existing auth signatures instead of requiring pre-release Catalog recreation.
+- [x] Commit each auth write and every directly derivable old and new global, tenant, or principal epoch bump in one Catalog transaction.
+- [ ] Add placement metadata or explicit epoch-scope rules for indirect plugin relationships that lack conventional `organizationId` or `userId` fields.
+- [ ] Bound or replace the matched-row preload used to derive epoch scopes for bulk updates and deletes.
+- [x] Make date and boolean serialization agree with the adapter's capability claims.
 - [ ] Implement adapter transactions for multi-write auth operations, or state and enforce the smaller supported auth profile.
-- [ ] Add integration tests for sign-up or anonymous sign-in, session lookup by token, organization creation, membership lookup, active organization selection, logout, and restart recovery.
+- [ ] Add integration tests for sign-up or anonymous sign-in, session lookup by token, organization creation, membership lookup, active organization selection, and logout.
+- [ ] Add a real workerd test that restarts the configured Catalog isolate and proves auth bootstrap and stored sessions survive.
 - [ ] Add one configured Better Auth plugin only after the core flow works.
 
 ## 5. Make authentication a real trust boundary
 
-Gateway currently parses unsigned JWT bytes and stores their tenant and role claims as auth state. `verifyJwt` exists but has no production caller.
+The configured Gateway verifies JWT signatures and registered claims during `hello` and `updateAuth`. Its attachment stores only verified subject and time bounds. Verified identity is not tenant authority, so mutations, subscriptions, and presence remain fail-closed until Catalog-derived membership, role, and policy state are attached.
 
-- [ ] Verify the JWT signature before storing `principalId`, tenant, role, or custom claims.
-- [ ] Pin issuer, audience, accepted algorithms, and clock tolerance.
-- [ ] Resolve JWKS through Catalog and handle key rotation.
-- [ ] Reject missing, malformed, tampered, expired, and not-yet-valid tokens.
-- [ ] Handle the existing `updateAuth` wire message so a live socket can refresh its credentials.
-- [ ] Recheck token expiry before every mutation and protected subscription.
-- [ ] Stop deriving a principal from `clientId` for protected requests.
+- [x] Verify the JWT signature before storing `principalId`; do not copy tenant, role, or custom claims into the verified attachment.
+- [x] Pin issuer, audience, and accepted algorithms from the configured Better Auth JWT plugin, with a bounded 30-second default clock tolerance.
+- [x] Resolve JWKS through the Catalog-backed resolver contract.
+- [ ] Prove outbound JWKS fetch, key rotation, and cache refresh through the configured Gateway path.
+- [x] Reject missing, malformed, tampered, expired, not-yet-valid, wrong-issuer, wrong-audience, and disallowed-algorithm tokens.
+- [x] Handle `updateAuth`, replace the verified subject only after successful verification, and invalidate existing subscriptions.
+- [x] Recheck token time bounds before every mutation, subscription, and presence operation.
+- [x] Stop deriving a principal from `clientId` for protected requests.
 - [ ] Derive active organization membership and role from trusted server state. Do not accept a caller-supplied organization argument as authority.
 - [ ] Build `ctx.auth` only after verification and membership resolution.
 - [ ] Define the anonymous query behavior explicitly.
-- [ ] Add tests for tampered tokens, expired tokens, wrong audience, revoked membership, changed role, and a socket that outlives its token.
+- [x] Test real signed tokens, tampering, expiry, not-before, issuer, audience, algorithm, subject refresh, and the Catalog resolver contract.
+- [x] Test the configured Gateway WebSocket dispatch under workerd with real Catalog SQLite cache and ES256 tokens.
+- [ ] Add tests for revoked membership, changed role, and a socket that outlives its membership authority.
 
 ## 6. Replace the policy engine before wiring it in
 
@@ -150,7 +150,9 @@ The subscription protocol now sends a query reference and raw arguments. Gateway
 - [x] Validate query arguments with the query's Standard Schema validator before intent extraction.
 - [ ] Resolve the query reference inside the Cdb isolate.
 - [x] Recompute the query intent on the server. Do not trust the client's intent or query hash.
+- [ ] Canonicalize query identity and include the query ref, validated arguments, verified principal, tenant, auth epoch, and policy epoch.
 - [ ] Route organization queries using the verified tenant and the server-computed intent.
+- [ ] Enumerate Catalog ranges or shard ids for scatter routing. Do not infer coverage by probing every 256th virtual shard.
 - [ ] Construct `QueryCtx` with a read database and verified auth.
 - [ ] Apply row and column policies during query execution.
 - [ ] Execute the query handler.
@@ -164,7 +166,7 @@ The subscription protocol now sends a query reference and raw arguments. Gateway
 
 Do not start with incremental row patches. Re-run the affected query after a commit and send a replacement snapshot. Optimize after this is correct.
 
-- [ ] Give every shard subscription a composite identity containing Gateway, client, and subscription IDs. Numeric `subId` alone collides across clients.
+- [ ] Give every shard subscription a composite identity containing Gateway, client, and subscription IDs. Numeric `subId` alone collides across clients and Gateway objects.
 - [ ] Persist shard subscription registrations.
 - [ ] Rebuild the in-memory interval index after a Cdb restart.
 - [ ] Include query reference, arguments, verified principal, tenant, auth epoch, and last delivered cookie in the persisted record.
@@ -217,7 +219,7 @@ The chat directory now consumes the packed package and passes compile-time check
 ## 11. Repair the CLI and local setup
 
 - [x] Rewrite `chardb init` to generate `forOrg`, `cdbTable`, current auth setup, current API helpers, and the actual Wrangler bindings.
-- [ ] Make the generated project install and build without this monorepo.
+- [x] Make the generated project install, typecheck, and pass a Wrangler dry-run build from the packed tarball without workspace aliases.
 - [x] Make `doctor` report unimplemented checks as failures, not success.
 - [x] Wire the advertised `explain` command into command dispatch.
 - [x] Keep unfinished commands visible only when help labels them `not implemented`, and make invocation exit nonzero.
