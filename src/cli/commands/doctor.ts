@@ -9,33 +9,26 @@ export async function runDoctor(ctx: CliContext, opts: DoctorOptions = {}): Prom
     const which = opts.which ?? "wrangler";
     if (which === "wrangler") return doctorWrangler(ctx);
     if (which === "schema") {
-        // The partition-contract digest comparison runs at `defineChardb`
-        // construction (deriving via `colocation/derive.ts`). The CLI gate
-        // that diff-checks the digest against the deployed value isn't
-        // wired yet — return a warning so callers don't treat this command
-        // as a real check.
-        ctx.stdout("chardb doctor schema: not yet implemented at the CLI layer\n");
+        const error = "chardb doctor schema: not implemented; no deployed partition-contract check was performed";
+        ctx.stderr(`error: ${error}\n`);
         return {
-            ok: true,
-            errors: [],
-            warnings: ["`chardb doctor schema` is not yet enforced — use `defineChardb` failure modes for now"],
+            ok: false,
+            errors: [error],
+            warnings: [],
         };
     }
     if (which === "auth") {
-        // `assertAuthProfile` in `chardb/auth/profile.ts` is the real
-        // check; it runs inside `withChardb()` at config time. The CLI
-        // entry point can't statically import the user's options without a
-        // loader, so we surface the same caveat here.
-        ctx.stdout("chardb doctor auth: not yet implemented at the CLI layer\n");
+        const error = "chardb doctor auth: not implemented; no application auth configuration was checked";
+        ctx.stderr(`error: ${error}\n`);
         return {
-            ok: true,
-            errors: [],
-            warnings: [
-                "`chardb doctor auth` is not yet enforced — `assertAuthProfile` in chardb/auth runs at config time",
-            ],
+            ok: false,
+            errors: [error],
+            warnings: [],
         };
     }
-    return { ok: true, errors: [], warnings: [] };
+    const error = `chardb doctor: unsupported target ${String(which)}`;
+    ctx.stderr(`error: ${error}\n`);
+    return { ok: false, errors: [error], warnings: [] };
 }
 
 async function doctorWrangler(ctx: CliContext): Promise<DoctorResult> {

@@ -89,3 +89,29 @@ describe("chardb init + doctor end-to-end", () => {
         expect(r.ok).toBe(true);
     });
 });
+
+describe("unimplemented doctor targets", () => {
+    test("schema reports a failed check on stderr", async () => {
+        const { ctx, out, err } = fakeCtx();
+
+        const result = await runDoctor(ctx, { which: "schema" });
+
+        expect(result.ok).toBe(false);
+        expect(result.errors).toHaveLength(1);
+        expect(result.errors[0]).toContain("not implemented");
+        expect(out).toEqual([]);
+        expect(err).toEqual([`error: ${result.errors[0]}\n`]);
+    });
+
+    test("auth reports a failed check on stderr", async () => {
+        const { ctx, out, err } = fakeCtx();
+
+        const result = await runDoctor(ctx, { which: "auth" });
+
+        expect(result.ok).toBe(false);
+        expect(result.errors).toHaveLength(1);
+        expect(result.errors[0]).toContain("not implemented");
+        expect(out).toEqual([]);
+        expect(err).toEqual([`error: ${result.errors[0]}\n`]);
+    });
+});

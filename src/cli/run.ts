@@ -7,7 +7,7 @@ const HELP = `chardb — experimental tenant-sharding prototype for Cloudflare D
 
 Commands:
   chardb init <name>            scaffold a new chardb app (writes wrangler.jsonc, schema, worker)
-  chardb doctor [which]         enforce wrangler.jsonc / schema / auth contract; which ∈ {wrangler,schema,auth}
+  chardb doctor [wrangler]      validate required wrangler.jsonc bindings
   chardb explain <intent-json>  planner decision + estimated fanout (use --strict for CI)
   chardb shards ...             not implemented
   chardb snapshot ...           not implemented
@@ -38,7 +38,11 @@ export async function runCli(ctx: CliContext, argv: readonly string[]): Promise<
             return 0;
         }
         case "doctor": {
-            const which = (rest[0] as "wrangler" | "schema" | "auth" | undefined) ?? "wrangler";
+            const which = rest[0] ?? "wrangler";
+            if (!isDoctorTarget(which)) {
+                ctx.stderr("usage: chardb doctor [wrangler|schema|auth]\n");
+                return 2;
+            }
             const r = await runDoctor(ctx, { which });
             return r.ok ? 0 : 1;
         }
@@ -71,6 +75,10 @@ export async function runCli(ctx: CliContext, argv: readonly string[]): Promise<
             ctx.stdout(HELP);
             return 2;
     }
+}
+
+function isDoctorTarget(value: string): value is "wrangler" | "schema" | "auth" {
+    return value === "wrangler" || value === "schema" || value === "auth";
 }
 
 function valueAfterFlag(argv: readonly string[], flag: string): string | undefined {

@@ -81,3 +81,31 @@ describe("chardb command availability", () => {
         }
     });
 });
+
+describe("chardb doctor CLI", () => {
+    test("help only advertises the implemented Wrangler check", async () => {
+        const { ctx, out } = fakeCtx();
+
+        expect(await runCli(ctx, ["--help"])).toBe(0);
+        expect(out.join("")).toContain("chardb doctor [wrangler]");
+        expect(out.join("")).not.toContain("wrangler.jsonc / schema / auth");
+    });
+
+    test("schema and auth exit one and print their errors", async () => {
+        for (const target of ["schema", "auth"]) {
+            const { ctx, out, err } = fakeCtx();
+
+            expect(await runCli(ctx, ["doctor", target])).toBe(1);
+            expect(out).toEqual([]);
+            expect(err.join("")).toContain(`chardb doctor ${target}: not implemented`);
+        }
+    });
+
+    test("unknown targets are usage errors", async () => {
+        const { ctx, out, err } = fakeCtx();
+
+        expect(await runCli(ctx, ["doctor", "spelling-error"])).toBe(2);
+        expect(out).toEqual([]);
+        expect(err).toEqual(["usage: chardb doctor [wrangler|schema|auth]\n"]);
+    });
+});
