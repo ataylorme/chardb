@@ -17,6 +17,8 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { CdbError, type CdbErrorCode } from "../../src/errors.ts";
 import {
     applyColumnMask,
+    applyPoliciesToWhere,
+    applyRowPolicies,
     assertColumnsWritable,
     buildAccessControl,
     compileCdbPolicies,
@@ -258,11 +260,15 @@ describe("compileCdbPolicies — RLS shape parity", () => {
 
     const policies = compileCdbPolicies(messages);
 
+    const sameTenantRow = { organization_id: "org-A", author_id: "u-member", body: "same tenant" };
+    const rows = [sameTenantRow, { organization_id: "org-B", author_id: "u-member", body: "other tenant" }];
+
     test("emits a tenant predicate policy named <table>_tenant", () => {
         const tenantPolicy = policies.find(p => p.name === "messages_for_compile_tenant");
         expect(tenantPolicy).toBeDefined();
         expect(tenantPolicy?.for).toBe("all");
         expect(tenantPolicy?.to).toBe("authenticated");
+        expect(tenantPolicy?.effect).toBe("floor");
     });
 
     test("tenant predicate enforces row[organization_id] === auth.tenantId", () => {
@@ -281,6 +287,7 @@ describe("compileCdbPolicies — RLS shape parity", () => {
         const memberPolicies = policies.filter(p => p.name.startsWith("messages_for_compile_role_member_"));
         // member: { read: "*", create: ["body"] } → 2 verbs
         expect(memberPolicies.length).toBe(2);
+        expect(adminPolicies.every(policy => policy.effect === "grant")).toBe(true);
     });
 
     test("emits self_<verb> policies bound to selfBy", () => {
@@ -291,6 +298,105 @@ describe("compileCdbPolicies — RLS shape parity", () => {
         const auth = { userId: "u-self", claims: {} };
         expect(selfUpdate?.using?.(auth, { author_id: "u-self" } as never)).toBe(true);
         expect(selfUpdate?.using?.(auth, { author_id: "u-other" } as never)).toBe(false);
+    });
+
+    test("denies anonymous reads on a private table", () => {
+        const visible = applyRowPolicies({
+            op: "select",
+            auth: { userId: "", claims: {} },
+            rows,
+            policies,
+        });
+        expect(visible).toEqual([]);
+
+        const predicate = applyPoliciesToWhere({
+            op: "select",
+            auth: { userId: "", claims: {} },
+            table: messages,
+            policies,
+        });
+        const rendered = predicate?.toQuery({
+            casing: { getColumnCasing: () => "snake_case" } as never,
+            escapeName: (name: string) => `"${name}"`,
+            escapeParam: (index: number) => `?${index + 1}`,
+            escapeString: (value: string) => `'${value}'`,
+        } as never);
+        expect(rendered?.sql).toContain("1 = 0");
+    });
+
+    test("ORs member and admin grants while retaining the tenant floor", () => {
+        const memberRows = applyRowPolicies({
+            op: "select",
+            auth: { userId: "u-member", tenantId: "org-A", role: "member", claims: {} },
+            rows,
+            policies,
+        });
+        const adminRows = applyRowPolicies({
+            op: "select",
+            auth: { userId: "u-admin", tenantId: "org-A", role: "admin", claims: {} },
+            rows,
+            policies,
+        });
+        expect(memberRows).toEqual([sameTenantRow]);
+        expect(adminRows).toEqual([sameTenantRow]);
+    });
+
+    test("denies writes when the table compiled no grant for that operation", () => {
+        const { cdbTable } = forOrg();
+        const readOnly = cdbTable(
+            "read_only_for_compile",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+            },
+            { roles: { member: { read: "*" } } }
+        );
+        const readOnlyPolicies = compileCdbPolicies(readOnly);
+        const visible = applyRowPolicies({
+            op: "insert",
+            auth: { userId: "u-member", tenantId: "org-A", role: "member", claims: {} },
+            rows: [{ id: "1", organization_id: "org-A" }],
+            policies: readOnlyPolicies,
+        });
+        expect(visible).toEqual([]);
+        const predicate = applyPoliciesToWhere({
+            op: "insert",
+            auth: { userId: "u-member", tenantId: "org-A", role: "member", claims: {} },
+            table: readOnly,
+            policies: readOnlyPolicies,
+        });
+        const rendered = predicate?.toQuery({
+            casing: { getColumnCasing: () => "snake_case" } as never,
+            escapeName: (name: string) => `"${name}"`,
+            escapeParam: (index: number) => `?${index + 1}`,
+            escapeString: (value: string) => `'${value}'`,
+        } as never);
+        expect(rendered?.sql).toContain("1 = 0");
+    });
+
+    test("publicRead grants select only", () => {
+        const { cdbTable } = forOrg();
+        const publicFeed = cdbTable(
+            "public_feed_for_compile",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+            },
+            { publicRead: true }
+        );
+        const publicPolicies = compileCdbPolicies(publicFeed);
+        const publicRows = [{ id: "1", organization_id: "org-A" }];
+        const anonymous = { userId: "", claims: {} };
+        expect(applyRowPolicies({ op: "select", auth: anonymous, rows: publicRows, policies: publicPolicies })).toEqual(
+            publicRows
+        );
+        expect(applyRowPolicies({ op: "insert", auth: anonymous, rows: publicRows, policies: publicPolicies })).toEqual(
+            []
+        );
     });
 });
 

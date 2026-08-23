@@ -30,6 +30,15 @@ const auth = (userId: string | undefined, tenantId?: string): AuthCtx => ({
     claims: {},
 });
 
+function renderSql(value: ReturnType<typeof applyPoliciesToWhere>) {
+    return value?.toQuery({
+        casing: { getColumnCasing: () => "snake_case" } as never,
+        escapeName: (n: string) => `"${n}"`,
+        escapeParam: (n: number) => `?${n + 1}`,
+        escapeString: (s: string) => `'${s}'`,
+    } as never);
+}
+
 describe("applyPoliciesToWhere", () => {
     test("ANDs the policy predicate into the user where", () => {
         const a = auth("u1");
@@ -42,12 +51,7 @@ describe("applyPoliciesToWhere", () => {
             policies: [ownerOnly],
         });
         expect(out).toBeDefined();
-        const sql = out?.toQuery({
-            casing: { getColumnCasing: () => "snake_case" } as never,
-            escapeName: (n: string) => `"${n}"`,
-            escapeParam: (n: number) => `?${n + 1}`,
-            escapeString: (s: string) => `'${s}'`,
-        } as never);
+        const sql = renderSql(out);
         expect(sql?.params).toContain("u1");
         expect(sql?.params).toContain("hello");
     });
@@ -66,7 +70,7 @@ describe("applyPoliciesToWhere", () => {
             table: documents,
             policies: [anonAdmin],
         });
-        expect(authed).toBeUndefined();
+        expect(renderSql(authed)?.sql).toContain("1 = 0");
     });
 
     test("op filter respected — owner_only is for=all, anon_admin is for=select", () => {
@@ -76,7 +80,29 @@ describe("applyPoliciesToWhere", () => {
             table: documents,
             policies: [anonAdmin],
         });
-        expect(updateAuthed).toBeUndefined();
+        expect(renderSql(updateAuthed)?.sql).toContain("1 = 0");
+    });
+
+    test("role audiences match caller roles, not user IDs", () => {
+        const roleGrant = chardbPolicy<typeof documents, { ownerId: string }>("admin_read", {
+            for: "select",
+            to: ["admin"],
+            usingSql: () => eq(documents.ownerId, "admin-visible"),
+        });
+        const allowed = applyPoliciesToWhere({
+            op: "select",
+            auth: { ...auth("user-1"), role: "admin" },
+            table: documents,
+            policies: [roleGrant],
+        });
+        const denied = applyPoliciesToWhere({
+            op: "select",
+            auth: auth("admin"),
+            table: documents,
+            policies: [roleGrant],
+        });
+        expect(renderSql(allowed)?.params).toContain("admin-visible");
+        expect(renderSql(denied)?.sql).toContain("1 = 0");
     });
 });
 
@@ -124,5 +150,20 @@ describe("policyDigest", () => {
             auth: a,
         });
         expect(d0).toBe(d1);
+    });
+
+    test("includes a canonical caller role set", () => {
+        const digestFor = (caller: AuthCtx) =>
+            policyDigest({
+                policies: [ownerOnly],
+                authEpochs: { global: 1, tenant: 1, principal: 1 },
+                auth: caller,
+            });
+        const member = digestFor({ userId: "u1", role: "member", claims: {} });
+        const adminMember = digestFor({ userId: "u1", roles: ["member", "admin", "member"], claims: {} });
+        const memberAdmin = digestFor({ userId: "u1", role: "admin, member", claims: {} });
+
+        expect(member).not.toBe(adminMember);
+        expect(adminMember).toBe(memberAdmin);
     });
 });

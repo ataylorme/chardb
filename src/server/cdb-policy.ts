@@ -8,14 +8,12 @@
  * Mapping rules (one cdbTable → ≤6 policies):
  *
  *   - tenant predicate (org or user) → `<table>_tenant` policy on
- *     `for: "all"` audience `authenticated`. Combinator with the rest is
- *     OR within the policy pipeline; this is the universal floor.
+ *     `for: "all"` audience `authenticated`. It is marked as a mandatory
+ *     floor and is AND-ed with the selected grant.
  *   - publicRead → `<table>_public_read` on `for: "select"` to `*`.
  *   - per-role ROW gate per verb (read/create/update/delete) →
- *     `<table>_role_<role>` policies. SQL form returns `undefined` when
- *     caller has the role (no extra filter) and `1=0` when not (zero
- *     rows). Mirrors the old `requireRole` helper exactly so the
- *     policyDigest is stable across the migration.
+ *     `<table>_role_<role>` grant policies. Alternative role grants are
+ *     OR-ed; a matching role contributes `1=1` and a non-match `1=0`.
  *   - `self` role → `<table>_self_<verb>` policies bound to the
  *     `selfBy` column (`row[selfBy] === ctx.auth.userId`).
  *
@@ -29,7 +27,7 @@
  * invalidate the same way pre/post migration.
  */
 
-import { type SQL, eq } from "drizzle-orm";
+import { type SQL, eq, sql } from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { COL_VERBS, type CdbTableMeta, type ColVerb, type Verb } from "./cdb-table-types.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
@@ -64,7 +62,8 @@ export const PRINCIPAL_EPOCH_TABLES: readonly string[] = Object.freeze([
     "apiKey",
 ]);
 
-const SQL_FALSE: SQL = eq("1" as never, "0");
+const SQL_FALSE: SQL = sql`1 = 0`;
+const SQL_TRUE: SQL = sql`1 = 1`;
 
 function epochTablesFor(meta: CdbTableMeta): readonly string[] {
     return meta.tenantKind === "org" ? TENANT_EPOCH_TABLES : PRINCIPAL_EPOCH_TABLES;
@@ -100,25 +99,27 @@ export function compileCdbPolicies(table: SQLiteTable): readonly PolicyDefinitio
             chardbPolicy<SQLiteTable, Record<string, unknown>>(`${meta.name}_tenant`, {
                 for: "all",
                 to: "authenticated",
+                effect: "floor",
                 using: (auth, row) => {
                     const expected = tenantValueFromAuth(meta, auth);
                     if (expected === undefined) return false;
                     return row[col] === expected;
                 },
-                usingSql: (auth, t) => sqlEqColumn(t, col, tenantValueFromAuth(meta, auth)),
+                usingSql: (auth, t) => sqlEqColumn(t, col, tenantValueFromAuth(meta, auth)) ?? SQL_FALSE,
                 authDependsOn: epochTables,
             }) as PolicyDefinition<SQLiteTable, unknown>
         );
     }
 
-    // 2) publicRead — anonymous SELECT.
+    // 2) publicRead — public SELECT.
     if (meta.publicRead) {
         policies.push(
             chardbPolicy<SQLiteTable, unknown>(`${meta.name}_public_read`, {
                 for: "select",
                 to: "*",
+                effect: "grant",
                 using: () => true,
-                usingSql: () => undefined,
+                usingSql: () => SQL_TRUE,
             }) as PolicyDefinition<SQLiteTable, unknown>
         );
     }
@@ -134,8 +135,9 @@ export function compileCdbPolicies(table: SQLiteTable): readonly PolicyDefinitio
                 chardbPolicy<SQLiteTable, unknown>(policyName, {
                     for: opFor,
                     to: "authenticated",
+                    effect: "grant",
                     using: auth => callerHasRole(auth, role),
-                    usingSql: auth => (callerHasRole(auth, role) ? undefined : SQL_FALSE),
+                    usingSql: auth => (callerHasRole(auth, role) ? SQL_TRUE : SQL_FALSE),
                     authDependsOn: epochTables,
                 }) as PolicyDefinition<SQLiteTable, unknown>
             );
@@ -158,6 +160,7 @@ export function compileCdbPolicies(table: SQLiteTable): readonly PolicyDefinitio
                 chardbPolicy<SQLiteTable, Record<string, unknown>>(policyName, {
                     for: opFor,
                     to: "authenticated",
+                    effect: "grant",
                     using: (auth, row) => row[selfBy] === auth.userId,
                     usingSql: (auth, t) => sqlEqColumn(t, selfBy, auth.userId),
                     authDependsOn: PRINCIPAL_EPOCH_TABLES,
