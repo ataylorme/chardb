@@ -52,9 +52,9 @@ import type {
     Team,
     TeamMember,
 } from "better-auth/plugins/organization";
-import { getTableColumns } from "drizzle-orm";
+import { getTableColumns, sql } from "drizzle-orm";
 import type { Column } from "drizzle-orm";
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 import type { AnySQLiteColumn, AnySQLiteTable, SQLiteColumnBuilderBase } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../errors.ts";
 
@@ -248,7 +248,7 @@ export function synthesizeAuthSchema<
 
     const ordered = Object.entries(spec).sort(([ka, a], [kb, b]) => orderOf(a) - orderOf(b) || ka.localeCompare(kb));
     for (const [model, entry] of ordered) {
-        tables[model] = buildTable(entry, () => tables);
+        tables[model] = buildTable(model, entry, () => tables);
     }
 
     for (const k of AUTH_DEFAULT_TABLES) {
@@ -404,14 +404,79 @@ function orderOf(entry: BetterAuthDBSchema[string]): number {
 
 type TableLookup = () => Record<string, AnySQLiteTable>;
 
-function buildTable(entry: BetterAuthDBSchema[string], lookup: TableLookup): AnySQLiteTable {
+const COMPOSITE_UNIQUES: Readonly<Record<string, readonly (readonly string[])[]>> = {
+    account: [["providerId", "accountId"]],
+    member: [["organizationId", "userId"]],
+};
+
+function buildTable(model: string, entry: BetterAuthDBSchema[string], lookup: TableLookup): AnySQLiteTable {
     const columns: Record<string, SQLiteColumnBuilderBase> = {
         id: text("id").primaryKey(),
     };
     for (const [key, attr] of Object.entries(entry.fields)) {
-        columns[key] = buildColumn(attr.fieldName ?? key, attr, lookup);
+        columns[key] = buildColumn(model, key, attr.fieldName ?? key, attr, lookup);
     }
-    return sqliteTable(entry.modelName, columns);
+    return sqliteTable(entry.modelName, columns, built => {
+        const extras = [];
+        for (const [key, attr] of Object.entries(entry.fields)) {
+            if (!attr.index) continue;
+            const column = built[key];
+            if (!column) continue;
+            extras.push(index(`${entry.modelName}_${column.name}_idx`).on(column));
+        }
+        for (const keys of COMPOSITE_UNIQUES[model] ?? []) {
+            const uniqueColumns = keys.map(key => built[key]).filter(column => column !== undefined);
+            if (uniqueColumns.length !== keys.length || uniqueColumns.length === 0) {
+                throw new CdbError({
+                    code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                    message: `synthesizeAuthSchema: ${model} is missing columns required for composite uniqueness`,
+                });
+            }
+            const name = `${entry.modelName}_${uniqueColumns.map(column => column.name).join("_")}_unique`;
+            extras.push(unique(name).on(uniqueColumns[0] as never, ...uniqueColumns.slice(1)));
+        }
+        return extras;
+    });
+}
+
+const KNOWN_NOW_DEFAULTS: ReadonlySet<string> = new Set([
+    "user.createdAt",
+    "user.updatedAt",
+    "session.createdAt",
+    "account.createdAt",
+    "verification.createdAt",
+    "verification.updatedAt",
+    "invitation.createdAt",
+    "rateLimit.lastRequest",
+]);
+
+function withDefault<T extends SQLiteColumnBuilderBase>(
+    column: T,
+    model: string,
+    key: string,
+    attr: DBFieldAttribute
+): T {
+    if (attr.defaultValue === undefined) return column;
+    const defaultable = column as unknown as { default(value: unknown): SQLiteColumnBuilderBase };
+    if (typeof attr.defaultValue === "function") {
+        if (KNOWN_NOW_DEFAULTS.has(`${model}.${key}`) && (attr.type === "date" || attr.type === "number")) {
+            const sample = attr.defaultValue();
+            const timestamp = sample instanceof Date ? sample.getTime() : sample;
+            if (
+                typeof timestamp === "number" &&
+                Number.isFinite(timestamp) &&
+                Math.abs(Date.now() - timestamp) < 1_000
+            ) {
+                return defaultable.default(sql.raw("(unixepoch() * 1000)")) as T;
+            }
+        }
+        throw new CdbError({
+            code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+            message: `synthesizeAuthSchema: cannot translate dynamic default for ${model}.${key} into SQLite DDL`,
+            hint: "use a static default or extend chardb's explicit SQL-default mapping",
+        });
+    }
+    return defaultable.default(attr.defaultValue) as T;
 }
 
 /**
@@ -420,7 +485,13 @@ function buildTable(entry: BetterAuthDBSchema[string], lookup: TableLookup): Any
  * to the concrete builder type after each step so the chain stays typed
  * but the variable type doesn't drift across branches.
  */
-function buildColumn(name: string, attr: DBFieldAttribute, lookup: TableLookup): SQLiteColumnBuilderBase {
+function buildColumn(
+    model: string,
+    key: string,
+    name: string,
+    attr: DBFieldAttribute,
+    lookup: TableLookup
+): SQLiteColumnBuilderBase {
     switch (attr.type) {
         case "string": {
             let c = text(name);
@@ -432,7 +503,7 @@ function buildColumn(name: string, attr: DBFieldAttribute, lookup: TableLookup):
                     ...(ref.onDelete ? { onDelete: ref.onDelete } : {}),
                 }) as typeof c;
             }
-            return c;
+            return withDefault(c, model, key, attr);
         }
         case "boolean": {
             let c = integer(name, { mode: "boolean" });
@@ -444,7 +515,7 @@ function buildColumn(name: string, attr: DBFieldAttribute, lookup: TableLookup):
                     ...(ref.onDelete ? { onDelete: ref.onDelete } : {}),
                 }) as typeof c;
             }
-            return c;
+            return withDefault(c, model, key, attr);
         }
         case "date": {
             let c = integer(name, { mode: "timestamp_ms" });
@@ -456,7 +527,7 @@ function buildColumn(name: string, attr: DBFieldAttribute, lookup: TableLookup):
                     ...(ref.onDelete ? { onDelete: ref.onDelete } : {}),
                 }) as typeof c;
             }
-            return c;
+            return withDefault(c, model, key, attr);
         }
         case "number": {
             let c = integer(name);
@@ -468,7 +539,7 @@ function buildColumn(name: string, attr: DBFieldAttribute, lookup: TableLookup):
                     ...(ref.onDelete ? { onDelete: ref.onDelete } : {}),
                 }) as typeof c;
             }
-            return c;
+            return withDefault(c, model, key, attr);
         }
         default: {
             // string[] / number[] / Literal[] / json all degrade to a JSON-encoded
@@ -483,7 +554,7 @@ function buildColumn(name: string, attr: DBFieldAttribute, lookup: TableLookup):
                     ...(ref.onDelete ? { onDelete: ref.onDelete } : {}),
                 }) as typeof c;
             }
-            return c;
+            return withDefault(c, model, key, attr);
         }
     }
 }

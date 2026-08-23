@@ -30,18 +30,25 @@ function sqlStorage(db: Database) {
 }
 
 class CatalogHarness {
-    readonly db = new Database(":memory:");
+    readonly db: Database;
     private bootstrap: Promise<unknown> = Promise.resolve();
-    private readonly state = {
-        storage: {
-            sql: sqlStorage(this.db),
-            transactionSync: <T>(callback: () => T): T => this.db.transaction(callback)(),
-        },
-        blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
-            this.bootstrap = callback();
-        },
-    };
-    catalog = new Catalog(this.state as never, {});
+    private readonly state: DurableObjectState;
+    catalog: Catalog;
+
+    constructor(prepare?: (db: Database) => void) {
+        this.db = new Database(":memory:");
+        prepare?.(this.db);
+        this.state = {
+            storage: {
+                sql: sqlStorage(this.db),
+                transactionSync: <T>(callback: () => T): T => this.db.transaction(callback)(),
+            },
+            blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
+                this.bootstrap = callback();
+            },
+        } as unknown as DurableObjectState;
+        this.catalog = new Catalog(this.state, {});
+    }
 
     async ready(): Promise<void> {
         await this.bootstrap;
@@ -152,6 +159,16 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             },
         });
         await adapter.create({
+            model: "organization",
+            forceAllowId: true,
+            data: {
+                id: "org-1",
+                name: "Example",
+                slug: "example",
+                createdAt: now,
+            },
+        });
+        await adapter.create({
             model: "member",
             forceAllowId: true,
             data: {
@@ -190,7 +207,13 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(await adapter.findMany({ model: "member", where: eq("userId", "user-1") })).toEqual([
             expect.objectContaining({ id: "member-1", organizationId: "org-1" }),
         ]);
-        expect(bumps).toEqual(["principal:user-1", "principal:user-1", "principal:user-1", "tenant:org-1"]);
+        expect(bumps).toEqual([
+            "principal:user-1",
+            "principal:user-1",
+            "principal:user-1",
+            "tenant:org-1",
+            "tenant:org-1",
+        ]);
     });
 
     test("updates and deletes through non-owner lookups while preserving epoch bumps", async () => {
@@ -286,6 +309,18 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
         const now = new Date("2026-08-23T00:00:00Z");
         await adapter.create({
+            model: "user",
+            forceAllowId: true,
+            data: {
+                id: "first-user",
+                name: "First",
+                email: "first@example.com",
+                emailVerified: true,
+                createdAt: now,
+                updatedAt: now,
+            },
+        });
+        await adapter.create({
             model: "session",
             forceAllowId: true,
             data: {
@@ -303,6 +338,18 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(
             await restartedAdapter.findOne({ model: "session", where: eq("token", "first-request-token") })
         ).toMatchObject({ id: "first-session", userId: "first-user" });
+    });
+
+    test("Catalog rejects a legacy auth table instead of pretending CREATE IF NOT EXISTS upgraded it", async () => {
+        harness.close();
+        harness = new CatalogHarness(db => {
+            db.run('CREATE TABLE "user" ("id" TEXT PRIMARY KEY, "email" TEXT)');
+        });
+
+        await expect(harness.ready()).rejects.toMatchObject({
+            code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+            message: expect.stringContaining("predates auth DDL v1"),
+        });
     });
 
     test("Catalog keeps tenant and principal epochs independent across restart", async () => {

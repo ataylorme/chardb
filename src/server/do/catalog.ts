@@ -17,9 +17,10 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { getTableConfig } from "drizzle-orm/sqlite-core";
+import { renderSqliteTableDdl } from "../../auth/ddl.ts";
 import { getAuthRuntime, tableFor } from "../../auth/runtime.ts";
 import { authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
+import { CdbError } from "../../errors.ts";
 import type { RawJson } from "../../types.ts";
 import { type PrincipalId, ShardId, type TenantId, type Vshard } from "../../types.ts";
 import { VSHARD_COUNT, VshardMap, type VshardRange } from "../../vshard.ts";
@@ -64,27 +65,6 @@ CREATE TABLE IF NOT EXISTS catalog_policy_digest (
 
 export type CatalogEnv = Record<string, never>;
 
-/**
- * Render a Drizzle column's SQLite affinity. Mirrors the four type
- * affinities our auth synthesizer emits (`text`, `integer`, plus the
- * boolean / timestamp_ms / json *modes* on integer / text). Unknown
- * column types fall back to `TEXT` — the same conservative choice the
- * synthesizer makes for forward-compat plugin schemas.
- */
-function renderColumnType(col: { dataType: string }): string {
-    switch (col.dataType) {
-        case "number":
-        case "boolean":
-        case "bigint":
-        case "date":
-            return "INTEGER";
-        case "buffer":
-            return "BLOB";
-        default:
-            return "TEXT";
-    }
-}
-
 export interface RouteResult {
     readonly shardId: ShardId;
     readonly schemaEpoch: number;
@@ -103,6 +83,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
     private async bootstrap(): Promise<void> {
         if (this.bootstrapped) return;
         const sql = adaptSqlStorage(this.ctx.storage.sql);
+        sql.exec("PRAGMA foreign_keys = ON");
         for (const stmt of CATALOG_DDL.split(";")
             .map(s => s.trim())
             .filter(Boolean)) {
@@ -147,19 +128,45 @@ export class Catalog extends DurableObject<CatalogEnv> {
             // Catalog still needs to function for non-auth deployments.
             return;
         }
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        for (const table of Object.values(runtime.schema)) {
-            const cfg = getTableConfig(table);
-            const cols = cfg.columns
-                .map(c => {
-                    const sqlType = renderColumnType(c);
-                    const notNull = c.notNull ? " NOT NULL" : "";
-                    const pk = c.primary ? " PRIMARY KEY" : "";
-                    return `"${c.name}" ${sqlType}${pk}${notNull}`;
-                })
-                .join(", ");
-            sql.exec(`CREATE TABLE IF NOT EXISTS "${cfg.name}" (${cols})`);
-        }
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            for (const table of Object.values(runtime.schema)) {
+                const ddl = renderSqliteTableDdl(table);
+                const metadataKey = `auth_ddl_v1:${ddl.tableName}`;
+                const existing = sql.one<{ sql: string }>(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    ddl.tableName
+                );
+                const recorded = sql.one<{ v: string }>("SELECT v FROM catalog_meta WHERE k = ?", metadataKey);
+                if (existing) {
+                    if (recorded?.v !== ddl.signature) {
+                        throw new CdbError({
+                            code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                            message: `Catalog auth table "${ddl.tableName}" predates auth DDL v1 or has an incompatible schema`,
+                            hint: "recreate pre-release Catalog storage or add an explicit auth schema migration",
+                        });
+                    }
+                    for (const indexName of ddl.indexNames) {
+                        const present = sql.one<{ name: string }>(
+                            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?",
+                            indexName,
+                            ddl.tableName
+                        );
+                        if (!present) {
+                            throw new CdbError({
+                                code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                                message: `Catalog auth table "${ddl.tableName}" is missing a declared index`,
+                                hint: "recreate pre-release Catalog storage or add an explicit auth schema migration",
+                            });
+                        }
+                    }
+                    continue;
+                }
+                sql.exec(ddl.createTable);
+                for (const statement of ddl.indexes) sql.exec(statement);
+                sql.exec("INSERT OR REPLACE INTO catalog_meta (k, v) VALUES (?, ?)", metadataKey, ddl.signature);
+            }
+        });
         this.authTablesBootstrapped = true;
     }
 
