@@ -101,6 +101,10 @@ describe("chardb init + doctor end-to-end", () => {
         expect(JSON.parse(files.get("/tmp/proj/package.json") ?? "")).toMatchObject({
             packageManager: "bun@1.2.22",
             dependencies: { chardb: "0.1.0" },
+            devDependencies: {
+                "@cloudflare/workers-types": "5.20260820.1",
+                wrangler: "4.125.0",
+            },
             scripts: { typecheck: "tsc --noEmit", build: "wrangler deploy --dry-run --outdir dist" },
         });
         expect(JSON.parse(files.get("/tmp/proj/tsconfig.json") ?? "").compilerOptions).not.toHaveProperty("paths");

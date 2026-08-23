@@ -28,7 +28,7 @@ const PACKAGE_TEMPLATE = (name: string) =>
                 zod: "4.4.3",
             },
             devDependencies: {
-                "@cloudflare/workers-types": "4.20260510.1",
+                "@cloudflare/workers-types": "5.20260820.1",
                 typescript: "5.9.3",
                 wrangler: "4.125.0",
             },
