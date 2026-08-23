@@ -18,9 +18,9 @@
  * shape so the user-side handler stays statically checked. The descriptor
  * stored in the manifest, however, deliberately erases that generic to
  * `RawJson`. This is the wire contract: an `Up.mut` envelope carries
- * `args: RawJson` after `decodeWire`, the worker's `runMutation` RPC accepts
- * `RawJson`, and the Gateway sends `RawJson` over the service binding. The
- * manifest descriptor accepts that erased argument shape. Mutation results
+ * `args: RawJson` after `decodeWire`, and the Gateway's local route resolver
+ * passes that value into a manifest descriptor with the same erased argument
+ * shape. Mutation results
  * remain `unknown` until the op-log wrapper verifies they are JSON.
  *
  * A phantom-map alternative (parallel `WeakMap<ChardbRef, TArgs>`) was
@@ -166,9 +166,9 @@ export function resolveMutation(manifest: ChardbManifest, ref: ChardbRef): Mutat
 
 /**
  * Pure routing decision: extract the partition key for a mutation and compute
- * the target vshard. Lifted out of `WorkerEntrypoint.runMutation` so it can
- * be exercised without booting workerd. Returns the JSON-serialisable shape
- * that the RPC envelope ships back to the Gateway.
+ * the target vshard. Kept pure so configured Gateway isolates and tests share
+ * the same decision without booting workerd. Returns the JSON-serialisable
+ * shape consumed by the mutation dispatcher.
  */
 export function routeMutation(
     manifest: ChardbManifest,

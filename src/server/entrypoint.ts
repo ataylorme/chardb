@@ -2,9 +2,6 @@
  * `defineChardb({ schema, auth })` returns a `WorkerEntrypoint` subclass.
  *
  * The class:
- *   - exposes a typed RPC surface for service-binding callers
- *     (`env.CDB.query.<table>.findMany(...)` via `wrangler types`); see
- *     https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/rpc/
  *   - implements `fetch(req)` for the reserved-route prefix list:
  *       /ws         — hibernatable WebSocket to the Gateway DO (wired)
  *       /_chardb/*  — internal dashboard / admin routes (wired)
@@ -31,11 +28,8 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import type { BetterAuthOptions } from "better-auth";
 import { bindAuthRuntime } from "../auth/runtime.ts";
 import { type SynthesizedAuthSchema, assertNoReservedTableShadow, synthesizeAuthSchema } from "../auth/synthesize.ts";
-import type { CdbError } from "../errors.ts";
-import type { RawJson } from "../types.ts";
-import { vshardOf } from "../vshard.ts";
 import { buildColocationOverrides } from "./cdb-colocation.ts";
-import { type ChardbManifest, emptyManifest, manifestFromExports, routeMutation } from "./manifest.ts";
+import { type ChardbManifest, emptyManifest, manifestFromExports } from "./manifest.ts";
 import { decorateResponse, extractCorrelationId, selectMatchingCrons } from "./observability_helpers.ts";
 
 export {
@@ -45,7 +39,6 @@ export {
 } from "./observability_helpers.ts";
 
 export interface ChardbEnv {
-    readonly CDB?: unknown;
     readonly CDB_CATALOG: DurableObjectNamespace;
     readonly CDB_SHARD: DurableObjectNamespace;
     readonly CDB_GATEWAY: DurableObjectNamespace;
@@ -111,41 +104,6 @@ class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
     /** Subclass overrides this via `defineChardb({ manifest })`. */
     protected manifest(): ChardbManifest {
         return emptyManifest();
-    }
-
-    /**
-     * Resolve a mutation by ref, derive its partition vshard from `args` (if the
-     * mutation declared `partitionKey`), and dispatch to the owning shard. The
-     * Gateway DO calls into this RPC for `Up.mut` messages. This method only
-     * makes the routing decision; the configured Cdb class resolves and runs
-     * the mutation locally. Cross-binding contract: only structured-cloneable
-     * args cross this boundary; the partition extractor is invoked here, not
-     * in the Gateway.
-     */
-    async runMutation(input: {
-        readonly ref: string;
-        readonly args: RawJson;
-        readonly mutId: string;
-        /**
-         * JWT-derived auth context the Gateway DO threaded into the
-         * envelope. Forwarded to the shard `Cdb.mutate` call so the
-         * user's mutation closure can read `ctx.auth` for tenant /
-         * principal scoping and policy enforcement. `null` means the
-         * inbound JWT was missing or unverified — the mutation is
-         * dispatched as anonymous and policies decide whether that's
-         * allowed.
-         */
-        readonly auth?: {
-            readonly userId: string;
-            readonly tenantId: string | null;
-            readonly role: string | null;
-            readonly claims: { readonly [k: string]: unknown };
-        } | null;
-    }): Promise<
-        | { readonly ok: true; readonly vshard: number }
-        | { readonly ok: false; readonly error: ReturnType<CdbError["toJSON"]> }
-    > {
-        return routeMutation(this.manifest(), { ref: input.ref, args: input.args }, vshardOf);
     }
 
     override async fetch(request: Request): Promise<Response> {

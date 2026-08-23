@@ -20,7 +20,11 @@ import { organization } from "better-auth/plugins/organization";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { defineAuth } from "../../src/auth/synthesize.ts";
 import { chardb } from "../../src/server/chardb.ts";
+import { defineMutation } from "../../src/server/define.ts";
 import { Cdb } from "../../src/server/do/cdb.ts";
+import { Gateway } from "../../src/server/do/gateway.ts";
+import type { RawJson } from "../../src/types.ts";
+import { vshardOf } from "../../src/vshard.ts";
 
 const items = sqliteTable("items", {
     id: text("id").primaryKey(),
@@ -30,6 +34,12 @@ const items = sqliteTable("items", {
 const auth = defineAuth({
     appName: "chardb-factory-test",
     plugins: [organization()],
+});
+
+type RoutedArgs = { readonly organizationId: string } & { readonly [key: string]: RawJson };
+const routedMutation = defineMutation<unknown, RoutedArgs, null>(() => null, {
+    singlePartition: true,
+    partitionKey: args => args.organizationId,
 });
 
 describe("chardb({…})", () => {
@@ -45,16 +55,31 @@ describe("chardb({…})", () => {
         expect(await res.text()).toBe("world");
     });
 
-    test("the six Durable Object classes are direct fields", () => {
+    test("the six Durable Object classes are direct fields and runtime classes are configured", () => {
         const app = chardb({ auth, schema: { items } });
         // Existence + identity — these are the named exports wrangler binds.
         expect(typeof app.Cdb).toBe("function");
         expect(app.Cdb).not.toBe(Cdb);
         expect(typeof app.Catalog).toBe("function");
         expect(typeof app.Gateway).toBe("function");
+        expect(app.Gateway).not.toBe(Gateway);
         expect(typeof app.BlobMeta).toBe("function");
         expect(typeof app.Resharder).toBe("function");
         expect(typeof app.GsiShard).toBe("function");
+    });
+
+    test("the configured Gateway resolves mutation refs from the factory api manifest", () => {
+        const app = chardb({ auth, schema: { items }, api: { routedMutation } });
+        const gateway = Object.create(app.Gateway.prototype) as InstanceType<typeof app.Gateway>;
+        expect(
+            gateway.routeMutation({
+                ref: routedMutation.__chardbRef,
+                args: { organizationId: "org-7" },
+            })
+        ).toEqual({ ok: true, vshard: Number(vshardOf(["org-7"])) });
+        const missing = gateway.routeMutation({ ref: "api.ts#missing", args: {} });
+        expect(missing.ok).toBe(false);
+        if (!missing.ok) expect(missing.error.code).toBe("CDB_REF_NOT_FOUND");
     });
 
     test("`auth` is the pre-built bundle when supplied", () => {

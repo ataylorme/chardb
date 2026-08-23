@@ -25,9 +25,16 @@ import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/rang
 import { type TableSpec, renderRowApply, renderTableTriggers } from "../../reshard/triggers.ts";
 import { type ChardbRef, type PrincipalId, type RawJson, SubId } from "../../types.ts";
 import { executeAtomicMutation } from "../atomic-mutation.ts";
-import type { AuthCtx } from "../define.ts";
 import { type ChardbManifest, emptyManifest, resolveMutation } from "../manifest.ts";
+import type { CdbMutationRequest, CdbMutationResponse } from "../rpc.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
+
+export type {
+    CdbMutationFailure,
+    CdbMutationRequest,
+    CdbMutationResponse,
+    CdbMutationSuccess,
+} from "../rpc.ts";
 
 export interface CdbEnv {
     readonly CDB_R2?: unknown;
@@ -44,30 +51,6 @@ export interface SubscribeArgs {
         readonly intervals: readonly import("../../wire.ts").WireInterval[];
     }[];
 }
-
-export interface CdbMutationRequest {
-    readonly principalId: string;
-    readonly mutId: string;
-    readonly ref: string;
-    readonly args: RawJson;
-    readonly auth: AuthCtx;
-    readonly schemaEpoch: number;
-}
-
-export interface CdbMutationSuccess {
-    readonly ok: true;
-    readonly cookie: string;
-    readonly ran: boolean;
-    readonly result: RawJson;
-    readonly rowsAffected: number;
-}
-
-export interface CdbMutationFailure {
-    readonly ok: false;
-    readonly error: ReturnType<CdbError["toJSON"]>;
-}
-
-export type CdbMutationResponse = CdbMutationSuccess | CdbMutationFailure;
 
 export interface CdbRuntimeConfig<TSchema extends Record<string, unknown>> {
     readonly schema: () => TSchema;

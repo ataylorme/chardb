@@ -24,7 +24,6 @@ export function renderWrangler(input: WranglerTemplateInput): string {
                 { name: "CDB_GSI", class_name: "GsiShard" },
             ],
         },
-        services: [{ binding: "CDB", service: input.name, entrypoint: "Cdb" }],
         migrations: [
             {
                 tag: "init",
@@ -74,7 +73,6 @@ export function checkWrangler(rawJsonc: string): DoctorResult {
     const warnings: string[] = [];
     let cfg: {
         durable_objects?: { bindings?: { name: string; class_name: string }[] };
-        services?: { binding: string; service: string; entrypoint: string }[];
         migrations?: { new_sqlite_classes?: string[] }[];
         observability?: { traces?: { enabled?: boolean } };
         assets?: { run_worker_first?: string[] };
@@ -98,14 +96,11 @@ export function checkWrangler(rawJsonc: string): DoctorResult {
     for (const klass of REQUIRED_DO_CLASSES) {
         if (!classes.has(klass)) errors.push(`durable_objects.bindings missing class_name="${klass}"`);
     }
-    if (!cfg.services?.some(s => s.binding === "CDB" && s.entrypoint === "Cdb")) {
-        errors.push(`services[] must include {binding:"CDB", entrypoint:"Cdb"} for typed RPC`);
-    }
     if (cfg.observability?.traces?.enabled !== true) {
-        warnings.push(`observability.traces.enabled is not true (G19 region observability)`);
+        warnings.push("observability.traces.enabled is not true (G19 region observability)");
     }
     if (!cfg.assets?.run_worker_first?.includes("/q")) {
-        warnings.push(`assets.run_worker_first should include reserved chardb routes (/q,/ws,/f,/p,/s)`);
+        warnings.push("assets.run_worker_first should include reserved chardb routes (/q,/ws,/f,/p,/s)");
     }
     return { ok: errors.length === 0, errors, warnings };
 }

@@ -41,6 +41,7 @@ describe("renderWrangler / checkWrangler", () => {
         const r = checkWrangler(text);
         expect(r.ok).toBe(true);
         expect(r.errors).toEqual([]);
+        expect(JSON.parse(text).services).toBeUndefined();
     });
 
     test("checkWrangler reports each missing DO binding", () => {
@@ -74,6 +75,8 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.has("/tmp/proj/src/worker.ts")).toBe(true);
         // Worker template must be specialised to the app name.
         expect(files.get("/tmp/proj/src/worker.ts")).toContain('appName: "myapp"');
+        expect(files.get("/tmp/proj/src/worker.ts")).not.toContain("ChardbWorker");
+        expect(files.get("/tmp/proj/wrangler.jsonc")).not.toContain("CDB_WORKER");
         expect(files.get("/tmp/proj/src/schema.ts")).toContain("const { cdbTable } = forOrg()");
         expect(files.get("/tmp/proj/src/schema.ts")).toContain('selfBy: "authorId"');
         expect(files.get("/tmp/proj/src/api.ts")).toContain('partitionKey: "organizationId"');

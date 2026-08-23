@@ -18,7 +18,7 @@
  * separate signature verification step succeeds. Until JWKS verification
  * is wired through `Gateway.onHello`, the `Gateway.principalId` derived
  * from this helper is a soft-trust hint used for routing and presence
- * bucket keys; the actual write paths (`runMutation` / `crossPartitionMutation`)
+ * bucket keys; the actual write paths (Gateway mutation dispatch / `crossPartitionMutation`)
  * MUST re-verify before they grant authority.
  *
  * RFC 7519 §4.1 defines the registered claims used here:

@@ -106,13 +106,21 @@ export {
     type MountChardbOptions,
 } from "./entrypoint.ts";
 export { chardb, type ChardbApp, type ChardbFactoryInput } from "./chardb.ts";
-export {
-    Cdb,
-    type CdbMutationFailure,
-    type CdbMutationRequest,
-    type CdbMutationResponse,
-    type CdbMutationSuccess,
-} from "./do/cdb.ts";
+export { Cdb } from "./do/cdb.ts";
+export type {
+    CatalogMutationRpc,
+    CdbErrorWire,
+    CdbMutationFailure,
+    CdbMutationRequest,
+    CdbMutationResponse,
+    CdbMutationRpc,
+    CdbMutationSuccess,
+    MutationRouteRequest,
+    MutationRouteResolver,
+    MutationRouteResponse,
+    TrustedMutationAuth,
+    TrustedMutationDispatchRequest,
+} from "./rpc.ts";
 export {
     defineAuth,
     synthesizeAuthSchema,

@@ -14,7 +14,6 @@ import { DurableObject } from "cloudflare:workers";
 import { decodeJwtClaims, principalIdFromJwt } from "../../auth/jwt.ts";
 import { CdbError, isCdbErrorCode } from "../../errors.ts";
 import {
-    type ChardbRef,
     type ClientId,
     Cookie,
     CorrelationId,
@@ -35,6 +34,18 @@ import {
     decodeWire,
     encodeWire,
 } from "../../wire.ts";
+import { type ChardbManifest, emptyManifest, routeMutation as resolveMutationRoute } from "../manifest.ts";
+import type {
+    CatalogMutationRpc,
+    CdbErrorWire,
+    CdbMutationResponse,
+    CdbMutationRpc,
+    MutationRouteRequest,
+    MutationRouteResolver,
+    MutationRouteResponse,
+    TrustedMutationAuth,
+    TrustedMutationDispatchRequest,
+} from "../rpc.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
 const GW_DDL = `
@@ -73,13 +84,7 @@ interface GwAttachment {
     readonly lastCookie?: Cookie;
     readonly jwtKid: string;
     readonly presenceKeys?: readonly string[];
-    /**
-     * Authenticated principal id, populated during `hello` from the
-     * decoded JWT `sub` claim. Falls back to a clientId projection in
-     * `onSub` when the token was missing/expired/malformed so
-     * subscription routing still works pre-auth — write paths
-     * re-validate authority before granting it.
-     */
+    /** Unverified `sub` hint decoded from the hello JWT. Never grants write authority. */
     readonly principalId?: PrincipalId;
     /**
      * Active tenant from the JWT (`activeOrganizationId` claim issued
@@ -97,33 +102,6 @@ interface GwAttachment {
      * custom-session payloads.
      */
     readonly claimsJson?: string;
-}
-
-/** Auth context the Gateway threads into mut/query envelopes for the entrypoint to consume. */
-export interface GwAuthEnvelope {
-    readonly userId: string;
-    readonly tenantId: string | null;
-    readonly role: string | null;
-    readonly claims: { readonly [k: string]: unknown };
-}
-
-function authEnvelopeFrom(att: GwAttachment): GwAuthEnvelope | null {
-    if (!att.principalId) return null;
-    let claims: { readonly [k: string]: unknown } = {};
-    if (att.claimsJson) {
-        try {
-            claims = JSON.parse(att.claimsJson) as { readonly [k: string]: unknown };
-        } catch {
-            // Corrupt blob — treat as empty rather than failing the mutation.
-            claims = {};
-        }
-    }
-    return {
-        userId: att.principalId as unknown as string,
-        tenantId: att.tenantId ?? null,
-        role: att.role ?? null,
-        claims,
-    };
 }
 
 /**
@@ -145,29 +123,6 @@ function errorCodeFrom(e: unknown): import("../../errors.ts").CdbErrorCode {
 export interface GatewayEnv {
     readonly CDB_CATALOG: DurableObjectNamespace;
     readonly CDB_SHARD: DurableObjectNamespace;
-    /**
-     * Service binding back to the user's `WorkerEntrypoint` (the class returned
-     * by `defineChardb`). The Gateway uses it to resolve mutations against the
-     * bundler-emitted manifest without re-evaluating the user's closures.
-     */
-    readonly CDB_WORKER?: ChardbWorkerRpc;
-}
-
-interface ChardbWorkerRpc {
-    runMutation(input: {
-        readonly ref: string;
-        readonly args: RawJson;
-        readonly mutId: string;
-        readonly auth?: GwAuthEnvelope | null;
-    }): Promise<
-        | { readonly ok: true; readonly vshard: number }
-        | { readonly ok: false; readonly error: { readonly code: string; readonly message: string } }
-    >;
-}
-
-/** Minimal RPC surface the Gateway requires from the Catalog DO. */
-interface CatalogRpc {
-    route(vshard: number): Promise<{ shardId: string; schemaEpoch: number }>;
 }
 
 /** Minimal RPC surface the Gateway requires from each Cdb shard DO. */
@@ -185,6 +140,64 @@ interface CdbRpc {
     unsubscribe(subId: number): Promise<void>;
 }
 
+export interface TrustedMutationDispatchDeps {
+    readonly routeMutation: MutationRouteResolver;
+    readonly catalog: CatalogMutationRpc;
+    readonly cdb: (shardId: string) => CdbMutationRpc;
+}
+
+export interface GatewayRuntimeConfig {
+    readonly manifest: () => ChardbManifest;
+}
+
+function mutationFailure(code: import("../../errors.ts").CdbErrorCode, message: string): CdbMutationResponse {
+    return { ok: false, error: new CdbError({ code, message }).toJSON() };
+}
+
+/**
+ * Complete mutation dispatch from an already-verified auth boundary. Ref
+ * routing stays local to the configured Gateway isolate; Catalog and Cdb are
+ * the only RPC hops. Every rejected or thrown boundary settles as structured
+ * wire data so no client mutation is stranded.
+ */
+export async function dispatchTrustedMutation(
+    deps: TrustedMutationDispatchDeps,
+    request: TrustedMutationDispatchRequest
+): Promise<CdbMutationResponse> {
+    let routed: MutationRouteResponse;
+    try {
+        routed = deps.routeMutation({ ref: request.ref, args: request.args });
+    } catch {
+        return mutationFailure("CDB_INVARIANT", "local mutation routing failed");
+    }
+    if (!routed.ok) return routed;
+
+    let location: Awaited<ReturnType<CatalogMutationRpc["route"]>>;
+    try {
+        location = await deps.catalog.route(routed.vshard);
+    } catch {
+        return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog routing RPC failed");
+    }
+
+    try {
+        return await deps.cdb(location.shardId).mutate({
+            principalId: request.auth.userId,
+            mutId: request.mutId,
+            ref: request.ref,
+            args: request.args,
+            auth: request.auth,
+            schemaEpoch: location.schemaEpoch,
+        });
+    } catch {
+        return mutationFailure("CDB_SHARD_UNAVAILABLE", "Cdb mutation RPC failed");
+    }
+}
+
+/** JWT decoding is not verification. This remains closed until a verifier stamps auth. */
+function trustedMutationAuthFromAttachment(_attachment: GwAttachment): TrustedMutationAuth | null {
+    return null;
+}
+
 export class Gateway extends DurableObject<GatewayEnv> {
     private bootstrapped = false;
     private coalesceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -193,6 +206,15 @@ export class Gateway extends DurableObject<GatewayEnv> {
     constructor(state: DurableObjectState, env: GatewayEnv) {
         super(state, env);
         state.blockConcurrencyWhile(async () => this.bootstrap());
+    }
+
+    protected mutationManifest(): ChardbManifest {
+        return emptyManifest();
+    }
+
+    /** Resolve the registered mutation inside this Gateway isolate. */
+    routeMutation(request: MutationRouteRequest): MutationRouteResponse {
+        return resolveMutationRoute(this.mutationManifest(), request, vshardOf);
     }
 
     private bootstrap(): void {
@@ -319,8 +341,25 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     private onMut(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): void {
         const att = ws.deserializeAttachment() as GwAttachment | null;
-        if (!att) return;
-        void this.routeMut(ws, att, msg);
+        if (!att) {
+            this.sendMutFailure(
+                ws,
+                msg.mutId,
+                new CdbError({ code: "CDB_AUTH_NOT_BOUND", message: "verified mutation auth is not bound" }).toJSON()
+            );
+            return;
+        }
+        const trusted = trustedMutationAuthFromAttachment(att);
+        if (!trusted) {
+            this.sendMutFailure(
+                ws,
+                msg.mutId,
+                new CdbError({ code: "CDB_AUTH_NOT_BOUND", message: "verified mutation auth is not bound" }).toJSON(),
+                att.lastCookie
+            );
+            return;
+        }
+        void this.routeMut(ws, att, msg, trusted);
     }
 
     /**
@@ -330,45 +369,51 @@ export class Gateway extends DurableObject<GatewayEnv> {
      * inside the shard DO under `transactionSync`. Errors flow back over the
      * wire as `Down.mutAck { ok: false, error }`.
      */
-    private async routeMut(ws: WebSocket, att: GwAttachment, msg: Extract<Up, { t: "mut" }>): Promise<void> {
-        const worker = this.env.CDB_WORKER;
-        if (!worker) {
-            this.sendMutFailure(ws, msg.mutId, "CDB_INVARIANT");
+    private async routeMut(
+        ws: WebSocket,
+        att: GwAttachment,
+        msg: Extract<Up, { t: "mut" }>,
+        trusted: TrustedMutationAuth
+    ): Promise<void> {
+        let catalog: CatalogMutationRpc;
+        try {
+            const catalogId = this.env.CDB_CATALOG.idFromName("global");
+            catalog = this.env.CDB_CATALOG.get(catalogId) as unknown as CatalogMutationRpc;
+        } catch {
+            this.sendMutFailure(
+                ws,
+                msg.mutId,
+                new CdbError({ code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog binding unavailable" }).toJSON(),
+                att.lastCookie
+            );
             return;
         }
-        const auth = authEnvelopeFrom(att);
-        const result = await worker.runMutation({
-            ref: msg.ref,
-            args: msg.args,
-            mutId: msg.mutId,
-            ...(auth ? { auth } : {}),
-        });
-        if (!result.ok) {
-            const code = isCdbErrorCode(result.error.code) ? result.error.code : "CDB_INVARIANT";
-            this.sendMutFailure(ws, msg.mutId, code);
-            return;
-        }
-        const catalogId = this.env.CDB_CATALOG.idFromName("global");
-        const catalog = this.env.CDB_CATALOG.get(catalogId) as unknown as CatalogRpc;
-        const { shardId } = await catalog.route(result.vshard);
-        const shardDoId = this.env.CDB_SHARD.idFromName(shardId);
-        const shard = this.env.CDB_SHARD.get(shardDoId) as unknown as {
-            mutate(args: { ref: ChardbRef; mutId: MutId; args: RawJson }): Promise<{
-                ok: boolean;
-                cookie?: Cookie;
-                result?: RawJson;
-            }>;
-        };
-        const ack = await shard.mutate({ ref: msg.ref, mutId: msg.mutId, args: msg.args });
-        if (ack.ok && ack.cookie) {
+        const ack = await dispatchTrustedMutation(
+            {
+                routeMutation: request => this.routeMutation(request),
+                catalog,
+                cdb: shardId => {
+                    const shardDoId = this.env.CDB_SHARD.idFromName(shardId);
+                    return this.env.CDB_SHARD.get(shardDoId) as unknown as CdbMutationRpc;
+                },
+            },
+            {
+                ref: msg.ref,
+                mutId: msg.mutId,
+                args: msg.args,
+                ...trusted,
+            }
+        );
+        if (ack.ok) {
+            const cookie = Cookie(ack.cookie);
             this.send(ws, {
                 t: "poke",
-                cookie: ack.cookie,
+                cookie,
                 patches: [],
-                mutResults: [{ mutId: msg.mutId, ok: true, result: ack.result ?? null, cookie: ack.cookie }],
+                mutResults: [{ mutId: msg.mutId, ok: true, result: ack.result, cookie }],
             });
         } else {
-            this.sendMutFailure(ws, msg.mutId, "CDB_INVARIANT");
+            this.sendMutFailure(ws, msg.mutId, ack.error, att.lastCookie);
         }
     }
 
@@ -509,9 +554,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
         return [...shards];
     }
 
-    private catalog(): CatalogRpc {
+    private catalog(): CatalogMutationRpc {
         const id = this.env.CDB_CATALOG.idFromName("global");
-        return this.env.CDB_CATALOG.get(id) as unknown as CatalogRpc;
+        return this.env.CDB_CATALOG.get(id) as unknown as CatalogMutationRpc;
     }
 
     private cdb(shardId: string): CdbRpc {
@@ -571,19 +616,19 @@ export class Gateway extends DurableObject<GatewayEnv> {
         });
     }
 
-    private sendMutFailure(ws: WebSocket, mutId: MutId, code: import("../../errors.ts").CdbErrorCode): void {
+    private sendMutFailure(ws: WebSocket, mutId: MutId, error: CdbErrorWire, lastCookie?: Cookie): void {
         this.send(ws, {
             t: "poke",
-            cookie: Cookie(""),
+            cookie: lastCookie ?? Cookie(""),
             patches: [],
             mutResults: [
                 {
                     mutId,
                     ok: false,
                     error: {
-                        code,
-                        retryable: false,
-                        docs: `https://chardb.dev/errors/${code.toLowerCase()}`,
+                        code: error.code,
+                        retryable: error.retryable,
+                        docs: error.docs,
                     },
                 },
             ],
@@ -591,8 +636,17 @@ export class Gateway extends DurableObject<GatewayEnv> {
     }
 }
 
-/** Re-export for downstream tests that want to drive the routing logic. */
-export type { CatalogRpc as GatewayCatalogRpc, CdbRpc as GatewayCdbRpc };
+/** Bind the bundler-built manifest into each Gateway isolate. */
+export function configureGatewayRuntime(config: GatewayRuntimeConfig): typeof Gateway {
+    return class ConfiguredGateway extends Gateway {
+        protected override mutationManifest(): ChardbManifest {
+            return config.manifest();
+        }
+    };
+}
+
+/** Re-export for downstream tests that want to drive subscription routing. */
+export type { CdbRpc as GatewayCdbRpc };
 
 function toScalar(v: RawJson): string | number | bigint | Uint8Array {
     if (typeof v === "string" || typeof v === "number" || typeof v === "bigint") return v;

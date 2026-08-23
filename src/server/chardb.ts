@@ -49,7 +49,7 @@ import { buildAccessControl } from "./cdb-access.ts";
 import { BlobMeta } from "./do/blobmeta.ts";
 import { Catalog } from "./do/catalog.ts";
 import { type Cdb, configureCdbRuntime } from "./do/cdb.ts";
-import { Gateway } from "./do/gateway.ts";
+import { type Gateway, configureGatewayRuntime } from "./do/gateway.ts";
 import { GsiShard } from "./do/gsishard.ts";
 import { Resharder } from "./do/resharder.ts";
 import {
@@ -183,6 +183,9 @@ export function chardb<
         schema: () => runtimeEntrypoint.schema,
         manifest: () => runtimeEntrypoint.chardbManifest,
     });
+    const ConfiguredGateway = configureGatewayRuntime({
+        manifest: () => runtimeEntrypoint.chardbManifest,
+    });
 
     const hono = new Hono<{ Bindings: ChardbEnv }>();
     if (input.routes) input.routes(hono);
@@ -241,7 +244,7 @@ export function chardb<
         auth,
         Cdb: ConfiguredCdb,
         Catalog,
-        Gateway,
+        Gateway: ConfiguredGateway,
         BlobMeta,
         Resharder,
         GsiShard,
