@@ -194,6 +194,27 @@ const registeredNonJsonResult = api.query({
         return new Date("2026-08-23T00:00:00Z");
     },
 });
+const registeredSizedResult = api.query({
+    ref: "queries.ts#registeredSizedResult",
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: (args: { organizationId: string }) => ({
+        kind: "select" as const,
+        tables: ["query_records"],
+        partitionKey: {
+            table: "query_records",
+            column: "organization_id",
+            values: [args.organizationId],
+        },
+    }),
+    handler: async function registeredSizedResultHandler(
+        _ctx,
+        args: { organizationId: string; rows: number; character: string; characterCount: number }
+    ) {
+        const value = args.character.repeat(args.characterCount);
+        return Array.from({ length: args.rows }, () => value);
+    },
+});
 type IntentCoverageMode = "complete" | "duplicate" | "empty" | "omitted" | "failure";
 function intentCoverage(mode: IntentCoverageMode, organizationId = "org-a") {
     const tables =
@@ -429,6 +450,7 @@ const manifest = manifestFromExports({
     registeredListRecords,
     registeredGetRecord,
     registeredNonJsonResult,
+    registeredSizedResult,
     registeredIntentCoverage,
     subqueryAttempt,
     rawPredicateAttempt,
@@ -507,6 +529,10 @@ function registeredQuery(
     auth: CdbRegisteredQueryRequest["auth"] = AUTH
 ): CdbRegisteredQueryRequest {
     return { subscription, auth };
+}
+
+function sizedResultArgs(rows: number, character: string, characterCount: number) {
+    return { organizationId: "org-a", rows, character, characterCount };
 }
 
 function intentCoverageLiveRequest(subscription: LiveSubscriptionId, mode: IntentCoverageMode): CdbSubscriptionRequest {
@@ -607,6 +633,69 @@ describe("Cdb registered query execution", () => {
             ],
         });
         expect(registeredProbeRuns).toBe(1);
+    });
+
+    test("accepts empty, small, and exact query result limits", async () => {
+        const { cdb } = await setup();
+        const cases = [
+            { registrationId: "registration-empty", args: sizedResultArgs(0, "", 0), expectedRows: 0 },
+            { registrationId: "registration-small", args: sizedResultArgs(2, "x", 1), expectedRows: 2 },
+            { registrationId: "registration-row-boundary", args: sizedResultArgs(4_096, "", 0), expectedRows: 4_096 },
+            {
+                registrationId: "registration-byte-boundary",
+                args: sizedResultArgs(1, "a", 512 * 1_024 - 4),
+                expectedRows: 1,
+            },
+        ] as const;
+
+        for (const item of cases) {
+            const subscription = liveIdentity({ registrationId: item.registrationId });
+            await cdb.subscribe(liveRequest(subscription, registeredSizedResult.__chardbRef, item.args));
+            const response = await cdb.queryRegistered(registeredQuery(subscription));
+            expect(response).toMatchObject({ ok: true });
+            if (response.ok) expect(response.result).toHaveLength(item.expectedRows);
+        }
+    });
+
+    test("rejects one row or byte over the result limits and measures multibyte UTF-8", async () => {
+        const { cdb } = await setup();
+        const cases = [
+            {
+                registrationId: "registration-row-over",
+                args: sizedResultArgs(4_097, "", 0),
+                message: "registered query result exceeds the 4096-row limit",
+            },
+            {
+                registrationId: "registration-byte-over",
+                args: sizedResultArgs(1, "a", 512 * 1_024 - 3),
+                message: "registered query result exceeds the 524288-byte serialized limit",
+            },
+            {
+                registrationId: "registration-multibyte-over",
+                args: sizedResultArgs(1, "é", (512 * 1_024 - 4) / 2 + 1),
+                message: "registered query result exceeds the 524288-byte serialized limit",
+            },
+        ] as const;
+
+        for (const item of cases) {
+            const subscription = liveIdentity({ registrationId: item.registrationId });
+            await cdb.subscribe(liveRequest(subscription, registeredSizedResult.__chardbRef, item.args));
+            await expect(cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject({
+                ok: false,
+                error: { code: "CDB_INVARIANT", message: item.message },
+            });
+        }
+
+        await expect(
+            cdb.query({
+                ref: registeredSizedResult.__chardbRef,
+                args: sizedResultArgs(4_097, "", 0),
+                auth: AUTH,
+            })
+        ).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT", message: "query result exceeds the 4096-row limit" },
+        });
     });
 
     test("checks registered query reads against complete, duplicate, and omitted intent tables", async () => {
