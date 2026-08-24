@@ -7,6 +7,7 @@ import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { forOrg } from "../../src/server/index.ts";
 import { manifestFromExports, resolveQuery } from "../../src/server/manifest.ts";
+import { CDB_RESULT_MAX_BYTES } from "../../src/server/result_limits.ts";
 import type {
     CdbQueryRequest,
     CdbRegisteredQueryRequest,
@@ -214,6 +215,60 @@ const registeredSizedResult = api.query({
         const value = args.character.repeat(args.characterCount);
         return Array.from({ length: args.rows }, () => value);
     },
+});
+let hostileResultDescriptorValue = "descriptor-value";
+let hostileResultGetValue = "get-trap-value";
+let hostileResultGetRuns = 0;
+let hostileResultOwnKeysRuns = 0;
+let hostileResultSnapshotSideEffect: (() => void) | undefined;
+let hostileResultReadsUndeclaredTable = false;
+
+function hostileNestedProxyResult(): RawJson[] {
+    const target = [hostileResultDescriptorValue];
+    const proxy = new Proxy(target, {
+        ownKeys(value) {
+            hostileResultOwnKeysRuns++;
+            const sideEffect = hostileResultSnapshotSideEffect;
+            hostileResultSnapshotSideEffect = undefined;
+            sideEffect?.();
+            return Reflect.ownKeys(value);
+        },
+        get(value, key, receiver) {
+            hostileResultGetRuns++;
+            if (key === "0") return hostileResultGetValue;
+            return Reflect.get(value, key, receiver);
+        },
+    });
+    return [proxy];
+}
+
+const registeredHostileResult = api.query({
+    ref: "queries.ts#registeredHostileResult",
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: (args: { organizationId: string }) => ({
+        kind: "select" as const,
+        tables: ["query_records"],
+        partitionKey: {
+            table: "query_records",
+            column: "organization_id",
+            values: [args.organizationId],
+        },
+    }),
+    handler: async function registeredHostileResultHandler(ctx) {
+        if (hostileResultReadsUndeclaredTable) {
+            hostileResultSnapshotSideEffect = () => {
+                void ctx.db.select().from(publicRecords);
+            };
+        }
+        return hostileNestedProxyResult();
+    },
+});
+
+let retainedQueryResult: Array<{ value: string }> | undefined;
+const retainedResult = api.query(async function retainedResultHandler() {
+    retainedQueryResult = [{ value: "original" }];
+    return retainedQueryResult;
 });
 type IntentCoverageMode = "complete" | "duplicate" | "empty" | "omitted" | "failure";
 function intentCoverage(mode: IntentCoverageMode, organizationId = "org-a") {
@@ -456,6 +511,7 @@ const manifest = manifestFromExports({
     registeredGetRecord,
     registeredNonJsonResult,
     registeredSizedResult,
+    registeredHostileResult,
     registeredIntentCoverage,
     subqueryAttempt,
     rawPredicateAttempt,
@@ -478,6 +534,7 @@ const manifest = manifestFromExports({
     rawAttempt,
     transactionAttempt,
     argumentProbe,
+    retainedResult,
 });
 const ConfiguredCdb = configureCdbRuntime({ schema: () => schema, manifest: () => manifest });
 const PolicyDriftCdb = configureCdbRuntime({
@@ -590,6 +647,13 @@ describe("Cdb registered query execution", () => {
         registeredProbeRuns = 0;
         argumentProbeRuns = 0;
         registeredQueryPause = undefined;
+        hostileResultDescriptorValue = "descriptor-value";
+        hostileResultGetValue = "get-trap-value";
+        hostileResultGetRuns = 0;
+        hostileResultOwnKeysRuns = 0;
+        hostileResultSnapshotSideEffect = undefined;
+        hostileResultReadsUndeclaredTable = false;
+        retainedQueryResult = undefined;
         const db = new Database(":memory:");
         databases.push(db);
         const configured = construct(ConfiguredCdb, db);
@@ -742,6 +806,118 @@ describe("Cdb registered query execution", () => {
             expect(response).toMatchObject({ ok: true });
             if (response.ok) expect(response.result).toHaveLength(item.expectedRows);
         }
+    });
+
+    test("owns direct and registered Proxy array results without invoking property gets", async () => {
+        const { cdb } = await setup();
+        const args = { organizationId: "org-a" };
+
+        await expect(cdb.query({ ref: registeredHostileResult.__chardbRef, args, auth: AUTH })).resolves.toEqual({
+            ok: true,
+            result: [["descriptor-value"]],
+        });
+        expect(hostileResultGetRuns).toBe(0);
+        expect(hostileResultOwnKeysRuns).toBe(1);
+
+        hostileResultGetRuns = 0;
+        hostileResultOwnKeysRuns = 0;
+        const subscription = liveIdentity({ registrationId: "registration-hostile-result" });
+        await cdb.subscribe(liveRequest(subscription, registeredHostileResult.__chardbRef, args));
+        const response = await cdb.queryRegistered(registeredQuery(subscription));
+        expect(response).toEqual({ ok: true, result: [["descriptor-value"]] });
+        expect(hostileResultGetRuns).toBe(0);
+        expect(hostileResultOwnKeysRuns).toBe(1);
+
+        hostileResultDescriptorValue = "changed-after-settlement";
+        hostileResultGetValue = "changed-get-value";
+        expect(response).toEqual({ ok: true, result: [["descriptor-value"]] });
+    });
+
+    test("checks reads performed by result snapshot traps against the declared intent", async () => {
+        const { cdb } = await setup();
+        const args = { organizationId: "org-a" };
+        const subscription = liveIdentity({ registrationId: "registration-hostile-result-read" });
+        await cdb.subscribe(liveRequest(subscription, registeredHostileResult.__chardbRef, args));
+        hostileResultReadsUndeclaredTable = true;
+
+        await expect(cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject({
+            ok: false,
+            error: {
+                code: "CDB_INVARIANT",
+                message: expect.stringContaining("read undeclared cdbTable: query_public_records"),
+            },
+        });
+        expect(hostileResultGetRuns).toBe(0);
+        expect(hostileResultOwnKeysRuns).toBe(1);
+    });
+
+    test("applies the durable generation fence after result snapshot traps", async () => {
+        const { cdb, db } = await setup();
+        const args = { organizationId: "org-a" };
+        const subscription = liveIdentity({ registrationId: "registration-hostile-result-retired" });
+        await cdb.subscribe(liveRequest(subscription, registeredHostileResult.__chardbRef, args));
+        hostileResultSnapshotSideEffect = () => {
+            db.query(
+                `UPDATE _chardb_live_subscriptions
+                 SET query_hash = query_hash || '-changed'
+                 WHERE gateway_id = ? AND registration_id = ?`
+            ).run(subscription.gatewayId, subscription.registrationId);
+        };
+
+        await expect(cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject({
+            ok: false,
+            error: {
+                code: "CDB_INVARIANT",
+                message: "registered query changed while its handler was running",
+            },
+        });
+        expect(hostileResultGetRuns).toBe(0);
+        expect(hostileResultOwnKeysRuns).toBe(1);
+        expect(
+            db
+                .query(
+                    "SELECT query_hash AS queryHash FROM _chardb_live_subscriptions WHERE gateway_id = ? AND registration_id = ?"
+                )
+                .get(subscription.gatewayId, subscription.registrationId)
+        ).toEqual({ queryHash: expect.stringContaining("-changed") });
+    });
+
+    test("rejects a descriptor-visible query result one byte over the serialized limit", async () => {
+        const { cdb } = await setup();
+        hostileResultDescriptorValue = "a".repeat(CDB_RESULT_MAX_BYTES - 5);
+        hostileResultGetValue = "small";
+        expect(new TextEncoder().encode(JSON.stringify([[hostileResultDescriptorValue]])).byteLength).toBe(
+            CDB_RESULT_MAX_BYTES + 1
+        );
+
+        await expect(
+            cdb.query({
+                ref: registeredHostileResult.__chardbRef,
+                args: { organizationId: "org-a" },
+                auth: AUTH,
+            })
+        ).resolves.toMatchObject({
+            ok: false,
+            error: {
+                code: "CDB_INVARIANT",
+                message: "query result exceeds the 524288-byte serialized limit",
+            },
+        });
+        expect(hostileResultGetRuns).toBe(0);
+        expect(hostileResultOwnKeysRuns).toBe(1);
+    });
+
+    test("isolates a returned query result from later source mutation", async () => {
+        const { cdb } = await setup();
+        const response = await cdb.query({ ref: retainedResult.__chardbRef, args: {}, auth: AUTH });
+        expect(response).toEqual({ ok: true, result: [{ value: "original" }] });
+        if (!retainedQueryResult) throw new Error("query handler did not retain its result");
+        const retainedFirst = retainedQueryResult[0];
+        if (!retainedFirst) throw new Error("query handler retained an empty result");
+
+        retainedFirst.value = "mutated";
+        retainedQueryResult.push({ value: "late" });
+        expect(response).toEqual({ ok: true, result: [{ value: "original" }] });
     });
 
     test("rejects one row or byte over the result limits and measures multibyte UTF-8", async () => {

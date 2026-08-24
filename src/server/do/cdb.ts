@@ -25,7 +25,6 @@ import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/rang
 import { type TableSpec, renderRowApply, renderTableTriggers } from "../../reshard/triggers.ts";
 import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId, TenantId } from "../../types.ts";
 import { stableHashHex } from "../../util/canonical.ts";
-import { rawJsonResult } from "../../util/raw_json.ts";
 import type { CdbIntent } from "../../wire.ts";
 import { executeAtomicMutation } from "../atomic-mutation.ts";
 import { type QueryReadRangeObservation, wrapQueryDb } from "../cdb-db-proxy.ts";
@@ -39,10 +38,10 @@ import {
     CDB_MUTATION_ARGS_MAX_BYTES,
     CDB_MUTATION_ARGS_MAX_DEPTH,
     CDB_QUERY_RESULT_MAX_ROWS,
-    assertCdbResultByteLimit,
     snapshotCdbJsonByteLimit,
     snapshotCdbMutationArgs,
     snapshotCdbQueryArgs,
+    snapshotCdbResultByteLimit,
 } from "../result_limits.ts";
 import type {
     CdbMutationRequest,
@@ -204,16 +203,20 @@ const CDB_MAX_ACTIVE_LIVE_REGISTRATIONS = 4_096;
 const CDB_MAX_INVALIDATION_OUTBOX_ROWS = 4_096;
 const CDB_MAX_INVALIDATIONS_PER_MUTATION = 4_096;
 
-function assertCdbQueryResultLimits(result: RawJson, subject: string): void {
-    if (Array.isArray(result) && result.length > CDB_QUERY_RESULT_MAX_ROWS) {
+function snapshotCdbQueryResultLimits(result: unknown, subject: string): RawJson {
+    const owned = snapshotCdbResultByteLimit(
+        result as RawJson,
+        subject,
+        "select fewer rows or columns, or paginate the result"
+    );
+    if (Array.isArray(owned) && owned.length > CDB_QUERY_RESULT_MAX_ROWS) {
         throw new CdbError({
             code: "CDB_INVARIANT",
             message: `${subject} exceeds the ${CDB_QUERY_RESULT_MAX_ROWS}-row limit`,
             hint: "add a query limit or paginate the result",
         });
     }
-
-    assertCdbResultByteLimit(result, subject, "select fewer rows or columns, or paginate the result");
+    return owned;
 }
 
 function subscriptionKey(subscription: LiveSubscriptionId): string {
@@ -1253,7 +1256,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 tableName => readTables.add(tableName),
                 observation => readRanges.set(observation.token, observation)
             );
-            const result = rawJsonResult(
+            const result = snapshotCdbQueryResultLimits(
                 await descriptor.invokeValidated({ db: readOnlyQueryDb(database), auth: request.auth }, request.args),
                 "query result"
             );
@@ -1261,7 +1264,6 @@ export class Cdb extends DurableObject<CdbEnv> {
                 assertQueryIntentCoversReads(request.ref, declaredIntent.tables, readTables);
                 assertQueryIntentCoversRanges(request.ref, declaredIntent, readRanges);
             }
-            assertCdbQueryResultLimits(result, "query result");
             return { ok: true, result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
@@ -1324,7 +1326,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 tableName => readTables.add(tableName),
                 observation => readRanges.set(observation.token, observation)
             );
-            const result = rawJsonResult(
+            const result = snapshotCdbQueryResultLimits(
                 await descriptor.invokeValidated(
                     { db: readOnlyQueryDb(database), auth: request.auth },
                     subscription.args
@@ -1360,7 +1362,6 @@ export class Cdb extends DurableObject<CdbEnv> {
             }
             parseStoredSubscription(current);
             assertSubscriptionTables(sql, request.subscription, [...new Set(subscription.tables)].sort());
-            assertCdbQueryResultLimits(result, "registered query result");
             return { ok: true, result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
