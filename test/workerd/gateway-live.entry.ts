@@ -135,7 +135,7 @@ export class Gateway extends ProductionGateway {
 
     async fixtureStageOnly(): Promise<void> {
         const nowMs = super.gatewayNowMs();
-        this.fixtureNowSequence = [nowMs, nowMs, nowMs + 1, nowMs, nowMs];
+        this.fixtureNowSequence = [nowMs, nowMs, nowMs, nowMs + 1, nowMs, nowMs];
         try {
             await super.alarm();
         } finally {
