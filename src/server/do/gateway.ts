@@ -2355,12 +2355,12 @@ export class Gateway extends DurableObject<GatewayEnv> {
         return task;
     }
 
-    private async retireGatewayRunnerRegistration(
+    private retireGatewayRunnerRegistration(
         identity: GatewayRegistrationKey & { readonly registrationId: string; readonly connectionId: string },
         nowMs: number,
         run?: GatewayDirtyRun
-    ): Promise<boolean> {
-        const retired = this.ctx.storage.transactionSync(() => {
+    ): boolean {
+        return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             return run
                 ? retireClaimedGatewayRegistration(sql, {
@@ -2371,8 +2371,6 @@ export class Gateway extends DurableObject<GatewayEnv> {
                   })
                 : retireGatewayRegistration(sql, identity, identity.registrationId, nowMs);
         });
-        if (retired) await this.scheduleGatewayWork(nowMs).catch(() => {});
-        return retired;
     }
 
     private settleRetiredGatewaySubscription(
@@ -2437,7 +2435,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const initialSocket = this.exactGatewaySocket(identity, nowMs);
         if (initialSocket.status === "refreshing") return;
         if (initialSocket.status === "terminal") {
-            await this.retireGatewayRunnerRegistration(identity, nowMs);
+            if (this.retireGatewayRunnerRegistration(identity, nowMs)) {
+                await this.scheduleGatewayWork(nowMs).catch(() => {});
+            }
             return;
         }
         await this.scheduleGatewayAlarm(nowMs + GATEWAY_QUERY_LEASE_MS);
@@ -2445,7 +2445,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const claimSocket = this.exactGatewaySocket(identity, claimNowMs);
         if (claimSocket.status === "refreshing") return;
         if (claimSocket.status === "terminal") {
-            await this.retireGatewayRunnerRegistration(identity, claimNowMs);
+            if (this.retireGatewayRunnerRegistration(identity, claimNowMs)) {
+                await this.scheduleGatewayWork(claimNowMs).catch(() => {});
+            }
             return;
         }
         const run = this.ctx.storage.transactionSync(() =>
@@ -2469,9 +2471,11 @@ export class Gateway extends DurableObject<GatewayEnv> {
             });
             if (!projected.ok) {
                 if (projected.code === "CDB_FORBIDDEN") {
-                    const retired = await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                    const retiredAt = this.gatewayNowMs();
+                    const retired = this.retireGatewayRunnerRegistration(identity, retiredAt, run);
                     if (retired) {
                         this.settleRetiredGatewaySubscription(identity, { kind: "error", code: projected.code });
+                        await this.scheduleGatewayWork(retiredAt).catch(() => {});
                     }
                 } else {
                     await this.settleGatewayQueryFailure(candidate, run, this.gatewayNowMs(), projected.message);
@@ -2485,9 +2489,11 @@ export class Gateway extends DurableObject<GatewayEnv> {
             }
             const routedPhysicalId = this.env.CDB_SHARD.idFromName(route.shardId).toString();
             if (routedPhysicalId !== run.sourceCdbId) {
-                const retired = await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                const retiredAt = this.gatewayNowMs();
+                const retired = this.retireGatewayRunnerRegistration(identity, retiredAt, run);
                 if (retired) {
                     this.settleRetiredGatewaySubscription(identity, { kind: "refetch", reason: "shardsChanged" });
+                    await this.scheduleGatewayWork(retiredAt).catch(() => {});
                 }
                 return;
             }
@@ -2507,12 +2513,14 @@ export class Gateway extends DurableObject<GatewayEnv> {
             );
             if (!response.ok) {
                 if (isTerminalRegisteredQueryFailure(response.error.code)) {
-                    const retired = await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                    const retiredAt = this.gatewayNowMs();
+                    const retired = this.retireGatewayRunnerRegistration(identity, retiredAt, run);
                     if (retired) {
                         this.settleRetiredGatewaySubscription(identity, {
                             kind: "error",
                             code: response.error.code,
                         });
+                        await this.scheduleGatewayWork(retiredAt).catch(() => {});
                     }
                 } else {
                     await this.settleGatewayQueryFailure(candidate, run, this.gatewayNowMs(), response.error.message);
@@ -2527,7 +2535,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 return;
             }
             if (currentSocket.status === "terminal") {
-                await this.retireGatewayRunnerRegistration(identity, settledAt, run);
+                if (this.retireGatewayRunnerRegistration(identity, settledAt, run)) {
+                    await this.scheduleGatewayWork(settledAt).catch(() => {});
+                }
                 return;
             }
             const authEpochs = projected.auth.authEpochs;
