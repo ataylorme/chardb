@@ -111,6 +111,7 @@ describe("Gateway active snapshot runner", () => {
     let sockets: FakeSocket[];
     let queryCalls: unknown[];
     let queryBehavior: () => unknown | Promise<unknown>;
+    let authorityBehavior: () => unknown | Promise<unknown>;
     let routePhysicalId: string;
 
     beforeEach(async () => {
@@ -124,18 +125,19 @@ describe("Gateway active snapshot runner", () => {
         sockets = [];
         queryCalls = [];
         queryBehavior = () => ({ ok: true, result: [{ id: 1, body: "hello" }] });
+        authorityBehavior = () => ({
+            principalId: PrincipalId("principal-1"),
+            organizationId: TenantId("org-1"),
+            role: "member",
+            roles: ["member"],
+            authEpochs: { global: 10, tenant: 11, principal: 12 },
+        });
         routePhysicalId = "physical-cdb-1";
 
         const catalog = {
             async resolveOrganizationAuthority() {
                 events.push("authority");
-                return {
-                    principalId: PrincipalId("principal-1"),
-                    organizationId: TenantId("org-1"),
-                    role: "member",
-                    roles: ["member"],
-                    authEpochs: { global: 10, tenant: 11, principal: 12 },
-                };
+                return await authorityBehavior();
             },
             async route() {
                 events.push("route");
@@ -309,7 +311,7 @@ describe("Gateway active snapshot runner", () => {
 
     test("retires a nonretryable registered-query failure", async () => {
         installActive();
-        attach();
+        const socket = attach();
         queryBehavior = () => ({
             ok: false,
             error: new CdbError({
@@ -323,6 +325,48 @@ describe("Gateway active snapshot runner", () => {
         expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
         expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
         expect(currentAlarm).toBe(101);
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
+        expect(JSON.parse(socket.sent[0] as string)).toMatchObject({
+            t: "error",
+            code: "CDB_INVARIANT",
+            subId: 1,
+        });
+    });
+
+    test("settles revoked authority instead of leaving stale live rows", async () => {
+        installActive();
+        const socket = attach();
+        authorityBehavior = () => null;
+
+        await fireAlarm();
+
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
+        expect(queryCalls).toEqual([]);
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
+        expect(JSON.parse(socket.sent[0] as string)).toMatchObject({
+            t: "error",
+            code: "CDB_FORBIDDEN",
+            subId: 1,
+        });
+    });
+
+    test("requests a refetch after the physical shard route changes", async () => {
+        installActive();
+        const socket = attach();
+        routePhysicalId = "physical-cdb-2";
+
+        await fireAlarm();
+
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
+        expect(queryCalls).toEqual([]);
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
+        expect(JSON.parse(socket.sent[0] as string)).toEqual({
+            t: "mustRefetch",
+            subIds: [1],
+            reason: "shardsChanged",
+        });
     });
 
     test("a stolen run fences the old query's terminal socket retirement", async () => {

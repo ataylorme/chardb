@@ -657,6 +657,38 @@ describe("createChardbClient — wire round-trip", () => {
         expect(resent.args).toEqual({ organizationId: "org-1" });
     });
 
+    test("a subscription error clears rows instead of leaving stale live data", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: unknown[][] = [];
+        c.subscribe<{ id: string }>("queries.ts#listMessages", { organizationId: "org-1" }, rows =>
+            seen.push([...rows])
+        );
+        await flush();
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:1"),
+            rows: [{ id: "r1" }],
+        });
+        await flush();
+        expect(seen[seen.length - 1]).toEqual([{ id: "r1" }]);
+
+        ws.emit({
+            t: "error",
+            code: "CDB_FORBIDDEN",
+            retryable: false,
+            correlationId: "corr-revoked" as never,
+            docs: "https://chardb.dev/errors/cdb_forbidden",
+            subId: SubId(1),
+        });
+        await flush();
+
+        expect(seen[seen.length - 1]).toEqual([]);
+    });
+
     test("reconnect within RYW window resumes from lastCookie via Up.hello.resumeFromCookie", async () => {
         const c = client();
         await flush();

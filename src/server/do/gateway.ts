@@ -2359,7 +2359,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         identity: GatewayRegistrationKey & { readonly registrationId: string; readonly connectionId: string },
         nowMs: number,
         run?: GatewayDirtyRun
-    ): Promise<void> {
+    ): Promise<boolean> {
         const retired = this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             return run
@@ -2371,7 +2371,27 @@ export class Gateway extends DurableObject<GatewayEnv> {
                   })
                 : retireGatewayRegistration(sql, identity, identity.registrationId, nowMs);
         });
-        if (retired) await this.scheduleGatewayWork(nowMs);
+        if (retired) await this.scheduleGatewayWork(nowMs).catch(() => {});
+        return retired;
+    }
+
+    private settleRetiredGatewaySubscription(
+        identity: GatewayRegistrationKey & { readonly connectionId: string },
+        settlement:
+            | { readonly kind: "error"; readonly code: import("../../errors.ts").CdbErrorCode }
+            | { readonly kind: "refetch"; readonly reason: "shardsChanged" }
+    ): void {
+        const current = this.exactGatewaySocket(identity, this.gatewayNowMs());
+        if (current.status !== "ready") return;
+        current.ws.serializeAttachment({
+            ...current.attachment,
+            snapshotSubIds: (current.attachment.snapshotSubIds ?? []).filter(subId => subId !== identity.subId),
+        } satisfies VerifiedGwAttachment);
+        if (settlement.kind === "refetch") {
+            this.send(current.ws, { t: "mustRefetch", subIds: [identity.subId], reason: settlement.reason });
+            return;
+        }
+        this.sendError(current.ws, settlement.code, identity.subId);
     }
 
     private async retireGatewaySnapshotAttempt(attempt: GatewaySnapshotSendAttempt, nowMs: number): Promise<void> {
@@ -2449,7 +2469,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
             });
             if (!projected.ok) {
                 if (projected.code === "CDB_FORBIDDEN") {
-                    await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                    const retired = await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                    if (retired) {
+                        this.settleRetiredGatewaySubscription(identity, { kind: "error", code: projected.code });
+                    }
                 } else {
                     await this.settleGatewayQueryFailure(candidate, run, this.gatewayNowMs(), projected.message);
                 }
@@ -2462,7 +2485,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
             }
             const routedPhysicalId = this.env.CDB_SHARD.idFromName(route.shardId).toString();
             if (routedPhysicalId !== run.sourceCdbId) {
-                await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                const retired = await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                if (retired) {
+                    this.settleRetiredGatewaySubscription(identity, { kind: "refetch", reason: "shardsChanged" });
+                }
                 return;
             }
             const sourceId = this.env.CDB_SHARD.idFromString(run.sourceCdbId);
@@ -2481,7 +2507,13 @@ export class Gateway extends DurableObject<GatewayEnv> {
             );
             if (!response.ok) {
                 if (isTerminalRegisteredQueryFailure(response.error.code)) {
-                    await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                    const retired = await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                    if (retired) {
+                        this.settleRetiredGatewaySubscription(identity, {
+                            kind: "error",
+                            code: response.error.code,
+                        });
+                    }
                 } else {
                     await this.settleGatewayQueryFailure(candidate, run, this.gatewayNowMs(), response.error.message);
                 }

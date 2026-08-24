@@ -314,6 +314,8 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             const sub = subs.get(subId);
             if (sub) {
                 sub.state = "error";
+                sub.rows = [];
+                sub.optimisticPatches = [];
                 notify(sub);
             }
         }
