@@ -9,8 +9,8 @@ import * as React from "react";
 import * as TestRenderer from "react-test-renderer";
 import type { ChardbClient } from "../src/client/index.ts";
 import * as ChardbReact from "../src/react/index.ts";
-import { ChardbProvider, useChardb, useMutation, useQuery } from "../src/react/index.ts";
-import type { RawJson } from "../src/wire.ts";
+import { ChardbProvider, useChardb, useMutation, useQuery, useSession } from "../src/react/index.ts";
+import { PROTOCOL_V, type RawJson } from "../src/wire.ts";
 
 interface SubInstance {
     readonly ref: string;
@@ -29,13 +29,16 @@ class ProviderWebSocket {
     onerror: (() => void) | null = null;
     readyState = ProviderWebSocket.OPEN;
     closeCalls = 0;
+    readonly sent: string[] = [];
 
     constructor(readonly url: string) {
         ProviderWebSocket.instances.push(this);
         queueMicrotask(() => this.onopen?.());
     }
 
-    send(_raw: string): void {}
+    send(raw: string): void {
+        this.sent.push(raw);
+    }
     close(): void {
         this.closeCalls += 1;
         this.readyState = ProviderWebSocket.CLOSED;
@@ -72,6 +75,25 @@ function stubClient() {
         state: "open" as const,
     };
     return { client, subs, mutateCalls, lifecycle };
+}
+
+function sessionAuth(userId: string, token: string) {
+    const activity = { fetchCalls: 0 };
+    const snapshot = {
+        data: { user: { id: userId } },
+        isPending: false,
+    };
+    const auth: ChardbReact.AuthClientLike = {
+        async $fetch<T>() {
+            activity.fetchCalls += 1;
+            return { data: { token } as T, error: null };
+        },
+        useSession: {
+            get: () => snapshot,
+            subscribe: () => () => {},
+        },
+    };
+    return { auth, activity };
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -218,6 +240,182 @@ describe("chardb/react — hook lifecycle", () => {
             expect(second.closeCalls).toBe(1);
         } finally {
             tree?.unmount();
+            (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;
+        }
+    });
+
+    test("an auth-only update preserves an owned client when getJwt is explicit", async () => {
+        const realWebSocket = globalThis.WebSocket;
+        ProviderWebSocket.instances.length = 0;
+        (globalThis as { WebSocket: unknown }).WebSocket = ProviderWebSocket;
+        const firstAuth = sessionAuth("user-a", "unused-a");
+        const secondAuth = sessionAuth("user-b", "unused-b");
+        const query = Object.assign(async (_ctx: never, _args: Record<string, never>) => [], {
+            __chardbRef: { toString: () => "queries.ts#auth-context" },
+        });
+        let getJwtCalls = 0;
+        const getJwt = async () => {
+            getJwtCalls += 1;
+            return "explicit-jwt";
+        };
+        let capturedClient: ChardbClient | undefined;
+        let capturedUserId: string | null | undefined;
+        let tree: TestRenderer.ReactTestRenderer | undefined;
+        let mutationOutcome:
+            | Promise<{ readonly ok: true; readonly value: RawJson } | { readonly ok: false }>
+            | undefined;
+
+        function Probe() {
+            capturedClient = useChardb();
+            capturedUserId = useSession().userId;
+            useQuery(query, {});
+            return null;
+        }
+
+        const render = (auth: ChardbReact.AuthClientLike) =>
+            React.createElement(
+                ChardbProvider,
+                {
+                    endpoint: "wss://example.com/auth-context",
+                    getJwt,
+                    auth,
+                    clientId: "provider-auth-context",
+                    crossTab: false,
+                },
+                React.createElement(Probe)
+            );
+
+        try {
+            await TestRenderer.act(async () => {
+                tree = TestRenderer.create(render(firstAuth.auth));
+                await flushMicrotasks();
+            });
+            const originalClient = capturedClient;
+            if (!originalClient) throw new Error("expected the provider-owned client");
+            const socket = ProviderWebSocket.instances[0];
+            if (!socket) throw new Error("expected the provider-owned socket");
+            let mutationSettled = false;
+            mutationOutcome = originalClient.mutate("mutations.ts#auth-context", {}).then(
+                value => {
+                    mutationSettled = true;
+                    return { ok: true as const, value };
+                },
+                () => {
+                    mutationSettled = true;
+                    return { ok: false as const };
+                }
+            );
+
+            await TestRenderer.act(async () => {
+                tree?.update(render(secondAuth.auth));
+                await flushMicrotasks();
+            });
+            expect(capturedClient).toBe(originalClient);
+            expect(capturedUserId).toBe("user-b");
+            expect(getJwtCalls).toBe(1);
+            expect(firstAuth.activity.fetchCalls).toBe(0);
+            expect(secondAuth.activity.fetchCalls).toBe(0);
+            expect(ProviderWebSocket.instances).toHaveLength(1);
+            expect(socket.closeCalls).toBe(0);
+            expect(mutationSettled).toBe(false);
+
+            socket.onmessage?.({
+                data: JSON.stringify({
+                    t: "welcome",
+                    protocolV: PROTOCOL_V,
+                    baseCookie: "c-auth-context:1",
+                    region: "test",
+                }),
+            });
+            const sent = socket.sent.map(raw => JSON.parse(raw) as { readonly t: string; readonly mutId?: string });
+            expect(sent.map(message => message.t)).toEqual(["hello", "sub", "mut"]);
+            expect(sent.filter(message => message.t === "sub")).toHaveLength(1);
+            const mutation = sent.find(message => message.t === "mut");
+            if (!mutation?.mutId) throw new Error("expected a queued mutation");
+            socket.onmessage?.({
+                data: JSON.stringify({
+                    t: "poke",
+                    cookie: "c-auth-context:2",
+                    patches: [],
+                    mutResults: [
+                        {
+                            mutId: mutation.mutId,
+                            ok: true,
+                            result: { saved: true },
+                            cookie: "c-auth-context:2",
+                        },
+                    ],
+                }),
+            });
+            await expect(mutationOutcome).resolves.toEqual({ ok: true, value: { saved: true } });
+
+            TestRenderer.act(() => tree?.unmount());
+            await flushMicrotasks();
+            expect(socket.closeCalls).toBe(1);
+        } finally {
+            tree?.unmount();
+            await mutationOutcome?.catch(() => {});
+            capturedClient?.close();
+            (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;
+        }
+    });
+
+    test("an auth-derived JWT update replaces and closes the owned client once", async () => {
+        const realWebSocket = globalThis.WebSocket;
+        ProviderWebSocket.instances.length = 0;
+        (globalThis as { WebSocket: unknown }).WebSocket = ProviderWebSocket;
+        const firstAuth = sessionAuth("user-a", "jwt-a");
+        const secondAuth = sessionAuth("user-b", "jwt-b");
+        let capturedClient: ChardbClient | undefined;
+        let tree: TestRenderer.ReactTestRenderer | undefined;
+
+        function CaptureClient() {
+            capturedClient = useChardb();
+            return null;
+        }
+
+        const render = (auth: ChardbReact.AuthClientLike) =>
+            React.createElement(
+                ChardbProvider,
+                {
+                    endpoint: "wss://example.com/auth-derived",
+                    auth,
+                    clientId: "provider-auth-derived",
+                    crossTab: false,
+                },
+                React.createElement(CaptureClient)
+            );
+
+        try {
+            await TestRenderer.act(async () => {
+                tree = TestRenderer.create(render(firstAuth.auth));
+                await flushMicrotasks();
+            });
+            const originalClient = capturedClient;
+            if (!originalClient) throw new Error("expected the first provider-owned client");
+            const firstSocket = ProviderWebSocket.instances[0];
+            if (!firstSocket) throw new Error("expected the first provider-owned socket");
+
+            await TestRenderer.act(async () => {
+                tree?.update(render(secondAuth.auth));
+                await flushMicrotasks();
+            });
+            expect(capturedClient).not.toBe(originalClient);
+            expect(firstAuth.activity.fetchCalls).toBe(1);
+            expect(secondAuth.activity.fetchCalls).toBe(1);
+            expect(ProviderWebSocket.instances).toHaveLength(2);
+            const secondSocket = ProviderWebSocket.instances[1];
+            if (!secondSocket) throw new Error("expected the replacement provider-owned socket");
+            expect(firstSocket.closeCalls).toBe(1);
+            expect(secondSocket.closeCalls).toBe(0);
+
+            TestRenderer.act(() => tree?.unmount());
+            await flushMicrotasks();
+            expect(firstSocket.closeCalls).toBe(1);
+            expect(secondSocket.closeCalls).toBe(1);
+        } finally {
+            tree?.unmount();
+            capturedClient?.close();
             (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;
         }
     });

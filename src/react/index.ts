@@ -111,14 +111,14 @@ export interface ChardbProviderProps extends Partial<ChardbClientOptions> {
 }
 
 export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): ReactElement {
+    const jwtAuth = props.getJwt === undefined ? props.auth : undefined;
     const resource = useMemo<ProviderClientResource>(() => {
         if (props.client !== undefined) return { client: props.client, owned: false };
-        const auth = props.auth;
         const getJwt =
             props.getJwt ??
-            (auth
+            (jwtAuth
                 ? async () => {
-                      const r = await auth.$fetch<{ token: string }>("/token");
+                      const r = await jwtAuth.$fetch<{ token: string }>("/token");
                       if (r.error || !r.data?.token) {
                           throw new Error(`chardb: failed to fetch JWT (${r.error?.message ?? "no token"})`);
                       }
@@ -142,7 +142,7 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
         props.client,
         props.endpoint,
         props.getJwt,
-        props.auth,
+        jwtAuth,
         props.clientId,
         props.logicalDb,
         props.crossTab,
