@@ -233,7 +233,8 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Return typed errors for malformed messages instead of accepting any object with a known `t` field.
 - [x] Validate every wire message field.
 - [x] Cap unsettled Gateway mutations at 32 per connection and 256 per Gateway object. Reject excess work before dispatch with retryable `CDB_RATE_LIMITED` and release capacity on every settlement path.
-- [x] Accept inbound WebSocket text frames only through the exact 1 MiB UTF-8 boundary. Measure before wire decoding and close oversized frames with code 1009.
+- [x] Accept Gateway inbound WebSocket text frames only through the exact 1 MiB UTF-8 boundary. Measure before wire decoding and close oversized frames with code 1009.
+- [x] Accept client inbound WebSocket data only as text through the exact 1 MiB UTF-8 boundary before wire decoding. Treat non-text or larger frames as terminal `CDB_INVARIANT`, clear subscriptions and pending mutations, cancel mutation and reconnect timers, close transport resources, and do not reconnect. Keep the existing snapshot, patch, cache, history, and aggregate retained-state caps after decode.
 - [x] Cap active client subscription records at 64. Validate the ref and owned arguments first, then reject excess work synchronously with retryable `CDB_RATE_LIMITED` before allocating an id, changing state, or sending. Preserve the same records across reconnect, release capacity on unsubscribe, clear all records on terminal session failure, roll back a failed subscribe send, and close the session when unsubscribe send fails.
 - [x] Cap each Gateway at 256 aggregate current and pending logical registrations. Count durable heads after restart, allow same-key replacement without extra capacity, deny duplicate pending races, and return retryable `CDB_RATE_LIMITED` before routing, Catalog, Cdb, or installation work.
 - [x] Permit at most one active subscription attempt and one queued replacement per Gateway connection and subscription id. Preserve the accepted replacement payload. Reject further duplicates with retryable `CDB_RATE_LIMITED` before capacity SQL, routing, Catalog, Cdb, or installation work, and fence stale route and final-scheduler errors after replacement or close.
@@ -282,6 +283,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Remove placeholder React hooks from public exports until implemented.
 - [x] Remove placeholder file and vector APIs from the main product description.
 - [x] Run each workerd harness in a separate sequential CI process to avoid shared Miniflare ports.
+- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 4/4, `gateway-jwt` 21/21, and `gateway-snapshot` 1/1. Give the snapshot reconstruction case a 15-second test budget because it starts workerd twice. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
 - [ ] Add one command that starts the example locally with migrations applied.
 
 ## 12. Fix package and repository hygiene
