@@ -102,7 +102,7 @@ One pending-mutation map holds at most 32 records, whether they are queued befor
 
 Gateway separately reserves capacity for at most 32 unsettled mutations on one verified connection and 256 across one Gateway object. The reservation covers work queued behind auth refresh and remains held until dispatch settles. Excess mutations receive retryable `CDB_RATE_LIMITED` before dispatch. Typed failures, thrown failures, stale socket settlement, and send failure all release the reservation.
 
-After routed mutation dispatch settles, Gateway deserializes the socket attachment again. It updates `lastCookie` and sends either success or failure only when that attachment is still verified and its `connectionId`, `clientId`, and `principalId` exactly match the admitted request. Close or attachment replacement therefore suppresses a stale result. The fence controls delivery only: dispatch may already have committed, and the Cdb op-log keeps the same replay and collision behavior for the mutation id.
+After routed mutation dispatch settles, Gateway deserializes the socket attachment again. It requires that attachment to remain verified with the admitted request's exact `connectionId`, `clientId`, and `principalId` before updating `lastCookie` on success or sending either success or failure. Close or attachment replacement therefore suppresses a stale result. The fence controls delivery only: dispatch may already have committed, and the Cdb op-log keeps the same replay and collision behavior for the mutation id.
 
 Gateway measures each inbound WebSocket text frame as UTF-8 before wire decoding. It accepts exactly 1 MiB and closes larger frames with code 1009 without dispatching or persisting their contents.
 

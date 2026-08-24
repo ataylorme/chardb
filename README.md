@@ -87,7 +87,7 @@ A newly executed atomic mutation accepts at most 256 successful typed write stat
 
 Gateway admits at most 32 unsettled mutations per connection and 256 per Gateway object. Excess mutations receive retryable `CDB_RATE_LIMITED` before dispatch. Inbound WebSocket text frames are measured as UTF-8 before wire decoding. Gateway accepts the exact 1 MiB boundary and closes larger frames with code 1009.
 
-After routed mutation work settles, Gateway updates the cookie and sends success or failure only if the socket still has the exact verified `connectionId`, `clientId`, and `principalId` admitted for that request. Socket close or attachment replacement suppresses stale delivery. This does not undo a commit or change the Cdb op-log's replay and collision semantics.
+After routed mutation work settles, Gateway requires the socket's exact verified `connectionId`, `clientId`, and `principalId` before updating `lastCookie` on success or sending either success or failure. Socket close or attachment replacement suppresses stale delivery. This does not undo a commit or change the Cdb op-log's replay and collision semantics.
 
 The client independently accepts inbound WebSocket data only as text through the exact 1 MiB UTF-8 boundary before decoding. A non-text or larger frame terminally closes the session with `CDB_INVARIANT`, clears subscriptions and pending mutations, cancels mutation and reconnect timers, and closes the socket and broadcast channel. Frames that pass still use the existing semantic caps: 4,096 rows and 512 KiB for snapshots and caches, 4,096 items and 512 KiB for patch batches and optimistic history, and 8 MiB across retained query state.
 
