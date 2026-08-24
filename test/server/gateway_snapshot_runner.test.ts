@@ -3,12 +3,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { CdbError } from "../../src/errors.ts";
 import type { SyncSql } from "../../src/oplog/wrapper.ts";
 import {
+    GATEWAY_MAX_DURABLE_PAYLOAD_BYTES,
     Gateway,
     type GatewayDirtyRun,
     type GatewayEnv,
     type GatewayRegistrationInstall,
     type VerifiedGwAttachment,
     claimDirtyGatewayRegistration,
+    gatewayDurablePayloadUsage,
     installGatewayRegistration,
     stageGatewaySnapshot,
 } from "../../src/server/do/gateway.ts";
@@ -306,6 +308,79 @@ describe("Gateway active snapshot runner", () => {
         expect(socket.attachment.lastCookie).toBe(Cookie("cookie-mutation"));
         await new Promise(resolve => setTimeout(resolve, 0));
         expect(currentAlarm).toBe(10_101);
+    });
+
+    test("retires an exact staged claim before a resume cookie can exceed the durable quota", async () => {
+        const registrations = Array.from({ length: 17 }, (_, index) =>
+            registration({
+                registrationId: `registration-cookie-${index}`,
+                subId: SubId(index),
+                connectionId: "connection-1",
+            })
+        );
+        for (const input of registrations) {
+            installActive(input);
+            const run = db.transaction(() =>
+                claimDirtyGatewayRegistration(sql, {
+                    principalId: input.principalId,
+                    clientId: input.clientId,
+                    subId: input.subId,
+                    registrationId: input.registrationId,
+                    connectionId: input.connectionId,
+                    nowMs: 20,
+                    leaseExpiresAt: 50,
+                })
+            )() as GatewayDirtyRun;
+            expect(
+                db.transaction(() =>
+                    stageGatewaySnapshot(sql, {
+                        principalId: input.principalId,
+                        clientId: input.clientId,
+                        subId: input.subId,
+                        registrationId: input.registrationId,
+                        connectionId: input.connectionId,
+                        runToken: run.runToken,
+                        runVersion: run.runVersion,
+                        targetVersion: run.targetVersion,
+                        cookie: Cookie(`snapshot-cookie-${input.subId}`),
+                        rows: [],
+                        authEpochs: input.authEpochs,
+                        nowMs: 30,
+                    })
+                )()
+            ).toBe(true);
+        }
+        const socket = attach(registrations[0], {
+            lastCookie: Cookie("r".repeat(1024 * 1024 - 64)),
+            snapshotSubIds: registrations.map(input => input.subId),
+        });
+
+        await fireAlarm();
+
+        const firstMessages = socket.sent.map(message => JSON.parse(message) as { t: string; code?: string });
+        const quotaErrors = firstMessages.filter(
+            message => message.t === "error" && message.code === "CDB_RATE_LIMITED"
+        );
+        expect(quotaErrors.length).toBeGreaterThan(0);
+        expect(gatewayDurablePayloadUsage(sql).totalBytes).toBeLessThanOrEqual(GATEWAY_MAX_DURABLE_PAYLOAD_BYTES);
+        expect(
+            db.query("SELECT COUNT(*) AS count FROM _gw_registration_generations WHERE lifecycle = 'retiring'").get()
+        ).toEqual({ count: quotaErrors.length });
+
+        await fireAlarm();
+        expect(unsubscribeCalls).toHaveLength(quotaErrors.length);
+        expect(
+            db.query("SELECT COUNT(*) AS count FROM _gw_registration_generations WHERE lifecycle = 'retiring'").get()
+        ).toEqual({ count: 0 });
+
+        clock = 10_100;
+        await fireAlarm();
+        expect(
+            socket.sent
+                .map(message => JSON.parse(message) as { t: string; code?: string })
+                .filter(message => message.t === "error" && message.code === "CDB_RATE_LIMITED")
+        ).toHaveLength(quotaErrors.length);
+        expect(gatewayDurablePayloadUsage(sql).totalBytes).toBeLessThanOrEqual(GATEWAY_MAX_DURABLE_PAYLOAD_BYTES);
     });
 
     test("fences query failure and schedules retry without losing dirty state", async () => {

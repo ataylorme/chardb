@@ -609,7 +609,7 @@ describe("Gateway durable registration generations", () => {
                 retry_count: 0,
                 retry_at: 100,
                 retry_error: null,
-                policy_digest: null,
+                policy_digest: "",
             });
             expect(legacy.query("SELECT * FROM _gw_registration_heads").all()).toEqual([]);
             expect(legacy.query("SELECT * FROM _gw_snapshot_outbox").all()).toEqual([]);

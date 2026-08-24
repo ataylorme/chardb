@@ -314,6 +314,27 @@ describe("Gateway public durable registration", () => {
         expect(db.query("SELECT * FROM _gw_snapshot_outbox").get()).toBeNull();
     });
 
+    test("returns a retryable quota error without dispatching or persisting an excess registration", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        db.query("UPDATE _gw_registration_generations SET args_json = ?").run(
+            `{"padding":"${"x".repeat(15 * 1024 * 1024)}"}`
+        );
+        const callsBefore = subscribeCalls.length;
+
+        await subscribe(SubId(2));
+
+        expect(subscribeCalls).toHaveLength(callsBefore);
+        expect(db.query("SELECT COUNT(*) AS count FROM _gw_registration_generations").get()).toEqual({ count: 1 });
+        expect(db.query("SELECT registration_id FROM _gw_registration_heads WHERE sub_id = 2").get()).toBeNull();
+        expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
+            t: "error",
+            subId: 2,
+            code: "CDB_RATE_LIMITED",
+            retryable: true,
+        });
+    });
+
     test("restart schedules a zero-clock initial snapshot before any run claim", async () => {
         await subscribe();
         await waitFor(() => generation()?.lifecycle === "active", "subscription activation");

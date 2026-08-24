@@ -195,6 +195,183 @@ export const GATEWAY_SEND_BATCH_SIZE = 32 as const;
 export const GATEWAY_QUERY_LEASE_MS = 30_000 as const;
 export const GATEWAY_SEND_LEASE_MS = 10_000 as const;
 export const GATEWAY_SUBSCRIBE_RECOVERY_MS = 30_000 as const;
+export const GATEWAY_MAX_DURABLE_PAYLOAD_BYTES = 16 * 1024 * 1024;
+export const GATEWAY_MAX_REGISTRATION_PAYLOAD_BYTES = 15 * 1024 * 1024;
+
+const GATEWAY_GENERATION_PAYLOAD_COLUMNS = [
+    "registration_id",
+    "principal_id",
+    "client_id",
+    "connection_id",
+    "organization_id",
+    "ref",
+    "args_json",
+    "intent_json",
+    "policy_digest",
+    "query_hash",
+    "shard_id",
+    "source_cdb_id",
+    "lifecycle",
+    "cdb_state",
+    "run_token",
+    "last_cookie",
+    "last_snapshot_cookie",
+    "retry_error",
+] as const;
+
+const GATEWAY_SNAPSHOT_PAYLOAD_COLUMNS = [
+    "registration_id",
+    "cookie",
+    "rows_json",
+    "claim_token",
+    "attachment_base_cookie",
+    "last_error",
+] as const;
+
+const GATEWAY_UUID_TOKEN_BYTES = 36;
+// Retry text is sliced to 512 UTF-16 code units. Four bytes per unit is a
+// conservative UTF-8 bound, including malformed surrogate input.
+const GATEWAY_MAX_RETRY_ERROR_BYTES = GATEWAY_CLEANUP_MAX_ERROR_LENGTH * 4;
+// A generated snapshot cookie contains a routed client id (at most 256
+// UTF-16 code units), a safe integer, separators, and one UUID.
+const GATEWAY_MAX_GENERATED_SNAPSHOT_COOKIE_BYTES = 1_080;
+
+function gatewayPayloadByteExpression(sql: SyncSql, table: string, columns: readonly string[]): string {
+    const available = new Set(sql.all<{ name: string }>(`PRAGMA table_info('${table}')`).map(column => column.name));
+    const expressions = columns
+        .filter(column => available.has(column))
+        .map(column => `length(CAST(COALESCE(${column}, '') AS BLOB))`);
+    return expressions.length === 0 ? "0" : expressions.join(" + ");
+}
+
+const GATEWAY_RETIRED_PAYLOAD_ASSIGNMENTS = `
+    organization_id = '', ref = '', args_json = 'null', intent_json = 'null',
+    policy_digest = '', query_hash = '', shard_id = '',
+    last_cookie = NULL, last_snapshot_cookie = NULL`;
+
+export interface GatewayDurablePayloadUsage {
+    readonly registrationBytes: number;
+    readonly snapshotBytes: number;
+    readonly totalBytes: number;
+    readonly registrationReservedBytes: number;
+    readonly snapshotReservedBytes: number;
+    readonly chargedRegistrationBytes: number;
+    readonly chargedTotalBytes: number;
+}
+
+/** Derive stored payload usage from SQLite values, never advisory byte_size columns. */
+export function gatewayDurablePayloadUsage(sql: SyncSql): GatewayDurablePayloadUsage {
+    const generationExpression = gatewayPayloadByteExpression(
+        sql,
+        "_gw_registration_generations",
+        GATEWAY_GENERATION_PAYLOAD_COLUMNS
+    );
+    const snapshotExpression = gatewayPayloadByteExpression(
+        sql,
+        "_gw_snapshot_outbox",
+        GATEWAY_SNAPSHOT_PAYLOAD_COLUMNS
+    );
+    const generationColumns = new Set(
+        sql.all<{ name: string }>("PRAGMA table_info('_gw_registration_generations')").map(column => column.name)
+    );
+    const snapshotColumns = new Set(
+        sql.all<{ name: string }>("PRAGMA table_info('_gw_snapshot_outbox')").map(column => column.name)
+    );
+    const storedBytes = (columns: ReadonlySet<string>, column: string, prefix = ""): string =>
+        columns.has(column) ? `length(CAST(COALESCE(${prefix}${column}, '') AS BLOB))` : "0";
+    const futureSnapshotCookieBytes = `MAX(
+        ${GATEWAY_MAX_GENERATED_SNAPSHOT_COOKIE_BYTES},
+        length(CAST(COALESCE(o.cookie, '') AS BLOB))
+    )`;
+    const generationRetryReservationExpression = `MAX(
+        0,
+        ${GATEWAY_MAX_RETRY_ERROR_BYTES} - ${storedBytes(generationColumns, "retry_error", "g.")}
+    )`;
+    const currentHeadReservationExpression = [
+        [`${GATEWAY_UUID_TOKEN_BYTES}`, storedBytes(generationColumns, "run_token", "g.")],
+        [futureSnapshotCookieBytes, storedBytes(generationColumns, "last_cookie", "g.")],
+        [futureSnapshotCookieBytes, storedBytes(generationColumns, "last_snapshot_cookie", "g.")],
+    ]
+        .map(([limit, actual]) => `MAX(0, ${limit} - ${actual})`)
+        .join(" + ");
+    const snapshotReservationExpression = [
+        [GATEWAY_UUID_TOKEN_BYTES, storedBytes(snapshotColumns, "claim_token")],
+        [GATEWAY_MAX_RETRY_ERROR_BYTES, storedBytes(snapshotColumns, "last_error")],
+    ]
+        .map(([limit, actual]) => `MAX(0, ${limit} - ${actual})`)
+        .join(" + ");
+    const row = sql.one<{
+        registration_bytes: number | bigint;
+        snapshot_bytes: number | bigint;
+        registration_reserved_bytes: number | bigint;
+        snapshot_reserved_bytes: number | bigint;
+    }>(
+        `SELECT
+           COALESCE((SELECT SUM(${generationExpression})
+                     FROM _gw_registration_generations), 0) AS registration_bytes,
+           COALESCE((SELECT SUM(${snapshotExpression})
+                     FROM _gw_snapshot_outbox), 0) AS snapshot_bytes,
+           (COALESCE((SELECT SUM(${generationRetryReservationExpression})
+                      FROM _gw_registration_generations g), 0)
+            + COALESCE((SELECT SUM(${currentHeadReservationExpression})
+                     FROM _gw_registration_generations g
+                     INNER JOIN _gw_registration_heads h ON h.registration_id = g.registration_id
+                     LEFT JOIN _gw_snapshot_outbox o ON o.registration_id = g.registration_id), 0))
+                     AS registration_reserved_bytes,
+           COALESCE((SELECT SUM(${snapshotReservationExpression})
+                     FROM _gw_snapshot_outbox), 0) AS snapshot_reserved_bytes`
+    );
+    const registrationBytes = Number(row?.registration_bytes ?? 0);
+    const snapshotBytes = Number(row?.snapshot_bytes ?? 0);
+    const registrationReservedBytes = Number(row?.registration_reserved_bytes ?? 0);
+    const snapshotReservedBytes = Number(row?.snapshot_reserved_bytes ?? 0);
+    if (
+        !Number.isSafeInteger(registrationBytes) ||
+        registrationBytes < 0 ||
+        !Number.isSafeInteger(snapshotBytes) ||
+        snapshotBytes < 0 ||
+        !Number.isSafeInteger(registrationReservedBytes) ||
+        registrationReservedBytes < 0 ||
+        !Number.isSafeInteger(snapshotReservedBytes) ||
+        snapshotReservedBytes < 0
+    ) {
+        throw gatewayInvalidationInvariant("Gateway durable payload usage is invalid");
+    }
+    const totalBytes = registrationBytes + snapshotBytes;
+    const chargedRegistrationBytes = registrationBytes + registrationReservedBytes;
+    const chargedTotalBytes = totalBytes + registrationReservedBytes + snapshotReservedBytes;
+    if (
+        !Number.isSafeInteger(totalBytes) ||
+        !Number.isSafeInteger(chargedRegistrationBytes) ||
+        !Number.isSafeInteger(chargedTotalBytes)
+    ) {
+        throw gatewayInvalidationInvariant("Gateway durable payload usage overflowed");
+    }
+    return {
+        registrationBytes,
+        snapshotBytes,
+        totalBytes,
+        registrationReservedBytes,
+        snapshotReservedBytes,
+        chargedRegistrationBytes,
+        chargedTotalBytes,
+    };
+}
+
+function assertGatewayDurablePayloadQuota(sql: SyncSql): void {
+    const usage = gatewayDurablePayloadUsage(sql);
+    if (
+        usage.chargedRegistrationBytes > GATEWAY_MAX_REGISTRATION_PAYLOAD_BYTES ||
+        usage.chargedTotalBytes > GATEWAY_MAX_DURABLE_PAYLOAD_BYTES
+    ) {
+        throw new CdbError({
+            code: "CDB_RATE_LIMITED",
+            message: "Gateway durable subscription payload quota exceeded",
+            retryAfterMs: GATEWAY_CLEANUP_BASE_RETRY_MS,
+            hint: "Retire an existing live query or wait for snapshot delivery before retrying.",
+        });
+    }
+}
 
 const GATEWAY_ABANDONED_REGISTRATION_CURSOR_KEY = "abandoned-registration-cursor" as const;
 // Match the Gateway-wide unsettled mutation budget so one isolate has a
@@ -873,7 +1050,8 @@ export function installGatewayRegistration(
     if (previous) {
         sql.exec(
             `UPDATE _gw_registration_generations
-             SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
+             SET ${GATEWAY_RETIRED_PAYLOAD_ASSIGNMENTS},
+                 lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
                  run_lease_expires_at = NULL,
                  run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
              WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
@@ -898,6 +1076,7 @@ export function installGatewayRegistration(
         input.registrationId,
         input.nowMs
     );
+    assertGatewayDurablePayloadQuota(sql);
     return { supersededRegistrationId: previous?.registration_id ?? null };
 }
 
@@ -977,6 +1156,7 @@ export function advanceGatewayRegistration(sql: SyncSql, input: GatewayRegistrat
     if (input.deliveredVersion > input.dirtyVersion) {
         throw new TypeError("deliveredVersion cannot exceed dirtyVersion");
     }
+    const retryError = input.retryError === null ? null : gatewayRetryError(input.retryError);
     sql.exec(
         `UPDATE _gw_registration_generations
          SET lifecycle = ?, cdb_state = ?, dirty_version = ?, delivered_version = ?,
@@ -997,7 +1177,7 @@ export function advanceGatewayRegistration(sql: SyncSql, input: GatewayRegistrat
         input.lastCookie,
         input.retryCount,
         input.retryAt,
-        input.retryError,
+        retryError,
         input.nowMs,
         input.registrationId,
         input.principalId,
@@ -1008,7 +1188,9 @@ export function advanceGatewayRegistration(sql: SyncSql, input: GatewayRegistrat
         input.clientId,
         input.subId
     );
-    return sql.changes() === 1;
+    const advanced = sql.changes() === 1;
+    if (advanced) assertGatewayDurablePayloadQuota(sql);
+    return advanced;
 }
 
 /**
@@ -1124,7 +1306,9 @@ export function settleInitialGatewaySnapshot(sql: SyncSql, input: GatewayInitial
         input.connectionId,
         input.runToken
     );
-    return sql.changes() === 1;
+    const settled = sql.changes() === 1;
+    if (settled) assertGatewayDurablePayloadQuota(sql);
+    return settled;
 }
 
 /**
@@ -1307,6 +1491,7 @@ export function stageGatewaySnapshot(sql: SyncSql, input: GatewaySnapshotStage):
         input.nowMs,
         input.nowMs
     );
+    assertGatewayDurablePayloadQuota(sql);
     return true;
 }
 
@@ -1504,8 +1689,10 @@ export function failGatewaySnapshotSend(sql: SyncSql, input: GatewaySnapshotSend
 export function markGatewaySnapshotSendBaseCookie(
     sql: SyncSql,
     input: GatewaySnapshotSendAttempt,
-    baseCookie: Cookie | null
-): boolean {
+    baseCookie: Cookie | null,
+    nowMs: number
+): "marked" | "retired" | "stale" {
+    assertNonnegativeSafeInteger(nowMs, "nowMs");
     sql.exec(
         `UPDATE _gw_snapshot_outbox
          SET attachment_base_cookie = COALESCE(attachment_base_cookie, ?)
@@ -1532,7 +1719,17 @@ export function markGatewaySnapshotSendBaseCookie(
         input.subId,
         input.connectionId
     );
-    return sql.changes() === 1;
+    if (sql.changes() !== 1) return "stale";
+    if (gatewayDurablePayloadUsage(sql).chargedTotalBytes <= GATEWAY_MAX_DURABLE_PAYLOAD_BYTES) return "marked";
+    if (
+        !retireClaimedGatewaySnapshot(sql, {
+            ...input,
+            nowMs,
+        })
+    ) {
+        throw gatewayInvalidationInvariant("over-quota Gateway snapshot claimant could not retire atomically");
+    }
+    return "retired";
 }
 
 /** Resolve a staged cookie only within one verified socket identity. */
@@ -1666,6 +1863,7 @@ export function acknowledgeGatewaySnapshot(sql: SyncSql, input: GatewaySnapshotA
     if (sql.changes() !== 1) {
         throw gatewayInvalidationInvariant("staged Gateway snapshot disappeared during acknowledgement");
     }
+    assertGatewayDurablePayloadQuota(sql);
     return true;
 }
 
@@ -1740,7 +1938,8 @@ export function retireCurrentGatewayRegistration(
     if (!current) return null;
     sql.exec(
         `UPDATE _gw_registration_generations
-         SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
+         SET ${GATEWAY_RETIRED_PAYLOAD_ASSIGNMENTS},
+             lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
              run_lease_expires_at = NULL,
              run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
@@ -1822,7 +2021,8 @@ export function retireGatewayRegistration(
     if (!removedHead) return false;
     sql.exec(
         `UPDATE _gw_registration_generations
-         SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
+         SET ${GATEWAY_RETIRED_PAYLOAD_ASSIGNMENTS},
+             lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
              run_lease_expires_at = NULL,
              run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
@@ -2014,6 +2214,23 @@ export function ensureGatewayRegistrationColumns(sql: SyncSql): void {
              CHECK (initial_snapshot_pending IN (0, 1))`
         );
     }
+    const currentColumns = new Set(
+        sql.all<{ name: string }>("PRAGMA table_info('_gw_registration_generations')").map(column => column.name)
+    );
+    const legacyRetiredPayloadAssignments = [
+        ["organization_id", "organization_id = ''"],
+        ["ref", "ref = ''"],
+        ["args_json", "args_json = 'null'"],
+        ["intent_json", "intent_json = 'null'"],
+        ["policy_digest", "policy_digest = ''"],
+        ["query_hash", "query_hash = ''"],
+        ["shard_id", "shard_id = ''"],
+        ["last_cookie", "last_cookie = NULL"],
+        ["last_snapshot_cookie", "last_snapshot_cookie = NULL"],
+    ]
+        .filter(([column]) => currentColumns.has(column as string))
+        .map(([, assignment]) => assignment)
+        .join(", ");
     sql.exec(
         `DELETE FROM _gw_registration_heads
          WHERE registration_id IN (
@@ -2028,11 +2245,27 @@ export function ensureGatewayRegistrationColumns(sql: SyncSql): void {
     );
     sql.exec(
         `UPDATE _gw_registration_generations
-         SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL,
+         SET ${legacyRetiredPayloadAssignments},
+             lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL,
              run_target_version = NULL, run_lease_expires_at = NULL,
              run_version = run_version + 1, retry_count = 0,
              retry_at = updated_at, retry_error = NULL
          WHERE policy_digest IS NULL AND lifecycle != 'retiring'`
+    );
+    // Legacy retired generations can predate payload compaction. Keep only
+    // the exact identity needed for idempotent Cdb unsubscribe and deletion.
+    sql.exec(
+        `DELETE FROM _gw_snapshot_outbox
+         WHERE registration_id IN (
+           SELECT registration_id FROM _gw_registration_generations WHERE lifecycle = 'retiring'
+         )`
+    );
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET ${legacyRetiredPayloadAssignments},
+             run_token = NULL, run_target_version = NULL, run_lease_expires_at = NULL,
+             retry_error = NULL
+         WHERE lifecycle = 'retiring'`
     );
     // Run this after every restart. A crash after ALTER but before repair must
     // not leave a partial run triple that no claimant can recover.
@@ -2736,14 +2969,20 @@ export class Gateway extends DurableObject<GatewayEnv> {
             }
             return;
         }
-        const marked = this.ctx.storage.transactionSync(() =>
+        const markResult = this.ctx.storage.transactionSync(() =>
             markGatewaySnapshotSendBaseCookie(
                 adaptSqlStorage(this.ctx.storage.sql),
                 attempt,
-                socket.attachment.lastCookie ?? null
+                socket.attachment.lastCookie ?? null,
+                sendNowMs
             )
         );
-        if (!marked) return;
+        if (markResult === "stale") return;
+        if (markResult === "retired") {
+            this.settleRetiredGatewaySubscription(attempt, { kind: "error", code: "CDB_RATE_LIMITED" });
+            await this.scheduleGatewayWork(sendNowMs).catch(() => {});
+            return;
+        }
         try {
             this.send(socket.ws, {
                 t: "snapshot",
@@ -3892,27 +4131,35 @@ export class Gateway extends DurableObject<GatewayEnv> {
         ) {
             return;
         }
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            installGatewayRegistration(sql, {
-                ...identity,
-                organizationId: TenantId(organizationId),
-                ref: msg.ref,
-                args: routed.args,
-                intent: routed.intent,
-                policyDigest: routed.policyDigest,
-                queryHash: routed.queryHash,
-                shardId,
-                sourceCdbId,
-                schemaEpoch,
-                authEpochs,
-                ...(att.lastCookie === undefined ? {} : { lastCookie: att.lastCookie }),
-                nowMs: installedAt,
+        try {
+            this.ctx.storage.transactionSync(() => {
+                const sql = adaptSqlStorage(this.ctx.storage.sql);
+                installGatewayRegistration(sql, {
+                    ...identity,
+                    organizationId: TenantId(organizationId),
+                    ref: msg.ref,
+                    args: routed.args,
+                    intent: routed.intent,
+                    policyDigest: routed.policyDigest,
+                    queryHash: routed.queryHash,
+                    shardId,
+                    sourceCdbId,
+                    schemaEpoch,
+                    authEpochs,
+                    ...(att.lastCookie === undefined ? {} : { lastCookie: att.lastCookie }),
+                    nowMs: installedAt,
+                });
+                if (!armGatewaySubscriptionRecovery(sql, { ...identity, recoveryAt, nowMs: installedAt })) {
+                    throw gatewayInvalidationInvariant("Gateway subscription install could not arm recovery");
+                }
             });
-            if (!armGatewaySubscriptionRecovery(sql, { ...identity, recoveryAt, nowMs: installedAt })) {
-                throw gatewayInvalidationInvariant("Gateway subscription install could not arm recovery");
+        } catch (error) {
+            if (error instanceof CdbError && error.code === "CDB_RATE_LIMITED") {
+                this.sendError(ws, error.code, msg.subId);
+                return;
             }
-        });
+            throw error;
+        }
         const retireInstalled = async (): Promise<void> => {
             this.ctx.storage.transactionSync(() => {
                 retireGatewayRegistration(
