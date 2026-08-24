@@ -73,6 +73,36 @@ function socketInbox(socket) {
     };
 }
 
+async function connectGateway(origin, clientId, jwt) {
+    const wsUrl = new URL(`/ws?clientId=${encodeURIComponent(clientId)}`, origin);
+    wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(wsUrl);
+    await new Promise((resolvePromise, reject) => {
+        const timeout = setTimeout(() => reject(new Error("timed out opening Gateway WebSocket")), 5_000);
+        socket.addEventListener(
+            "open",
+            () => {
+                clearTimeout(timeout);
+                resolvePromise();
+            },
+            { once: true }
+        );
+        socket.addEventListener(
+            "error",
+            () => {
+                clearTimeout(timeout);
+                reject(new Error("Gateway WebSocket failed to open"));
+            },
+            { once: true }
+        );
+    });
+    const next = socketInbox(socket);
+    socket.send(JSON.stringify({ t: "hello", protocolV: 3, clientId, jwt }));
+    const welcome = await next(message => message.t === "welcome" || message.t === "error");
+    assert(welcome.t === "welcome", `Gateway rejected Better Auth JWT: ${JSON.stringify(welcome)}`);
+    return { socket, next };
+}
+
 async function bundleWorker(consumer, bundlePath) {
     run(
         "bun",
@@ -106,7 +136,7 @@ async function main() {
     const scratch = await mkdtemp(join(tmpdir(), "chardb-packed-chat-"));
     const consumer = join(scratch, "consumer");
     let mf;
-    let socket;
+    const sockets = [];
     try {
         await mkdir(consumer, { recursive: true });
         await cp(join(CHAT, "src"), join(consumer, "src"), { recursive: true });
@@ -181,32 +211,9 @@ async function main() {
             `JWT issue failed: ${JSON.stringify(tokenBody)}`
         );
 
-        const wsUrl = new URL("/ws?clientId=packed-chat-client", origin);
-        wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
-        socket = new WebSocket(wsUrl);
-        await new Promise((resolvePromise, reject) => {
-            const timeout = setTimeout(() => reject(new Error("timed out opening Gateway WebSocket")), 5_000);
-            socket.addEventListener(
-                "open",
-                () => {
-                    clearTimeout(timeout);
-                    resolvePromise();
-                },
-                { once: true }
-            );
-            socket.addEventListener(
-                "error",
-                () => {
-                    clearTimeout(timeout);
-                    reject(new Error("Gateway WebSocket failed to open"));
-                },
-                { once: true }
-            );
-        });
-        const next = socketInbox(socket);
-        socket.send(JSON.stringify({ t: "hello", protocolV: 3, clientId: "packed-chat-client", jwt: tokenBody.token }));
-        const welcome = await next(message => message.t === "welcome" || message.t === "error");
-        assert(welcome.t === "welcome", `Gateway rejected Better Auth JWT: ${JSON.stringify(welcome)}`);
+        const primary = await connectGateway(origin, "packed-chat-client", tokenBody.token);
+        const { socket, next } = primary;
+        sockets.push(socket);
 
         const queryArgs = { organizationId: "demo-org", channelId: "general", limit: 50 };
         socket.send(JSON.stringify({ t: "sub", subId: 1, ref: "src/server/queries.ts#listMessages", args: queryArgs }));
@@ -219,20 +226,19 @@ async function main() {
         );
         socket.send(JSON.stringify({ t: "ack", cookie: initial.cookie }));
 
-        socket.send(
-            JSON.stringify({
-                t: "mut",
-                mutId: "packed-chat-mut-1",
-                ref: "src/server/api.ts#postMessage",
-                args: {
-                    id: "packed-message-1",
-                    organizationId: "demo-org",
-                    channelId: "general",
-                    body: "packed hello",
-                    clientCreatedAt: 1,
-                },
-            })
-        );
+        const mutationRequest = {
+            t: "mut",
+            mutId: "packed-chat-mut-1",
+            ref: "src/server/api.ts#postMessage",
+            args: {
+                id: "packed-message-1",
+                organizationId: "demo-org",
+                channelId: "general",
+                body: "packed hello",
+                clientCreatedAt: 1,
+            },
+        };
+        socket.send(JSON.stringify(mutationRequest));
         const mutation = await next(
             message => message.t === "error" || message.mutResults?.some(result => result.mutId === "packed-chat-mut-1")
         );
@@ -248,18 +254,112 @@ async function main() {
         );
         socket.send(JSON.stringify({ t: "ack", cookie: replacement.cookie }));
 
+        socket.send(JSON.stringify(mutationRequest));
+        const replay = await next(
+            message => message.t === "error" || message.mutResults?.some(entry => entry.mutId === "packed-chat-mut-1")
+        );
+        const replayResult = replay.mutResults?.find(entry => entry.mutId === "packed-chat-mut-1");
+        assert(replayResult?.ok === true, `packed mutation replay failed: ${JSON.stringify(replay)}`);
+        assert(
+            JSON.stringify(replayResult) === JSON.stringify(result),
+            `packed mutation replay changed its result: ${JSON.stringify({ first: result, replay: replayResult })}`
+        );
+
         socket.send(JSON.stringify({ t: "sub", subId: 2, ref: "src/server/queries.ts#listMessages", args: queryArgs }));
         const readback = await next(
             message => (message.t === "snapshot" && message.subId === 2) || message.t === "error"
         );
         assert(
-            readback.t === "snapshot" && readback.rows.some(row => row.id === "packed-message-1"),
+            readback.t === "snapshot" &&
+                readback.rows.length === 1 &&
+                readback.rows.filter(row => row.id === "packed-message-1").length === 1,
             `readback snapshot failed: ${JSON.stringify(readback)}`
         );
         socket.send(JSON.stringify({ t: "ack", cookie: readback.cookie }));
+
+        const secondSignIn = await mf.dispatchFetch(new URL("/api/auth/sign-in/anonymous", origin), {
+            method: "POST",
+            headers: { "content-type": "application/json", origin: origin.origin },
+            body: "{}",
+        });
+        const secondSignInText = await secondSignIn.text();
+        assert(secondSignIn.ok, `second anonymous sign-in failed (${secondSignIn.status}): ${secondSignInText}`);
+        const secondCookie = sessionCookies(secondSignIn.headers);
+        assert(secondCookie.length > 0, "second anonymous sign-in returned no session cookie");
+
+        const leaveDemo = await mf.dispatchFetch(new URL("/api/auth/organization/leave", origin), {
+            method: "POST",
+            headers: { "content-type": "application/json", cookie: secondCookie, origin: origin.origin },
+            body: JSON.stringify({ organizationId: "demo-org" }),
+        });
+        const leaveDemoText = await leaveDemo.text();
+        assert(leaveDemo.ok, `second user could not leave demo-org (${leaveDemo.status}): ${leaveDemoText}`);
+
+        const createOrganization = await mf.dispatchFetch(new URL("/api/auth/organization/create", origin), {
+            method: "POST",
+            headers: { "content-type": "application/json", cookie: secondCookie, origin: origin.origin },
+            body: JSON.stringify({ name: "Packed Isolation", slug: "packed-isolation" }),
+        });
+        const isolationOrganization = await createOrganization.json();
+        assert(
+            createOrganization.ok && typeof isolationOrganization?.id === "string",
+            `second organization creation failed: ${JSON.stringify(isolationOrganization)}`
+        );
+
+        const secondSession = await mf.dispatchFetch(new URL("/api/auth/get-session", origin), {
+            headers: { cookie: secondCookie },
+        });
+        const secondSessionBody = await secondSession.json();
+        assert(
+            secondSession.ok &&
+                typeof secondSessionBody?.user?.id === "string" &&
+                secondSessionBody?.user?.id !== sessionBody.user.id &&
+                secondSessionBody?.session?.activeOrganizationId === isolationOrganization.id,
+            `second session did not select its organization: ${JSON.stringify(secondSessionBody)}`
+        );
+        const secondTokenResponse = await mf.dispatchFetch(new URL("/api/auth/token", origin), {
+            headers: { cookie: secondCookie },
+        });
+        const secondTokenBody = await secondTokenResponse.json();
+        assert(
+            secondTokenResponse.ok && typeof secondTokenBody?.token === "string",
+            `second JWT issue failed: ${JSON.stringify(secondTokenBody)}`
+        );
+
+        const isolated = await connectGateway(origin, "packed-chat-isolated-client", secondTokenBody.token);
+        sockets.push(isolated.socket);
+        isolated.socket.send(
+            JSON.stringify({ t: "sub", subId: 1, ref: "src/server/queries.ts#listMessages", args: queryArgs })
+        );
+        const forbiddenRead = await isolated.next(
+            message =>
+                (message.t === "error" && message.subId === 1) || (message.t === "snapshot" && message.subId === 1)
+        );
+        assert(
+            forbiddenRead.t === "error" && forbiddenRead.code === "CDB_FORBIDDEN",
+            `second tenant read demo-org data: ${JSON.stringify(forbiddenRead)}`
+        );
+
+        const isolationArgs = { ...queryArgs, organizationId: isolationOrganization.id };
+        isolated.socket.send(
+            JSON.stringify({
+                t: "sub",
+                subId: 2,
+                ref: "src/server/queries.ts#listMessages",
+                args: isolationArgs,
+            })
+        );
+        const isolatedSnapshot = await isolated.next(
+            message => (message.t === "snapshot" && message.subId === 2) || message.t === "error"
+        );
+        assert(
+            isolatedSnapshot.t === "snapshot" && isolatedSnapshot.rows.length === 0,
+            `second tenant snapshot was not isolated: ${JSON.stringify(isolatedSnapshot)}`
+        );
+        isolated.socket.send(JSON.stringify({ t: "ack", cookie: isolatedSnapshot.cookie }));
         console.log(`packed chat proof passed with chardb ${installed.version}`);
     } finally {
-        socket?.close();
+        for (const socket of sockets) socket.close();
         await mf?.dispose();
         await rm(scratch, { recursive: true, force: true });
         await rm(tarball, { force: true });
