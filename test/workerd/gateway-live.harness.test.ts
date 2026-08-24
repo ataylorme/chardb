@@ -925,6 +925,180 @@ describe("public durable live queries in real workerd", () => {
         expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
     });
 
+    test("one configured Gateway enforces the exact 256-registration boundary and readmits after release", async () => {
+        if (!mf || !queryRef) throw new Error("live fixture was not initialized");
+        const readRef = queryRef;
+        const gatewayPrefix = "quota-shared";
+        const expectedClientIds = Array.from(
+            { length: 4 },
+            (_, index) => `${gatewayPrefix}-${index.toString().padStart(2, "0")}`
+        );
+        const clients: Array<{
+            readonly clientId: string;
+            readonly client: ChardbClient;
+            readonly subscriptions: Array<{ unsubscribe: () => void }>;
+        }> = [];
+        let rejectedSocket: OpenedSocket | undefined;
+        let primaryFailure: unknown;
+        const cleanupFailures: unknown[] = [];
+
+        const quotaRows = (state: GatewayLiveState) =>
+            state.registrations.filter(row => row.currentHead && row.clientId.startsWith(gatewayPrefix));
+        const waitForCounts = async (gatewayCount: number, cdbCount: number): Promise<GatewayLiveState> => {
+            const deadline = Date.now() + Math.max(SCALE_WAIT_MS, 15_000);
+            let lastGatewayCount = -1;
+            let lastCdbCount = -1;
+            while (Date.now() < deadline) {
+                await drainGateway(expectedClientIds[0] as string);
+                const state = await gatewayState(expectedClientIds[0] as string);
+                const gatewayRows = quotaRows(state);
+                const cdb = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                const activeCdbRows = cdb.subscriptions.filter(
+                    row => row.state === "active" && row.clientId.startsWith(gatewayPrefix)
+                );
+                lastGatewayCount = gatewayRows.length;
+                lastCdbCount = activeCdbRows.length;
+                const settled = gatewayRows.every(
+                    row =>
+                        row.lifecycle === "active" &&
+                        row.cdbState === "active" &&
+                        !row.initialSnapshotPending &&
+                        row.dirtyVersion === row.deliveredVersion &&
+                        row.outboxCookie === null &&
+                        row.outboxTargetVersion === null
+                );
+                if (gatewayRows.length === gatewayCount && activeCdbRows.length === cdbCount && settled) {
+                    return state;
+                }
+                await Bun.sleep(10);
+            }
+            throw new Error(
+                `timed out waiting for Gateway/Cdb quota counts ${gatewayCount}/${cdbCount}; last=${lastGatewayCount}/${lastCdbCount}`
+            );
+        };
+
+        try {
+            for (const clientId of expectedClientIds) {
+                const client = await createSdkClient(clientId, "workerd-user");
+                const subscriptions: Array<{ unsubscribe: () => void }> = [];
+                clients.push({ clientId, client, subscriptions });
+                for (let index = 0; index < 64; index++) {
+                    subscriptions.push(
+                        client.subscribe<ScaleRow>(
+                            readRef,
+                            {
+                                organizationId: ORGANIZATION_A,
+                                body: `quota-${clientId}-${index.toString().padStart(2, "0")}`,
+                            },
+                            () => {}
+                        )
+                    );
+                }
+            }
+
+            const full = await waitForCounts(256, 256);
+            const fullRows = quotaRows(full);
+            expect(fullRows).toHaveLength(256);
+            expect(new Set(fullRows.map(row => `${row.clientId}:${row.subId}`)).size).toBe(256);
+            for (const clientId of expectedClientIds) {
+                expect(fullRows.filter(row => row.clientId === clientId)).toHaveLength(64);
+            }
+
+            const rejectedClientId = `${gatewayPrefix}-rejected`;
+            rejectedSocket = await openSocket(rejectedClientId, await signed("workerd-user"));
+            expect(rejectedSocket.welcome).toMatchObject({ t: "welcome" });
+            const rejection = nextDown(rejectedSocket.socket, Math.max(SCALE_WAIT_MS, 5_000));
+            rejectedSocket.socket.send(
+                encodeWire({
+                    t: "sub",
+                    subId: SubId(1),
+                    ref: readRef,
+                    args: { organizationId: ORGANIZATION_A, body: "quota-rejected" },
+                })
+            );
+            const rejectionMessage = await rejection;
+            expect(rejectionMessage).toMatchObject({
+                t: "error",
+                subId: 1,
+                code: "CDB_RATE_LIMITED",
+                retryable: true,
+            });
+            const afterRejection = await gatewayState(rejectedClientId);
+            expect(quotaRows(afterRejection)).toHaveLength(256);
+            expect(afterRejection.registrations.some(row => row.clientId === rejectedClientId)).toBe(false);
+            expect(
+                (await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId })).subscriptions.some(
+                    row => row.clientId === rejectedClientId
+                )
+            ).toBe(false);
+            rejectedSocket.socket.close();
+            await rejectedSocket.closed;
+            rejectedSocket = undefined;
+
+            const releasing = clients[0];
+            if (!releasing) throw new Error("missing quota client to release");
+            const released = releasing.subscriptions.shift();
+            if (!released) throw new Error("missing quota subscription to release");
+            released.unsubscribe();
+            await waitForCounts(255, 255);
+
+            const replacementClientId = `${gatewayPrefix}-replacement`;
+            const replacementClient = await createSdkClient(replacementClientId, "workerd-user");
+            const replacementSubscriptions: Array<{ unsubscribe: () => void }> = [];
+            clients.push({
+                clientId: replacementClientId,
+                client: replacementClient,
+                subscriptions: replacementSubscriptions,
+            });
+            replacementSubscriptions.push(
+                replacementClient.subscribe<ScaleRow>(
+                    readRef,
+                    { organizationId: ORGANIZATION_A, body: "quota-replacement" },
+                    () => {}
+                )
+            );
+            const refilled = await waitForCounts(256, 256);
+            expect(
+                quotaRows(refilled).find(row => row.clientId === replacementClientId && row.subId === 1)
+            ).toMatchObject({ lifecycle: "active", cdbState: "active", currentHead: true });
+        } catch (error) {
+            primaryFailure = error;
+        } finally {
+            if (rejectedSocket) {
+                try {
+                    rejectedSocket.socket.close();
+                    await rejectedSocket.closed;
+                } catch (error) {
+                    cleanupFailures.push(error);
+                }
+            }
+            for (const entry of clients) {
+                try {
+                    await cleanupSdkClient(entry.clientId, entry.client, entry.subscriptions);
+                } catch (error) {
+                    cleanupFailures.push(error);
+                }
+            }
+            try {
+                await waitForCounts(0, 0);
+            } catch (error) {
+                cleanupFailures.push(error);
+            }
+        }
+
+        if (primaryFailure !== undefined) {
+            if (primaryFailure instanceof Error && cleanupFailures.length > 0) {
+                Object.defineProperty(primaryFailure, "cause", {
+                    configurable: true,
+                    value: new AggregateError(cleanupFailures, "quota proof cleanup failed"),
+                });
+            }
+            throw primaryFailure;
+        }
+        if (cleanupFailures.length > 0) throw new AggregateError(cleanupFailures, "quota proof cleanup failed");
+        expect(quotaRows(await waitForCounts(0, 0))).toHaveLength(0);
+    }, 30_000);
+
     test(
         "scaled SDK mutation fanout stays tenant-isolated",
         async () => {
