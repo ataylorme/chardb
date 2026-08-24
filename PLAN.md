@@ -267,6 +267,7 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [ ] Make disconnect and shutdown reject or retain pending mutations according to a documented rule.
 - [x] Cover malformed and throwing Catalog authority responses in the configured Gateway workerd harness.
 - [x] Add default-small, environment-scalable SDK workerd scenarios for two-tenant mutation fanout and selective subscription refresh. Assert exact rows, durable convergence, drained outboxes, and cleanup; emit timing telemetry without performance thresholds.
+- [x] Drive one configured Gateway to 256 active registrations with four real SDK clients, reject the 257th with retryable `CDB_RATE_LIMITED` before Cdb installation, release one exact slot, readmit one replacement, and drain Gateway and Cdb back to zero.
 - [x] Use one correctness command that runs ordinary tests together and every workerd harness serially, with process-tree cleanup on timeout or cancellation.
 - [x] Add a manual scale workflow with frozen `ci-smoke`, `client-max-accepted`, and `throughput` profiles and 1 to 20 sequential samples. Preserve per-sample output, write `chardb.scale.sample.v1` NDJSON records and a `chardb.scale.report.v1` aggregate with min, p50, p95, max, and mean, and record exact workload, Git, Bun, OS, and CPU metadata. Keep timing out of correctness decisions.
 - [x] Prove through configured workerd that an already delivered but unacknowledged snapshot redelivers with the exact cookie and rows after Gateway and Cdb reconstruct around the same hibernated socket, then accepts one acknowledgement and delivers a later mutation.
@@ -309,7 +310,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Remove placeholder React hooks from public exports until implemented.
 - [x] Remove placeholder file and vector APIs from the main product description.
 - [x] Run each workerd harness in a separate sequential CI process to avoid shared Miniflare ports.
-- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 6/6 including the two default-small scale scenarios, `gateway-jwt` 21/21, and `gateway-snapshot` 2/2. Give both snapshot durability cases 15-second test budgets. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
+- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 7/7 including the aggregate registration boundary and two default-small scale scenarios, `gateway-jwt` 21/21, and `gateway-snapshot` 2/2. Give both snapshot durability cases 15-second test budgets. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
 - [ ] Add one command that starts the example locally with migrations applied.
 
 ## 12. Fix package and repository hygiene
