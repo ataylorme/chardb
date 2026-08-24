@@ -172,14 +172,18 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         ws = socket;
         socket.onopen = () => {
             if (terminated || attempt !== connectionAttempt || ws !== socket) return;
-            const hello: Up = {
-                t: "hello",
-                protocolV: PROTOCOL_V,
-                clientId,
-                ...(lastCookie ? { resumeFromCookie: lastCookie } : {}),
-                jwt,
-            };
-            socket.send(encodeWire(hello));
+            try {
+                const hello: Up = {
+                    t: "hello",
+                    protocolV: PROTOCOL_V,
+                    clientId,
+                    ...(lastCookie ? { resumeFromCookie: lastCookie } : {}),
+                    jwt,
+                };
+                socket.send(encodeWire(hello));
+            } catch {
+                disconnectSocket(attempt, socket);
+            }
         };
         socket.onmessage = ev => {
             if (terminated || attempt !== connectionAttempt || ws !== socket) return;
@@ -190,13 +194,17 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
             onClose();
         };
         socket.onerror = () => {
-            if (!revokeSocket(attempt, socket)) return;
-            try {
-                socket.close();
-            } finally {
-                onClose();
-            }
+            disconnectSocket(attempt, socket);
         };
+    }
+
+    function disconnectSocket(attempt: number, socket: WebSocket): void {
+        if (!revokeSocket(attempt, socket)) return;
+        try {
+            socket.close();
+        } finally {
+            onClose();
+        }
     }
 
     function revokeSocket(attempt: number, socket: WebSocket): boolean {

@@ -321,6 +321,68 @@ describe("createChardbClient — wire round-trip", () => {
         expect(sent.protocolV).toBe(PROTOCOL_V);
     });
 
+    test("reconnects queued work when the hello send throws", async () => {
+        const timers = installManualTimers();
+        FakeWS.autoOpen = false;
+        let c: ReturnType<typeof client> | undefined;
+        let mutation: Promise<{ saved: boolean }> | undefined;
+        try {
+            c = client({ mutationTimeoutMs: 1_000 });
+            await flush();
+            const first = fakeWebSocket();
+            const queuedError = first.onerror;
+            const queuedClose = first.onclose;
+            c.subscribe("queries.ts#hello-retry", { organizationId: "org-1" }, () => {});
+            mutation = c.mutate("mutations.ts#hello-retry", { organizationId: "org-1" });
+
+            first.failNextSend = true;
+            expect(() => first.onopen?.()).not.toThrow();
+            queuedError?.();
+            queuedClose?.();
+            await flush();
+
+            expect(c.state).toBe("reconnecting");
+            expect(first.sent).toEqual([]);
+            expect(first.closeCalls).toBe(1);
+            expect(timers.scheduledDelays().sort((left, right) => left - right)).toEqual([250, 1_000]);
+            expect(FakeWS.instances).toHaveLength(1);
+
+            timers.runDelay(250);
+            await flush();
+            const replacement = fakeWebSocket(1);
+            replacement.onopen?.();
+            expect(replacement.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+            await welcome(replacement, "c-hello-retry:1");
+            const replacementMessages = replacement.sent.map(raw => JSON.parse(raw) as Up);
+            expect(replacementMessages.map(message => message.t)).toEqual(["hello", "sub", "mut"]);
+            expect(replacementMessages.filter(message => message.t === "sub")).toHaveLength(1);
+            const sentMutation = replacementMessages.find(message => message.t === "mut");
+            if (!sentMutation || sentMutation.t !== "mut") throw new Error("expected queued mutation on replacement");
+            expect(timers.scheduledDelays()).toEqual([1_000]);
+
+            replacement.emit({
+                t: "poke",
+                cookie: Cookie("c-hello-retry:2"),
+                patches: [],
+                mutResults: [
+                    {
+                        mutId: sentMutation.mutId,
+                        ok: true,
+                        result: { saved: true },
+                        cookie: Cookie("c-hello-retry:2"),
+                    },
+                ],
+            });
+            await expect(mutation).resolves.toEqual({ saved: true });
+            expect(timers.scheduledDelays()).toEqual([]);
+        } finally {
+            c?.close();
+            await mutation?.catch(() => {});
+            FakeWS.autoOpen = true;
+            timers.restore();
+        }
+    });
+
     test("a mismatched welcome protocol terminates every queued operation once", async () => {
         const c = client();
         await flush();
