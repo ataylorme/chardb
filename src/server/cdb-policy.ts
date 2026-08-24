@@ -1,9 +1,7 @@
 /**
  * Compile a `cdbTable` config to the existing `PolicyDefinition[]`
- * surface (`policy.ts`). The framework's row-level pipeline
- * (`applyPoliciesToWhere`, `applyRowPolicies`, `policyDigest`) is
- * unchanged; this module is the bridge between schema-first authoring
- * and the runtime closure surface.
+ * surface (`policy.ts`). This module bridges schema-first authoring to the
+ * runtime closure checks and registered-query policy identity.
  *
  * Mapping rules (one cdbTable → ≤6 policies):
  *
@@ -20,15 +18,15 @@
  * All policies use `chardbPolicy(...)` so they inherit the existing
  * frozen-object discipline, name conventions, and digest hashing.
  *
- * Cache invalidation: `authDependsOn` defaults to better-auth's tenant-
- * keyed model set for org-tenanted tables and the principal-keyed set
- * for user-tenanted ones. Mirrors the old `TENANT_EPOCH_TABLES` /
- * `PRINCIPAL_EPOCH_TABLES` constants verbatim so cached subscriptions
- * invalidate the same way pre/post migration.
+ * `authDependsOn` defaults to Better Auth's tenant-keyed model set for org
+ * tables and the principal-keyed set for user tables.
  */
 
 import { type SQL, eq, getTableColumns, sql } from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
+import { CdbError } from "../errors.ts";
+import { stableHashHex } from "../util/canonical.ts";
+import { collectCdbTables } from "./cdb-table-registry.ts";
 import { COL_VERBS, type CdbTableMeta, type ColVerb, type Verb } from "./cdb-table-types.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
 import type { AuthCtx } from "./define.ts";
@@ -85,8 +83,8 @@ function sqlEqColumn(table: SQLiteTable, column: string, value: string | undefin
 
 /**
  * Compile every row-level policy for a single cdbTable. Returns the
- * frozen `PolicyDefinition[]` that drops directly into
- * `applyPoliciesToWhere` / `applyRowPolicies` / `policyDigest`.
+ * frozen `PolicyDefinition[]` consumed by the row policy wrappers and static
+ * policy identity builder.
  */
 export function compileCdbPolicies(table: SQLiteTable): readonly PolicyDefinition<SQLiteTable, unknown>[] {
     const meta = resolveCdbMeta(table);
@@ -171,6 +169,73 @@ export function compileCdbPolicies(table: SQLiteTable): readonly PolicyDefinitio
     }
 
     return Object.freeze(policies);
+}
+
+/**
+ * Hash the row and column policy semantics for the exact cdbTables declared by
+ * one query intent. Function source is excluded because cdbTable policies are
+ * compiled from this metadata and closure text is not stable across builds.
+ */
+export function cdbPolicyDigest(schema: Record<string, unknown>, tableNames: readonly string[]): string {
+    const tablesByName = new Map<string, SQLiteTable>();
+    for (const entry of collectCdbTables(schema)) {
+        const name = resolveCdbMeta(entry.table).name;
+        if (tablesByName.has(name)) {
+            throw new CdbError({
+                code: "CDB_INVARIANT",
+                message: `schema contains more than one cdbTable named ${name}`,
+            });
+        }
+        tablesByName.set(name, entry.table);
+    }
+
+    const names = [...new Set(tableNames)].sort();
+    const tables = names.map(name => {
+        const table = tablesByName.get(name);
+        if (!table) {
+            throw new CdbError({
+                code: "CDB_INVARIANT",
+                message: `query intent references unknown cdbTable ${name}`,
+            });
+        }
+        const meta = resolveCdbMeta(table);
+        const matrix = [...meta.matrix.allowed.entries()]
+            .sort(([left], [right]) => compareCanonicalName(left, right))
+            .map(([role, verbs]) => ({
+                role,
+                verbs: COL_VERBS.map(verb => {
+                    const columns = verbs.get(verb);
+                    return {
+                        verb,
+                        columns: columns === null ? "*" : columns === undefined ? [] : [...columns].sort(),
+                    };
+                }),
+            }));
+        const policies = compileCdbPolicies(table)
+            .map(policy => ({
+                name: policy.name,
+                for: policy.for,
+                to: Array.isArray(policy.to) ? [...policy.to].sort() : policy.to,
+                effect: policy.effect ?? "grant",
+                authDependsOn: policy.authDependsOn ? [...policy.authDependsOn].sort() : [],
+            }))
+            .sort((left, right) => compareCanonicalName(left.name, right.name));
+        return {
+            name,
+            tenantKind: meta.tenantKind,
+            tenantBy: meta.tenantBy ?? null,
+            selfBy: meta.selfBy ?? null,
+            publicRead: meta.publicRead,
+            allColumns: [...meta.matrix.allColumns].sort(),
+            matrix,
+            policies,
+        };
+    });
+    return stableHashHex({ version: 1, tables });
+}
+
+function compareCanonicalName(left: string, right: string): number {
+    return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function verbToPolicyOp(verb: Verb): PolicyDefinition<unknown, unknown>["for"] {

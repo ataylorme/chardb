@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { and, eq, exists, sql } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { forOrg } from "../../src/server/index.ts";
@@ -98,6 +99,22 @@ const publicRecords = cdbTable(
         displayName: text("display_name").notNull(),
     },
     { publicRead: true }
+);
+const policyDriftRecords = cdbTable(
+    "query_records",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organization.id),
+        ownerId: text("owner_id")
+            .notNull()
+            .references(() => user.id),
+        groupId: text("group_id").notNull(),
+        value: integer("value").notNull(),
+        secretNote: text("secret_note"),
+    },
+    { selfBy: "ownerId", roles: { member: { read: "*" }, self: { read: "*" } } }
 );
 const joinTarget = sqliteTable("query_join_target", { id: text("id").primaryKey() });
 const schema = { organization, user, records, privateRecords, publicRecords };
@@ -340,6 +357,10 @@ const manifest = manifestFromExports({
     transactionAttempt,
 });
 const ConfiguredCdb = configureCdbRuntime({ schema: () => schema, manifest: () => manifest });
+const PolicyDriftCdb = configureCdbRuntime({
+    schema: () => ({ ...schema, records: policyDriftRecords }),
+    manifest: () => manifest,
+});
 const AUTH: CdbQueryRequest["auth"] = {
     userId: "user-1",
     tenantId: "org-a",
@@ -373,13 +394,14 @@ function liveRequest(
             values: ["org-a"],
         },
     };
+    const policyDigest = cdbPolicyDigest(schema, intent.tables);
     return {
         subscription,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-a"),
         ref,
         args,
-        queryHash: stableJson({ ref, args, intent }),
+        queryHash: stableJson({ ref, args, intent, policyDigest }),
         tables: ["query_records"],
         intervals: [{ table: "query_records", indexName: "by_group", intervals: [{ kind: "full" }] }],
     };
@@ -395,13 +417,14 @@ function registeredQuery(
 function intentCoverageLiveRequest(subscription: LiveSubscriptionId, mode: IntentCoverageMode): CdbSubscriptionRequest {
     const args = { organizationId: "org-a", mode };
     const intent = intentCoverage(mode);
+    const policyDigest = cdbPolicyDigest(schema, intent.tables);
     return {
         subscription,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-a"),
         ref: registeredIntentCoverage.__chardbRef,
         args,
-        queryHash: stableJson({ ref: registeredIntentCoverage.__chardbRef, args, intent }),
+        queryHash: stableJson({ ref: registeredIntentCoverage.__chardbRef, args, intent, policyDigest }),
         tables: intent.tables,
         intervals: [...new Set(intent.tables)].map(table => ({
             table,
@@ -669,6 +692,23 @@ describe("Cdb registered query execution", () => {
                 queries.set(registeredListRecords.__chardbRef, original);
             }
         }
+    });
+
+    test("rejects a registered query after its declared table policy changes", async () => {
+        const { cdb, db } = await setup();
+        const subscription = liveIdentity({ registrationId: "registration-policy-drift" });
+        await cdb.subscribe(liveRequest(subscription));
+
+        const drifted = construct(PolicyDriftCdb, db);
+        await drifted.ready;
+        await expect(drifted.cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject({
+            ok: false,
+            error: {
+                code: "CDB_INVARIANT",
+                message: "registered query policy changed after registration",
+            },
+        });
+        expect(registeredProbeRuns).toBe(0);
     });
 
     test("rejects corrupt payloads and table mappings before execution", async () => {

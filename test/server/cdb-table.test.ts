@@ -15,6 +15,7 @@
 import { describe, expect, test } from "bun:test";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { CdbError, type CdbErrorCode } from "../../src/errors.ts";
+import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import {
     applyColumnMask,
     applyPoliciesToWhere,
@@ -396,6 +397,60 @@ describe("compileCdbPolicies — RLS shape parity", () => {
         );
         expect(applyRowPolicies({ op: "insert", auth: anonymous, rows: publicRows, policies: publicPolicies })).toEqual(
             []
+        );
+    });
+
+    test("policy identity covers only the declared tables and changes with their access rules", () => {
+        const restrictedMessages = cdbTable(
+            "messages_for_compile",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                authorId: text("author_id")
+                    .notNull()
+                    .references(() => userTable.id),
+                body: text("body").notNull(),
+                flagged: text("flagged"),
+            },
+            { roles: { member: { read: { exclude: ["flagged"] } } } }
+        );
+        const unrelated = cdbTable(
+            "unrelated_policy_table",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+            },
+            { publicRead: true }
+        );
+
+        const digest = cdbPolicyDigest({ messages, unrelated }, ["messages_for_compile"]);
+        expect(cdbPolicyDigest({ unrelated, messages }, ["messages_for_compile", "messages_for_compile"])).toBe(digest);
+        expect(cdbPolicyDigest({ messages }, ["messages_for_compile"])).toBe(digest);
+        expect(cdbPolicyDigest({ restrictedMessages }, ["messages_for_compile"])).not.toBe(digest);
+        expect(() => cdbPolicyDigest({ messages }, ["missing_table"])).toThrow("unknown cdbTable missing_table");
+    });
+
+    test("policy identity uses locale-independent Unicode name ordering", () => {
+        const makeTable = (roles: Record<string, { readonly read: "*" }>) =>
+            cdbTable(
+                "unicode_policy_order",
+                {
+                    id: text("id").primaryKey(),
+                    organizationId: text("organization_id")
+                        .notNull()
+                        .references(() => orgTable.id),
+                },
+                { roles }
+            );
+        const first = makeTable({ équipe: { read: "*" }, zebra: { read: "*" } });
+        const second = makeTable({ zebra: { read: "*" }, équipe: { read: "*" } });
+
+        expect(cdbPolicyDigest({ first }, ["unicode_policy_order"])).toBe(
+            cdbPolicyDigest({ second }, ["unicode_policy_order"])
         );
     });
 });

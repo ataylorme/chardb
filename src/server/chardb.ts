@@ -185,6 +185,7 @@ export function chardb<
     });
     const authBasePath = input.authBasePath ?? auth.options.basePath ?? "/api/auth";
     const ConfiguredGateway = configureGatewayRuntime({
+        schema: () => runtimeEntrypoint.schema,
         manifest: () => runtimeEntrypoint.chardbManifest,
         auth: gatewayJwtConfigFromAuthOptions(auth.options, authBasePath),
     });

@@ -1,8 +1,28 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { Cdb } from "../../src/server/do/cdb.ts";
+import { sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { forOrg } from "../../src/server/cdb-tenant.ts";
+import { Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
+import { emptyManifest } from "../../src/server/manifest.ts";
 import type { CdbSubscriptionRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
+
+const organization = sqliteTable("organization", { id: text("id").primaryKey() });
+const { cdbTable } = forOrg();
+const messages = cdbTable(
+    "messages",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organization.id),
+    },
+    { roles: { member: { read: "*" } } }
+);
+const ConfiguredCdb = configureCdbRuntime({
+    schema: () => ({ organization, messages }),
+    manifest: () => emptyManifest(),
+});
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -66,7 +86,7 @@ describe("Cdb live subscription identity", () => {
     let state: DurableObjectState;
 
     async function reconstruct(): Promise<void> {
-        cdb = new Cdb(state, {});
+        cdb = new ConfiguredCdb(state, {});
         await bootstrap;
     }
 
@@ -185,7 +205,7 @@ describe("Cdb live subscription identity", () => {
         ).run(identity.gatewayId, identity.registrationId, "messages");
 
         await expect(cdb.subscribe(original)).rejects.toMatchObject({ code: "CDB_INVARIANT" });
-        cdb = new Cdb(state, {});
+        cdb = new ConfiguredCdb(state, {});
         await expect(bootstrap).rejects.toMatchObject({ code: "CDB_INVARIANT" });
     });
 
@@ -260,7 +280,7 @@ describe("Cdb live subscription identity", () => {
         await expect(bootstrap).rejects.toMatchObject({ code: "CDB_INVARIANT" });
     });
 
-    test("retires pre-authority active rows during bootstrap", async () => {
+    test("retires active rows created before authority and policy identity existed", async () => {
         const legacyDb = new Database(":memory:");
         try {
             legacyDb.exec(`
@@ -311,7 +331,8 @@ describe("Cdb live subscription identity", () => {
             expect(
                 legacyDb
                     .prepare(
-                        `SELECT state, payload_hash, principal_id, organization_id, ref, args_json, query_hash,
+                        `SELECT state, payload_hash, principal_id, organization_id, ref, args_json, policy_digest,
+                                query_hash,
                                 tables_json, intervals_json
                          FROM _chardb_live_subscriptions
                          WHERE registration_id = 'registration-legacy'`
@@ -324,6 +345,7 @@ describe("Cdb live subscription identity", () => {
                 organization_id: null,
                 ref: null,
                 args_json: null,
+                policy_digest: null,
                 query_hash: null,
                 tables_json: null,
                 intervals_json: null,

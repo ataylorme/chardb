@@ -77,6 +77,7 @@ describe("Gateway public durable registration", () => {
             tables: ["messages"],
             partitionKey: { table: "messages", column: "organization_id", values: ["org-1"] },
         },
+        policyDigest: "policy-digest-1",
         queryHash: "query-hash-1",
         authority: "organization",
         partitionKey: "org-1",

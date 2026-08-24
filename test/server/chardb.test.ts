@@ -20,6 +20,8 @@ import { organization } from "better-auth/plugins/organization";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { defineAuth } from "../../src/auth/synthesize.ts";
+import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
+import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { chardb } from "../../src/server/chardb.ts";
 import { defineMutation, defineQuery } from "../../src/server/define.ts";
 import { Cdb } from "../../src/server/do/cdb.ts";
@@ -28,10 +30,19 @@ import type { RawJson } from "../../src/types.ts";
 import { stableJson } from "../../src/util/canonical.ts";
 import { vshardOf } from "../../src/vshard.ts";
 
-const items = sqliteTable("items", {
-    id: text("id").primaryKey(),
-    name: text("name").notNull(),
-});
+const organizationTable = sqliteTable("organization", { id: text("id").primaryKey() });
+const { cdbTable } = forOrg();
+const items = cdbTable(
+    "items",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizationTable.id),
+        name: text("name").notNull(),
+    },
+    { roles: { member: { read: "*" } } }
+);
 
 const auth = defineAuth({
     appName: "chardb-factory-test",
@@ -131,8 +142,10 @@ describe("chardb({…})", () => {
         expect(routed.args).toEqual({ organizationId: "org-7", limit: 25 });
         expect(routed.authority).toBe("organization");
         expect(routed.partitionKey).toBe("org-7");
+        const policyDigest = cdbPolicyDigest({ items }, routed.intent.tables);
+        expect(routed.policyDigest).toBe(policyDigest);
         expect(routed.queryHash).toBe(
-            stableJson({ ref: routedQuery.__chardbRef, args: routed.args, intent: routed.intent })
+            stableJson({ ref: routedQuery.__chardbRef, args: routed.args, intent: routed.intent, policyDigest })
         );
 
         const invalid = await gateway.routeQuery({ ref: routedQuery.__chardbRef, args: { organizationId: 7 } });

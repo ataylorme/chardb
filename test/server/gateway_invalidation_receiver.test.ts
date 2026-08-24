@@ -68,6 +68,7 @@ function registration(
             tables: ["messages"],
             partitionKey: { table: "messages", column: "organization_id", values: ["org-1"] },
         },
+        policyDigest: "policy-digest-1",
         queryHash: "query-hash-1",
         shardId: "logical-shard-1",
         sourceCdbId: "physical-cdb-1",

@@ -7,19 +7,15 @@
  *     after the row is materialized. Convenient for one-off rules.
  *   - `usingSql` / `withCheckSql` accept a Drizzle `SQL` builder. Floors are
  *     AND-ed and alternative grants are OR-ed before the policy expression is
- *     AND-ed into the query, shrinking the planner's row scan. The rewritten
- *     AST — not the user's original — is what gets hashed for live-query
- *     fan-in, so two callers with different policies share zero subscriber
- *     state.
+ *     AND-ed into the query, shrinking the planner's row scan.
  *
  * A denied row remains indistinguishable from a missing row, which prevents
  * the timing / membership leaks an `IS_DENIED` distinction would otherwise
  * enable.
  *
- * Cache invalidation: every write the user's `authDependsOn` tables emit
- * bumps the matching `auth_epoch_*` counter; the gateway folds the current
- * epoch into the live-query hash via `policyDigest`, so a single epoch bump
- * invalidates every dependent subscription on the next `mustRefetch`.
+ * Registered live queries use `cdbPolicyDigest` from `cdb-policy.ts`. That
+ * digest covers the resolved cdbTable policy metadata for the exact tables in
+ * the query intent. Gateway still obtains fresh Catalog authority on each run.
  */
 
 import { type SQL, and as drizzleAnd, or as drizzleOr, sql } from "drizzle-orm";
@@ -120,13 +116,9 @@ export function applyRowPolicies<TTable, TRow>(args: {
 }
 
 /**
- * Returns the digest mixed into `queryHash` so a write that bumps an
- * `auth_epoch` invalidates exactly the subscriptions that depend on it.
- *
- * The digest covers policy composition and audience, declared
- * `authDependsOn` tables, the canonical caller role sets, and the relevant
- * `auth_epoch_*` counters — never closure source, since that is unstable
- * across hot-reloads.
+ * Build a caller-specific policy cache digest from explicit policy entries,
+ * auth epochs, and authority. Registered cdbTable queries use the static
+ * schema digest in `cdb-policy.ts` instead.
  */
 export interface PolicyDigestEntry {
     readonly name: string;

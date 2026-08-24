@@ -41,6 +41,7 @@ import {
     decodeWire,
     encodeWire,
 } from "../../wire.ts";
+import { cdbPolicyDigest } from "../cdb-policy.ts";
 import type { AuthCtx } from "../define.ts";
 import {
     type ChardbManifest,
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS _gw_registration_generations (
   ref TEXT NOT NULL,
   args_json TEXT NOT NULL,
   intent_json TEXT NOT NULL,
+  policy_digest TEXT NOT NULL,
   query_hash TEXT NOT NULL,
   shard_id TEXT NOT NULL,
   source_cdb_id TEXT NOT NULL,
@@ -241,6 +243,7 @@ export interface TrustedMutationDispatchDeps {
 }
 
 export interface GatewayRuntimeConfig {
+    readonly schema: () => Record<string, unknown>;
     readonly manifest: () => ChardbManifest;
     readonly auth: GatewayJwtConfig | null;
 }
@@ -580,6 +583,7 @@ export interface GatewayRegistrationInstall extends GatewayRegistrationKey {
     readonly ref: ChardbRef;
     readonly args: RawJson;
     readonly intent: CdbIntent;
+    readonly policyDigest: string;
     readonly queryHash: string;
     /** Catalog's logical shard identifier. */
     readonly shardId: string;
@@ -653,6 +657,8 @@ export interface GatewayDirtyRun {
     readonly organizationId: TenantId;
     readonly shardId: string;
     readonly sourceCdbId: string;
+    readonly intentJson: string;
+    readonly policyDigest: string;
 }
 
 export interface GatewaySnapshotStage extends GatewayRegistrationKey {
@@ -687,6 +693,8 @@ export interface GatewaySnapshotSendAttempt extends GatewayRegistrationKey {
     readonly nextAttemptAt: number;
     readonly claimToken: string;
     readonly claimVersion: number;
+    readonly intentJson: string;
+    readonly policyDigest: string;
 }
 
 export interface GatewayDirtyRunFailure extends GatewayRegistrationKey {
@@ -802,12 +810,12 @@ export function installGatewayRegistration(
     sql.exec(
         `INSERT INTO _gw_registration_generations
          (registration_id, principal_id, client_id, sub_id, connection_id, organization_id,
-          ref, args_json, intent_json, query_hash, shard_id, source_cdb_id, schema_epoch,
+          ref, args_json, intent_json, policy_digest, query_hash, shard_id, source_cdb_id, schema_epoch,
           auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
           lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_target_version,
           run_lease_expires_at, run_version,
           last_cookie, retry_count, retry_at, retry_error, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                  'installing', 'pending', 0, 0, NULL, NULL, NULL, 0, ?, 0, NULL, NULL, ?, ?)`,
         input.registrationId,
         input.principalId,
@@ -818,6 +826,7 @@ export function installGatewayRegistration(
         input.ref,
         stableJson(input.args),
         stableJson(input.intent),
+        input.policyDigest,
         input.queryHash,
         input.shardId,
         input.sourceCdbId,
@@ -1104,9 +1113,11 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         organization_id: string;
         shard_id: string;
         source_cdb_id: string;
+        intent_json: string;
+        policy_digest: string;
     }>(
         `SELECT g.dirty_version, g.delivered_version, g.run_token, g.run_version,
-                g.organization_id, g.shard_id, g.source_cdb_id
+                g.organization_id, g.shard_id, g.source_cdb_id, g.intent_json, g.policy_digest
          FROM _gw_registration_generations g
          INNER JOIN _gw_registration_heads h
            ON h.registration_id = g.registration_id
@@ -1190,6 +1201,8 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         organizationId: TenantId(current.organization_id),
         shardId: current.shard_id,
         sourceCdbId: current.source_cdb_id,
+        intentJson: current.intent_json,
+        policyDigest: current.policy_digest,
     };
 }
 
@@ -1289,10 +1302,12 @@ export function claimDueGatewaySnapshot(
         next_attempt_at: number;
         claim_token: string | null;
         claim_version: number;
+        intent_json: string;
+        policy_digest: string;
     }>(
         `SELECT o.registration_id, g.principal_id, g.client_id, g.sub_id, g.connection_id,
                 o.cookie, o.target_version, o.rows_json, o.byte_size, o.send_attempts, o.next_attempt_at,
-                o.claim_token, o.claim_version
+                o.claim_token, o.claim_version, g.intent_json, g.policy_digest
          FROM _gw_snapshot_outbox o
          INNER JOIN _gw_registration_generations g ON g.registration_id = o.registration_id
          INNER JOIN _gw_registration_heads h
@@ -1359,6 +1374,8 @@ export function claimDueGatewaySnapshot(
         nextAttemptAt: input.attemptExpiresAt,
         claimToken,
         claimVersion,
+        intentJson: due.intent_json,
+        policyDigest: due.policy_digest,
     };
 }
 
@@ -1881,6 +1898,7 @@ function assertGatewayRegistrationInstall(input: GatewayRegistrationInstall): vo
         ["connectionId", input.connectionId],
         ["organizationId", input.organizationId],
         ["ref", input.ref],
+        ["policyDigest", input.policyDigest],
         ["queryHash", input.queryHash],
         ["shardId", input.shardId],
         ["sourceCdbId", input.sourceCdbId],
@@ -1928,7 +1946,7 @@ function gatewayRetryError(error: unknown): string {
     return (error instanceof Error ? error.message : String(error)).slice(0, GATEWAY_CLEANUP_MAX_ERROR_LENGTH);
 }
 
-function ensureGatewayRegistrationColumns(sql: SyncSql): void {
+export function ensureGatewayRegistrationColumns(sql: SyncSql): void {
     const columns = new Set(
         sql.all<{ name: string }>("PRAGMA table_info('_gw_registration_generations')").map(column => column.name)
     );
@@ -1936,6 +1954,9 @@ function ensureGatewayRegistrationColumns(sql: SyncSql): void {
         // Existing generations predate physical Cdb identity. A null source is
         // intentionally stale until that logical subscription is replaced.
         sql.exec("ALTER TABLE _gw_registration_generations ADD COLUMN source_cdb_id TEXT");
+    }
+    if (!columns.has("policy_digest")) {
+        sql.exec("ALTER TABLE _gw_registration_generations ADD COLUMN policy_digest TEXT");
     }
     if (!columns.has("run_target_version")) {
         sql.exec(
@@ -1961,6 +1982,26 @@ function ensureGatewayRegistrationColumns(sql: SyncSql): void {
              CHECK (initial_snapshot_pending IN (0, 1))`
         );
     }
+    sql.exec(
+        `DELETE FROM _gw_registration_heads
+         WHERE registration_id IN (
+           SELECT registration_id FROM _gw_registration_generations WHERE policy_digest IS NULL
+         )`
+    );
+    sql.exec(
+        `DELETE FROM _gw_snapshot_outbox
+         WHERE registration_id IN (
+           SELECT registration_id FROM _gw_registration_generations WHERE policy_digest IS NULL
+         )`
+    );
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL,
+             run_target_version = NULL, run_lease_expires_at = NULL,
+             run_version = run_version + 1, retry_count = 0,
+             retry_at = updated_at, retry_error = NULL
+         WHERE policy_digest IS NULL AND lifecycle != 'retiring'`
+    );
     // Run this after every restart. A crash after ALTER but before repair must
     // not leave a partial run triple that no claimant can recover.
     sql.exec(
@@ -2230,6 +2271,23 @@ export class Gateway extends DurableObject<GatewayEnv> {
         return emptyManifest();
     }
 
+    protected runtimePolicyDigest(tableNames: readonly string[]): string | null {
+        void tableNames;
+        return null;
+    }
+
+    private currentGatewayPolicyDigest(intentJson: string): string | null {
+        try {
+            const intent = JSON.parse(intentJson) as { readonly tables?: unknown };
+            if (!Array.isArray(intent.tables) || !intent.tables.every(table => typeof table === "string")) {
+                throw new TypeError("persisted Gateway query intent has invalid tables");
+            }
+            return this.runtimePolicyDigest(intent.tables);
+        } catch {
+            return "";
+        }
+    }
+
     protected jwtConfig(): GatewayJwtConfig | null {
         return null;
     }
@@ -2241,7 +2299,13 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     /** Resolve query routing from the server manifest, never client hints. */
     routeQuery(request: { readonly ref: string; readonly args: RawJson }): Promise<QueryRouteResponse> {
-        return resolveQueryRoute(this.runtimeManifest(), request);
+        return resolveQueryRoute(this.runtimeManifest(), request, tables => {
+            const digest = this.runtimePolicyDigest(tables);
+            if (digest === null) {
+                throw new CdbError({ code: "CDB_INVARIANT", message: "Gateway query policy schema is unavailable" });
+            }
+            return digest;
+        });
     }
 
     protected gatewayNowMs(): number {
@@ -2394,14 +2458,13 @@ export class Gateway extends DurableObject<GatewayEnv> {
         this.sendError(current.ws, settlement.code, identity.subId);
     }
 
-    private async retireGatewaySnapshotAttempt(attempt: GatewaySnapshotSendAttempt, nowMs: number): Promise<void> {
-        const retired = this.ctx.storage.transactionSync(() =>
+    private retireGatewaySnapshotAttempt(attempt: GatewaySnapshotSendAttempt, nowMs: number): boolean {
+        return this.ctx.storage.transactionSync(() =>
             retireClaimedGatewaySnapshot(adaptSqlStorage(this.ctx.storage.sql), {
                 ...attempt,
                 nowMs,
             })
         );
-        if (retired) await this.scheduleGatewayWork(nowMs);
     }
 
     private async settleGatewayQueryFailure(
@@ -2462,6 +2525,17 @@ export class Gateway extends DurableObject<GatewayEnv> {
         if (!run) return;
 
         try {
+            const currentPolicyDigest = this.currentGatewayPolicyDigest(run.intentJson);
+            if (currentPolicyDigest !== null && currentPolicyDigest !== run.policyDigest) {
+                const retiredAt = this.gatewayNowMs();
+                const retired = this.retireGatewayRunnerRegistration(identity, retiredAt, run);
+                if (retired) {
+                    this.settleRetiredGatewaySubscription(identity, { kind: "error", code: "CDB_INVARIANT" });
+                    await this.scheduleGatewayWork(retiredAt).catch(() => {});
+                }
+                return;
+            }
+
             const catalog = this.catalog() as CatalogRoutingRpc & CatalogOrganizationAuthorityRpc;
             const authority = await catalog.resolveOrganizationAuthority({
                 principalId: identity.principalId,
@@ -2573,6 +2647,14 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     private async runGatewaySnapshotSend(attempt: GatewaySnapshotSendAttempt): Promise<void> {
         const sendNowMs = this.gatewayNowMs();
+        const currentPolicyDigest = this.currentGatewayPolicyDigest(attempt.intentJson);
+        if (currentPolicyDigest !== null && currentPolicyDigest !== attempt.policyDigest) {
+            if (this.retireGatewaySnapshotAttempt(attempt, sendNowMs)) {
+                this.settleRetiredGatewaySubscription(attempt, { kind: "error", code: "CDB_INVARIANT" });
+                await this.scheduleGatewayWork(sendNowMs).catch(() => {});
+            }
+            return;
+        }
         const socket = this.exactGatewaySocket(attempt, sendNowMs);
         if (socket.status === "refreshing") {
             this.ctx.storage.transactionSync(() => {
@@ -2589,7 +2671,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return;
         }
         if (socket.status === "terminal") {
-            await this.retireGatewaySnapshotAttempt(attempt, sendNowMs);
+            if (this.retireGatewaySnapshotAttempt(attempt, sendNowMs)) {
+                await this.scheduleGatewayWork(sendNowMs).catch(() => {});
+            }
             return;
         }
         const marked = this.ctx.storage.transactionSync(() =>
@@ -3519,6 +3603,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 ref: msg.ref,
                 args: routed.args,
                 intent: routed.intent,
+                policyDigest: routed.policyDigest,
                 queryHash: routed.queryHash,
                 shardId,
                 sourceCdbId,
@@ -3961,6 +4046,10 @@ export function configureGatewayRuntime(config: GatewayRuntimeConfig): typeof Ga
     return class ConfiguredGateway extends Gateway {
         protected override runtimeManifest(): ChardbManifest {
             return config.manifest();
+        }
+
+        protected override runtimePolicyDigest(tableNames: readonly string[]): string {
+            return cdbPolicyDigest(config.schema(), tableNames);
         }
 
         protected override jwtConfig(): GatewayJwtConfig | null {

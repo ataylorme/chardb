@@ -25,6 +25,7 @@ const REGISTRATION: GatewayRegistrationInstall = {
         tables: ["messages"],
         partitionKey: { table: "messages", column: "organization_id", values: ["organization-workerd"] },
     },
+    policyDigest: "policy-digest-workerd",
     queryHash: "query-hash-workerd",
     shardId: "logical-shard-workerd",
     sourceCdbId: "physical-cdb-workerd",

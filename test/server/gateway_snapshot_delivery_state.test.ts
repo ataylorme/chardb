@@ -77,6 +77,7 @@ function registration(
             tables: ["messages"],
             partitionKey: { table: "messages", column: "organization_id", values: ["org-1"] },
         },
+        policyDigest: "policy-digest-1",
         queryHash: "query-hash-1",
         shardId: "logical-shard-1",
         sourceCdbId: "physical-cdb-1",
@@ -612,12 +613,13 @@ describe("Gateway snapshot delivery state", () => {
         db.query(
             `INSERT INTO _gw_registration_generations
              (registration_id, principal_id, client_id, sub_id, connection_id, organization_id,
-              ref, args_json, intent_json, query_hash, shard_id, source_cdb_id, schema_epoch,
+              ref, args_json, intent_json, policy_digest, query_hash, shard_id, source_cdb_id, schema_epoch,
               auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
               lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_target_version,
               run_version, last_cookie, retry_count, retry_at, retry_error, created_at, updated_at)
              VALUES ('registration-legacy', 'principal-1', 'client-1', 1, 'connection-legacy', 'org-1',
-                     'queries.ts#messages', '{}', '{}', 'query-hash', 'logical-shard', 'physical-cdb', 1,
+                     'queries.ts#messages', '{}', '{}', 'policy-digest', 'query-hash',
+                     'logical-shard', 'physical-cdb', 1,
                      1, 2, 3, 'active', 'active', 5, 2, 'legacy-token', 5,
                      4, NULL, 0, NULL, NULL, 100, 100)`
         ).run();

@@ -69,6 +69,7 @@ function registration(overrides: Partial<GatewayRegistrationInstall> = {}): Gate
             tables: ["messages"],
             partitionKey: { table: "messages", column: "organization_id", values: ["org-1"] },
         },
+        policyDigest: "policy-digest-1",
         queryHash: "query-hash-1",
         shardId: "logical-shard-1",
         sourceCdbId: "physical-cdb-1",
@@ -113,6 +114,9 @@ describe("Gateway active snapshot runner", () => {
     let queryBehavior: () => unknown | Promise<unknown>;
     let authorityBehavior: () => unknown | Promise<unknown>;
     let routePhysicalId: string;
+    let currentPolicyDigest: string;
+    let failAlarmAt: number | null;
+    let alarmFailures: number;
 
     beforeEach(async () => {
         db = new Database(":memory:");
@@ -133,6 +137,9 @@ describe("Gateway active snapshot runner", () => {
             authEpochs: { global: 10, tenant: 11, principal: 12 },
         });
         routePhysicalId = "physical-cdb-1";
+        currentPolicyDigest = "policy-digest-1";
+        failAlarmAt = null;
+        alarmFailures = 0;
 
         const catalog = {
             async resolveOrganizationAuthority() {
@@ -171,7 +178,13 @@ describe("Gateway active snapshot runner", () => {
                 transactionSync: <T>(callback: () => T): T => db.transaction(callback)(),
                 getAlarm: async (): Promise<number | null> => currentAlarm,
                 setAlarm: async (scheduledTime: number | Date): Promise<void> => {
-                    currentAlarm = scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime;
+                    const nextAlarm = scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime;
+                    if (nextAlarm === failAlarmAt) {
+                        failAlarmAt = null;
+                        alarmFailures++;
+                        throw new Error("alarm unavailable");
+                    }
+                    currentAlarm = nextAlarm;
                     alarms.push(currentAlarm);
                     events.push(`alarm:${currentAlarm}`);
                 },
@@ -184,6 +197,10 @@ describe("Gateway active snapshot runner", () => {
         class TestGateway extends Gateway {
             protected override gatewayNowMs(): number {
                 return clock;
+            }
+
+            protected override runtimePolicyDigest(): string {
+                return currentPolicyDigest;
             }
         }
         gateway = new TestGateway(state, { CDB_CATALOG: catalogNamespace, CDB_SHARD: shardNamespace } as GatewayEnv);
@@ -331,6 +348,125 @@ describe("Gateway active snapshot runner", () => {
             code: "CDB_INVARIANT",
             subId: 1,
         });
+    });
+
+    test("retires before authority lookup when the declared table policy changed", async () => {
+        installActive();
+        const socket = attach();
+        currentPolicyDigest = "policy-digest-2";
+
+        await fireAlarm();
+
+        expect(events).not.toContain("authority");
+        expect(queryCalls).toEqual([]);
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
+        expect(JSON.parse(socket.sent[0] as string)).toMatchObject({
+            t: "error",
+            code: "CDB_INVARIANT",
+            subId: 1,
+        });
+    });
+
+    test("does not send a staged snapshot after the declared table policy changed", async () => {
+        const input = registration();
+        installActive(input);
+        const socket = attach(input);
+        const run = db.transaction(() =>
+            claimDirtyGatewayRegistration(sql, {
+                principalId: input.principalId,
+                clientId: input.clientId,
+                subId: input.subId,
+                registrationId: input.registrationId,
+                connectionId: input.connectionId,
+                nowMs: clock,
+                leaseExpiresAt: clock + 30_000,
+            })
+        )() as GatewayDirtyRun;
+        expect(
+            db.transaction(() =>
+                stageGatewaySnapshot(sql, {
+                    principalId: input.principalId,
+                    clientId: input.clientId,
+                    subId: input.subId,
+                    registrationId: input.registrationId,
+                    connectionId: input.connectionId,
+                    runToken: run.runToken,
+                    runVersion: run.runVersion,
+                    targetVersion: run.targetVersion,
+                    cookie: Cookie("cookie-old-policy"),
+                    rows: [{ id: 1, secret: "old policy" }],
+                    authEpochs: { global: 10, tenant: 11, principal: 12 },
+                    nowMs: clock,
+                })
+            )()
+        ).toBe(true);
+        currentPolicyDigest = "policy-digest-2";
+
+        await fireAlarm();
+
+        expect(events).not.toContain("authority");
+        expect(queryCalls).toEqual([]);
+        expect(socket.sent).toHaveLength(1);
+        expect(JSON.parse(socket.sent[0] as string)).toMatchObject({
+            t: "error",
+            code: "CDB_INVARIANT",
+            subId: 1,
+        });
+        expect(db.query("SELECT * FROM _gw_snapshot_outbox").get()).toBeNull();
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
+    });
+
+    test("clears staged policy drift state before cleanup alarm recovery", async () => {
+        const input = registration();
+        installActive(input);
+        const socket = attach(input);
+        const run = db.transaction(() =>
+            claimDirtyGatewayRegistration(sql, {
+                principalId: input.principalId,
+                clientId: input.clientId,
+                subId: input.subId,
+                registrationId: input.registrationId,
+                connectionId: input.connectionId,
+                nowMs: clock,
+                leaseExpiresAt: clock + 30_000,
+            })
+        )() as GatewayDirtyRun;
+        db.transaction(() =>
+            stageGatewaySnapshot(sql, {
+                principalId: input.principalId,
+                clientId: input.clientId,
+                subId: input.subId,
+                registrationId: input.registrationId,
+                connectionId: input.connectionId,
+                runToken: run.runToken,
+                runVersion: run.runVersion,
+                targetVersion: run.targetVersion,
+                cookie: Cookie("cookie-old-policy-alarm-failure"),
+                rows: [{ id: 1, secret: "old policy" }],
+                authEpochs: { global: 10, tenant: 11, principal: 12 },
+                nowMs: clock,
+            })
+        )();
+        currentPolicyDigest = "policy-digest-2";
+        failAlarmAt = clock + 1;
+
+        await fireAlarm();
+
+        expect(alarmFailures).toBe(1);
+        expect(socket.sent).toHaveLength(1);
+        expect(JSON.parse(socket.sent[0] as string)).toMatchObject({
+            t: "error",
+            code: "CDB_INVARIANT",
+            subId: 1,
+        });
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
+        expect(db.query("SELECT * FROM _gw_snapshot_outbox").get()).toBeNull();
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
     });
 
     test("settles revoked authority instead of leaving stale live rows", async () => {

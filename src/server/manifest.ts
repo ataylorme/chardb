@@ -96,6 +96,7 @@ export type QueryRouteResponse =
           readonly ok: true;
           readonly args: RawJson;
           readonly intent: CdbIntent;
+          readonly policyDigest: string;
           readonly queryHash: string;
           readonly authority: MutationAuthority | null;
           readonly partitionKey: string | null;
@@ -237,7 +238,8 @@ export function resolveQuery(manifest: ChardbManifest, ref: ChardbRef): QueryDes
 /** Re-derive query placement from arguments that Gateway already validated. */
 export function routeValidatedQuery(
     manifest: ChardbManifest,
-    input: { readonly ref: string; readonly args: RawJson }
+    input: { readonly ref: string; readonly args: RawJson },
+    policyDigestForTables: (tableNames: readonly string[]) => string
 ): Extract<QueryRouteResponse, { readonly ok: true }> {
     const descriptor = resolveQuery(manifest, input.ref as ChardbRef);
     if (!descriptor.extractIntent) {
@@ -247,6 +249,7 @@ export function routeValidatedQuery(
         });
     }
     const intent = descriptor.extractIntent(input.args);
+    const policyDigest = policyDigestForTables(intent.tables);
     const key = descriptor.extractPartitionKey?.(input.args);
     if (descriptor.authority === "organization" && (typeof key !== "string" || key.length === 0)) {
         throw new CdbError({
@@ -258,7 +261,8 @@ export function routeValidatedQuery(
         ok: true,
         args: input.args,
         intent,
-        queryHash: stableJson({ ref: input.ref, args: input.args, intent }),
+        policyDigest,
+        queryHash: stableJson({ ref: input.ref, args: input.args, intent, policyDigest }),
         authority: descriptor.authority ?? null,
         partitionKey: key === undefined ? null : String(key),
     };
@@ -267,7 +271,8 @@ export function routeValidatedQuery(
 /** Resolve server-owned query routing metadata without executing the query. */
 export async function routeQuery(
     manifest: ChardbManifest,
-    input: { readonly ref: string; readonly args: RawJson }
+    input: { readonly ref: string; readonly args: RawJson },
+    policyDigestForTables: (tableNames: readonly string[]) => string
 ): Promise<QueryRouteResponse> {
     try {
         const descriptor = resolveQuery(manifest, input.ref as ChardbRef);
@@ -282,7 +287,7 @@ export async function routeQuery(
             "query arguments",
             "CDB_INVALID_ARGS"
         );
-        return routeValidatedQuery(manifest, { ref: input.ref, args: validatedArgs });
+        return routeValidatedQuery(manifest, { ref: input.ref, args: validatedArgs }, policyDigestForTables);
     } catch (error) {
         const cdb =
             error instanceof CdbError

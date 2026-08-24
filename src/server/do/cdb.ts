@@ -27,6 +27,7 @@ import { stableHashHex } from "../../util/canonical.ts";
 import { rawJsonResult } from "../../util/raw_json.ts";
 import { executeAtomicMutation } from "../atomic-mutation.ts";
 import { wrapQueryDb } from "../cdb-db-proxy.ts";
+import { cdbPolicyDigest } from "../cdb-policy.ts";
 import { collectCdbTables } from "../cdb-table-registry.ts";
 import { resolveCdbMeta } from "../cdb-table.ts";
 import { type ChardbManifest, emptyManifest, resolveMutation, resolveQuery, routeValidatedQuery } from "../manifest.ts";
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
   organization_id TEXT,
   ref TEXT,
   args_json TEXT,
+  policy_digest TEXT,
   query_hash TEXT,
   tables_json TEXT,
   intervals_json TEXT,
@@ -85,6 +87,7 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
       AND organization_id IS NULL
       AND ref IS NULL
       AND args_json IS NULL
+      AND policy_digest IS NULL
       AND query_hash IS NULL
       AND tables_json IS NULL
       AND intervals_json IS NULL
@@ -96,6 +99,7 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
       AND organization_id IS NOT NULL
       AND ref IS NOT NULL
       AND args_json IS NOT NULL
+      AND policy_digest IS NOT NULL
       AND query_hash IS NOT NULL
       AND tables_json IS NOT NULL
       AND intervals_json IS NOT NULL
@@ -150,6 +154,7 @@ interface StoredSubscriptionRow {
     readonly organization_id: string | null;
     readonly ref: string | null;
     readonly args_json: string | null;
+    readonly policy_digest: string | null;
     readonly query_hash: string | null;
     readonly tables_json: string | null;
     readonly intervals_json: string | null;
@@ -184,7 +189,7 @@ function subscriptionKey(subscription: LiveSubscriptionId): string {
     return JSON.stringify([subscription.gatewayId, subscription.registrationId]);
 }
 
-function subscriptionPayloadHash(args: CdbSubscriptionRequest): string {
+function subscriptionPayloadHash(args: CdbSubscriptionRequest, policyDigest: string): string {
     return stableHashHex({
         connectionId: args.subscription.connectionId,
         clientId: args.subscription.clientId,
@@ -193,6 +198,7 @@ function subscriptionPayloadHash(args: CdbSubscriptionRequest): string {
         organizationId: args.organizationId,
         ref: args.ref,
         args: args.args,
+        policyDigest,
         queryHash: args.queryHash,
         tables: args.tables,
         intervals: args.intervals,
@@ -243,6 +249,9 @@ function ensureLiveSubscriptionAuthorityColumns(sql: SyncSql): void {
     if (!columns.has("query_hash")) {
         sql.exec("ALTER TABLE _chardb_live_subscriptions ADD COLUMN query_hash TEXT");
     }
+    if (!columns.has("policy_digest")) {
+        sql.exec("ALTER TABLE _chardb_live_subscriptions ADD COLUMN policy_digest TEXT");
+    }
 }
 
 function retireLegacyLiveSubscriptions(sql: SyncSql): void {
@@ -254,10 +263,11 @@ function retireLegacyLiveSubscriptions(sql: SyncSql): void {
              organization_id = NULL,
              ref = NULL,
              args_json = NULL,
+             policy_digest = NULL,
              query_hash = NULL,
              tables_json = NULL,
              intervals_json = NULL
-         WHERE state = 'active' AND (organization_id IS NULL OR query_hash IS NULL)`
+         WHERE state = 'active' AND (organization_id IS NULL OR query_hash IS NULL OR policy_digest IS NULL)`
     );
     sql.exec(
         `DELETE FROM _chardb_live_subscription_tables
@@ -322,6 +332,7 @@ function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionReq
         row.organization_id === null ||
         row.ref === null ||
         row.args_json === null ||
+        row.policy_digest === null ||
         row.query_hash === null ||
         row.tables_json === null ||
         row.intervals_json === null
@@ -364,7 +375,7 @@ function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionReq
         tables,
         intervals: intervals as CdbSubscriptionRequest["intervals"],
     };
-    if (row.payload_hash !== subscriptionPayloadHash(request)) {
+    if (row.payload_hash !== subscriptionPayloadHash(request, row.policy_digest)) {
         throw subscriptionInvariant("active live subscription payload hash does not match its persisted payload");
     }
     return request;
@@ -542,7 +553,8 @@ export class Cdb extends DurableObject<CdbEnv> {
         this.ensureDomainTables();
         const cursor = this.ctx.storage.sql.exec<StoredSubscriptionRow>(
             `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                    principal_id, organization_id, ref, args_json, query_hash, tables_json, intervals_json
+                    principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                    tables_json, intervals_json
              FROM _chardb_live_subscriptions
              WHERE state = 'active'
              ORDER BY gateway_id, registration_id`
@@ -790,14 +802,16 @@ export class Cdb extends DurableObject<CdbEnv> {
      */
     async subscribe(args: SubscribeArgs): Promise<{ subscription: LiveSubscriptionId; changeSeq: number }> {
         const intervals = this.prepareIntervals(args);
-        const payloadHash = subscriptionPayloadHash(args);
+        const policyDigest = cdbPolicyDigest(this.mutationSchema(), args.tables);
+        const payloadHash = subscriptionPayloadHash(args, policyDigest);
         const tableNames = [...new Set(args.tables)].sort();
         let changeSeq: number | undefined;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             const existing = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, ref, args_json, query_hash, tables_json, intervals_json
+                        principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                        tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
                 args.subscription.gatewayId,
@@ -818,8 +832,9 @@ export class Cdb extends DurableObject<CdbEnv> {
                 sql.exec(
                     `INSERT INTO _chardb_live_subscriptions
                      (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                      principal_id, organization_id, ref, args_json, query_hash, tables_json, intervals_json)
-                     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`,
+                      principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                      tables_json, intervals_json)
+                     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                     args.subscription.gatewayId,
                     args.subscription.registrationId,
                     args.subscription.connectionId,
@@ -830,6 +845,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                     args.organizationId,
                     args.ref,
                     JSON.stringify(args.args),
+                    policyDigest,
                     args.queryHash,
                     JSON.stringify(args.tables),
                     JSON.stringify(args.intervals)
@@ -858,7 +874,8 @@ export class Cdb extends DurableObject<CdbEnv> {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             const existing = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, ref, args_json, query_hash, tables_json, intervals_json
+                        principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                        tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
                 subscription.gatewayId,
@@ -878,6 +895,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                    organization_id = NULL,
                    ref = NULL,
                    args_json = NULL,
+                   policy_digest = NULL,
                    query_hash = NULL,
                    tables_json = NULL,
                    intervals_json = NULL`,
@@ -975,7 +993,8 @@ export class Cdb extends DurableObject<CdbEnv> {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             const row = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, ref, args_json, query_hash, tables_json, intervals_json
+                        principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                        tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
                 request.subscription.gatewayId,
@@ -997,15 +1016,19 @@ export class Cdb extends DurableObject<CdbEnv> {
             assertSubscriptionTables(sql, subscription.subscription, [...new Set(subscription.tables)].sort());
             this.prepareIntervals(subscription);
 
-            const routed = routeValidatedQuery(this.mutationManifest(), {
-                ref: subscription.ref,
-                args: subscription.args,
-            });
+            const routed = routeValidatedQuery(
+                this.mutationManifest(),
+                { ref: subscription.ref, args: subscription.args },
+                tables => cdbPolicyDigest(this.mutationSchema(), tables)
+            );
             if (routed.authority !== "organization") {
                 throw subscriptionInvariant("registered query no longer has organization authority");
             }
             if (routed.partitionKey !== subscription.organizationId) {
                 throw subscriptionInvariant("registered query organization partition changed after registration");
+            }
+            if (routed.policyDigest !== row.policy_digest) {
+                throw subscriptionInvariant("registered query policy changed after registration");
             }
             if (routed.queryHash !== subscription.queryHash) {
                 throw subscriptionInvariant("registered query intent changed after registration");
@@ -1032,7 +1055,8 @@ export class Cdb extends DurableObject<CdbEnv> {
 
             const current = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, ref, args_json, query_hash, tables_json, intervals_json
+                        principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                        tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
                 request.subscription.gatewayId,
@@ -1045,6 +1069,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 current.principal_id !== row.principal_id ||
                 current.organization_id !== row.organization_id ||
                 current.payload_hash !== row.payload_hash ||
+                current.policy_digest !== row.policy_digest ||
                 current.query_hash !== row.query_hash
             ) {
                 throw subscriptionInvariant("registered query changed while its handler was running");

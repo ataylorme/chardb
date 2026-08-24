@@ -8,6 +8,7 @@ import {
     advanceGatewayRegistration,
     beginInitialGatewayQuery,
     cleanupGatewayRegistration,
+    ensureGatewayRegistrationColumns,
     installGatewayRegistration,
     listCurrentGatewayRegistrationsForConnection,
     retireCurrentGatewayRegistration,
@@ -53,6 +54,7 @@ function registration(
             tables: ["messages"],
             partitionKey: { table: "messages", column: "organization_id", values: ["org-1"] },
         },
+        policyDigest: "policy-digest-1",
         queryHash: "query-hash-1",
         shardId: "shard-1",
         sourceCdbId: "cdb-object-1",
@@ -105,11 +107,12 @@ describe("Gateway durable registration generations", () => {
             (db.query("PRAGMA table_info('_gw_registration_generations')").all() as { name: string }[]).map(
                 column => column.name
             )
-        ).not.toContain("policy_digest");
+        ).toContain("policy_digest");
         expect(
             db
                 .query(
-                    `SELECT connection_id, organization_id, ref, args_json, intent_json, query_hash, shard_id,
+                    `SELECT connection_id, organization_id, ref, args_json, intent_json, policy_digest,
+                            query_hash, shard_id,
                             source_cdb_id,
                             schema_epoch, auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
                             lifecycle, cdb_state, dirty_version, delivered_version,
@@ -125,6 +128,7 @@ describe("Gateway durable registration generations", () => {
             args_json: '{"organizationId":"org-1","z":1}',
             intent_json:
                 '{"kind":"select","partitionKey":{"column":"organization_id","table":"messages","values":["org-1"]},"tables":["messages"]}',
+            policy_digest: "policy-digest-1",
             query_hash: "query-hash-1",
             shard_id: "shard-1",
             source_cdb_id: "cdb-object-1",
@@ -547,5 +551,70 @@ describe("Gateway durable registration generations", () => {
         expect(
             db.transaction(() => beginInitialGatewayQuery(sql, { ...corruptGeneration, changeSeq: 1, nowMs: 200 }))()
         ).toBeNull();
+    });
+
+    test("retires active generations created before policy identity existed", () => {
+        const legacy = new Database(":memory:");
+        try {
+            legacy.exec(`
+                CREATE TABLE _gw_registration_generations (
+                  registration_id TEXT PRIMARY KEY,
+                  source_cdb_id TEXT,
+                  lifecycle TEXT NOT NULL,
+                  cdb_state TEXT NOT NULL,
+                  run_token TEXT,
+                  run_target_version INTEGER,
+                  run_lease_expires_at INTEGER,
+                  run_version INTEGER NOT NULL,
+                  last_snapshot_cookie TEXT,
+                  initial_snapshot_pending INTEGER NOT NULL,
+                  retry_count INTEGER NOT NULL,
+                  retry_at INTEGER,
+                  retry_error TEXT,
+                  updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE _gw_registration_heads (registration_id TEXT PRIMARY KEY);
+                CREATE TABLE _gw_snapshot_outbox (registration_id TEXT PRIMARY KEY);
+                INSERT INTO _gw_registration_generations VALUES (
+                  'registration-legacy', 'cdb-legacy', 'active', 'active',
+                  'run-legacy', 2, 500, 3, 'cookie-legacy', 0, 4, 600, 'old error', 100
+                );
+                INSERT INTO _gw_registration_heads VALUES ('registration-legacy');
+                INSERT INTO _gw_snapshot_outbox VALUES ('registration-legacy');
+            `);
+            const legacySql = syncSql(legacy);
+
+            ensureGatewayRegistrationColumns(legacySql);
+
+            expect(
+                (legacy.query("PRAGMA table_info('_gw_registration_generations')").all() as { name: string }[]).map(
+                    column => column.name
+                )
+            ).toContain("policy_digest");
+            expect(
+                legacy
+                    .query(
+                        `SELECT lifecycle, cdb_state, run_token, run_target_version, run_lease_expires_at,
+                                run_version, retry_count, retry_at, retry_error, policy_digest
+                         FROM _gw_registration_generations`
+                    )
+                    .get()
+            ).toEqual({
+                lifecycle: "retiring",
+                cdb_state: "retiring",
+                run_token: null,
+                run_target_version: null,
+                run_lease_expires_at: null,
+                run_version: 4,
+                retry_count: 0,
+                retry_at: 100,
+                retry_error: null,
+                policy_digest: null,
+            });
+            expect(legacy.query("SELECT * FROM _gw_registration_heads").all()).toEqual([]);
+            expect(legacy.query("SELECT * FROM _gw_snapshot_outbox").all()).toEqual([]);
+        } finally {
+            legacy.close();
+        }
     });
 });
