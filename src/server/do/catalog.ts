@@ -31,7 +31,7 @@ import {
     parseCachedJwk,
 } from "../../auth/jwks_cache.ts";
 import { getAuthRuntime, placementFor, tableFor } from "../../auth/runtime.ts";
-import { authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
+import { authCount, authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
 import { CdbError } from "../../errors.ts";
 import type { RawJson } from "../../types.ts";
 import { type PrincipalId, ShardId, type TenantId, type Vshard } from "../../types.ts";
@@ -391,6 +391,16 @@ export class Catalog extends DurableObject<CatalogEnv> {
             return one ? [one] : [];
         }
         return authFindMany(sql, table, args.where, args.limit);
+    }
+
+    /** Count Better Auth rows without materializing them across the Catalog RPC. */
+    async countAuth(args: {
+        readonly model: string;
+        readonly where: { readonly [k: string]: RawJson };
+    }): Promise<number> {
+        await this.bootstrap();
+        this.ensureAuthTables();
+        return authCount(adaptSqlStorage(this.ctx.storage.sql), tableFor(args.model), args.where);
     }
 
     /**

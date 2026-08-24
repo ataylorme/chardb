@@ -47,6 +47,7 @@ interface CatalogRpc {
         where: { [k: string]: RawJson };
         limit?: number;
     }): Promise<readonly Record<string, RawJson>[]>;
+    countAuth(args: { model: string; where: { [k: string]: RawJson } }): Promise<number>;
 }
 
 export interface ChardbAuthAdapterOptions {
@@ -89,8 +90,7 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
 
             async count({ model, where }) {
                 const flat = where ? whereToFlat(where) : {};
-                const rows = await catalog().queryAuth({ model, where: flat });
-                return rows.length;
+                return catalog().countAuth({ model, where: flat });
             },
 
             async update({ model, where, update }) {

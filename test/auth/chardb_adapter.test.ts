@@ -12,9 +12,10 @@ interface Cursor<T> extends Iterable<T> {
     raw(): IterableIterator<unknown[]>;
 }
 
-function sqlStorage(db: Database) {
+function sqlStorage(db: Database, statements: string[] = []) {
     return {
         exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): Cursor<T> {
+            statements.push(query);
             const statement = db.prepare(query);
             const rows = statement.all(...(bindings as never[])) as Record<string, unknown>[];
             const columnNames = [...statement.columnNames];
@@ -32,6 +33,7 @@ function sqlStorage(db: Database) {
 
 class CatalogHarness {
     readonly db: Database;
+    readonly sqlStatements: string[] = [];
     private bootstrap: Promise<unknown> = Promise.resolve();
     private readonly state: DurableObjectState;
     catalog: Catalog;
@@ -41,7 +43,7 @@ class CatalogHarness {
         prepare?.(this.db);
         this.state = {
             storage: {
-                sql: sqlStorage(this.db),
+                sql: sqlStorage(this.db, this.sqlStatements),
                 transactionSync: <T>(callback: () => T): T => this.db.transaction(callback)(),
             },
             blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
@@ -199,6 +201,55 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             tenant: 2,
             principal: 4,
         });
+    });
+
+    test("counts filtered rows with scalar SQL and no row materialization", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const now = new Date("2026-08-23T00:00:00Z");
+        for (const [id, name] of [
+            ["count-user-1", "Counted"],
+            ["count-user-2", "Counted"],
+            ["count-user-3", "Excluded"],
+        ] as const) {
+            await adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id,
+                    name,
+                    email: `${id}@example.com`,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+        }
+        harness.sqlStatements.length = 0;
+
+        await expect(adapter.count({ model: "user", where: eq("name", "Counted") })).resolves.toBe(2);
+        expect(harness.sqlStatements).toContain('SELECT COUNT(*) AS c FROM "user" WHERE "name" = ?');
+        expect(harness.sqlStatements.some(statement => statement.includes('SELECT * FROM "user"'))).toBe(false);
+    });
+
+    test("routes adapter counts to countAuth without falling back to queryAuth", async () => {
+        const requests: Array<{ model: string; where: Record<string, unknown> }> = [];
+        const catalog = {
+            async countAuth(request: { model: string; where: Record<string, unknown> }) {
+                requests.push(request);
+                return 7;
+            },
+            async queryAuth() {
+                throw new Error("count must not materialize auth rows");
+            },
+        };
+        const namespace = {
+            idFromName: () => "global",
+            get: () => catalog,
+        } as unknown as DurableObjectNamespace;
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespace } })(auth.options);
+
+        await expect(adapter.count({ model: "user", where: eq("name", "Counted") })).resolves.toBe(7);
+        expect(requests).toEqual([{ model: "user", where: { name: "Counted" } }]);
     });
 
     test("updates and deletes through non-owner lookups while preserving epoch bumps", async () => {
