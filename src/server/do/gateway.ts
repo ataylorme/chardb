@@ -196,6 +196,10 @@ export const GATEWAY_SEND_LEASE_MS = 10_000 as const;
 export const GATEWAY_SUBSCRIBE_RECOVERY_MS = 30_000 as const;
 
 const GATEWAY_ABANDONED_REGISTRATION_CURSOR_KEY = "abandoned-registration-cursor" as const;
+// Preserve the platform's original 1 MiB WebSocket message ceiling even on
+// runtimes that accept larger frames. File payloads belong on the upload path.
+const GATEWAY_MAX_INBOUND_WEBSOCKET_BYTES = 1024 * 1024;
+const GATEWAY_TEXT_ENCODER = new TextEncoder();
 
 interface PendingGwAttachment {
     readonly kind: "pending";
@@ -3261,6 +3265,16 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     override async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer): Promise<void> {
         if (typeof raw !== "string") return;
+        // UTF-8 is never shorter than the JavaScript code-unit count. Reject
+        // obviously large strings before allocating an encoded copy, then
+        // measure exact bytes for multibyte input before JSON parsing.
+        if (
+            raw.length > GATEWAY_MAX_INBOUND_WEBSOCKET_BYTES ||
+            GATEWAY_TEXT_ENCODER.encode(raw).byteLength > GATEWAY_MAX_INBOUND_WEBSOCKET_BYTES
+        ) {
+            ws.close(1009, "message too large");
+            return;
+        }
         let msg: WireMessage;
         try {
             msg = decodeWire(raw);
