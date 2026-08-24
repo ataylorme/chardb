@@ -212,6 +212,7 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [ ] Connect replacement snapshots to a durable cookie coordinate and prove cookie replay after missed invalidations.
 - [x] Bound pending mutation settlement with `mutationTimeoutMs`, defaulting to 60 seconds and returning nonretryable `CDB_MUTATION_OUTCOME_UNKNOWN` when the server may already have committed.
 - [x] Reuse the original `mutId` when reconnect resends a mutation that remains pending, without resetting its deadline.
+- [x] Cap client pending mutation records at 32 across queued, in-flight, and reconnecting work. Validate refs first, then reject a valid 33rd immediately with retryable `CDB_RATE_LIMITED` before UUID allocation, timer creation, map insertion, or send. Preserve admitted ids and deadlines across reconnect and release capacity on every settlement and close path.
 - [ ] Expose a public retry handle and define an automatic retry policy for terminal errors marked retryable.
 - [x] Preserve the last delivered nonempty cookie on mutation failures and across auth refresh.
 - [x] Return typed errors for malformed messages instead of accepting any object with a known `t` field.
