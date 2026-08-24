@@ -2297,6 +2297,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     private bootstrapped = false;
     private alarmScheduler: Promise<void> = Promise.resolve();
+    private readonly authOperationClaims = new Map<string, object>();
     private readonly authRefreshBarriers = new Map<string, Promise<boolean>>();
     private readonly activeOperations = new Map<string, Set<Promise<void>>>();
     private readonly pendingSubscriptions = new Map<string, PendingSubscription>();
@@ -3322,6 +3323,14 @@ export class Gateway extends DurableObject<GatewayEnv> {
     override async webSocketClose(ws: WebSocket): Promise<void> {
         const attachment = ws.deserializeAttachment() as GwAttachment | null;
         if (attachment) {
+            if (attachment.kind !== "rejected") {
+                ws.serializeAttachment({
+                    kind: "rejected",
+                    connectionId: attachment.connectionId,
+                    authOrigin: attachment.authOrigin,
+                } satisfies RejectedGwAttachment);
+            }
+            this.authOperationClaims.delete(attachment.connectionId);
             this.authRefreshBarriers.delete(attachment.connectionId);
             this.activeOperations.delete(attachment.connectionId);
             for (const pending of this.pendingSubscriptions.values()) {
@@ -3349,33 +3358,55 @@ export class Gateway extends DurableObject<GatewayEnv> {
             this.rejectAuth(ws, "CDB_FORBIDDEN");
             return;
         }
-        const mismatch = checkProtocolV(msg.protocolV);
-        if (mismatch) {
-            this.send(ws, mismatch);
-            ws.close(1002, `unsupported chardb protocol ${msg.protocolV}`);
+        const claim = this.claimAuthOperation(pending.connectionId);
+        if (!claim) {
+            this.sendError(ws, "CDB_RATE_LIMITED");
             return;
         }
-        const attachment = await this.verifyAttachment(ws, {
-            authOrigin: pending.authOrigin,
-            connectionId: pending.connectionId,
-            clientId: pending.routedClientId,
-            jwt: msg.jwt,
-            ...(msg.resumeFromCookie ? { lastCookie: msg.resumeFromCookie } : {}),
-        });
-        if (!attachment) return;
-        const baseCookie = Cookie(`${pending.routedClientId}:0`);
-        ws.serializeAttachment({
-            ...attachment,
-            lastCookie: msg.resumeFromCookie ?? baseCookie,
-        } satisfies VerifiedGwAttachment);
-        const welcome: Down = {
-            t: "welcome",
-            protocolV: PROTOCOL_V,
-            baseCookie,
-            region: "WNAM",
-            ...(msg.resumeFromCookie ? { resumedFromCookie: msg.resumeFromCookie } : {}),
-        };
-        this.send(ws, welcome);
+        try {
+            const mismatch = checkProtocolV(msg.protocolV);
+            if (mismatch) {
+                this.send(ws, mismatch);
+                ws.close(1002, `unsupported chardb protocol ${msg.protocolV}`);
+                return;
+            }
+            const attachment = await this.verifyAttachment(
+                ws,
+                {
+                    authOrigin: pending.authOrigin,
+                    connectionId: pending.connectionId,
+                    clientId: pending.routedClientId,
+                    jwt: msg.jwt,
+                    ...(msg.resumeFromCookie ? { lastCookie: msg.resumeFromCookie } : {}),
+                },
+                () => this.authOperationClaims.get(pending.connectionId) === claim
+            );
+            if (!attachment || this.authOperationClaims.get(pending.connectionId) !== claim) return;
+            const current = ws.deserializeAttachment() as GwAttachment | null;
+            if (
+                current?.kind !== "pending" ||
+                current.connectionId !== pending.connectionId ||
+                current.authOrigin !== pending.authOrigin ||
+                current.routedClientId !== pending.routedClientId
+            ) {
+                return;
+            }
+            const baseCookie = Cookie(`${pending.routedClientId}:0`);
+            ws.serializeAttachment({
+                ...attachment,
+                lastCookie: msg.resumeFromCookie ?? baseCookie,
+            } satisfies VerifiedGwAttachment);
+            const welcome: Down = {
+                t: "welcome",
+                protocolV: PROTOCOL_V,
+                baseCookie,
+                region: "WNAM",
+                ...(msg.resumeFromCookie ? { resumedFromCookie: msg.resumeFromCookie } : {}),
+            };
+            this.send(ws, welcome);
+        } finally {
+            this.releaseAuthOperation(pending.connectionId, claim);
+        }
     }
 
     private async onUpdateAuth(ws: WebSocket, msg: Extract<Up, { t: "updateAuth" }>): Promise<void> {
@@ -3385,42 +3416,69 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return;
         }
         const connectionId = current.connectionId;
-        const previous = this.authRefreshBarriers.get(connectionId) ?? Promise.resolve(true);
-        const barrier = previous
-            .then(previousSucceeded => (previousSucceeded ? this.performUpdateAuth(ws, connectionId, msg) : false))
-            .catch(() => {
-                this.rejectAuth(ws, "CDB_CATALOG_UNAVAILABLE");
-                return false;
-            });
+        const claim = this.claimAuthOperation(connectionId);
+        if (!claim) {
+            this.sendError(ws, "CDB_RATE_LIMITED");
+            return;
+        }
+        const isCurrent = (): boolean => this.authOperationClaims.get(connectionId) === claim;
+        const barrier = this.performUpdateAuth(ws, connectionId, msg, isCurrent).catch(() => {
+            if (isCurrent()) this.rejectAuth(ws, "CDB_CATALOG_UNAVAILABLE");
+            return false;
+        });
         this.authRefreshBarriers.set(connectionId, barrier);
-        const succeeded = await barrier;
-        if (succeeded && this.authRefreshBarriers.get(connectionId) === barrier) {
-            this.authRefreshBarriers.delete(connectionId);
+        try {
+            await barrier;
+        } finally {
+            if (this.authRefreshBarriers.get(connectionId) === barrier) {
+                this.authRefreshBarriers.delete(connectionId);
+            }
+            this.releaseAuthOperation(connectionId, claim);
+        }
+    }
+
+    private claimAuthOperation(connectionId: string): object | null {
+        if (this.authOperationClaims.has(connectionId)) return null;
+        const claim = {};
+        this.authOperationClaims.set(connectionId, claim);
+        return claim;
+    }
+
+    private releaseAuthOperation(connectionId: string, claim: object): void {
+        if (this.authOperationClaims.get(connectionId) === claim) {
+            this.authOperationClaims.delete(connectionId);
         }
     }
 
     private async performUpdateAuth(
         ws: WebSocket,
         connectionId: string,
-        msg: Extract<Up, { t: "updateAuth" }>
+        msg: Extract<Up, { t: "updateAuth" }>,
+        isCurrent: () => boolean = () => true
     ): Promise<boolean> {
+        if (!isCurrent()) return false;
         const current = ws.deserializeAttachment() as GwAttachment | null;
         if (!isVerifiedAttachment(current) || current.connectionId !== connectionId) {
-            this.rejectAuth(ws, "CDB_FORBIDDEN");
+            if (isCurrent()) this.rejectAuth(ws, "CDB_FORBIDDEN");
             return false;
         }
-        const attachment = await this.verifyAttachment(ws, {
-            authOrigin: current.authOrigin,
-            connectionId,
-            clientId: current.clientId,
-            jwt: msg.jwt,
-            ...(current.lastCookie !== undefined ? { lastCookie: current.lastCookie } : {}),
-            ...(current.presenceKeys !== undefined ? { presenceKeys: current.presenceKeys } : {}),
-        });
-        if (!attachment) return false;
+        const attachment = await this.verifyAttachment(
+            ws,
+            {
+                authOrigin: current.authOrigin,
+                connectionId,
+                clientId: current.clientId,
+                jwt: msg.jwt,
+                ...(current.lastCookie !== undefined ? { lastCookie: current.lastCookie } : {}),
+                ...(current.presenceKeys !== undefined ? { presenceKeys: current.presenceKeys } : {}),
+            },
+            isCurrent
+        );
+        if (!isCurrent() || !attachment) return false;
 
         const active = this.activeOperations.get(connectionId);
         if (active && active.size > 0) await Promise.allSettled([...active]);
+        if (!isCurrent()) return false;
 
         const latest = ws.deserializeAttachment() as GwAttachment | null;
         if (
@@ -3428,9 +3486,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
             latest.connectionId !== connectionId ||
             latest.clientId !== current.clientId
         ) {
-            this.rejectAuth(ws, "CDB_FORBIDDEN");
+            if (isCurrent()) this.rejectAuth(ws, "CDB_FORBIDDEN");
             return false;
         }
+        if (!isCurrent()) return false;
         ws.serializeAttachment({
             ...attachment,
             ...(latest.lastCookie !== undefined ? { lastCookie: latest.lastCookie } : {}),
@@ -3439,7 +3498,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
         } satisfies VerifiedGwAttachment);
         try {
             const retirementAt = this.gatewayNowMs();
+            if (!isCurrent()) return false;
             await this.scheduleGatewayAlarm(retirementAt + GATEWAY_SUBSCRIBE_RECOVERY_MS);
+            if (!isCurrent()) return false;
             const retired = this.ctx.storage.transactionSync(() =>
                 retireCurrentGatewayRegistrationsForConnection(
                     adaptSqlStorage(this.ctx.storage.sql),
@@ -3448,14 +3509,16 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 )
             );
             await this.scheduleGatewayWork(retirementAt).catch(() => {});
+            if (!isCurrent()) return false;
             const legacy = await this.invalidateClientSubscriptions(latest.clientId);
+            if (!isCurrent()) return false;
             if (legacy.rpcFailed) {
                 this.rejectConnection(ws, "CDB_SHARD_UNAVAILABLE", 1011, "subscription invalidation failed");
                 return false;
             }
             const refreshed = ws.deserializeAttachment() as GwAttachment | null;
             if (!isVerifiedAttachment(refreshed) || refreshed.connectionId !== connectionId) {
-                this.rejectAuth(ws, "CDB_FORBIDDEN");
+                if (isCurrent()) this.rejectAuth(ws, "CDB_FORBIDDEN");
                 return false;
             }
             const subIds = [
@@ -3463,22 +3526,26 @@ export class Gateway extends DurableObject<GatewayEnv> {
             ]
                 .sort((left, right) => left - right)
                 .map(SubId);
+            if (!isCurrent()) return false;
             ws.serializeAttachment({ ...refreshed, snapshotSubIds: [] } satisfies VerifiedGwAttachment);
             this.send(ws, { t: "mustRefetch", subIds, reason: "authChanged" });
             return true;
         } catch {
-            this.rejectConnection(ws, "CDB_SHARD_UNAVAILABLE", 1011, "subscription invalidation failed");
+            if (isCurrent()) {
+                this.rejectConnection(ws, "CDB_SHARD_UNAVAILABLE", 1011, "subscription invalidation failed");
+            }
             return false;
         }
     }
 
     private async verifyAttachment(
         ws: WebSocket,
-        request: Omit<GatewayJwtVerificationRequest, "config" | "catalog">
+        request: Omit<GatewayJwtVerificationRequest, "config" | "catalog">,
+        isCurrent: () => boolean = () => true
     ): Promise<VerifiedGwAttachment | null> {
         const config = this.jwtConfig();
         if (!config) {
-            this.rejectAuth(ws, "CDB_AUTH_NOT_BOUND");
+            if (isCurrent()) this.rejectAuth(ws, "CDB_AUTH_NOT_BOUND");
             return null;
         }
         try {
@@ -3488,7 +3555,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 catalog: this.catalog() as unknown as CatalogJwksRpc,
             });
         } catch (error) {
-            this.rejectAuth(ws, error instanceof CdbError ? error.code : "CDB_CATALOG_UNAVAILABLE");
+            if (isCurrent()) {
+                this.rejectAuth(ws, error instanceof CdbError ? error.code : "CDB_CATALOG_UNAVAILABLE");
+            }
             return null;
         }
     }
