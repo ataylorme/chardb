@@ -1,12 +1,12 @@
 # chardb completion plan
 
-Last reviewed: 2026-08-23
+Last reviewed: 2026-08-24
 
 ## What this project is
 
 Chardb should do one thing well: a developer marks an organization boundary in a Drizzle schema, and chardb routes that organization's data to a SQLite Durable Object with tenant isolation, atomic mutations, idempotent retries, initial queries, and live updates.
 
-The repository now proves that narrow path under workerd. A declared organization mutation crosses Gateway, Catalog, and Cdb. An explicit stable-ref query with `authority: "organization"` can register against one exact partition, receive an initial snapshot, rerun after a matching commit, and receive a replacement snapshot. The clients acknowledge delivery, and the Cdb invalidation outbox drains. A reconstruction test evicts Gateway and Cdb with a hibernated socket and a staged snapshot, then completes delivery after both objects restart. A clean-tarball smoke proves same-`mutId` replay and denial between two principals in different organizations. Resume cookies still do not replay missed changes.
+The repository now proves that narrow path under workerd. A declared organization mutation crosses Gateway, Catalog, and Cdb. An explicit stable-ref query with `authority: "organization"` can register against one exact partition, receive an initial snapshot, rerun after a matching commit, and receive a replacement snapshot. The clients acknowledge delivery, and the Cdb invalidation outbox drains. One reconstruction test stages a snapshot before send, evicts Gateway and Cdb, then completes delivery after both objects restart. A second test sends a snapshot without receiving its acknowledgement, reconstructs both objects around the same hibernated socket, redelivers the exact cookie and rows, accepts one acknowledgement, and delivers a later mutation normally. The clean-tarball smoke persists Durable Object storage through a full Miniflare restart. It reconstructs the existing Better Auth session, issues a fresh JWT for the restarted origin, replays the exact prior mutation with an identical result and one stored row, then continues cross-organization denial. Resume cookies still do not replay missed changes after a transport disconnect.
 
 Finish the organization-tenanted SQL path first. Stop presenting files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding as working product features. Keep that code as experimental work until the database path works.
 
@@ -268,7 +268,8 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Cover malformed and throwing Catalog authority responses in the configured Gateway workerd harness.
 - [x] Add default-small, environment-scalable SDK workerd scenarios for two-tenant mutation fanout and selective subscription refresh. Assert exact rows, durable convergence, drained outboxes, and cleanup; emit timing telemetry without performance thresholds.
 - [x] Use one correctness command that runs ordinary tests together and every workerd harness serially, with process-tree cleanup on timeout or cancellation.
-- [x] Add a manual scale workflow with bounded workload inputs, reproducible run metadata, and machine-readable benchmark artifacts.
+- [x] Add a manual scale workflow with frozen `ci-smoke`, `client-max-accepted`, and `throughput` profiles and 1 to 20 sequential samples. Preserve per-sample output, write `chardb.scale.sample.v1` NDJSON records and a `chardb.scale.report.v1` aggregate with min, p50, p95, max, and mean, and record exact workload, Git, Bun, OS, and CPU metadata. Keep timing out of correctness decisions.
+- [x] Prove through configured workerd that an already delivered but unacknowledged snapshot redelivers with the exact cookie and rows after Gateway and Cdb reconstruct around the same hibernated socket, then accepts one acknowledgement and delivers a later mutation.
 - [ ] Prove through configured workerd that a socket lost after snapshot delivery but before acknowledgement reconnects, receives the same staged cookie, acknowledges once, and continues.
 - [ ] Add configured workerd proofs for stale schema epochs and protocol mismatch. Keep focused fake-runtime coverage, but do not count it as configured-runtime evidence.
 - [ ] Add remaining Worker RPC failure and shard-eviction cases that are not already covered by Gateway and Cdb reconstruction tests.
@@ -276,7 +277,7 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 
 ## 10. Make one real example
 
-The chat directory consumes the packed package and passes compile-time checks. Its mutation and query declare the public organization authority contract. The clean-tarball smoke now runs Better Auth anonymous sign-in, the demo organization hook, an empty initial query, `postMessage`, live replacement, and independent readback under workerd. Domain migrations and broader failure coverage remain incomplete.
+The chat directory consumes the packed package and passes compile-time checks. Its mutation and query declare the public organization authority contract. The clean-tarball smoke now runs Better Auth anonymous sign-in, the demo organization hook, an empty initial query, `postMessage`, and live replacement under workerd. It then restarts Miniflare over the same Durable Object storage, reconstructs the original session before any new sign-in, issues a fresh JWT, replays the exact mutation with an identical result and one stored row, and continues the second-principal isolation proof. Domain migrations and broader failure coverage remain incomplete.
 
 - [x] Install the package through npm's packed file-dependency path with a committed consumer lockfile.
 - [x] Declare every dependency used by the example.
@@ -295,7 +296,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Keep test-only raw SQL RPCs out of the packed smoke.
 - [x] Add packed denial between principals in different organizations.
 - [x] Replay the same packed mutation id and prove the stored result and row count do not change.
-- [ ] Restart the packed Worker and Durable Objects during the application smoke.
+- [x] Restart Miniflare over the packed Worker's persistent Durable Object directory, reconstruct the original Better Auth session before any new sign-in, issue a fresh JWT for the restarted origin, replay the exact prior mutation and result, and prove the domain row still exists exactly once.
 
 ## 11. Repair the CLI and local setup
 
@@ -308,7 +309,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Remove placeholder React hooks from public exports until implemented.
 - [x] Remove placeholder file and vector APIs from the main product description.
 - [x] Run each workerd harness in a separate sequential CI process to avoid shared Miniflare ports.
-- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 6/6 including the two default-small scale scenarios, `gateway-jwt` 21/21, and `gateway-snapshot` 1/1. Give the snapshot reconstruction case a 15-second test budget because it starts workerd twice. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
+- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 6/6 including the two default-small scale scenarios, `gateway-jwt` 21/21, and `gateway-snapshot` 2/2. Give both snapshot durability cases 15-second test budgets. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
 - [ ] Add one command that starts the example locally with migrations applied.
 
 ## 12. Fix package and repository hygiene
@@ -330,7 +331,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Include `STATUS.md`, `ARCHITECTURE.md`, `SECURITY.md`, and `CONTRIBUTING.md` in the tarball.
 - [x] Create an empty consumer fixture that installs the tarball and imports every advertised subpath.
 - [x] Test the chat consumer's runtime imports and declarations from the packed package without workspace hoisting.
-- [x] Install version 0.1.0 from a clean tarball and run `scripts/smoke-packed-chat.mjs` through sign-in, mutation, live replacement, and readback.
+- [x] Install version 0.1.0 from a clean tarball and run `scripts/smoke-packed-chat.mjs` through sign-in, mutation, live replacement, persistent Miniflare restart, session reconstruction, exact mutation replay, one-row readback, and cross-organization denial.
 - [x] Fix all Biome errors and warnings, or narrow the lint inputs deliberately and document why.
 - [x] Add CI for frozen install, typecheck, lint, unit tests, serialized workerd tests, package build, package consumer tests, generated-project smoke, packed chat smoke, landing build, and example build.
 - [x] Upgrade compatible `nanoid`, PostCSS, Sharp, SVGO, and `ws` dependency paths past their published advisories.
