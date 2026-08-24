@@ -18,6 +18,7 @@ import {
 } from "react";
 import type { ChardbClient, ChardbClientOptions } from "../client/index.ts";
 import { createDeferredChardbClientController } from "../client/index.ts";
+import { snapshotSubscriptionArguments } from "../client/serialized-json.ts";
 import { stableJson } from "../util/canonical.ts";
 import type { RawJson } from "../wire.ts";
 
@@ -227,8 +228,13 @@ export function useQuery<F extends (...args: never[]) => Promise<unknown>>(
     const client = useChardb();
     if (!isHandle(handle)) throw new TypeError("useQuery requires a defineQuery handle and raw JSON args");
     const ref = handle.__chardbRef.toString();
-    const argsIdentity = stableJson(args as RawJson);
-    const stableArgs = useMemo(() => JSON.parse(argsIdentity) as RawJson, [argsIdentity]);
+    const ownedArgs = snapshotSubscriptionArguments(args as RawJson);
+    const argsIdentity = stableJson(ownedArgs);
+    const argsCache = useRef<{ readonly identity: string; readonly args: RawJson }>();
+    if (argsCache.current?.identity !== argsIdentity) {
+        argsCache.current = { identity: argsIdentity, args: ownedArgs };
+    }
+    const stableArgs = argsCache.current.args;
     const identity = useMemo(() => ({ client, ref, argsIdentity }), [client, ref, argsIdentity]);
     const [snapshot, setSnapshot] = useState<{
         readonly identity: typeof identity;

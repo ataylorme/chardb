@@ -131,6 +131,12 @@ function nestedJson(depth: number): RawJson {
     return value;
 }
 
+function nestedEmptyJson(depth: number): RawJson {
+    let value: RawJson = {};
+    for (let level = 1; level < depth; level++) value = { value };
+    return value;
+}
+
 function stringRowsAtBytes(bytes: number): RawJson[] {
     if (bytes < 4) throw new RangeError("serialized row array must include brackets and string quotes");
     return ["x".repeat(bytes - 4)];
@@ -856,6 +862,7 @@ describe("createChardbClient — wire round-trip", () => {
         for (const args of [
             Array.from({ length: 2_048 }, (_, index) => (index === 0 ? [null, null] : [null])),
             nestedJson(100),
+            nestedEmptyJson(100),
             { value: "é".repeat(262_139) },
             accessorArgs,
             cyclicArgs,
@@ -874,11 +881,12 @@ describe("createChardbClient — wire round-trip", () => {
             () => {}
         );
         c.subscribe("queries.ts#exact-argument-depth", nestedJson(99), () => {});
+        c.subscribe("queries.ts#exact-empty-argument-depth", nestedEmptyJson(99), () => {});
         c.subscribe("queries.ts#exact-argument-bytes", { value: "é".repeat(262_138) }, () => {});
         expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
 
         await welcome(ws);
-        expect(sentSubscriptions(ws).map(message => message.subId)).toEqual([SubId(1), SubId(2), SubId(3)]);
+        expect(sentSubscriptions(ws).map(message => message.subId)).toEqual([SubId(1), SubId(2), SubId(3), SubId(4)]);
         c.close();
     });
 
@@ -2125,10 +2133,13 @@ describe("createChardbClient — wire round-trip", () => {
                 )
                 .catch(error => error);
             const exactDepth = c.mutate("mutations.ts#exact-argument-depth", nestedJson(99)).catch(error => error);
+            const exactEmptyDepth = c
+                .mutate("mutations.ts#exact-empty-argument-depth", nestedEmptyJson(99))
+                .catch(error => error);
             const exactBytes = c
                 .mutate("mutations.ts#exact-argument-bytes", { value: "é".repeat(262_138) })
                 .catch(error => error);
-            expect(timers.scheduledDelays()).toHaveLength(3);
+            expect(timers.scheduledDelays()).toHaveLength(4);
             expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
 
             await expect(
@@ -2141,16 +2152,20 @@ describe("createChardbClient — wire round-trip", () => {
                 code: "CDB_INVALID_ARGS",
                 retryable: false,
             });
+            await expect(c.mutate("mutations.ts#too-deep-empty-arguments", nestedEmptyJson(100))).rejects.toMatchObject(
+                { code: "CDB_INVALID_ARGS", retryable: false }
+            );
             await expect(
                 c.mutate("mutations.ts#too-many-argument-bytes", { value: "é".repeat(262_139) })
             ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
-            expect(timers.scheduledDelays()).toHaveLength(3);
+            expect(timers.scheduledDelays()).toHaveLength(4);
             expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
 
             await welcome(ws);
             expect(sentMutations(ws).map(message => message.ref)).toEqual([
                 ChardbRef("mutations.ts#exact-argument-count"),
                 ChardbRef("mutations.ts#exact-argument-depth"),
+                ChardbRef("mutations.ts#exact-empty-argument-depth"),
                 ChardbRef("mutations.ts#exact-argument-bytes"),
             ]);
             const exactDepthRaw = ws.sent.find(raw => raw.includes('"ref":"mutations.ts#exact-argument-depth"'));
@@ -2161,7 +2176,7 @@ describe("createChardbClient — wire round-trip", () => {
             });
 
             c.close();
-            await Promise.all([exactCount, exactDepth, exactBytes]);
+            await Promise.all([exactCount, exactDepth, exactEmptyDepth, exactBytes]);
         } finally {
             timers.restore();
             c.close();

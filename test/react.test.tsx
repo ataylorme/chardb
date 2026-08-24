@@ -101,6 +101,12 @@ async function flushMicrotasks(): Promise<void> {
     await Promise.resolve();
 }
 
+function nestedEmptyJson(depth: number): RawJson {
+    let value: RawJson = {};
+    for (let level = 1; level < depth; level++) value = { value };
+    return value;
+}
+
 describe("chardb/react — hook lifecycle", () => {
     test("exports only supported hooks", () => {
         for (const name of ["ChardbProvider", "useChardb", "useQuery", "useMutation", "useSession"]) {
@@ -632,27 +638,200 @@ describe("chardb/react — hook lifecycle", () => {
 
     test("useQuery keeps one subscription when inline args are recreated by a result render", () => {
         const { client, subs } = stubClient();
-        const query = Object.assign(async (_ctx: never, _args: { organizationId: string }) => [], {
+        const query = Object.assign(async (_ctx: never, _args: { a: number; b: number }) => [], {
             __chardbRef: { toString: () => "queries.ts#listMessages" },
         });
 
-        function Probe() {
-            useQuery(query, { organizationId: "org-1" });
+        function Probe(props: { readonly reverse: boolean }) {
+            useQuery(query, props.reverse ? { b: 2, a: 1 } : { a: 1, b: 2 });
             return null;
         }
 
+        let tree!: TestRenderer.ReactTestRenderer;
         TestRenderer.act(() => {
-            TestRenderer.create(React.createElement(ChardbProvider, { client }, React.createElement(Probe)));
+            tree = TestRenderer.create(
+                React.createElement(ChardbProvider, { client }, React.createElement(Probe, { reverse: false }))
+            );
         });
         const sub = subs[0];
         if (!sub) throw new Error("expected useQuery to create a subscription");
 
         TestRenderer.act(() => {
             sub.listener([{ id: "r1" }]);
+            tree.update(React.createElement(ChardbProvider, { client }, React.createElement(Probe, { reverse: true })));
         });
 
         expect(subs).toHaveLength(1);
         expect(sub.unsubscribed).toBe(false);
+    });
+
+    test("useQuery rejects non-JSON argument shapes without invoking getters", () => {
+        const query = Object.assign(async (_ctx: never, _args: RawJson) => [], {
+            __chardbRef: { toString: () => "queries.ts#strictArguments" },
+        });
+        let getterRuns = 0;
+        const accessor: Record<string, unknown> = {};
+        Object.defineProperty(accessor, "value", {
+            enumerable: true,
+            get() {
+                getterRuns++;
+                return "unsafe";
+            },
+        });
+        const nonEnumerable = { visible: true };
+        Object.defineProperty(nonEnumerable, "hidden", { value: true });
+        const objectSymbol = { visible: true };
+        Object.defineProperty(objectSymbol, Symbol("hidden"), { value: true, enumerable: true });
+        const sparse = Array(1);
+        const extraArray: unknown[] = [];
+        Object.defineProperty(extraArray, "extra", { value: true, enumerable: true });
+        const symbolArray: unknown[] = [];
+        Object.defineProperty(symbolArray, Symbol("extra"), { value: true, enumerable: true });
+        const cyclic: Record<string, unknown> = {};
+        cyclic.self = cyclic;
+
+        for (const args of [
+            { value: -0 },
+            { value: Number.NaN },
+            sparse,
+            extraArray,
+            symbolArray,
+            objectSymbol,
+            nonEnumerable,
+            accessor,
+            new Date(0),
+            cyclic,
+        ]) {
+            const { client, subs } = stubClient();
+            let thrown: unknown;
+            try {
+                TestRenderer.create(
+                    React.createElement(
+                        ChardbProvider,
+                        { client },
+                        React.createElement(() => {
+                            useQuery(query, args as RawJson);
+                            return null;
+                        })
+                    )
+                );
+            } catch (error) {
+                thrown = error;
+            }
+            expect(thrown).toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
+            expect(subs).toHaveLength(0);
+        }
+        expect(getterRuns).toBe(0);
+    });
+
+    test("useQuery rejects a live argument change from zero to negative zero", () => {
+        const { client, subs } = stubClient();
+        const query = Object.assign(async (_ctx: never, _args: { value: number }) => [], {
+            __chardbRef: { toString: () => "queries.ts#signedZero" },
+        });
+        let captured: RawJson[] | undefined;
+        function Probe(props: { readonly value: number }) {
+            captured = useQuery(query, { value: props.value }).data as RawJson[] | undefined;
+            return null;
+        }
+        const render = (value: number) =>
+            React.createElement(ChardbProvider, { client }, React.createElement(Probe, { value }));
+
+        let tree!: TestRenderer.ReactTestRenderer;
+        TestRenderer.act(() => {
+            tree = TestRenderer.create(render(0));
+        });
+        const sub = subs[0];
+        if (!sub) throw new Error("expected the initial query subscription");
+        TestRenderer.act(() => sub.listener([{ id: "zero" }]));
+        expect(captured).toEqual([{ id: "zero" }]);
+
+        let thrown: unknown;
+        try {
+            TestRenderer.act(() => tree.update(render(-0)));
+        } catch (error) {
+            thrown = error;
+        }
+        expect(thrown).toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
+        expect(subs).toHaveLength(1);
+    });
+
+    test("useQuery accepts the exact argument byte limit and rejects one value over it", () => {
+        const query = Object.assign(async (_ctx: never, _args: { value: string }) => [], {
+            __chardbRef: { toString: () => "queries.ts#argumentBytes" },
+        });
+        const exact = stubClient();
+        TestRenderer.act(() => {
+            TestRenderer.create(
+                React.createElement(
+                    ChardbProvider,
+                    { client: exact.client },
+                    React.createElement(() => {
+                        useQuery(query, { value: "é".repeat(262_138) });
+                        return null;
+                    })
+                )
+            );
+        });
+        expect(exact.subs).toHaveLength(1);
+
+        const over = stubClient();
+        let thrown: unknown;
+        try {
+            TestRenderer.create(
+                React.createElement(
+                    ChardbProvider,
+                    { client: over.client },
+                    React.createElement(() => {
+                        useQuery(query, { value: "é".repeat(262_139) });
+                        return null;
+                    })
+                )
+            );
+        } catch (error) {
+            thrown = error;
+        }
+        expect(thrown).toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
+        expect(over.subs).toHaveLength(0);
+    });
+
+    test("useQuery accepts 99 empty container levels and rejects the 100th before subscribing", () => {
+        const query = Object.assign(async (_ctx: never, _args: RawJson) => [], {
+            __chardbRef: { toString: () => "queries.ts#argumentDepth" },
+        });
+        const exact = stubClient();
+        TestRenderer.act(() => {
+            TestRenderer.create(
+                React.createElement(
+                    ChardbProvider,
+                    { client: exact.client },
+                    React.createElement(() => {
+                        useQuery(query, nestedEmptyJson(99));
+                        return null;
+                    })
+                )
+            );
+        });
+        expect(exact.subs).toHaveLength(1);
+
+        const over = stubClient();
+        let thrown: unknown;
+        try {
+            TestRenderer.create(
+                React.createElement(
+                    ChardbProvider,
+                    { client: over.client },
+                    React.createElement(() => {
+                        useQuery(query, nestedEmptyJson(100));
+                        return null;
+                    })
+                )
+            );
+        } catch (error) {
+            thrown = error;
+        }
+        expect(thrown).toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
+        expect(over.subs).toHaveLength(0);
     });
 
     test("useMutation invokes client.mutate with the function's __chardbRef", async () => {
