@@ -19,15 +19,15 @@ export function OgImage() {
                     </h1>
 
                     <p className="mt-7 text-fg-muted" style={{ fontSize: 24, lineHeight: 1.5, maxWidth: 640 }}>
-                        Tested organization mutations and one-shot snapshots derived from Drizzle. Live delivery and
-                        migrations remain unfinished.
+                        Tested organization mutations and acknowledged live snapshots derived from Drizzle. Resume
+                        replay and migrations remain unfinished.
                     </p>
 
-                    <div className="mt-10 inline-flex items-center rounded-full border border-line2 bg-ink-850 px-6 py-2.5 font-mono">
+                    <div className="mt-8 inline-flex items-center rounded-full border border-line2 bg-ink-850 px-6 py-2.5 font-mono">
                         <span className="text-fg text-[20px]">experimental prototype</span>
                     </div>
 
-                    <div className="mt-12 font-mono text-[16px] text-fg-dim lowercase flex items-center gap-3">
+                    <div className="mt-4 font-mono text-[16px] text-fg-dim lowercase flex items-center gap-3">
                         <span>source available</span>
                         <span className="text-fg-dim/60">·</span>
                         <span>for Cloudflare Workers</span>

@@ -6,9 +6,11 @@ I am publishing chardb to find out whether its core model is worth finishing. De
 
 A narrow read/write slice now works under workerd. Mutations cross verified JWT subject, Catalog membership and roles, tenant routing, Cdb policy enforcement, and an atomic SQLite write with its idempotency log.
 
-An explicit organization query now takes a stable ref, partition key, and server-owned intent. Catalog authorizes it, routes exactly one organization partition to one Cdb read, and returns one protocol-v3 snapshot. Empty results arrive as an empty array.
+An explicit organization query takes a stable ref, `authority: "organization"`, a partition key, and a developer-written intent callback that runs on the server. Gateway installs a durable generation before Cdb subscribes. A commit writes matching invalidations to a durable outbox, Gateway reruns the query, and clients receive and acknowledge replacement snapshots.
 
-This is still a prototype. The snapshot creates no server registration. Live invalidation, replacement delivery, replay, versioned migrations, and a packed-app sign-in-to-read/write flow are unfinished. I would not use it for production data.
+A real workerd test covers two clients in one organization, an isolated empty result for another organization, outbox drain, acknowledgements, and reconnect with a fresh subscription. Focused reconstruction tests show that durable retry and cleanup state survive reconstruction. A separate clean-tarball smoke installs version 0.1.0 and proves the packed chat slice through actual Better Auth anonymous sign-in, live replacement, and independent readback.
+
+This is still a prototype. The packed smoke does not cover second-tenant denial, mutation replay, Worker and Durable Object restart, outbound JWKS rotation, resume replay, or versioned migrations. I would not use it for production data.
 
 Does schema-declared organization tenancy solve a real problem, or just move complexity around?
 
@@ -24,11 +26,15 @@ The idea is to make the organization boundary part of the Drizzle schema. A tabl
 
 One narrow path now works in a focused workerd harness. A public mutation must declare `authority: "organization"` and an explicit stable ref. Gateway verifies the JWT and retains only its subject. It validates the mutation arguments, extracts the organization key, and asks Catalog for current membership, roles, and auth epochs. Catalog routes the organization to a Cdb Durable Object. Cdb applies the schema policy and commits the SQLite write with its idempotency record in one synchronous transaction.
 
-The same harness now exercises one public query path. The query declares `authority: "organization"`, an explicit stable ref, a partition key, and server-owned intent. Gateway validates the arguments before Catalog checks current organization membership. The intent must resolve to the same organization and exactly one shard. One Cdb applies select policy and returns one protocol-v3 snapshot, including an empty array when nothing matches.
+The same public boundary now supports one narrow live query path. The query declares `authority: "organization"`, an explicit stable ref, a partition key, and a developer-written intent callback that runs on the server. Gateway validates the arguments before Catalog checks current organization membership. The intent must resolve to the same organization and exactly one shard.
 
-These tests cross a configured WebSocket, Gateway, Catalog, and Cdb, but they use test-seeded auth. They are not a complete application proof.
+Gateway persists a unique generation before calling `Cdb.subscribe`. Cdb records matching write invalidations in a durable outbox inside the same transaction as domain SQL and the operation log. Gateway reruns dirty registrations, stages immutable snapshots, retries delivery, and advances delivery only when the client acknowledges the exact cookie. A same-cookie retry gets another acknowledgement without applying the rows twice.
 
-The query is deliberately one-shot. It creates no server registration and has no live invalidation, replacement delivery, or missed-change replay. Versioned domain migrations and a packed application test that starts with Better Auth sign-in and independently reads back a persisted write are also unfinished. Automated resharding is only tested as separate helpers and state machines. This is source for review, not something to run against production data.
+A focused workerd test connects two org-A clients and one org-B client. All three receive and acknowledge initial snapshots. A public mutation then produces replacement snapshots for org A, while org B reruns to an empty result under policy. The clients acknowledge those snapshots, the Cdb outbox drains, and a reconnect with a fresh subscription reads current state. Focused reconstruction tests cover durable registration, retry, acknowledgement, and cleanup state.
+
+The focused tests cross a configured WebSocket, Gateway, Catalog, and Cdb with test-seeded auth. A separate smoke script installs chardb 0.1.0 from a clean tarball, builds the chat client with both stable refs, performs actual Better Auth anonymous sign-in, runs the idempotent demo organization hook, acknowledges an empty initial snapshot, posts a message, acknowledges the live replacement, and reads the row through a second subscription.
+
+That packed smoke still covers one organization and one process lifetime. It does not test packed second-tenant denial, mutation replay, Worker and Durable Object restart, outbound JWKS rotation, resume replay, or migrations. The runtime also does not prove that the manual intent table list matches every table read by the handler. A wrong list can leave a result stale. General query shapes and automated resharding remain unfinished. This is source for review, not something to run against production data.
 
 I am less interested in presenting a finished database than in testing the premise. Does putting organization tenancy in the schema remove enough repeated routing and authorization code to justify the machinery? Or does it hide decisions that applications should keep explicit?
 
@@ -39,5 +45,5 @@ I am less interested in presenting a finished database than in testing the premi
 1. Would you trust the schema declaration as the source of organization placement and policy, or would you want those decisions explicit in every handler?
 2. Is the mutation trust boundary sound when Gateway keeps only the verified JWT subject and re-derives membership and roles from Catalog?
 3. Is requiring both `authority: "organization"` and an explicit stable ref useful friction, or awkward API design?
-4. What would turn the one-shot snapshot into credible server registration and live invalidation?
-5. What migration and recovery guarantees would you require before testing this with non-production application data?
+4. Is full-snapshot replacement a useful first live-query model, or would your workload require incremental patches immediately?
+5. What migration and resume guarantees would you require before testing this with non-production application data?

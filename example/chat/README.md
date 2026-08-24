@@ -1,6 +1,6 @@
 # chardb chat example
 
-This is a compile-checked concept example for chardb's chat API: Drizzle tables, better-auth configuration, typed mutations and queries, and React hooks in one small application. It typechecks and produces a Vite build against a packed chardb package. The `postMessage` mutation and `listMessages` query opt into organization authority with explicit stable refs and partition metadata. A focused repository workerd harness proves the mutation path and one exact-partition initial query snapshot, but it does not run this packed app or Better Auth sign-in. Server registration, live updates, replay, and presence remain unfinished, so this is not an end-to-end runnable demo.
+This is a compile-checked concept example for chardb's chat API: Drizzle tables, better-auth configuration, typed mutations and queries, and React hooks in one small application. It typechecks and produces a Vite build against a packed chardb package. The `postMessage` mutation and `listMessages` query opt into organization authority with explicit stable refs and partition metadata. [`scripts/smoke-packed-chat.mjs`](../../scripts/smoke-packed-chat.mjs) installs version 0.1.0 from a clean tarball and proves actual Better Auth anonymous sign-in, the demo organization hook, an empty initial snapshot, `postMessage`, a live replacement, and independent readback. Resume replay and production readiness remain unfinished.
 
 The intended backend surface is one factory call:
 
@@ -29,7 +29,7 @@ export default app;
 export const { BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;
 ```
 
-The source shows the intended composition of auth, schema, API handles, routes, and Durable Object exports. Treat that composition as design evidence, not proof that the full public request path works today.
+The source shows the composition of auth, schema, API handles, routes, and Durable Object exports used by the packed smoke proof.
 
 Mutations and policies stay light:
 
@@ -72,8 +72,8 @@ export const listMessages = api.query({
   args: z.object({ organizationId: z.string(), channelId: z.string(), limit: z.number().int().positive() }),
   authority: "organization",
   partitionKey: "organizationId",
-  // Server-owned routing intent. The browser sends only this export's
-  // stamped ref and the raw arguments passed to useQuery.
+  // Developer-declared routing intent evaluated on the server. The browser
+  // sends only this export's stamped ref and the raw arguments passed to useQuery.
   intent: (args) => ({
     kind: "select",
     tables: ["messages"],
@@ -171,9 +171,9 @@ Handlers can use typed builders only against registered `cdbTable` definitions. 
 
 ### Validator-driven args, intent extractors, no per-operation type aliases
 
-`api.ts` never declares a `Db`, `*Args`, or `*Row` alias. Each `api.mutation({...})` / `api.query({...})` call takes a **StandardSchemaV1 validator** (zod, valibot, arktype, typebox, drizzle-zod, …) as its `args:` field; chardb infers `TArgs` from the validator. For public organization mutations and initial queries, Gateway validates and transforms raw arguments once, then uses that exact value for partition extraction, Catalog authorization, the Cdb request, and the validated handler entry point.
+`api.ts` never declares a `Db`, `*Args`, or `*Row` alias. Each `api.mutation({...})` / `api.query({...})` call takes a **StandardSchemaV1 validator** such as zod, valibot, arktype, typebox, or drizzle-zod as its `args:` field. Chardb infers `TArgs` from the validator. For public organization mutations and queries, Gateway validates and transforms raw arguments once, then uses that exact value for partition extraction, Catalog authorization, the Cdb request, and the validated handler entry point.
 
-`authority: "organization"` is an explicit opt-in. Mutations and queries require a literal stable `ref` and a nonempty string partition key; queries also require a server-owned intent. Gateway sends Catalog only the verified JWT subject and the organization extracted from validated arguments. Catalog returns current membership, role, roles, and global, tenant, and principal auth epochs. JWT tenant, role, and custom claims are ignored. Cdb treats the request as a trusted post-validation internal seam and runs the validated handler without applying the argument transform again. Operations without the authority declaration stay closed with `CDB_AUTH_NOT_BOUND`.
+`authority: "organization"` is an explicit opt-in. Mutations and queries require a literal stable `ref` and a nonempty string partition key; queries also require a developer-declared intent callback that Gateway evaluates on the server. Gateway sends Catalog only the verified JWT subject and the organization extracted from validated arguments. Catalog returns current membership, role, roles, and global, tenant, and principal auth epochs. JWT tenant, role, and custom claims are ignored. Cdb treats the request as a trusted post-validation internal seam and runs the validated handler without applying the argument transform again. Operations without the authority declaration stay closed with `CDB_AUTH_NOT_BOUND`.
 
 `api.query({...})` accepts an `intent: (args) => CdbIntent` extractor. The Vite transform stamps the exported handle with a stable ref. `useQuery(handle, args)` sends that ref and the raw arguments under protocol v3. Gateway resolves the server manifest, validates the arguments, and runs the intent extractor locally:
 
@@ -189,7 +189,7 @@ export function useChatMessages(channelId: string) {
 }
 ```
 
-For an explicit organization query, Gateway requires the declared partition and server-owned intent to identify the same exact organization and one virtual shard. It re-derives authority through Catalog, routes to one Cdb read, and sends one protocol-v3 snapshot, including an empty snapshot. This initial read does not register the query on Gateway or Cdb, and committed mutations do not invalidate or re-run it.
+For an explicit organization query, Gateway requires the declared partition and developer-declared server-side intent to identify the same exact organization and one virtual shard. It re-derives authority through Catalog and persists a unique generation before `Cdb.subscribe`. Matching commits enter the Cdb invalidation outbox. Gateway reruns dirty registrations and stages replacement snapshots until the client acknowledges the exact cookie. The client deduplicates and re-acknowledges a same-cookie retry. The runtime does not yet prove that the intent's table list covers every table read by the handler.
 
 Downstream consumers pull the wire shape out of the handle via `InferRow` / `InferArgs`:
 
@@ -217,12 +217,14 @@ If a domain table shadows a reserved name (`organization`, `user`, `member`, …
 - Organization-rooted Drizzle tables built with `forOrg()` and `cdbTable`.
 - Mutation and query handles using the current exported package subpaths.
 - A public organization mutation declaration with an explicit stable ref.
-- An explicit exact-partition organization query declaration for an initial snapshot.
+- An explicit exact-partition organization query declaration for live replacement snapshots.
 - Synchronous mutation handlers compatible with Durable Object SQLite transactions.
 - A browser bundle that consumes the packed package instead of private source subpaths.
 - The current React surface for auth, mutations, and queries.
 
-The repository's workerd harness proves that refs imported from a real emitted Vite browser chunk match an independently bundled Worker, runs a declared organization mutation through Gateway, Catalog, Cdb policy, and the atomic op-log, then returns one authorized exact-partition Cdb read as a protocol-v3 snapshot. It covers nonempty and empty snapshots but uses test-only routes to seed JWKs and auth rows rather than this example's Better Auth sign-in. It does not register the query or produce live results after later writes. Presence, upload, stream, and vector hooks are not exported. Migration commands do not upgrade domain DDL on deployed shards.
+The repository's focused workerd harnesses prove that refs imported from a real emitted Vite browser chunk match an independently bundled Worker and run a declared organization mutation through Gateway, Catalog, Cdb policy, and the atomic op-log. The live harness connects two org-A clients and one org-B client. It covers initial snapshots and acknowledgements, a public mutation, Cdb invalidation delivery, replacement snapshots and acknowledgements, an org-B rerun that stays empty under policy, outbox drain, and reconnect with a fresh subscription. Those harnesses use test-only auth setup.
+
+The separate packed smoke copies this example into a clean temporary consumer, installs chardb 0.1.0 from its tarball, builds the Vite client with both stable refs, performs actual Better Auth anonymous sign-in, confirms the idempotent demo organization hook selected `demo-org`, receives and acknowledges an empty initial snapshot, executes `postMessage`, receives and acknowledges the live replacement, and reads the row through a second subscription. It does not cover a second packed tenant, mutation replay, Worker or Durable Object restart, outbound JWKS rotation, resume replay, or migrations. Presence, upload, stream, and vector hooks are not exported.
 
 ## Running
 
@@ -240,7 +242,7 @@ npm run build              # production Vite build
 bun test test/e2e/
 ```
 
-These commands verify package consumption, TypeScript contracts, the browser bundle, and the pure-layer tests. They do not verify a browser-to-workerd mutation, query, or live-subscription round trip.
+These commands verify package consumption, TypeScript contracts, the browser bundle, and the pure-layer tests. The repository-level `scripts/smoke-packed-chat.mjs` adds the clean-tarball workerd proof.
 
 ## E2E coverage
 
@@ -248,10 +250,10 @@ These commands verify package consumption, TypeScript contracts, the browser bun
 
 ## Runtime wiring still required
 
-Before this can be presented as a runnable demo, the packed chat app needs a workerd test that starts with Better Auth sign-in, runs `postMessage`, and independently reads the stored row through its declared initial query. It also needs versioned domain migrations, server-side query registration, replay, and live invalidation with replacement snapshots. Query identity must use canonical arguments plus verified auth and policy epochs. Persisted shard registrations already use composite Gateway, client, and subscription ids and rebuild after Cdb startup, but the public initial-query path does not create them and they still lack verified tenant, epoch, and delivery-cookie state. Existing `auth_ddl_v1` layouts need a versioned upgrade path.
+The packed smoke proves one anonymous user in `demo-org` through sign-in, live replacement, and readback. Before this can be presented as a production-ready demo, it still needs packed second-tenant denial, mutation replay, Worker and Durable Object restart, outbound JWKS rotation, versioned domain migrations, and missed-change replay. The narrow runtime persists exact Gateway and Cdb generations, auth epochs, retry state, and delivery cookies. Query identity still needs an enforced policy epoch or digest. Existing `auth_ddl_v1` layouts need a versioned upgrade path.
 
 The repository audit still reports five advisories through `miniflare@4.20260730.0 -> undici@7.28.0`. Miniflare 4 pins that version, and the fixed `undici@7.29.0` currently requires Miniflare 5 alpha. The example does not override the dependency.
 
 Each auth mutation commits with every directly derivable old and new global, tenant, or principal epoch bump. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. Bulk updates and deletes preload matched rows to derive epoch scopes. Indirect plugin relationships without placement metadata or conventional `organizationId` or `userId` fields may lack a secondary scope. Coverage uses a Bun fake-Durable-Object harness, not workerd.
 
-JWT coverage includes real signatures, the Catalog resolver contract, and configured Gateway Durable Object WebSocket dispatch under Miniflare workerd with ES256 tokens, a real Catalog SQLite cache, and a configured Cdb. The verified attachment stores the subject only. Catalog supplies current organization authority for each declared mutation and exact-partition initial query. Auth refresh barriers use a server connection id, drain admitted operations, report delivered snapshot ids through `mustRefetch`, gate later work, and store a terminal rejected attachment before closing on failure. Catalog's authority read does not cancel an in-flight Cdb call that it already authorized. The harness seeds JWKs and auth rows through test-only routes, so outbound JWKS fetch, cache refresh, key rotation, and the full Better Auth sign-in path remain untested. The complete packed-app test still needs sign-in, persisted readback, a live replacement, isolation from a second organization, and restart recovery. The Wrangler file remains a template until that test passes.
+JWT coverage includes real signatures, the Catalog resolver contract, and configured Gateway Durable Object WebSocket dispatch under Miniflare workerd with ES256 tokens, a real Catalog SQLite cache, and a configured Cdb. The verified attachment stores the subject only. Catalog supplies current organization authority for each declared mutation and exact-partition query. Auth refresh barriers use a server connection id, drain admitted operations, retire current durable registrations, report affected subscription ids through `mustRefetch`, gate later work, and store a terminal rejected attachment before closing on failure. Catalog's authority read does not cancel an in-flight Cdb call that it already authorized. Focused harnesses seed JWKs and auth rows through test-only routes, while the packed smoke uses Better Auth anonymous sign-in and token issue. Outbound JWKS fetch, cache refresh, key rotation, packed organization isolation, and restart recovery remain untested. The Wrangler file remains a template until those broader tests pass.

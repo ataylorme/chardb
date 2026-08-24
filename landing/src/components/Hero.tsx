@@ -16,9 +16,9 @@ export function Hero() {
                         className="mt-6 text-fg-muted max-w-2xl"
                         style={{ fontSize: "clamp(16px, 1.4vw, 18px)", lineHeight: 1.6 }}
                     >
-                        Declare an organization boundary in Drizzle. Declared mutations and one-shot queries now cross
-                        verified identity, Catalog membership, tenant routing, and policy enforcement. A query returns
-                        one snapshot. It does not register or update live yet.
+                        Declare an organization boundary in Drizzle. A narrow workerd path now carries declared
+                        mutations and exact-partition live queries through verified identity, Catalog authority, tenant
+                        routing, policy enforcement, durable invalidation, and acknowledged replacement snapshots.
                     </p>
 
                     <div className="mt-8 flex flex-col sm:flex-row sm:items-center gap-4">

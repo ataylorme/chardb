@@ -5,18 +5,21 @@ export function Binding() {
         <Section id="binding" num="01" label="status">
             <SectionHeading>One organization read/write slice works. The database does not.</SectionHeading>
             <SectionLead>
-                A focused workerd harness carries declared organization mutations and one explicit organization query
-                through Catalog authority and routing into Cdb. The query has a stable ref, a partition key, and
-                server-owned intent. It reaches one organization partition and returns one protocol-v3 snapshot,
-                including an empty array when no rows match. The harness uses test-seeded auth, not the packed chat app.
+                A focused workerd harness carries declared organization mutations and explicit stable-ref queries
+                through Catalog authority and routing into Cdb. The queries use organization authority, a partition key,
+                and developer-declared server-side intent to reach one exact partition. A matching commit produces
+                acknowledged replacement snapshots through durable Cdb and Gateway state. A separate clean-tarball smoke
+                proves the packed chat slice through actual Better Auth anonymous sign-in and readback.
             </SectionLead>
 
             <BulletList
                 items={[
                     "tested: explicit stable refs across emitted browser and Worker builds",
                     "tested: organization authority, tenant routing, write policy, and idempotent shard-local commit",
-                    "tested: one Catalog-authorized organization query, one Cdb read, and one initial snapshot",
-                    "unfinished: server registration, live invalidation, replacement delivery, replay, and versioned migrations",
+                    "tested: durable registration, invalidation, query rerun, replacement snapshots, and acknowledgements",
+                    "tested: two org-A clients update while an org-B query remains empty under policy",
+                    "tested: clean-tarball chat sign-in, empty snapshot, mutation, live replacement, and readback",
+                    "unfinished: packed tenant denial, replay, restart, JWKS rotation, and versioned migrations",
                 ]}
             />
 

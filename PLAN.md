@@ -6,7 +6,7 @@ Last reviewed: 2026-08-23
 
 Chardb should do one thing well: a developer marks an organization boundary in a Drizzle schema, and chardb routes that organization's data to a SQLite Durable Object with tenant isolation, atomic mutations, idempotent retries, initial queries, and live updates.
 
-The repository does not do that yet. A declared organization mutation now crosses the public Gateway, Catalog, and Cdb path in a focused workerd test. An explicit organization query can authorize and read one exact partition from one Cdb and return one initial snapshot, including an empty one. That path does not register the query, replay missed changes, or send live updates. The packed example and live-update path are still incomplete.
+The repository now proves that narrow path under workerd. A declared organization mutation crosses Gateway, Catalog, and Cdb. An explicit stable-ref query with `authority: "organization"` can register against one exact partition, receive an initial snapshot, rerun after a matching commit, and receive a replacement snapshot. The clients acknowledge delivery, and the Cdb invalidation outbox drains. A clean-tarball smoke also proves the packed chat slice from actual Better Auth anonymous sign-in through live replacement and independent readback. Resume cookies still do not replay missed changes.
 
 Finish the organization-tenanted SQL path first. Stop presenting files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding as working product features. Keep that code as experimental work until the database path works.
 
@@ -80,7 +80,7 @@ Online schema changes can wait. A maintenance-mode migration is enough for the f
 
 ## 4. Simplify and fix auth storage
 
-The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lookups no longer depend on a shard partition column. Catalog now renders constraint-complete table and index DDL from the synthesized schema. Existing tables must carry the matching `auth_ddl_v1` signature; there is no versioned upgrade path. Each auth mutation and every directly derivable old and new global, tenant, or principal epoch bump commit in one Catalog transaction. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`, and no complete sign-in flow has run through the public application path.
+The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lookups no longer depend on a shard partition column. Catalog now renders constraint-complete table and index DDL from the synthesized schema. Existing tables must carry the matching `auth_ddl_v1` signature; there is no versioned upgrade path. Each auth mutation and every directly derivable old and new global, tenant, or principal epoch bump commit in one Catalog transaction. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. The packed chat smoke proves the anonymous sign-in, session, demo organization hook, token, and domain path. Broader auth workflows and restart remain open.
 
 - [x] Put all Better Auth tables in Catalog for the first working version.
 - [x] Remove auth sharding from the adapter and Cdb storage path.
@@ -95,19 +95,20 @@ The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lo
 - [x] Make date and boolean serialization agree with the adapter's capability claims.
 - [ ] Implement adapter transactions for multi-write auth operations, or state and enforce the smaller supported auth profile.
 - [ ] Add integration tests for sign-up or anonymous sign-in, session lookup by token, organization creation, membership lookup, active organization selection, and logout.
+- [x] Prove Better Auth anonymous sign-in, session lookup, idempotent demo organization selection, JWT issue, and a domain mutation in the clean packed chat consumer.
 - [ ] Add a real workerd test that restarts the configured Catalog isolate and proves auth bootstrap and stored sessions survive.
 - [ ] Add one configured Better Auth plugin only after the core flow works.
 
 ## 5. Make authentication a real trust boundary
 
-The configured Gateway verifies JWT signatures and registered claims during `hello` and `updateAuth`. Its attachment stores only the verified subject and time bounds. For each declared organization mutation or exact-partition organization query, Gateway asks Catalog to derive current membership, role, roles, and auth epochs. Undeclared operations, mismatched or cross-partition queries, persistent subscriptions, and presence remain fail-closed.
+The configured Gateway verifies JWT signatures and registered claims during `hello` and `updateAuth`. Its attachment stores only the verified subject and time bounds. For each declared organization mutation or exact-partition organization query, Gateway asks Catalog to derive current membership, role, roles, and auth epochs. Undeclared operations, mismatched, scatter, and cross-partition queries, and presence remain fail-closed.
 
 - [x] Verify the JWT signature before storing `principalId`; do not copy tenant, role, or custom claims into the verified attachment.
 - [x] Pin issuer, audience, and accepted algorithms from the configured Better Auth JWT plugin, with a bounded 30-second default clock tolerance.
 - [x] Resolve JWKS through the Catalog-backed resolver contract.
 - [ ] Prove outbound JWKS fetch, key rotation, and cache refresh through the configured Gateway path.
 - [x] Reject missing, malformed, tampered, expired, not-yet-valid, wrong-issuer, wrong-audience, and disallowed-algorithm tokens.
-- [x] Serialize `updateAuth` per server connection id, drain admitted mutations and initial queries, replace the subject only after successful verification, report delivered snapshot ids through `mustRefetch`, and store a terminal rejected attachment on failure.
+- [x] Serialize `updateAuth` per server connection id, drain admitted work, retire current durable registrations before replacing the subject, report affected subscription ids through `mustRefetch`, and store a terminal rejected attachment on failure.
 - [x] Recheck token time bounds before every mutation, subscription, and presence operation.
 - [x] Stop deriving a principal from `clientId` for protected requests.
 - [x] Derive organization membership, role, roles, and auth epochs from Catalog for each declared organization mutation and exact-partition organization query. Treat the caller's validated organization only as the requested partition.
@@ -142,19 +143,19 @@ The database proxy now applies one explicit rule to registered-table inserts, up
 - [ ] Add hostile two-tenant tests for every CRUD operation.
 - [ ] Test admin, member, self, public read, no matching role, forbidden columns, explicit tenant override, and membership revocation.
 
-## 7. Implement queries instead of subscription registration
+## 7. Implement narrow organization queries
 
-Protocol v3 subscription requests send a query reference and raw arguments. For an explicit organization query with a stable ref, partition key, and server-owned intent, Gateway validates the arguments, requires the partition and intent to resolve to the same exact organization and one virtual shard, derives current authority from Catalog, calls one Cdb read, and sends one snapshot. The public path is still one-shot: it does not install the committed durable registration state or create replay or live-update behavior. Cdb now has an internal registered-query RPC, but Gateway does not call it from `onSub` yet.
+Protocol v3 subscription requests send a query reference and raw arguments. For an explicit organization query with a stable ref, partition key, developer-declared server-side intent, and `authority: "organization"`, Gateway validates the arguments and requires the partition and intent to resolve to the same exact organization and one virtual shard. It derives current authority from Catalog, installs a durable generation before `Cdb.subscribe`, reruns the exact registered query, and sends snapshots. The runtime does not prove that the declared `intent.tables` covers every table read by the handler. An omission can leave live results stale. General query shapes remain closed. Resume cookies do not replay missed changes.
 
 - [x] Change the wire protocol so `sub` carries the query reference and raw arguments.
 - [x] Increment the protocol version and enforce it during `hello` and `welcome`.
 - [x] Validate query arguments with the query's Standard Schema validator before intent extraction.
 - [x] Resolve the query reference inside the Cdb isolate.
-- [x] Recompute the query intent on the server. Do not trust the client's intent or query hash.
-- [x] Canonicalize the query ref, validated arguments, and server-derived intent into a query hash used by persisted Cdb registrations and deploy-drift checks.
+- [x] Evaluate the developer-declared intent callback on the server. Do not trust client-supplied intent or a client query hash.
+- [x] Canonicalize the query ref, validated arguments, and server-evaluated declared intent into a query hash used by persisted Cdb registrations and deploy-drift checks.
 - [x] Persist principal and organization identity on Cdb registrations and require freshly derived tenant authority when executing the registered-query RPC.
 - [ ] Add a real policy epoch or digest to registered-query identity once that value is derived and enforced.
-- [x] Route explicit organization queries only when the validated partition metadata and server-computed intent resolve to the same exact organization and one virtual shard.
+- [x] Route explicit organization queries only when the validated partition metadata and server-evaluated declared intent resolve to the same exact organization and one virtual shard.
 - [x] Enumerate distinct current Catalog shard ids for scatter routing instead of probing virtual shards.
 - [x] Construct `QueryCtx` with a read-only database and the auth carried by the internal request.
 - [x] Apply row predicates and readable-column masks during full-row single-`cdbTable` query execution. Keep projections and joins blocked.
@@ -165,8 +166,8 @@ Protocol v3 subscription requests send a query reference and raw arguments. For 
 - [x] Move the client subscription from `pending` to `live` when a valid snapshot arrives.
 - [ ] Define ordering and stable row keys for collection results.
 - [x] Reject undeclared, mismatched, scatter, and cross-partition queries instead of silently routing them.
-- [ ] Remove the requirement that users manually keep a query handler and intent extractor equivalent, or verify that equivalence during the build.
-- [ ] Connect public authorized registration to `onSub` before treating the one-shot snapshot as a subscription.
+- [ ] Derive intent from the query handler or verify that the developer-declared `intent.tables` and intervals cover every table and range the handler can read. Until then, a wrong declaration can leave live results stale.
+- [x] Connect public authorized registration to `onSub`, installing the exact Gateway generation before `Cdb.subscribe` and pre-arming durable recovery before the RPC.
 
 ## 8. Implement live updates with simple invalidation first
 
@@ -183,12 +184,13 @@ Do not start with incremental row patches. Re-run the affected query after a com
 - [x] Validate production Gateway invalidation requests against the routed Gateway and exact current generation, connection, client, subscription, and physical Cdb source before accepting them.
 - [x] Durably coalesce accepted invalidations by raising `dirty_version` monotonically, including safe retries of the same change sequence.
 - [x] Persist a token-owned `run_target_version` separately from `delivered_version`; beginning a query does not claim delivery, and guarded settlement advances only the stored target while preserving newer dirtiness.
-- [ ] Wire public `onSub`, `onUnsub`, auth replacement, cancellation, and disconnect paths to install, retire, unsubscribe, and clean up exact durable generations.
-- [ ] Re-run subscriptions whose table set intersects the touched tables.
-- [ ] Send replacement snapshots with a new cookie.
-- [ ] Add the replacement-query runner that owns run tokens, consumes coalesced dirtiness, and stages or sends a snapshot before settling delivery.
+- [x] Wire public `onSub`, `onUnsub`, auth replacement, cancellation, and disconnect paths to install, retire, unsubscribe, and clean up exact durable generations.
+- [x] Re-run subscriptions whose table set intersects the touched tables.
+- [x] Send replacement snapshots with a new cookie.
+- [x] Add the replacement-query runner that owns run tokens, consumes coalesced dirtiness, and stages an immutable snapshot before delivery settlement.
 - [ ] Remove dead `matchSubsForRow` and patch-queue code if replacement snapshots supersede it.
-- [ ] Add a two-client test in which one client posts and the other receives the updated query result.
+- [x] Add a workerd test in which two org-A clients receive and acknowledge a replacement snapshot after a public mutation while an org-B rerun stays empty under policy.
+- [x] Prove focused Gateway and Cdb reconstruction preserves registration, outbox, retry, acknowledgement, and cleanup state.
 - [ ] Restart both Gateway and Cdb during the test and prove subscriptions can recover.
 
 ## 9. Define reconnect, retry, and failure behavior
@@ -205,14 +207,14 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Return typed errors for malformed messages instead of accepting any object with a known `t` field.
 - [x] Validate every wire message field.
 - [ ] Bound pending mutations, subscriptions, patch queues, and presence state.
-- [ ] Define client snapshot or poke acknowledgement, retention, retry, and duplicate-delivery behavior.
+- [x] Define and test snapshot acknowledgement, durable retry until exact acknowledgement, and client same-cookie deduplication with re-acknowledgement.
 - [ ] Apply backpressure or disconnect slow consumers.
 - [ ] Make disconnect and shutdown reject or retain pending mutations according to a documented rule.
 - [ ] Add failure tests for Worker RPC errors, Catalog errors, shard eviction, socket loss before acknowledgment, duplicate delivery, stale schema epoch, and protocol mismatch.
 
 ## 10. Make one real example
 
-The chat directory now consumes the packed package and passes compile-time checks. Its mutation and query declare the public organization authority contract, but the packed example has not run a Better Auth sign-in, persisted mutation readback, initial query, or live update under workerd. Domain migrations are also incomplete.
+The chat directory consumes the packed package and passes compile-time checks. Its mutation and query declare the public organization authority contract. The clean-tarball smoke now runs Better Auth anonymous sign-in, the demo organization hook, an empty initial query, `postMessage`, live replacement, and independent readback under workerd. Domain migrations and broader failure coverage remain incomplete.
 
 - [x] Install the package through npm's packed file-dependency path with a committed consumer lockfile.
 - [x] Declare every dependency used by the example.
@@ -223,12 +225,13 @@ The chat directory now consumes the packed package and passes compile-time check
 - [ ] Generate the example schema through real migrations.
 - [x] Add an idempotent auth hook that reuses the demo organization and user membership, tolerates confirmed concurrent creation, then sets the active organization.
 - [x] Give `postMessage` an explicit stable ref and organization authority, and call it through the public mutation hook.
-- [ ] Make opening a channel in the packed chat app return a persisted initial query result under workerd.
+- [x] Make opening a channel in the clean packed chat consumer return and acknowledge an empty initial query result under workerd.
 - [ ] Make a second browser receive the live replacement result.
 - [ ] Add an organization switch and prove data isolation.
 - [x] Install, typecheck, and build the example against the packed package instead of TypeScript aliases or source imports.
-- [ ] Add one workerd test that crosses the real WebSocket, Gateway, Worker, Catalog, Cdb, auth, policy, mutation, query, and live-update paths.
-- [ ] Do not use test-only raw SQL RPCs or fabricated `poke` messages in that test.
+- [x] Add a clean-tarball workerd smoke that crosses the real WebSocket, Gateway, Worker, Catalog, Cdb, Better Auth, policy, mutation, query, and live-update paths.
+- [x] Keep test-only raw SQL RPCs and fabricated `poke` messages out of the packed smoke.
+- [ ] Add packed second-tenant denial, mutation replay, and Worker plus Durable Object restart coverage.
 
 ## 11. Repair the CLI and local setup
 
@@ -262,8 +265,9 @@ The chat directory now consumes the packed package and passes compile-time check
 - [x] Include `STATUS.md`, `ARCHITECTURE.md`, `SECURITY.md`, and `CONTRIBUTING.md` in the tarball.
 - [x] Create an empty consumer fixture that installs the tarball and imports every advertised subpath.
 - [x] Test the chat consumer's runtime imports and declarations from the packed package without workspace hoisting.
+- [x] Install version 0.1.0 from a clean tarball and run `scripts/smoke-packed-chat.mjs` through sign-in, mutation, live replacement, and readback.
 - [x] Fix all Biome errors and warnings, or narrow the lint inputs deliberately and document why.
-- [x] Add CI for frozen install, typecheck, lint, unit tests, serialized workerd tests, package build, package consumer test, landing build, and example build.
+- [x] Add CI for frozen install, typecheck, lint, unit tests, serialized workerd tests, package build, package consumer tests, generated-project smoke, packed chat smoke, landing build, and example build.
 - [x] Upgrade compatible `nanoid`, PostCSS, Sharp, SVGO, and `ws` dependency paths past their published advisories.
 - [ ] Upgrade Miniflare when a compatible stable release stops pinning vulnerable `undici@7.28.0`; do not hide the advisory with an override.
 - [ ] Run a full-history secret scan before changing repository visibility.
@@ -288,7 +292,7 @@ The README and landing page now describe the repository as an experiment. Keep e
 
 ## 14. Work that stays deferred
 
-Do not work on these until the organization-tenanted mutation, query, and live-update path is working through the packed package:
+Keep these out of the supported path while the remaining migration, replay, isolation, and recovery work is unfinished:
 
 - Files and R2 upload lifecycle
 - Vector search and Vectorize integration

@@ -7,17 +7,20 @@ export function Auth() {
         <Section id="auth" num="04" label="auth">
             <SectionHeading>Declare access beside the table.</SectionHeading>
             <SectionLead>
-                Better Auth models live in Catalog. For each declared organization mutation or query, Gateway re-derives
-                membership and roles from Catalog. Cdb then enforces schema-declared write and select rules. The query
-                path returns one initial snapshot. It creates no server registration or live stream.
+                Better Auth models live in Catalog. For each declared organization mutation or exact-partition query,
+                Gateway re-derives membership, roles, and auth epochs from Catalog. Cdb then enforces schema-declared
+                write and select rules. The query path persists an exact generation and sends replacement snapshots
+                after matching commits.
             </SectionLead>
 
             <BulletList
                 items={[
                     "Catalog-backed Better Auth models and signed Gateway identity",
                     "declared organization writes use current membership, roles, auth epochs, row predicates, and column rules",
-                    "declared organization queries return a policy-filtered one-shot snapshot from one Cdb",
-                    "live registration, invalidation, replacement delivery, replay, and a full application test remain unfinished",
+                    "declared exact-partition queries return policy-filtered initial and replacement snapshots",
+                    "durable delivery retries until an exact client acknowledgement",
+                    "packed anonymous sign-in through live readback passes in a clean-tarball smoke",
+                    "resume replay, packed tenant denial, restart, JWKS rotation, and migrations remain unfinished",
                 ]}
             />
 
@@ -174,11 +177,11 @@ export function Auth() {
             </div>
 
             <p className="mt-6 text-sm text-fg-muted">
-                Declared organization mutations and one-shot queries execute through the policy wrapper in focused
-                workerd tests. The package remains experimental; do not use production data.
+                Declared organization mutations and exact-partition live queries execute through the policy wrapper in
+                focused workerd tests. The package remains experimental; do not use production data.
             </p>
 
-            <PullQuote>declared organization reads and writes enforce policy. live delivery does not exist.</PullQuote>
+            <PullQuote>one narrow live path works. it is not production ready.</PullQuote>
         </Section>
     );
 }
