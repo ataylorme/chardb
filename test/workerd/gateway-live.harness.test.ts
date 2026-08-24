@@ -3,6 +3,7 @@ import { rm } from "node:fs/promises";
 import * as path from "node:path";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { Miniflare } from "miniflare";
+import { type ChardbClient, createChardbClient } from "../../src/client/index.ts";
 import { type ChardbRef, ClientId, MutId, SubId } from "../../src/types.ts";
 import { type Down, PROTOCOL_V, type Up, decodeWire, encodeWire } from "../../src/wire.ts";
 
@@ -15,6 +16,24 @@ const ISSUER = "https://issuer.example";
 const AUDIENCE = "chardb-workerd";
 const ORGANIZATION_A = "workerd-org";
 const ORGANIZATION_B = "workerd-org-b";
+const SCALE_CLIENTS_PER_TENANT = boundedIntegerEnv("CHARDB_WORKERD_CLIENTS_PER_TENANT", 1, 1, 8);
+const SCALE_MUTATIONS_PER_TENANT = boundedIntegerEnv("CHARDB_WORKERD_MUTATIONS_PER_TENANT", 4, 1, 1_024);
+const SCALE_MUTATION_BATCH = boundedIntegerEnv("CHARDB_WORKERD_MUTATION_BATCH", 16, 1, 32);
+const SCALE_SUBSCRIPTIONS = boundedIntegerEnv("CHARDB_WORKERD_SUBSCRIPTIONS", 4, 1, 64);
+const SCALE_REFRESH_ROUNDS = boundedIntegerEnv("CHARDB_WORKERD_REFRESH_ROUNDS", 2, 1, 64);
+const SCALE_WAIT_MS = boundedIntegerEnv("CHARDB_WORKERD_WAIT_MS", 5_000, 1_000, 60_000);
+const SCALE_TEST_TIMEOUT_MS = boundedIntegerEnv("CHARDB_WORKERD_TEST_TIMEOUT_MS", 30_000, 5_000, 300_000);
+
+function boundedIntegerEnv(name: string, fallback: number, minimum: number, maximum: number): number {
+    const raw = process.env[name];
+    if (raw === undefined) return fallback;
+    if (!/^[0-9]+$/.test(raw)) throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+        throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+    }
+    return value;
+}
 
 interface GatewayLiveState {
     readonly instanceId: string;
@@ -264,6 +283,152 @@ async function expectNoDown(socket: WebSocket, waitMs = 100): Promise<void> {
 async function signed(subject: string): Promise<string> {
     if (!signToken) throw new Error("JWT signer is not initialized");
     return signToken(subject);
+}
+
+interface ScaleRow {
+    readonly id: string;
+    readonly organizationId: string;
+    readonly body: string;
+    readonly createdAt: number;
+    readonly viewerId: string;
+}
+
+interface QueryObservation {
+    readonly rows: readonly ScaleRow[];
+    readonly state: string;
+}
+
+interface QueryObserver {
+    readonly listener: (rows: ScaleRow[], state?: string) => void;
+    readonly latest: () => QueryObservation | null;
+    readonly waitFor: (
+        predicate: (observation: QueryObservation) => boolean,
+        label: string
+    ) => Promise<QueryObservation>;
+}
+
+function createQueryObserver(): QueryObserver {
+    let current: QueryObservation | null = null;
+    const waiters = new Set<() => void>();
+    return {
+        listener(rows, state) {
+            current = { rows: rows.map(row => ({ ...row })), state: state ?? "missing" };
+            for (const wake of [...waiters]) wake();
+        },
+        latest: () => current,
+        async waitFor(predicate, label) {
+            const deadline = Date.now() + SCALE_WAIT_MS;
+            while (current === null || !predicate(current)) {
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) {
+                    throw new Error(`timed out waiting for ${label}; latest=${JSON.stringify(current)}`);
+                }
+                await new Promise<void>((resolve, reject) => {
+                    const wake = () => {
+                        clearTimeout(timeout);
+                        waiters.delete(wake);
+                        resolve();
+                    };
+                    const timeout = setTimeout(() => {
+                        waiters.delete(wake);
+                        reject(new Error(`timed out waiting for ${label}; latest=${JSON.stringify(current)}`));
+                    }, remaining);
+                    waiters.add(wake);
+                });
+            }
+            return current;
+        },
+    };
+}
+
+function sdkEndpoint(): string {
+    if (!workerdUrl) throw new Error("Miniflare is not initialized");
+    const url = new URL("/ws", workerdUrl);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return url.toString();
+}
+
+async function createSdkClient(clientId: string, subject: string): Promise<ChardbClient> {
+    const jwt = await signed(subject);
+    return createChardbClient({
+        endpoint: sdkEndpoint(),
+        clientId,
+        getJwt: async () => jwt,
+        crossTab: false,
+        mutationTimeoutMs: SCALE_WAIT_MS,
+    });
+}
+
+async function drainUntilSettled(clientId: string, subIds: readonly number[]): Promise<GatewayLiveState> {
+    const deadline = Date.now() + SCALE_WAIT_MS;
+    let latest: GatewayLiveState | null = null;
+    while (Date.now() < deadline) {
+        await drainGateway(clientId);
+        const state = await gatewayState(clientId);
+        latest = state;
+        const settled = subIds.every(subId => {
+            const row = state.registrations.find(
+                candidate => candidate.clientId === clientId && candidate.subId === subId && candidate.currentHead
+            );
+            return (
+                row?.lifecycle === "active" &&
+                row.cdbState === "active" &&
+                !row.initialSnapshotPending &&
+                row.dirtyVersion === row.deliveredVersion &&
+                row.outboxCookie === null &&
+                row.outboxTargetVersion === null
+            );
+        });
+        if (settled) return state;
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    const unresolved = subIds.filter(subId => {
+        const row = latest?.registrations.find(
+            candidate => candidate.clientId === clientId && candidate.subId === subId && candidate.currentHead
+        );
+        return (
+            row?.lifecycle !== "active" ||
+            row.cdbState !== "active" ||
+            row.initialSnapshotPending ||
+            row.dirtyVersion !== row.deliveredVersion ||
+            row.outboxCookie !== null ||
+            row.outboxTargetVersion !== null
+        );
+    });
+    throw new Error(`Gateway did not settle ${clientId} subscriptions ${unresolved.join(",")}`);
+}
+
+async function cleanupSdkClient(
+    clientId: string,
+    client: ChardbClient,
+    subscriptions: readonly { unsubscribe: () => void }[]
+): Promise<void> {
+    for (const subscription of subscriptions) {
+        try {
+            subscription.unsubscribe();
+        } catch {
+            // close() below remains the terminal cleanup path.
+        }
+    }
+    client.close();
+    const deadline = Date.now() + SCALE_WAIT_MS;
+    while (Date.now() < deadline) {
+        await drainGateway(clientId);
+        const state = await gatewayState(clientId);
+        if (!state.registrations.some(row => row.clientId === clientId && row.currentHead)) return;
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw new Error(`timed out cleaning SDK client ${clientId}`);
+}
+
+async function inBatches<T>(items: readonly T[], batchSize: number, run: (item: T) => Promise<void>): Promise<void> {
+    for (let offset = 0; offset < items.length; offset += batchSize) {
+        await Promise.all(items.slice(offset, offset + batchSize).map(run));
+    }
+}
+
+function rate(count: number, durationMs: number): number {
+    return durationMs === 0 ? 0 : Number(((count * 1_000) / durationMs).toFixed(2));
 }
 
 beforeAll(async () => {
@@ -759,4 +924,283 @@ describe("public durable live queries in real workerd", () => {
         await Promise.all([drainGateway(clientId), drainGateway(writerId)]);
         expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
     });
+
+    test(
+        "scaled SDK mutation fanout stays tenant-isolated",
+        async () => {
+            if (!mutationRef || !queryRef) throw new Error("live fixture refs were not seeded");
+            const writeRef = mutationRef;
+            const readRef = queryRef;
+            const body = "sdk-scale-fanout-v1";
+            const tenants = [
+                { label: "a", organizationId: ORGANIZATION_A, subject: "workerd-user" },
+                { label: "b", organizationId: ORGANIZATION_B, subject: "workerd-user-b" },
+            ] as const;
+            const clients: Array<{
+                readonly clientId: string;
+                readonly organizationId: string;
+                readonly subject: string;
+                readonly client: ChardbClient;
+                readonly observer: QueryObserver;
+                readonly subscriptions: Array<{ unsubscribe: () => void }>;
+            }> = [];
+            const startedAt = performance.now();
+            try {
+                for (const tenant of tenants) {
+                    for (let index = 0; index < SCALE_CLIENTS_PER_TENANT; index++) {
+                        const clientId = `bench-${tenant.label}-${index.toString().padStart(4, "0")}`;
+                        const client = await createSdkClient(clientId, tenant.subject);
+                        const observer = createQueryObserver();
+                        const subscription = client.subscribe<ScaleRow>(
+                            readRef,
+                            { organizationId: tenant.organizationId, body },
+                            observer.listener
+                        );
+                        clients.push({
+                            clientId,
+                            organizationId: tenant.organizationId,
+                            subject: tenant.subject,
+                            client,
+                            observer,
+                            subscriptions: [subscription],
+                        });
+                    }
+                }
+
+                await Promise.all(clients.map(entry => drainUntilSettled(entry.clientId, [1])));
+                await Promise.all(
+                    clients.map(entry =>
+                        entry.observer.waitFor(
+                            observation => observation.state === "live" && observation.rows.length === 0,
+                            `${entry.clientId} initial empty snapshot`
+                        )
+                    )
+                );
+                const initialMs = performance.now() - startedAt;
+
+                const expectedIds = new Map<string, string[]>();
+                const mutationStartedAt = performance.now();
+                await Promise.all(
+                    tenants.map(async tenant => {
+                        const mutator = clients.find(entry => entry.organizationId === tenant.organizationId);
+                        if (!mutator) throw new Error(`missing mutator for ${tenant.organizationId}`);
+                        const jobs = Array.from({ length: SCALE_MUTATIONS_PER_TENANT }, (_, index) => ({
+                            index,
+                            id: `sdk-fanout-${tenant.label}-${index.toString().padStart(5, "0")}`,
+                        }));
+                        expectedIds.set(
+                            tenant.organizationId,
+                            jobs.map(job => job.id)
+                        );
+                        await inBatches(jobs, SCALE_MUTATION_BATCH, async job => {
+                            const result = await mutator.client.mutate<{
+                                readonly id: string;
+                                readonly userId: string;
+                                readonly tenantId: string | null;
+                            }>(writeRef, {
+                                id: job.id,
+                                organizationId: tenant.organizationId,
+                                body,
+                                createdAt: 10_000 + job.index,
+                            });
+                            expect(result).toMatchObject({
+                                id: job.id,
+                                userId: tenant.subject,
+                                tenantId: tenant.organizationId,
+                            });
+                        });
+                    })
+                );
+                const mutationMs = performance.now() - mutationStartedAt;
+
+                const convergenceStartedAt = performance.now();
+                const settledStates = await Promise.all(clients.map(entry => drainUntilSettled(entry.clientId, [1])));
+                const finalObservations = await Promise.all(
+                    clients.map(entry =>
+                        entry.observer.waitFor(
+                            observation =>
+                                observation.state === "live" && observation.rows.length === SCALE_MUTATIONS_PER_TENANT,
+                            `${entry.clientId} final fanout snapshot`
+                        )
+                    )
+                );
+                const convergenceMs = performance.now() - convergenceStartedAt;
+
+                for (let index = 0; index < clients.length; index++) {
+                    const entry = clients[index] as (typeof clients)[number];
+                    const observation = finalObservations[index] as QueryObservation;
+                    const ids = observation.rows.map(row => row.id);
+                    const tenantIds = expectedIds.get(entry.organizationId);
+                    if (!tenantIds) throw new Error(`missing expected ids for ${entry.organizationId}`);
+                    expect(ids).toEqual(tenantIds);
+                    expect(new Set(ids).size).toBe(SCALE_MUTATIONS_PER_TENANT);
+                    expect(
+                        observation.rows.every(
+                            row =>
+                                row.organizationId === entry.organizationId &&
+                                row.body === body &&
+                                row.viewerId === entry.subject
+                        )
+                    ).toBe(true);
+                    const registration = settledStates[index]?.registrations.find(
+                        row => row.clientId === entry.clientId && row.subId === 1 && row.currentHead
+                    );
+                    expect(registration).toMatchObject({
+                        lifecycle: "active",
+                        cdbState: "active",
+                        initialSnapshotPending: false,
+                        outboxCookie: null,
+                        outboxTargetVersion: null,
+                    });
+                    expect(registration?.dirtyVersion).toBe(registration?.deliveredVersion);
+                }
+                expect((await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId })).invalidations).toEqual([]);
+
+                const mutationCount = tenants.length * SCALE_MUTATIONS_PER_TENANT;
+                const logicalRowDeliveries = clients.length * SCALE_MUTATIONS_PER_TENANT;
+                console.info(
+                    JSON.stringify({
+                        type: "chardb-workerd-benchmark",
+                        scenario: "sdk-two-tenant-mutation-fanout",
+                        clients: clients.length,
+                        mutations: mutationCount,
+                        initialMs: Number(initialMs.toFixed(2)),
+                        mutationMs: Number(mutationMs.toFixed(2)),
+                        mutationsPerSecond: rate(mutationCount, mutationMs),
+                        convergenceMs: Number(convergenceMs.toFixed(2)),
+                        logicalRowDeliveries,
+                        logicalRowDeliveriesPerSecond: rate(logicalRowDeliveries, convergenceMs),
+                    })
+                );
+            } finally {
+                await Promise.all(
+                    clients.map(entry => cleanupSdkClient(entry.clientId, entry.client, entry.subscriptions))
+                );
+            }
+        },
+        SCALE_TEST_TIMEOUT_MS
+    );
+
+    test(
+        "scaled SDK selective subscription refresh stays exact",
+        async () => {
+            if (!mutationRef || !queryRef) throw new Error("live fixture refs were not seeded");
+            const writeRef = mutationRef;
+            const readRef = queryRef;
+            const clientId = "bench-select-0001";
+            const client = await createSdkClient(clientId, "workerd-user");
+            const subscriptions: Array<{ unsubscribe: () => void }> = [];
+            const observers = Array.from({ length: SCALE_SUBSCRIPTIONS }, () => createQueryObserver());
+            const bodies = observers.map((_, index) => `sdk-scale-filter-${index.toString().padStart(3, "0")}`);
+            let writeMs = 0;
+            let refreshMs = 0;
+            const registrationStartedAt = performance.now();
+            try {
+                for (let index = 0; index < observers.length; index++) {
+                    subscriptions.push(
+                        client.subscribe<ScaleRow>(
+                            readRef,
+                            { organizationId: ORGANIZATION_A, body: bodies[index] as string },
+                            (observers[index] as QueryObserver).listener
+                        )
+                    );
+                }
+                const subIds = observers.map((_, index) => index + 1);
+                await drainUntilSettled(clientId, subIds);
+                await Promise.all(
+                    observers.map((observer, index) =>
+                        observer.waitFor(
+                            observation => observation.state === "live" && observation.rows.length === 0,
+                            `selective subscription ${index} initial snapshot`
+                        )
+                    )
+                );
+                const registrationMs = performance.now() - registrationStartedAt;
+
+                for (let round = 0; round < SCALE_REFRESH_ROUNDS; round++) {
+                    const jobs = bodies.map((body, index) => ({
+                        body,
+                        index,
+                        id: `sdk-select-${index.toString().padStart(3, "0")}-${round.toString().padStart(3, "0")}`,
+                    }));
+                    const writesStartedAt = performance.now();
+                    await inBatches(jobs, SCALE_MUTATION_BATCH, async job => {
+                        const result = await client.mutate<{
+                            readonly id: string;
+                            readonly userId: string;
+                            readonly tenantId: string | null;
+                        }>(writeRef, {
+                            id: job.id,
+                            organizationId: ORGANIZATION_A,
+                            body: job.body,
+                            createdAt: 20_000 + round * SCALE_SUBSCRIPTIONS + job.index,
+                        });
+                        expect(result).toMatchObject({
+                            id: job.id,
+                            userId: "workerd-user",
+                            tenantId: ORGANIZATION_A,
+                        });
+                    });
+                    writeMs += performance.now() - writesStartedAt;
+
+                    const refreshStartedAt = performance.now();
+                    await drainUntilSettled(clientId, subIds);
+                    await Promise.all(
+                        observers.map((observer, index) =>
+                            observer.waitFor(
+                                observation => observation.state === "live" && observation.rows.length === round + 1,
+                                `selective subscription ${index} round ${round}`
+                            )
+                        )
+                    );
+                    refreshMs += performance.now() - refreshStartedAt;
+
+                    for (let index = 0; index < observers.length; index++) {
+                        const observation = (observers[index] as QueryObserver).latest();
+                        if (!observation) throw new Error(`missing selective observation ${index}`);
+                        expect(observation.rows.map(row => row.id)).toEqual(
+                            Array.from(
+                                { length: round + 1 },
+                                (_, priorRound) =>
+                                    `sdk-select-${index.toString().padStart(3, "0")}-${priorRound
+                                        .toString()
+                                        .padStart(3, "0")}`
+                            )
+                        );
+                        expect(
+                            observation.rows.every(
+                                row =>
+                                    row.organizationId === ORGANIZATION_A &&
+                                    row.body === bodies[index] &&
+                                    row.viewerId === "workerd-user"
+                            )
+                        ).toBe(true);
+                    }
+                }
+                expect((await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId })).invalidations).toEqual([]);
+
+                const writes = SCALE_SUBSCRIPTIONS * SCALE_REFRESH_ROUNDS;
+                const materializations = SCALE_SUBSCRIPTIONS * SCALE_REFRESH_ROUNDS;
+                console.info(
+                    JSON.stringify({
+                        type: "chardb-workerd-benchmark",
+                        scenario: "sdk-selective-subscription-refresh",
+                        subscriptions: SCALE_SUBSCRIPTIONS,
+                        rounds: SCALE_REFRESH_ROUNDS,
+                        writes,
+                        registrationMs: Number(registrationMs.toFixed(2)),
+                        registrationsPerSecond: rate(SCALE_SUBSCRIPTIONS, registrationMs),
+                        writeMs: Number(writeMs.toFixed(2)),
+                        writesPerSecond: rate(writes, writeMs),
+                        refreshMs: Number(refreshMs.toFixed(2)),
+                        materializations,
+                        materializationsPerSecond: rate(materializations, refreshMs),
+                    })
+                );
+            } finally {
+                await cleanupSdkClient(clientId, client, subscriptions);
+            }
+        },
+        SCALE_TEST_TIMEOUT_MS
+    );
 });
