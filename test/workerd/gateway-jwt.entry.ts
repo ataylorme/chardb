@@ -220,7 +220,9 @@ export default {
     async fetch(request: Request, env: Env): Promise<Response> {
         const url = new URL(request.url);
         if (url.pathname === "/seed") {
-            const body = (await request.json()) as { readonly kid: string; readonly jwk: JsonWebKey };
+            const body = request.headers.get("content-type")?.includes("application/json")
+                ? ((await request.json()) as { readonly kid?: string; readonly jwk?: JsonWebKey })
+                : {};
             const id = env.CDB_CATALOG.idFromName("global");
             const catalog = env.CDB_CATALOG.get(id) as unknown as {
                 putJwk(kid: string, jwkJson: string, ttlMs: number): Promise<void>;
@@ -231,7 +233,9 @@ export default {
                 }): Promise<unknown>;
                 route(vshard: number): Promise<{ readonly shardId: string }>;
             };
-            await catalog.putJwk(body.kid, JSON.stringify(body.jwk), 60_000);
+            if (body.kid !== undefined && body.jwk !== undefined) {
+                await catalog.putJwk(body.kid, JSON.stringify(body.jwk), 60_000);
+            }
             const now = Date.parse("2026-08-23T00:00:00Z");
             await catalog.mutateAuth({
                 model: "user",
@@ -329,6 +333,18 @@ export default {
                 shardA: routeA.shardId,
                 shardB: routeB.shardId,
             });
+        }
+        if (url.pathname === "/expire-jwk") {
+            const body = (await request.json()) as { readonly kid: string };
+            const id = env.CDB_CATALOG.idFromName("global");
+            const catalog = env.CDB_CATALOG.get(id) as unknown as {
+                getJwk(kid: string): Promise<{ readonly jwkJson: string } | null>;
+                putJwk(kid: string, jwkJson: string, ttlMs: number): Promise<void>;
+            };
+            const cached = await catalog.getJwk(body.kid);
+            if (!cached) return new Response("JWK is not cached", { status: 404 });
+            await catalog.putJwk(body.kid, cached.jwkJson, -1);
+            return Response.json({ ok: true });
         }
         if (url.pathname === "/authority-fault") {
             const body = (await request.json()) as { readonly fault: AuthorityFault };

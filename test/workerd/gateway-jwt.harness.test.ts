@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { SignJWT, exportJWK, generateKeyPair } from "jose";
+import { type JWK, SignJWT, exportJWK, generateKeyPair } from "jose";
 import { Miniflare } from "miniflare";
 import { build as viteBuild } from "vite";
 import { ChardbRef, ClientId, Cookie, MutId, SubId } from "../../src/types.ts";
@@ -14,6 +14,8 @@ const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ENTRY = path.join(HERE, "gateway-jwt.entry.ts");
 const BUNDLE = path.join(process.env.TMPDIR ?? "/tmp", `chardb-gateway-jwt-${process.pid}.bundle.mjs`);
 const KID = "gateway-workerd-key";
+const ROTATED_KID = "gateway-workerd-key-rotated";
+const UNKNOWN_KID = "gateway-workerd-key-unknown";
 const ISSUER = "https://issuer.example";
 const AUDIENCE = "chardb-workerd";
 const WRITE_REF = "test/workerd/gateway-jwt.entry.ts#writeOrganizationRow";
@@ -23,6 +25,9 @@ const LIST_REF = "test/workerd/gateway-jwt.entry.ts#listOrganizationRows";
 let mf: Miniflare | undefined;
 let workerdUrl: URL | undefined;
 let signToken: ((claims?: TokenOverrides) => Promise<string>) | undefined;
+let signRotatedToken: ((claims?: TokenOverrides) => Promise<string>) | undefined;
+let signUnknownToken: ((claims?: TokenOverrides) => Promise<string>) | undefined;
+let rotatedPublicJwk: JWK | undefined;
 let mutationRef: ChardbRef | undefined;
 let closedMutationRef: ChardbRef | undefined;
 let queryRef: ChardbRef | undefined;
@@ -35,6 +40,33 @@ interface TokenOverrides {
     readonly audience?: string;
     readonly expirationTime?: number;
 }
+
+const JWKS_WORKER = `
+let keys;
+let fetchCount = 0;
+let lastUrl = null;
+
+export default {
+    async fetch(request, env) {
+        keys ??= JSON.parse(env.INITIAL_JWKS).keys;
+        const url = new URL(request.url);
+        if (url.pathname === "/jwks") {
+            fetchCount += 1;
+            lastUrl = request.url;
+            return Response.json({ keys });
+        }
+        if (url.pathname === "/__control/rotate" && request.method === "POST") {
+            const document = await request.json();
+            keys = document.keys;
+            return Response.json({ ok: true });
+        }
+        if (url.pathname === "/__control/stats") {
+            return Response.json({ fetchCount, lastUrl, kids: keys.map(key => key.kid) });
+        }
+        return new Response("not found", { status: 404 });
+    }
+};
+`;
 
 async function buildWorker(): Promise<string> {
     try {
@@ -127,38 +159,62 @@ beforeAll(async () => {
         ChardbRef(LIST_REF),
     ]);
 
-    const { privateKey, publicKey } = await generateKeyPair("ES256");
-    const publicJwk = { ...(await exportJWK(publicKey)), kid: KID, alg: "ES256", use: "sig" };
-    signToken = async (overrides = {}) => {
-        const now = Math.floor(Date.now() / 1000);
-        return new SignJWT({ probe: "workerd", tenantId: "workerd-org-b", role: "owner", roles: ["owner"] })
-            .setProtectedHeader({ alg: "ES256", kid: KID })
-            .setSubject(overrides.subject ?? "workerd-user")
-            .setIssuer(overrides.issuer ?? ISSUER)
-            .setAudience(overrides.audience ?? AUDIENCE)
-            .setIssuedAt(now)
-            .setExpirationTime(overrides.expirationTime ?? now + 300)
-            .sign(privateKey);
+    const initialKeyPair = await generateKeyPair("ES256");
+    const rotatedKeyPair = await generateKeyPair("ES256");
+    const unknownKeyPair = await generateKeyPair("ES256");
+    const publicJwk = { ...(await exportJWK(initialKeyPair.publicKey)), kid: KID, alg: "ES256", use: "sig" };
+    rotatedPublicJwk = {
+        ...(await exportJWK(rotatedKeyPair.publicKey)),
+        kid: ROTATED_KID,
+        alg: "ES256",
+        use: "sig",
     };
+    const createSigner =
+        (privateKey: CryptoKey, kid: string) =>
+        async (overrides: TokenOverrides = {}) => {
+            const now = Math.floor(Date.now() / 1000);
+            return new SignJWT({ probe: "workerd", tenantId: "workerd-org-b", role: "owner", roles: ["owner"] })
+                .setProtectedHeader({ alg: "ES256", kid })
+                .setSubject(overrides.subject ?? "workerd-user")
+                .setIssuer(overrides.issuer ?? ISSUER)
+                .setAudience(overrides.audience ?? AUDIENCE)
+                .setIssuedAt(now)
+                .setExpirationTime(overrides.expirationTime ?? now + 300)
+                .sign(privateKey);
+        };
+    signToken = createSigner(initialKeyPair.privateKey, KID);
+    signRotatedToken = createSigner(rotatedKeyPair.privateKey, ROTATED_KID);
+    signUnknownToken = createSigner(unknownKeyPair.privateKey, UNKNOWN_KID);
 
     mf = new Miniflare({
-        modules: true,
-        script: await buildWorker(),
-        durableObjects: {
-            CDB_CATALOG: { className: "Catalog", useSQLite: true },
-            CDB_GATEWAY: { className: "Gateway", useSQLite: true },
-            CDB_SHARD: { className: "Cdb", useSQLite: true },
-        },
-        compatibilityDate: "2025-09-01",
-        compatibilityFlags: ["nodejs_compat"],
+        workers: [
+            {
+                name: "gateway-jwt",
+                modules: true,
+                script: await buildWorker(),
+                outboundService: "jwks",
+                durableObjects: {
+                    CDB_CATALOG: { className: "Catalog", useSQLite: true },
+                    CDB_GATEWAY: { className: "Gateway", useSQLite: true },
+                    CDB_SHARD: { className: "Cdb", useSQLite: true },
+                },
+                compatibilityDate: "2025-09-01",
+                compatibilityFlags: ["nodejs_compat"],
+            },
+            {
+                name: "jwks",
+                modules: true,
+                script: JWKS_WORKER,
+                bindings: { INITIAL_JWKS: JSON.stringify({ keys: [publicJwk] }) },
+                compatibilityDate: "2025-09-01",
+            },
+        ],
     });
     workerdUrl = await mf.ready;
     const seeded = await mf.dispatchFetch("http://example.com/seed", {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ kid: KID, jwk: publicJwk }),
     });
-    if (!seeded.ok) throw new Error(`failed to seed Catalog JWK: ${seeded.status} ${await seeded.text()}`);
+    if (!seeded.ok) throw new Error(`failed to seed Catalog state: ${seeded.status} ${await seeded.text()}`);
     const seedResult = (await seeded.json()) as {
         mutationRef: ChardbRef;
         closedMutationRef: ChardbRef;
@@ -255,6 +311,53 @@ async function signed(overrides?: TokenOverrides): Promise<string> {
     return signToken(overrides);
 }
 
+async function signedRotated(overrides?: TokenOverrides): Promise<string> {
+    if (!signRotatedToken) throw new Error("rotated signer not initialized");
+    return signRotatedToken(overrides);
+}
+
+async function signedUnknown(overrides?: TokenOverrides): Promise<string> {
+    if (!signUnknownToken) throw new Error("unknown signer not initialized");
+    return signUnknownToken(overrides);
+}
+
+async function jwksStats(): Promise<{
+    readonly fetchCount: number;
+    readonly lastUrl: string | null;
+    readonly kids: string[];
+}> {
+    if (!mf) throw new Error("miniflare not initialized");
+    const worker = await mf.getWorker("jwks");
+    const response = await worker.fetch("http://jwks.test/__control/stats");
+    if (!response.ok) throw new Error(`failed to read JWKS stats: ${response.status}`);
+    return (await response.json()) as {
+        readonly fetchCount: number;
+        readonly lastUrl: string | null;
+        readonly kids: string[];
+    };
+}
+
+async function rotateJwks(): Promise<void> {
+    if (!mf || !rotatedPublicJwk) throw new Error("rotated JWKS not initialized");
+    const worker = await mf.getWorker("jwks");
+    const response = await worker.fetch("http://jwks.test/__control/rotate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ keys: [rotatedPublicJwk] }),
+    });
+    if (!response.ok) throw new Error(`failed to rotate JWKS: ${response.status}`);
+}
+
+async function expireCatalogJwk(kid: string): Promise<void> {
+    if (!mf) throw new Error("miniflare not initialized");
+    const response = await mf.dispatchFetch("http://example.com/expire-jwk", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kid }),
+    });
+    if (!response.ok) throw new Error(`failed to expire Catalog JWK: ${response.status} ${await response.text()}`);
+}
+
 function sendAndReceive(socket: WebSocket, message: Up): Promise<Down> {
     const response = nextDown(socket);
     socket.send(encodeWire(message));
@@ -314,6 +417,26 @@ async function authorityControl(pathname: "/authority-waiting" | "/authority-rel
 }
 
 describe("configured Gateway JWT handshake in real workerd", () => {
+    test("fetches the configured JWKS URL once and reuses the Catalog cache", async () => {
+        expect(await jwksStats()).toEqual({ fetchCount: 0, lastUrl: null, kids: [KID] });
+
+        const first = await openSocket(await signed(), { clientId: "jwks-cold-fetch" });
+        await expect(first.first).resolves.toMatchObject({ t: "welcome" });
+        first.socket.close();
+        await first.closed;
+
+        const cached = await openSocket(await signed(), { clientId: "jwks-cached-fetch" });
+        await expect(cached.first).resolves.toMatchObject({ t: "welcome" });
+        cached.socket.close();
+        await cached.closed;
+
+        expect(await jwksStats()).toEqual({
+            fetchCount: 1,
+            lastUrl: "https://unreachable.invalid/jwks",
+            kids: [KID],
+        });
+    });
+
     test("rejects a hello client id that differs from the Worker-routed client id", async () => {
         const { first, closed } = await openSocket(await signed(), {
             clientId: "hello-client",
@@ -983,5 +1106,67 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         });
         expect(retryResponse).toMatchObject({ t: "poke", mutResults: [{ ok: true }] });
         retry.socket.close();
+    });
+
+    test("refreshes an expired key, accepts the rotated kid, and rejects retired or unknown keys", async () => {
+        if (!mutationRef) throw new Error("mutation ref was not seeded");
+        const beforePrime = await jwksStats();
+        expect(beforePrime).toMatchObject({ kids: [KID] });
+        const primed = await openSocket(await signed(), { clientId: "jwks-rotation-prime" });
+        await expect(primed.first).resolves.toMatchObject({ t: "welcome" });
+        primed.socket.close();
+        await primed.closed;
+        const afterPrime = await jwksStats();
+        expect(afterPrime.fetchCount - beforePrime.fetchCount).toBe(beforePrime.fetchCount === 0 ? 1 : 0);
+        const fetchBaseline = afterPrime.fetchCount;
+
+        await rotateJwks();
+        await expireCatalogJwk(KID);
+
+        const retired = await openSocket(await signed(), { clientId: "jwks-retired-key" });
+        await expect(retired.first).resolves.toMatchObject({ t: "error", code: "CDB_FORBIDDEN", retryable: false });
+        await retired.closed;
+        expect(await jwksStats()).toEqual({
+            fetchCount: fetchBaseline + 1,
+            lastUrl: "https://unreachable.invalid/jwks",
+            kids: [ROTATED_KID],
+        });
+
+        const rotated = await openSocket(await signedRotated(), { clientId: "jwks-rotated-key" });
+        await expect(rotated.first).resolves.toMatchObject({ t: "welcome" });
+        const authorized = await sendAndReceive(rotated.socket, {
+            t: "mut",
+            mutId: MutId("jwks-rotated-authority"),
+            ref: mutationRef,
+            args: {
+                id: "jwks-rotated-authority",
+                organizationId: "workerd-org",
+                body: "rotated",
+                createdAt: 14,
+            },
+        });
+        expect(authorized).toMatchObject({
+            t: "poke",
+            mutResults: [
+                {
+                    ok: true,
+                    result: {
+                        userId: "workerd-user",
+                        tenantId: "workerd-org",
+                        role: "member",
+                        roles: ["member"],
+                        claims: {},
+                    },
+                },
+            ],
+        });
+        rotated.socket.close();
+        await rotated.closed;
+        expect(await jwksStats()).toMatchObject({ fetchCount: fetchBaseline + 1 });
+
+        const unknown = await openSocket(await signedUnknown(), { clientId: "jwks-unknown-key" });
+        await expect(unknown.first).resolves.toMatchObject({ t: "error", code: "CDB_FORBIDDEN", retryable: false });
+        await unknown.closed;
+        expect(await jwksStats()).toMatchObject({ fetchCount: fetchBaseline + 2, kids: [ROTATED_KID] });
     });
 });
