@@ -108,6 +108,12 @@ function sentMutations(ws: FakeWS): Extract<Up, { t: "mut" }>[] {
         .filter((message): message is Extract<Up, { t: "mut" }> => message.t === "mut");
 }
 
+function sentSubscriptions(ws: FakeWS): Extract<Up, { t: "sub" }>[] {
+    return ws.sent
+        .map(raw => JSON.parse(raw) as Up)
+        .filter((message): message is Extract<Up, { t: "sub" }> => message.t === "sub");
+}
+
 function nestedJson(depth: number): RawJson {
     let value: RawJson = null;
     for (let level = 0; level < depth; level++) value = { value };
@@ -427,6 +433,10 @@ describe("createChardbClient — wire round-trip", () => {
         const sentBeforeRejection = ws.sent.length;
         expect(() => c.subscribe("still-invalid-at-cap", {}, () => {})).toThrow("invalid ChardbRef");
         expect(ws.sent).toHaveLength(sentBeforeRejection);
+        expect(
+            captureCdbError(() => c.subscribe("queries.ts#invalid-at-cap", nestedJson(100), () => {}))
+        ).toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
+        expect(ws.sent).toHaveLength(sentBeforeRejection);
         const limited = captureCdbError(() => c.subscribe("queries.ts#over-limit", {}, () => {}));
         expect(limited).toMatchObject({ code: "CDB_RATE_LIMITED", retryable: true });
         expect(ws.sent).toHaveLength(sentBeforeRejection);
@@ -449,6 +459,197 @@ describe("createChardbClient — wire round-trip", () => {
         });
     });
 
+    test("caps subscription argument members, depth, and bytes before id allocation or send", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        let getterRuns = 0;
+        const accessorArgs: Record<string, RawJson> = {};
+        Object.defineProperty(accessorArgs, "value", {
+            enumerable: true,
+            get() {
+                getterRuns++;
+                return null;
+            },
+        });
+        const cyclicArgs: Record<string, RawJson> = {};
+        cyclicArgs.self = cyclicArgs;
+
+        expect(() => c.subscribe("invalid-ref", accessorArgs, () => {})).toThrow(TypeError);
+        expect(getterRuns).toBe(0);
+        for (const args of [
+            Array.from({ length: 2_048 }, (_, index) => (index === 0 ? [null, null] : [null])),
+            nestedJson(100),
+            { value: "é".repeat(262_139) },
+            accessorArgs,
+            cyclicArgs,
+        ] as RawJson[]) {
+            expect(captureCdbError(() => c.subscribe("queries.ts#invalid-arguments", args, () => {}))).toMatchObject({
+                code: "CDB_INVALID_ARGS",
+                retryable: false,
+            });
+        }
+        expect(getterRuns).toBe(0);
+        expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+
+        c.subscribe(
+            "queries.ts#exact-argument-count",
+            Array.from({ length: 2_048 }, () => [null]),
+            () => {}
+        );
+        c.subscribe("queries.ts#exact-argument-depth", nestedJson(99), () => {});
+        c.subscribe("queries.ts#exact-argument-bytes", { value: "é".repeat(262_138) }, () => {});
+        expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+
+        await welcome(ws);
+        expect(sentSubscriptions(ws).map(message => message.subId)).toEqual([SubId(1), SubId(2), SubId(3)]);
+        c.close();
+    });
+
+    test("owns queued subscription and mutation arguments before welcome", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 1_000 });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            const subscriptionArgs = Object.create(null) as Record<string, RawJson>;
+            subscriptionArgs.value = "subscription-original";
+            Object.defineProperty(subscriptionArgs, "__proto__", {
+                value: { marker: "subscription-proto" },
+                enumerable: true,
+                writable: true,
+                configurable: true,
+            });
+            const mutationArgs = Object.create(null) as Record<string, RawJson>;
+            mutationArgs.value = "mutation-original";
+            Object.defineProperty(mutationArgs, "__proto__", {
+                value: { marker: "mutation-proto" },
+                enumerable: true,
+                writable: true,
+                configurable: true,
+            });
+
+            c.subscribe("queries.ts#owned-arguments", subscriptionArgs, () => {});
+            const mutation = c.mutate("mutations.ts#owned-arguments", mutationArgs).catch(error => error);
+            subscriptionArgs.value = "subscription-mutated";
+            subscriptionArgs.self = subscriptionArgs;
+            mutationArgs.value = "mutation-mutated";
+            mutationArgs.self = mutationArgs;
+
+            await welcome(ws);
+            const sentSubArgs = sentSubscriptions(ws)[0]?.args as Record<string, RawJson>;
+            const sentMutationArgs = sentMutations(ws)[0]?.args as Record<string, RawJson>;
+            expect(sentSubArgs.value).toBe("subscription-original");
+            expect(Object.getOwnPropertyDescriptor(sentSubArgs, "__proto__")?.value).toEqual({
+                marker: "subscription-proto",
+            });
+            expect(sentMutationArgs.value).toBe("mutation-original");
+            expect(Object.getOwnPropertyDescriptor(sentMutationArgs, "__proto__")?.value).toEqual({
+                marker: "mutation-proto",
+            });
+
+            c.close();
+            await expect(mutation).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
+            expect(timers.scheduledDelays()).toEqual([]);
+        } finally {
+            timers.restore();
+            c.close();
+        }
+    });
+
+    test("clones subscription and mutation arrays without reading a poisoned prototype", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 1_000 });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            let getterRuns = 0;
+            const poisonedArray = (value: string): RawJson[] => {
+                const array: RawJson[] = [value];
+                const prototype = Object.create(Array.prototype) as Record<string, unknown>;
+                Object.defineProperty(prototype, "map", {
+                    get() {
+                        getterRuns++;
+                        throw new Error("poisoned map getter must not run");
+                    },
+                });
+                Object.setPrototypeOf(array, prototype);
+                return array;
+            };
+            const subscriptionArgs = poisonedArray("subscription-original");
+            const mutationArgs = poisonedArray("mutation-original");
+
+            c.subscribe("queries.ts#poisoned-array-prototype", subscriptionArgs, () => {});
+            const mutation = c.mutate("mutations.ts#poisoned-array-prototype", mutationArgs).catch(error => error);
+            expect(getterRuns).toBe(0);
+            await welcome(ws);
+            expect(getterRuns).toBe(0);
+            expect(sentSubscriptions(ws)[0]?.args).toEqual(["subscription-original"]);
+            expect(sentMutations(ws)[0]?.args).toEqual(["mutation-original"]);
+
+            c.close();
+            await expect(mutation).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
+        } finally {
+            timers.restore();
+            c.close();
+        }
+    });
+
+    test("snapshots proxy arguments without a second enumeration or property read", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 1_000 });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            const adversarialArgs = (safe: string) => {
+                let ownKeysRuns = 0;
+                let getRuns = 0;
+                const target: Record<string, RawJson> = { safe, hiddenOnSecondTraversal: "hostile" };
+                const args = new Proxy(target, {
+                    ownKeys() {
+                        ownKeysRuns++;
+                        return ownKeysRuns === 1 ? ["safe"] : ["safe", "hiddenOnSecondTraversal"];
+                    },
+                    getOwnPropertyDescriptor(targetObject, key) {
+                        return Reflect.getOwnPropertyDescriptor(targetObject, key);
+                    },
+                    get() {
+                        getRuns++;
+                        return "hostile-get-value";
+                    },
+                });
+                return {
+                    args: args as RawJson,
+                    ownKeysRuns: () => ownKeysRuns,
+                    getRuns: () => getRuns,
+                };
+            };
+            const subscription = adversarialArgs("subscription-descriptor-value");
+            const mutationArgs = adversarialArgs("mutation-descriptor-value");
+
+            c.subscribe("queries.ts#single-pass-proxy", subscription.args, () => {});
+            const mutation = c.mutate("mutations.ts#single-pass-proxy", mutationArgs.args).catch(error => error);
+            expect(subscription.ownKeysRuns()).toBe(1);
+            expect(mutationArgs.ownKeysRuns()).toBe(1);
+            expect(subscription.getRuns()).toBe(0);
+            expect(mutationArgs.getRuns()).toBe(0);
+
+            await welcome(ws);
+            expect(sentSubscriptions(ws)[0]?.args).toEqual({ safe: "subscription-descriptor-value" });
+            expect(sentMutations(ws)[0]?.args).toEqual({ safe: "mutation-descriptor-value" });
+            expect(subscription.ownKeysRuns()).toBe(1);
+            expect(mutationArgs.ownKeysRuns()).toBe(1);
+            expect(subscription.getRuns()).toBe(0);
+            expect(mutationArgs.getRuns()).toBe(0);
+
+            c.close();
+            await expect(mutation).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
+        } finally {
+            timers.restore();
+            c.close();
+        }
+    });
+
     test("rolls back a subscription whose synchronous send fails and never reconnects it", async () => {
         const timers = installManualTimers();
         const c = client();
@@ -457,9 +658,11 @@ describe("createChardbClient — wire round-trip", () => {
             const first = fakeWebSocket();
             await welcome(first);
             first.failNextSend = true;
-            expect(captureCdbError(() => c.subscribe("queries.ts#send-failure", {}, () => {}))).toMatchObject({
+            const failedArgs: Record<string, RawJson> = { value: "original" };
+            expect(captureCdbError(() => c.subscribe("queries.ts#send-failure", failedArgs, () => {}))).toMatchObject({
                 code: "CDB_STREAM_ABORTED",
             });
+            failedArgs.self = failedArgs;
 
             first.close();
             await flush();
@@ -1757,6 +1960,45 @@ describe("createChardbClient — wire round-trip", () => {
 
             c.close();
             await Promise.all([...pending, replacement]);
+        } finally {
+            timers.restore();
+            c.close();
+        }
+    });
+
+    test("reconnect resends owned subscription and mutation arguments byte-for-byte", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 5_000 });
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+            const subscriptionArgs: Record<string, RawJson> = { value: "subscription-original" };
+            const mutationArgs: Record<string, RawJson> = { value: "mutation-original" };
+            c.subscribe("queries.ts#owned-reconnect", subscriptionArgs, () => {});
+            const mutation = c.mutate("mutations.ts#owned-reconnect", mutationArgs).catch(error => error);
+            const originalSub = first.sent.find(raw => (JSON.parse(raw) as Up).t === "sub");
+            const originalMutation = first.sent.find(raw => (JSON.parse(raw) as Up).t === "mut");
+            if (!originalSub || !originalMutation) throw new Error("expected initial owned requests");
+
+            subscriptionArgs.value = "subscription-mutated";
+            subscriptionArgs.self = subscriptionArgs;
+            mutationArgs.value = "mutation-mutated";
+            mutationArgs.self = mutationArgs;
+            first.close();
+            await flush();
+            timers.runDelay(250);
+            await flush();
+            const reconnected = fakeWebSocket(1);
+            await welcome(reconnected);
+            expect(reconnected.sent.find(raw => (JSON.parse(raw) as Up).t === "sub")).toBe(originalSub);
+            expect(reconnected.sent.find(raw => (JSON.parse(raw) as Up).t === "mut")).toBe(originalMutation);
+
+            c.close();
+            await expect(mutation).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
+            expect(timers.scheduledDelays()).toEqual([]);
+            await flush();
+            expect(FakeWS.instances).toHaveLength(2);
         } finally {
             timers.restore();
             c.close();

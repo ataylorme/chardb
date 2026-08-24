@@ -396,16 +396,19 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         assertSerializedSize(value, MAX_PATCH_BATCH_BYTES, "patch batch");
     }
 
-    function assertSerializedSize(
+    interface SerializedJsonLimits {
+        readonly memberLimit?: number;
+        readonly maxDepth?: number;
+        readonly errorCode?: CdbErrorCode;
+    }
+
+    function inspectSerializedJson(
         value: unknown,
         limit: number,
         subject: string,
-        limits: {
-            readonly memberLimit?: number;
-            readonly maxDepth?: number;
-            readonly errorCode?: CdbErrorCode;
-        } = {}
-    ): number {
+        limits: SerializedJsonLimits,
+        copy: boolean
+    ): { readonly bytes: number; readonly owned?: RawJson } {
         const errorCode = limits.errorCode ?? "CDB_INVARIANT";
         let bytes = 0;
         let members = 0;
@@ -428,7 +431,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 });
             }
         };
-        const visitChild = (child: unknown, depth: number): void => {
+        const visitChild = (child: unknown, depth: number): RawJson | undefined => {
             addMember();
             if (limits.maxDepth !== undefined && depth >= limits.maxDepth) {
                 throw new CdbError({
@@ -436,7 +439,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                     message: `${subject} exceeds the ${limits.maxDepth}-level client depth limit`,
                 });
             }
-            visit(child, depth + 1);
+            return visit(child, depth + 1);
         };
         const addString = (text: string): void => {
             add(2);
@@ -473,77 +476,137 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 }
             }
         };
-        const visit = (item: unknown, depth: number): void => {
+        const visit = (item: unknown, depth: number): RawJson | undefined => {
             if (item === null) {
                 add(4);
-            } else if (typeof item === "string") {
+                return copy ? null : undefined;
+            }
+            if (typeof item === "string") {
                 addString(item);
-            } else if (typeof item === "number") {
+                return copy ? item : undefined;
+            }
+            if (typeof item === "number") {
                 if (!Number.isFinite(item) || Object.is(item, -0)) {
                     invalidJson("numbers must be finite and must not be negative zero");
                 }
                 add(JSON.stringify(item).length);
-            } else if (typeof item === "boolean") {
+                return copy ? item : undefined;
+            }
+            if (typeof item === "boolean") {
                 add(item ? 4 : 5);
-            } else if (typeof item === "object") {
-                if (ancestors.has(item)) invalidJson("cyclic references are unsupported");
-                ancestors.add(item);
-                if (Array.isArray(item)) {
-                    const ownKeys = Reflect.ownKeys(item);
-                    if (ownKeys.some(key => typeof key === "symbol")) {
-                        invalidJson("symbol properties are unsupported");
+                return copy ? item : undefined;
+            }
+            if (typeof item !== "object") return invalidJson(`${typeof item} values are unsupported`);
+
+            if (ancestors.has(item)) invalidJson("cyclic references are unsupported");
+            ancestors.add(item);
+            if (Array.isArray(item)) {
+                const ownKeys = Reflect.ownKeys(item);
+                if (ownKeys.some(key => typeof key === "symbol")) {
+                    invalidJson("symbol properties are unsupported");
+                }
+                const lengthDescriptor = Object.getOwnPropertyDescriptor(item, "length");
+                if (!lengthDescriptor || !("value" in lengthDescriptor)) {
+                    return invalidJson("arrays must have an own data length");
+                }
+                const length = lengthDescriptor.value;
+                if (!Number.isSafeInteger(length) || length < 0 || ownKeys.length !== length + 1) {
+                    invalidJson("arrays cannot be sparse or have extra properties");
+                }
+                const owned: RawJson[] | undefined = copy ? [] : undefined;
+                add(2);
+                for (let index = 0; index < length; index++) {
+                    const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
+                    if (!descriptor) invalidJson("array entries must be own properties");
+                    const dataDescriptor = descriptor as PropertyDescriptor;
+                    if (!dataDescriptor.enumerable || !("value" in dataDescriptor)) {
+                        invalidJson("array entries must be enumerable data properties");
                     }
-                    if (ownKeys.length !== item.length + 1) {
-                        invalidJson("arrays cannot be sparse or have extra properties");
-                    }
-                    add(2);
-                    for (let index = 0; index < item.length; index++) {
-                        const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
-                        if (!descriptor) invalidJson("array entries must be own properties");
-                        const dataDescriptor = descriptor as PropertyDescriptor;
-                        if (!dataDescriptor.enumerable || !("value" in dataDescriptor)) {
-                            invalidJson("array entries must be enumerable data properties");
-                        }
-                        if (index > 0) add(1);
-                        visitChild(dataDescriptor.value, depth);
-                    }
-                } else {
-                    const prototype = Object.getPrototypeOf(item);
-                    if (prototype !== Object.prototype && prototype !== null) {
-                        invalidJson("objects must be plain objects");
-                    }
-                    add(2);
-                    let first = true;
-                    for (const key of Reflect.ownKeys(item)) {
-                        if (typeof key !== "string") invalidJson("symbol properties are unsupported");
-                        const stringKey = key as string;
-                        const descriptor = Object.getOwnPropertyDescriptor(item, stringKey);
-                        if (!descriptor) invalidJson("object properties must be own properties");
-                        const dataDescriptor = descriptor as PropertyDescriptor;
-                        if (!dataDescriptor.enumerable || !("value" in dataDescriptor)) {
-                            invalidJson("object properties must be enumerable data properties");
-                        }
-                        if (!first) add(1);
-                        first = false;
-                        addString(stringKey);
-                        add(1);
-                        visitChild(dataDescriptor.value, depth);
-                    }
+                    if (index > 0) add(1);
+                    const child = visitChild(dataDescriptor.value, depth);
+                    if (owned) owned.push(child as RawJson);
                 }
                 ancestors.delete(item);
-            } else {
-                invalidJson(`${typeof item} values are unsupported`);
+                return owned;
             }
+
+            const prototype = Object.getPrototypeOf(item);
+            if (prototype !== Object.prototype && prototype !== null) {
+                invalidJson("objects must be plain objects");
+            }
+            const owned: Record<string, RawJson> | undefined = copy
+                ? prototype === null
+                    ? Object.create(null)
+                    : {}
+                : undefined;
+            add(2);
+            let first = true;
+            for (const key of Reflect.ownKeys(item)) {
+                if (typeof key !== "string") invalidJson("symbol properties are unsupported");
+                const stringKey = key as string;
+                const descriptor = Object.getOwnPropertyDescriptor(item, stringKey);
+                if (!descriptor) invalidJson("object properties must be own properties");
+                const dataDescriptor = descriptor as PropertyDescriptor;
+                if (!dataDescriptor.enumerable || !("value" in dataDescriptor)) {
+                    invalidJson("object properties must be enumerable data properties");
+                }
+                if (!first) add(1);
+                first = false;
+                addString(stringKey);
+                add(1);
+                const child = visitChild(dataDescriptor.value, depth);
+                if (owned) {
+                    Object.defineProperty(owned, stringKey, {
+                        value: child,
+                        enumerable: true,
+                        writable: true,
+                        configurable: true,
+                    });
+                }
+            }
+            ancestors.delete(item);
+            return owned;
         };
-        visit(value, 0);
-        return bytes;
+        const owned = visit(value, 0);
+        return copy ? { bytes, owned: owned as RawJson } : { bytes };
+    }
+
+    function assertSerializedSize(
+        value: unknown,
+        limit: number,
+        subject: string,
+        limits: SerializedJsonLimits = {}
+    ): number {
+        return inspectSerializedJson(value, limit, subject, limits, false).bytes;
+    }
+
+    function snapshotSerializedJson(
+        value: unknown,
+        limit: number,
+        subject: string,
+        limits: SerializedJsonLimits
+    ): RawJson {
+        return inspectSerializedJson(value, limit, subject, limits, true).owned as RawJson;
     }
 
     function cloneRawJson(value: RawJson | readonly RawJson[]): RawJson | RawJson[] {
         if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
             return value;
         }
-        if (Array.isArray(value)) return value.map(item => cloneRawJson(item) as RawJson);
+        if (Array.isArray(value)) {
+            const clone: RawJson[] = [];
+            for (let index = 0; index < value.length; index++) {
+                const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+                if (!descriptor || !("value" in descriptor)) {
+                    throw new CdbError({
+                        code: "CDB_INVARIANT",
+                        message: "cannot clone an invalid JSON array",
+                    });
+                }
+                clone.push(cloneRawJson(descriptor.value as RawJson) as RawJson);
+            }
+            return clone;
+        }
         const clone: Record<string, RawJson> = Object.getPrototypeOf(value) === null ? Object.create(null) : {};
         for (const [key, child] of Object.entries(value)) {
             Object.defineProperty(clone, key, {
@@ -585,8 +648,16 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         if (additional) add(additional);
     }
 
-    function assertMutationArguments(args: RawJson): void {
-        assertSerializedSize(args, MAX_MUTATION_ARGUMENT_BYTES, "mutation arguments", {
+    function snapshotMutationArguments(args: RawJson): RawJson {
+        return snapshotSerializedJson(args, MAX_MUTATION_ARGUMENT_BYTES, "mutation arguments", {
+            memberLimit: MAX_MUTATION_ARGUMENT_MEMBERS,
+            maxDepth: MAX_MUTATION_ARGUMENT_DEPTH,
+            errorCode: "CDB_INVALID_ARGS",
+        });
+    }
+
+    function snapshotSubscriptionArguments(args: RawJson): RawJson {
+        return snapshotSerializedJson(args, MAX_MUTATION_ARGUMENT_BYTES, "subscription arguments", {
             memberLimit: MAX_MUTATION_ARGUMENT_MEMBERS,
             maxDepth: MAX_MUTATION_ARGUMENT_DEPTH,
             errorCode: "CDB_INVALID_ARGS",
@@ -691,6 +762,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             });
         }
         const queryRef = ChardbRef(ref);
+        const ownedArgs = snapshotSubscriptionArguments(args);
         if (subs.size >= MAX_ACTIVE_SUBSCRIPTIONS) {
             throw new CdbError({
                 code: "CDB_RATE_LIMITED",
@@ -703,7 +775,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         const rec: SubRecord = {
             subId,
             ref: queryRef,
-            args,
+            args: ownedArgs,
             state: "pending",
             rows: [],
             listeners: new Set([widenedListener]),
@@ -711,7 +783,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         };
         subs.set(subId, rec);
         if (ws && state === "open") {
-            const up: Up = { t: "sub", subId, ref: queryRef, args };
+            const up: Up = { t: "sub", subId, ref: queryRef, args: rec.args };
             try {
                 ws.send(encodeWire(up));
             } catch (cause) {
@@ -756,9 +828,10 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             );
         }
         let mutationRef: ChardbRef;
+        let ownedArgs: RawJson;
         try {
             mutationRef = ChardbRef(ref);
-            assertMutationArguments(args);
+            ownedArgs = snapshotMutationArguments(args);
         } catch (error) {
             return Promise.reject(error);
         }
@@ -775,7 +848,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             const rec: PendingMutation = {
                 mutId,
                 ref: mutationRef,
-                args,
+                args: ownedArgs,
                 resolve: resolve as (r: RawJson) => void,
                 reject,
                 inFlight: false,
@@ -794,7 +867,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 );
             }, mutationTimeoutMs);
             if (ws && state === "open") {
-                const up: Up = { t: "mut", mutId, ref: rec.ref, args };
+                const up: Up = { t: "mut", mutId, ref: rec.ref, args: rec.args };
                 try {
                     ws.send(encodeWire(up));
                     rec.inFlight = true;
