@@ -183,16 +183,19 @@ Do not start with incremental row patches. Re-run the affected query after a com
 
 - [x] Give every shard subscription a generation identity containing Gateway, registration, connection, client, and subscription IDs.
 - [x] Persist exact Cdb generation identity, principal, organization, query ref, arguments, query hash, tables, and intervals; retain retired tombstones so stale subscribe replays cannot reactivate a generation.
+- [x] Cap each Cdb at 4,096 active registrations. Let an exact active replay succeed without another slot, release a slot on unsubscribe, and return exact typed success or a matching `registrationState: "absent"` capacity failure.
 - [x] Rebuild active Cdb generation identity and the in-memory interval index from SQLite when Cdb starts.
 - [x] Persist durable Gateway logical heads and generation rows with organization, logical shard, physical Cdb ID, schema epoch, three auth epochs, lifecycle, cookie, retry, and delivery fields.
 - [x] Persist the static `cdbTable` policy digest on Gateway registrations and retire a generation when current metadata no longer matches it.
 - [x] Collect deterministic registered-table write sets inside successful newly-run atomic mutations without exposing them on the public mutation wire result.
 - [x] Advance the Cdb change clock and coalesce table-matched registrations into the invalidation outbox inside the same transaction as the domain write and op-log.
+- [x] Cap each Cdb invalidation outbox at 4,096 rows while allowing existing exact rows to coalesce at capacity and acknowledgement deletes to release space. Cap one mutation at 4,096 distinct registration targets with a `LIMIT 4097` guard; overflow rolls back the domain write, provisional op-log, change clock, and outbox work.
 - [x] Deliver bounded invalidation batches from Cdb to the physical Gateway ID with durable alarms, retries, conditional acknowledgement deletes, and dead-letter state.
 - [x] Validate production Gateway invalidation requests against the routed Gateway and exact current generation, connection, client, subscription, and physical Cdb source before accepting them.
 - [x] Durably coalesce accepted invalidations by raising `dirty_version` monotonically, including safe retries of the same change sequence.
 - [x] Persist a token-owned `run_target_version` separately from `delivered_version`; beginning a query does not claim delivery, and guarded settlement advances only the stored target while preserving newer dirtiness.
 - [x] Wire public `onSub`, `onUnsub`, auth replacement, cancellation, and disconnect paths to install, retire, unsubscribe, and clean up exact durable generations.
+- [x] Treat only a matching typed Cdb absence response as proof that a pending install can be deleted without an unsubscribe tombstone. Preserve cancelled pending state until that response or its durable 30-second recovery deadline; compensate ambiguous, lost, malformed, or identity-mismatched outcomes with exact Cdb unsubscribe, including after restart.
 - [x] Commit logical-head retirement and its cleanup alarm in one storage transaction so an alarm failure rolls both changes back.
 - [x] After a close-time retirement failure, best-effort schedule a separate reconciliation alarm. Scan active heads in durable rowid pages of 32, preserve only exact current verified socket identities, retire missing, stale, or mismatched attachments, and run exact Cdb cleanup without resetting an in-progress cursor.
 - [ ] Guarantee prompt cleanup when both the original atomic retirement and the fallback alarm transaction fail. A quiet abandoned head can otherwise persist until another event or bootstrap reaches the Gateway.
@@ -230,7 +233,7 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Preflight canonical and cross-tab optimistic patch batches at 4,096 items and exactly 512 KiB before subscription lookup or cross-tab stringify. Enforce the same row and byte caps on every planned cache, plus 4,096 items and 512 KiB on optimistic history. Commit every valid planned state before listeners run, and fail the session without partial application on malformed or oversized input.
 - [x] Cap aggregate retained client query rows and optimistic history at the exact 8 MiB serialized boundary. Deep-clone inbound state and every listener delivery, preserve own `__proto__` data properties without prototype mutation, validate multi-subscription plans before any commit, and release retained state on unsubscribe or terminal cleanup.
 - [x] Cap charged Gateway durable subscription payload at 16 MiB, with registrations limited to 15 MiB so 1 MiB remains for staged snapshots. Charge exact stored UTF-8 plus bounded mutable metadata headroom, check arbitrary resume-cookie growth atomically, scrub retired payload while preserving cleanup identity, and repair legacy retired rows on restart.
-- [ ] Bound remaining Cdb durable bytes, including total subscription-tombstone retention, plus presence state, other queues, and retention watermarks.
+- [ ] Bound retired Cdb subscription-tombstone total bytes and define its compaction watermark, plus presence state, other queues, slow-consumer backpressure, and other retention watermarks.
 - [x] Define and test snapshot acknowledgement, durable retry until exact acknowledgement, and client same-cookie deduplication with re-acknowledgement.
 - [ ] Apply backpressure or disconnect slow consumers.
 - [ ] Make disconnect and shutdown reject or retain pending mutations according to a documented rule.
