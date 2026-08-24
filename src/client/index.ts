@@ -70,9 +70,9 @@ interface SubRecord {
     readonly args: RawJson;
     state: SubState;
     rows: RawJson[];
-    listeners: Set<(rows: RawJson[]) => void>;
+    listeners: Set<(rows: RawJson[], state: SubState) => void>;
     optimisticPatches: RowPatch[];
-    lastSnapshotCookie?: Cookie;
+    lastSnapshotCookie: Cookie | undefined;
 }
 
 interface PlannedSubState {
@@ -96,7 +96,7 @@ export interface ChardbClient {
     subscribe<TRow = RawJson>(
         ref: string,
         args: RawJson,
-        onChange: (rows: TRow[]) => void
+        onChange: (rows: TRow[], state?: SubState) => void
     ): { unsubscribe: () => void };
     /** Issue a mutation; resolves with server result after canonical state arrives. */
     mutate<TResult = RawJson>(ref: string, args: RawJson): Promise<TResult>;
@@ -370,6 +370,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                     sub.state = msg.reason === "authChanged" ? "refetching" : "refetching";
                     sub.rows = [];
                     sub.optimisticPatches = [];
+                    sub.lastSnapshotCookie = undefined;
                     notify(sub);
                     const up: Up = {
                         t: "sub",
@@ -434,7 +435,6 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         for (const [sub, next] of planned) {
             sub.rows = next.rows;
             sub.optimisticPatches = next.optimisticPatches;
-            sub.state = "live";
         }
         for (const sub of planned.keys()) {
             notify(sub);
@@ -580,7 +580,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
             sub.optimisticPatches = [];
             for (const listener of sub.listeners) {
                 try {
-                    listener(cloneRawJson(sub.rows) as RawJson[]);
+                    listener(cloneRawJson(sub.rows) as RawJson[], sub.state);
                 } catch {
                     // User listeners cannot interrupt terminal resource cleanup.
                 }
@@ -601,13 +601,13 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
     }
 
     function notify(sub: SubRecord): void {
-        for (const fn of sub.listeners) fn(cloneRawJson(sub.rows) as RawJson[]);
+        for (const fn of sub.listeners) fn(cloneRawJson(sub.rows) as RawJson[], sub.state);
     }
 
     function subscribe<TRow = RawJson>(
         ref: string,
         args: RawJson,
-        onChange: (rows: TRow[]) => void
+        onChange: (rows: TRow[], state?: SubState) => void
     ): { unsubscribe: () => void } {
         if (terminated) {
             throw new CdbError({
@@ -625,7 +625,8 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         }
         assertAggregateQueryState(new Map(), { rows: [], optimisticPatches: [] }, "CDB_RATE_LIMITED");
         const subId = SubId(nextSubId++);
-        const widenedListener: (rows: RawJson[]) => void = rows => onChange(rows as readonly RawJson[] as TRow[]);
+        const widenedListener: (rows: RawJson[], state: SubState) => void = (rows, state) =>
+            onChange(rows as readonly RawJson[] as TRow[], state);
         const rec: SubRecord = {
             subId,
             ref: queryRef,
@@ -634,6 +635,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
             rows: [],
             listeners: new Set([widenedListener]),
             optimisticPatches: [],
+            lastSnapshotCookie: undefined,
         };
         subs.set(subId, rec);
         start();

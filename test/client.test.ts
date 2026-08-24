@@ -2640,25 +2640,35 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
         const ws = fakeWebSocket();
         await welcome(ws);
-        const seen: unknown[][] = [];
-        c.subscribe<{ id: string }>("queries.ts#listMessages", { organizationId: "org-1" }, rows =>
-            seen.push([...rows])
+        const seen: Array<{ readonly rows: unknown[]; readonly state: string }> = [];
+        c.subscribe<{ id: string }>("queries.ts#listMessages", { organizationId: "org-1" }, (rows, state) =>
+            seen.push({ rows: [...rows], state: state ?? "missing" })
         );
         await flush();
-        // Prime with a row, then issue mustRefetch and confirm the listener
-        // sees the cleared state and the client re-sends `sub`.
+        // A patch cannot promote a pending subscription before its first
+        // authoritative snapshot.
         ws.emit({
             t: "poke",
             cookie: Cookie("c-1:1"),
             patches: [{ op: "put", subId: SubId(1), rowKey: "r1", row: { id: "r1" } }],
         });
         await flush();
-        expect(seen[seen.length - 1]).toEqual([{ id: "r1", __key: "r1" }]);
+        expect(seen.at(-1)).toEqual({ rows: [{ id: "r1", __key: "r1" }], state: "pending" });
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:2"),
+            rows: [{ id: "authoritative" }],
+        });
+        await flush();
+        expect(seen.at(-1)).toEqual({ rows: [{ id: "authoritative" }], state: "live" });
+
+        // Refetch clears the authoritative rows and re-sends `sub`.
         const sentBefore = ws.sent.length;
         ws.emit({ t: "mustRefetch", subIds: [SubId(1)], reason: "schemaChanged" });
         await flush();
         // Listener saw cleared rows.
-        expect(seen[seen.length - 1]).toEqual([]);
+        expect(seen.at(-1)).toEqual({ rows: [], state: "refetching" });
         // Client re-sent the `sub` envelope after refetch.
         const newSubs = ws.sent
             .slice(sentBefore)
@@ -2669,6 +2679,48 @@ describe("createChardbClient — wire round-trip", () => {
         if (!resent || resent.t !== "sub") throw new Error("expected a re-sent query subscription");
         expect(resent.ref).toBe(ChardbRef("queries.ts#listMessages"));
         expect(resent.args).toEqual({ organizationId: "org-1" });
+
+        // A rematerialization may reuse the prior data cookie. The first
+        // snapshot after mustRefetch is authoritative despite that equality;
+        // once accepted, another copy is a duplicate again.
+        const seenBeforeReplacement = seen.length;
+        const acknowledgementsBeforeReplacement = ws.sent.filter(raw => (JSON.parse(raw) as Up).t === "ack").length;
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:2"),
+            rows: [{ id: "rematerialized" }],
+        });
+        await flush();
+        expect(seen.at(-1)).toEqual({ rows: [{ id: "rematerialized" }], state: "live" });
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:2"),
+            rows: [{ id: "duplicate-must-not-apply" }],
+        });
+        await flush();
+        expect(seen).toHaveLength(seenBeforeReplacement + 1);
+        expect(seen.at(-1)).toEqual({ rows: [{ id: "rematerialized" }], state: "live" });
+        expect(ws.sent.filter(raw => (JSON.parse(raw) as Up).t === "ack")).toHaveLength(
+            acknowledgementsBeforeReplacement + 2
+        );
+
+        // A patch during the refetch window is not a complete materialization
+        // and therefore cannot restore live state.
+        ws.emit({ t: "mustRefetch", subIds: [SubId(1)], reason: "schemaChanged" });
+        await flush();
+        ws.emit({
+            t: "poke",
+            cookie: Cookie("c-1:3"),
+            patches: [{ op: "put", subId: SubId(1), rowKey: "partial", row: { id: "partial" } }],
+        });
+        await flush();
+        expect(seen.at(-1)).toEqual({ rows: [{ id: "partial", __key: "partial" }], state: "refetching" });
+
+        ws.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-1:4"), rows: [] });
+        await flush();
+        expect(seen.at(-1)).toEqual({ rows: [], state: "live" });
     });
 
     test("a subscription error clears rows instead of leaving stale live data", async () => {
@@ -2676,9 +2728,9 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
         const ws = fakeWebSocket();
         await welcome(ws);
-        const seen: unknown[][] = [];
-        c.subscribe<{ id: string }>("queries.ts#listMessages", { organizationId: "org-1" }, rows =>
-            seen.push([...rows])
+        const seen: Array<{ readonly rows: unknown[]; readonly state: string }> = [];
+        c.subscribe<{ id: string }>("queries.ts#listMessages", { organizationId: "org-1" }, (rows, state) =>
+            seen.push({ rows: [...rows], state: state ?? "missing" })
         );
         await flush();
         ws.emit({
@@ -2688,7 +2740,7 @@ describe("createChardbClient — wire round-trip", () => {
             rows: [{ id: "r1" }],
         });
         await flush();
-        expect(seen[seen.length - 1]).toEqual([{ id: "r1" }]);
+        expect(seen.at(-1)).toEqual({ rows: [{ id: "r1" }], state: "live" });
 
         ws.emit({
             t: "error",
@@ -2700,7 +2752,7 @@ describe("createChardbClient — wire round-trip", () => {
         });
         await flush();
 
-        expect(seen[seen.length - 1]).toEqual([]);
+        expect(seen.at(-1)).toEqual({ rows: [], state: "error" });
     });
 
     test("reconnect within RYW window resumes from lastCookie via Up.hello.resumeFromCookie", async () => {
@@ -2757,7 +2809,11 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
         const ws = fakeWebSocket();
         let subscriptionNotifications = 0;
-        c.subscribe("queries.ts#listMessages", {}, () => subscriptionNotifications++);
+        const subscriptionStates: string[] = [];
+        c.subscribe("queries.ts#listMessages", {}, (_rows, state) => {
+            subscriptionNotifications++;
+            subscriptionStates.push(state ?? "missing");
+        });
         let rejectionCount = 0;
         const mutationError = c.mutate("src/api.ts#post", {}).catch(error => {
             rejectionCount++;
@@ -2769,6 +2825,7 @@ describe("createChardbClient — wire round-trip", () => {
         expect(c.state).toBe("closed");
         expect(ws.readyState).toBe(FakeWS.CLOSED);
         expect(subscriptionNotifications).toBe(1);
+        expect(subscriptionStates).toEqual(["closed"]);
         expect(rejectionCount).toBe(1);
         await expect(mutationError).resolves.toMatchObject({
             code: "CDB_STREAM_ABORTED",

@@ -239,12 +239,13 @@ export function useQuery<F extends (...args: never[]) => Promise<unknown>>(
     const [snapshot, setSnapshot] = useState<{
         readonly identity: typeof identity;
         readonly data: RowOf<F>[];
+        readonly state: UseQueryResult<RowOf<F>>["state"];
     }>();
     useEffect(() => {
         let active = true;
         setSnapshot(current => (current?.identity === identity ? current : undefined));
-        const sub = client.subscribe<RowOf<F>>(ref, stableArgs, rows => {
-            if (active) setSnapshot({ identity, data: rows });
+        const sub = client.subscribe<RowOf<F>>(ref, stableArgs, (rows, state) => {
+            if (active) setSnapshot({ identity, data: rows, state: state ?? "live" });
         });
         return () => {
             active = false;
@@ -252,7 +253,8 @@ export function useQuery<F extends (...args: never[]) => Promise<unknown>>(
         };
     }, [client, identity, ref, stableArgs]);
     const data = snapshot?.identity === identity ? snapshot.data : undefined;
-    return { data, state: data === undefined ? "pending" : "live" };
+    const state = snapshot?.identity === identity ? snapshot.state : "pending";
+    return { data, state };
 }
 
 function isHandle(v: unknown): v is ((...args: never[]) => unknown) & QueryHandleStamp<unknown> {

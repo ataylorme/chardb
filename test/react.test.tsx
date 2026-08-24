@@ -12,10 +12,12 @@ import * as ChardbReact from "../src/react/index.ts";
 import { ChardbProvider, useChardb, useMutation, useQuery, useSession } from "../src/react/index.ts";
 import { PROTOCOL_V, type RawJson } from "../src/wire.ts";
 
+type TestSubState = "pending" | "live" | "refetching" | "error" | "closed";
+
 interface SubInstance {
     readonly ref: string;
     readonly args: RawJson;
-    readonly listener: (rows: RawJson[]) => void;
+    readonly listener: (rows: RawJson[], state?: TestSubState) => void;
     unsubscribed: boolean;
 }
 
@@ -51,11 +53,11 @@ function stubClient() {
     const mutateCalls: { ref: string; args: RawJson }[] = [];
     const lifecycle = { closeCalls: 0 };
     const client: ChardbClient = {
-        subscribe<TRow>(ref: string, args: RawJson, onChange: (rows: TRow[]) => void) {
+        subscribe<TRow>(ref: string, args: RawJson, onChange: (rows: TRow[], state: TestSubState) => void) {
             const inst: SubInstance = {
                 ref,
                 args,
-                listener: onChange as (rows: RawJson[]) => void,
+                listener: (rows, state = "live") => onChange(rows as TRow[], state),
                 unsubscribed: false,
             };
             subs.push(inst);
@@ -166,6 +168,75 @@ describe("chardb/react — hook lifecycle", () => {
         });
         expect(sub.unsubscribed).toBe(true);
         expect(lifecycle.closeCalls).toBe(0);
+    });
+
+    test("useQuery distinguishes live empty rows from refetching, error, and closed state", () => {
+        const { client, subs } = stubClient();
+        const query = Object.assign(async (_ctx: never, _args: Record<string, never>) => [], {
+            __chardbRef: { toString: () => "queries.ts#stateful" },
+        });
+        let captured: ReturnType<typeof useQuery<typeof query>> | undefined;
+        function Probe() {
+            captured = useQuery(query, {});
+            return null;
+        }
+
+        TestRenderer.act(() => {
+            TestRenderer.create(React.createElement(ChardbProvider, { client }, React.createElement(Probe)));
+        });
+        expect(captured).toMatchObject({ data: undefined, state: "pending" });
+        const sub = subs[0];
+        if (!sub) throw new Error("expected useQuery to create a subscription");
+
+        TestRenderer.act(() => sub.listener([{ id: "first" }], "live"));
+        expect(captured).toMatchObject({ data: [{ id: "first" }], state: "live" });
+        TestRenderer.act(() => sub.listener([], "refetching"));
+        expect(captured).toMatchObject({ data: [], state: "refetching" });
+        TestRenderer.act(() => sub.listener([], "live"));
+        expect(captured).toMatchObject({ data: [], state: "live" });
+        TestRenderer.act(() => sub.listener([], "error"));
+        expect(captured).toMatchObject({ data: [], state: "error" });
+        TestRenderer.act(() => sub.listener([], "closed"));
+        expect(captured).toMatchObject({ data: [], state: "closed" });
+    });
+
+    test("useQuery accepts a structural legacy client and treats an omitted listener state as live", () => {
+        let listener: ((rows: RawJson[]) => void) | undefined;
+        let unsubscribed = false;
+        const client: ChardbClient = {
+            subscribe<TRow>(_ref: string, _args: RawJson, onChange: (rows: TRow[]) => void) {
+                listener = rows => onChange(rows as TRow[]);
+                return {
+                    unsubscribe() {
+                        unsubscribed = true;
+                    },
+                };
+            },
+            async mutate<TResult>(): Promise<TResult> {
+                return null as TResult;
+            },
+            close() {},
+            state: "open",
+        };
+        const query = Object.assign(async (_ctx: never, _args: Record<string, never>) => [], {
+            __chardbRef: { toString: () => "queries.ts#legacy" },
+        });
+        let captured: ReturnType<typeof useQuery<typeof query>> | undefined;
+        function Probe() {
+            captured = useQuery(query, {});
+            return null;
+        }
+
+        let tree!: TestRenderer.ReactTestRenderer;
+        TestRenderer.act(() => {
+            tree = TestRenderer.create(React.createElement(ChardbProvider, { client }, React.createElement(Probe)));
+        });
+        expect(captured).toMatchObject({ data: undefined, state: "pending" });
+        TestRenderer.act(() => listener?.([{ id: "legacy" }]));
+        expect(captured).toMatchObject({ data: [{ id: "legacy" }], state: "live" });
+
+        TestRenderer.act(() => tree.unmount());
+        expect(unsubscribed).toBe(true);
     });
 
     test("replacing borrowed clients unsubscribes local queries without closing either client", () => {
