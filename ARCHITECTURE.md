@@ -88,6 +88,10 @@ Gateway separately reserves capacity for at most 32 unsettled mutations on one v
 
 Gateway measures each inbound WebSocket text frame as UTF-8 before wire decoding. It accepts exactly 1 MiB and closes larger frames with code 1009 without dispatching or persisting their contents. These limits do not complete the bounds for subscriptions, staged snapshots, presence state, other queues, or slow-consumer buffering.
 
+The browser client keeps at most 64 active subscription records. A valid subscription over the cap throws retryable `CDB_RATE_LIMITED` synchronously before it consumes an id, changes local state, or sends a frame. Reconnect resends the same records and ids without consuming more capacity. Unsubscribe removes its record before sending and releases the slot. Terminal session cleanup clears every record even if a listener throws. A synchronous subscribe-send failure removes the new record so reconnect cannot revive it. If an unsubscribe frame cannot be sent, the client closes the session rather than pretending server cleanup succeeded.
+
+The remaining resource work includes server-wide subscription bounds, staged snapshot counts, snapshot byte and row limits, optimistic row and patch limits, presence state, other queues, and slow-consumer backpressure.
+
 Durable Object SQLite transactions cannot span `await`. The atomic executor rejects native async handlers and thenables. Input validation and any external I/O must finish before entering the transaction.
 
 The typed Gateway dispatcher opens only mutations that declare `authority: "organization"` and an explicit ref. It passes the verified subject and the organization extracted from validated arguments to Catalog. Catalog re-derives current membership, role, roles, and global, tenant, and principal auth epochs. Gateway rejects missing, revoked, mismatched, or malformed authority before selecting Cdb, then reads the shard and schema epoch and sends one serializable request.
