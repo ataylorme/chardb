@@ -92,9 +92,13 @@ Gateway measures each inbound WebSocket text frame as UTF-8 before wire decoding
 
 The browser client keeps at most 64 active subscription records. A valid subscription over the cap throws retryable `CDB_RATE_LIMITED` synchronously before it consumes an id, changes local state, or sends a frame. Reconnect resends the same records and ids without consuming more capacity. Unsubscribe removes its record before sending and releases the slot. Terminal session cleanup clears every record even if a listener throws. A synchronous subscribe-send failure removes the new record so reconnect cannot revive it. If an unsubscribe frame cannot be sent, the client closes the session rather than pretending server cleanup succeeded.
 
+For a new snapshot cookie, the client accepts up to 4,096 rows and the exact 512 KiB serialized JSON boundary. A same-cookie snapshot takes the duplicate path first. The client re-acknowledges it and ignores its rows without sizing or applying them. Canonical server patch batches and cross-tab optimistic batches accept up to 4,096 items and 512 KiB. The client preflights the whole batch and every patch row before any subscription lookup. Cross-tab input passes the same preflight before JSON stringify and wire decoding.
+
+Patch application builds and validates every affected subscription state before changing any record. Each resulting row cache has the same 4,096-row and 512 KiB limits. Optimistic history accepts up to 4,096 patches and 512 KiB. After all plans pass, the client commits every cache and history, then invokes listeners. Malformed or oversized snapshots, patches, caches, or histories fail the session with `CDB_INVARIANT` and no partial state application.
+
 Each Gateway admits at most 256 aggregate current and pending logical registrations. The admission check counts durable current heads from SQLite, so restart does not reset capacity. A replacement with the same principal, client, and subscription key reuses its slot. A second pending request for that key on another connection receives retryable `CDB_RATE_LIMITED` instead of racing the first installation. New work over the aggregate cap is rejected before query routing, Catalog authority or placement reads, Cdb RPCs, or durable installation.
 
-The remaining resource work includes independent mutation-argument and write-volume bounds, client inbound row and patch limits, durable total-byte limits, presence state, other queues, slow-consumer backpressure, and retention watermarks.
+The remaining resource work includes independent mutation-argument and write-volume bounds, durable total-byte limits, presence state, other queues, slow-consumer backpressure, and retention watermarks.
 
 Durable Object SQLite transactions cannot span `await`. The atomic executor rejects native async handlers and thenables. Input validation and any external I/O must finish before entering the transaction.
 
