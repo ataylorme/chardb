@@ -61,6 +61,7 @@ describe("Gateway public durable registration", () => {
     let clock: number;
     let currentAlarm: number | null;
     let alarmFailures: number;
+    let transactionCommitFailures: number;
     let subscribeCalls: CdbSubscriptionRequest[];
     let unsubscribeCalls: LiveSubscriptionId[];
     let registeredQueryCalls: unknown[];
@@ -87,6 +88,7 @@ describe("Gateway public durable registration", () => {
         clock = 100;
         currentAlarm = null;
         alarmFailures = 0;
+        transactionCommitFailures = 0;
         subscribeCalls = [];
         unsubscribeCalls = [];
         registeredQueryCalls = [];
@@ -154,6 +156,34 @@ describe("Gateway public durable registration", () => {
                         throw new Error("alarm unavailable");
                     }
                     currentAlarm = value instanceof Date ? value.getTime() : value;
+                },
+                transaction: async <T>(callback: (transaction: DurableObjectTransaction) => Promise<T>) => {
+                    const originalAlarm = currentAlarm;
+                    let stagedAlarm = currentAlarm;
+                    db.exec("BEGIN IMMEDIATE");
+                    try {
+                        const result = await callback({
+                            getAlarm: async () => stagedAlarm,
+                            setAlarm: async (value: number | Date) => {
+                                if (alarmFailures > 0) {
+                                    alarmFailures -= 1;
+                                    throw new Error("alarm unavailable");
+                                }
+                                stagedAlarm = value instanceof Date ? value.getTime() : value;
+                            },
+                        } as DurableObjectTransaction);
+                        if (transactionCommitFailures > 0) {
+                            transactionCommitFailures -= 1;
+                            throw new Error("transaction commit unavailable");
+                        }
+                        db.exec("COMMIT");
+                        currentAlarm = stagedAlarm;
+                        return result;
+                    } catch (error) {
+                        db.exec("ROLLBACK");
+                        currentAlarm = originalAlarm;
+                        throw error;
+                    }
                 },
             },
             getWebSockets: () => [socket] as unknown as WebSocket[],
@@ -371,7 +401,7 @@ describe("Gateway public durable registration", () => {
         expect(currentAlarm).toBe(101);
     });
 
-    test("unsubscribe recovers a failed pre-arm without retaining the live head", async () => {
+    test("unsubscribe retires the head in the transaction that owns its cleanup alarm", async () => {
         await subscribe();
         await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
         const subscription = subscribeCalls[0]?.subscription;
@@ -379,41 +409,21 @@ describe("Gateway public durable registration", () => {
         currentAlarm = null;
         alarmFailures = 1;
 
-        await gateway.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({ t: "unsub", subId: 1 }));
-
-        expect(head()).toBeNull();
-        expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "retiring", retry_at: 100 });
-        expect(currentAlarm as number | null).toBe(101);
-        expect(socket.attachment.snapshotSubIds).toEqual([]);
-
-        clock = 101;
-        currentAlarm = null;
-        await gateway.alarm();
-        expect(unsubscribeCalls).toEqual([subscription]);
-        expect(generation()).toBeNull();
-    });
-
-    test("unsubscribe clears attachment state when both alarm writes fail", async () => {
-        await subscribe();
-        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
-        const subscription = subscribeCalls[0]?.subscription;
-        if (!subscription) throw new Error("subscribe call was not recorded");
-        currentAlarm = null;
-        alarmFailures = 2;
-
         await expect(
             gateway.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({ t: "unsub", subId: 1 }))
         ).rejects.toThrow("alarm unavailable");
 
+        expect(head()).not.toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "active", cdb_state: "active", retry_at: null });
+        expect(socket.attachment.snapshotSubIds).toEqual([SubId(1)]);
+        expect(currentAlarm).toBeNull();
+        expect(unsubscribeCalls).toEqual([]);
+
+        await gateway.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({ t: "unsub", subId: 1 }));
         expect(head()).toBeNull();
         expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "retiring", retry_at: 100 });
-        expect(socket.attachment.snapshotSubIds).toEqual([]);
-        expect(currentAlarm).toBeNull();
-
-        alarmFailures = 0;
-        gateway = createGateway();
-        await ready;
         expect(currentAlarm as number | null).toBe(101);
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
 
         clock = 101;
         currentAlarm = null;
@@ -422,23 +432,40 @@ describe("Gateway public durable registration", () => {
         expect(generation()).toBeNull();
     });
 
-    test("socket close leaves bootstrap-owned cleanup when both alarm writes fail", async () => {
+    test("unsubscribe rolls back its alarm when the retirement transaction cannot commit", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        currentAlarm = null;
+        transactionCommitFailures = 1;
+
+        await expect(
+            gateway.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({ t: "unsub", subId: 1 }))
+        ).rejects.toThrow("transaction commit unavailable");
+
+        expect(head()).not.toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "active", cdb_state: "active", retry_at: null });
+        expect(socket.attachment.snapshotSubIds).toEqual([SubId(1)]);
+        expect(currentAlarm).toBeNull();
+    });
+
+    test("socket close does not retire the head unless it owns a cleanup alarm", async () => {
         await subscribe();
         await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
         const subscription = subscribeCalls[0]?.subscription;
         if (!subscription) throw new Error("subscribe call was not recorded");
         currentAlarm = null;
-        alarmFailures = 2;
+        alarmFailures = 1;
 
         await expect(gateway.webSocketClose(socket as unknown as WebSocket)).rejects.toThrow("alarm unavailable");
 
+        expect(head()).not.toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "active", cdb_state: "active", retry_at: null });
+        expect(currentAlarm).toBeNull();
+        expect(unsubscribeCalls).toEqual([]);
+
+        await gateway.webSocketClose(socket as unknown as WebSocket);
         expect(head()).toBeNull();
         expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "retiring", retry_at: 100 });
-        expect(currentAlarm).toBeNull();
-
-        alarmFailures = 0;
-        gateway = createGateway();
-        await ready;
         expect(currentAlarm as number | null).toBe(101);
 
         clock = 101;

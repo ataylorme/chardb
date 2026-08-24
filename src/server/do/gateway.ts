@@ -2253,17 +2253,24 @@ export class Gateway extends DurableObject<GatewayEnv> {
         return Date.now();
     }
 
+    private serializeGatewayAlarmOperation<T>(operation: () => Promise<T>): Promise<T> {
+        const scheduled = this.alarmScheduler.then(operation);
+        this.alarmScheduler = scheduled.then(
+            () => {},
+            () => {}
+        );
+        return scheduled;
+    }
+
     /** Serialize every Gateway alarm write and preserve any earlier durable deadline. */
     protected scheduleGatewayAlarm(requestedAt: number): Promise<void> {
         assertNonnegativeSafeInteger(requestedAt, "requestedAt");
-        const scheduled = this.alarmScheduler.then(async () => {
+        return this.serializeGatewayAlarmOperation(async () => {
             const current = await this.ctx.storage.getAlarm();
             if (current === null || requestedAt < current) {
                 await this.ctx.storage.setAlarm(requestedAt);
             }
         });
-        this.alarmScheduler = scheduled.catch(() => {});
-        return scheduled;
     }
 
     private dueGatewayRunCandidates(nowMs: number): readonly StoredGatewayRunCandidate[] {
@@ -2852,25 +2859,16 @@ export class Gateway extends DurableObject<GatewayEnv> {
         await this.scheduleGatewayAlarm(Math.max(nowMs + 1, Math.min(...due)));
     }
 
-    /**
-     * Pre-arm cleanup, then retire the logical head. If pre-arming fails, the
-     * durable retirement still removes query ownership and the immediate alarm
-     * write gets one independent attempt. A later bootstrap can recover the
-     * headless cleanup row if both alarm writes fail.
-     */
+    /** Retire the logical head only in the transaction that owns its cleanup alarm. */
     private async retireGatewayStateWithCleanupAlarm(nowMs: number, retire: () => void): Promise<void> {
-        let prearmed = false;
-        try {
-            await this.scheduleGatewayAlarm(nowMs + GATEWAY_SUBSCRIBE_RECOVERY_MS);
-            prearmed = true;
-        } catch {}
-
-        retire();
-        try {
-            await this.scheduleGatewayWork(nowMs);
-        } catch (error) {
-            if (!prearmed) throw error;
-        }
+        const alarmAt = nowMs + 1;
+        await this.serializeGatewayAlarmOperation(() =>
+            this.ctx.storage.transaction(async transaction => {
+                const current = await transaction.getAlarm();
+                if (current === null || alarmAt < current) await transaction.setAlarm(alarmAt);
+                retire();
+            })
+        );
     }
 
     private async drainGatewayWork(): Promise<void> {
@@ -3114,13 +3112,11 @@ export class Gateway extends DurableObject<GatewayEnv> {
             }
             const nowMs = this.gatewayNowMs();
             await this.retireGatewayStateWithCleanupAlarm(nowMs, () => {
-                this.ctx.storage.transactionSync(() => {
-                    retireCurrentGatewayRegistrationsForConnection(
-                        adaptSqlStorage(this.ctx.storage.sql),
-                        attachment.connectionId,
-                        nowMs
-                    );
-                });
+                retireCurrentGatewayRegistrationsForConnection(
+                    adaptSqlStorage(this.ctx.storage.sql),
+                    attachment.connectionId,
+                    nowMs
+                );
             });
         }
     }
@@ -3626,22 +3622,20 @@ export class Gateway extends DurableObject<GatewayEnv> {
         if (pending) pending.cancelled = true;
         const nowMs = this.gatewayNowMs();
         await this.retireGatewayStateWithCleanupAlarm(nowMs, () => {
-            this.ctx.storage.transactionSync(() => {
-                retireCurrentGatewayRegistration(adaptSqlStorage(this.ctx.storage.sql), {
-                    principalId: att.principalId,
-                    clientId: att.clientId,
-                    subId: msg.subId,
-                    connectionId: att.connectionId,
-                    nowMs,
-                });
+            retireCurrentGatewayRegistration(adaptSqlStorage(this.ctx.storage.sql), {
+                principalId: att.principalId,
+                clientId: att.clientId,
+                subId: msg.subId,
+                connectionId: att.connectionId,
+                nowMs,
             });
-            if (att.snapshotSubIds?.includes(msg.subId)) {
-                ws.serializeAttachment({
-                    ...att,
-                    snapshotSubIds: att.snapshotSubIds.filter(subId => subId !== msg.subId),
-                } satisfies VerifiedGwAttachment);
-            }
         });
+        if (att.snapshotSubIds?.includes(msg.subId)) {
+            ws.serializeAttachment({
+                ...att,
+                snapshotSubIds: att.snapshotSubIds.filter(subId => subId !== msg.subId),
+            } satisfies VerifiedGwAttachment);
+        }
     }
 
     private onAck(ws: WebSocket, msg: Extract<Up, { t: "ack" }>): void {
