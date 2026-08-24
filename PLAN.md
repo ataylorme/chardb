@@ -95,7 +95,7 @@ The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lo
 - [x] Make date and boolean serialization agree with the adapter's capability claims.
 - [ ] Implement adapter transactions for multi-write auth operations, or state and enforce the smaller supported auth profile.
 - [ ] Add integration tests for sign-up or anonymous sign-in, session lookup by token, organization creation, membership lookup, active organization selection, and logout.
-- [x] Prove Better Auth anonymous sign-in, session lookup, idempotent demo organization selection, JWT issue, and a domain mutation in the clean packed chat consumer.
+- [x] Prove one Better Auth anonymous sign-in, session lookup, demo organization hook execution, JWT issue, and domain mutation in the clean packed chat consumer. Prove repeated-session idempotency in focused bootstrap tests.
 - [ ] Add a real workerd test that restarts the configured Catalog isolate and proves auth bootstrap and stored sessions survive.
 - [ ] Add one configured Better Auth plugin only after the core flow works.
 
