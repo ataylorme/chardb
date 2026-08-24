@@ -53,6 +53,7 @@ The configured Gateway owns partition extraction and manifest lookup. For a decl
 - [x] Remove the Worker `runMutation` RPC that returned only a vshard while dropping `mutId` and auth.
 - [x] Route with the organization extracted from validated arguments only after Catalog confirms the verified subject's membership in it.
 - [x] Read the current routing table and schema epoch from Catalog before invoking Cdb.
+- [x] Publish a successful Catalog cutover to the in-memory range cache only after the range, schema epoch, and migration guard commit durably. Leave the cache and durable state unchanged after a failed commit so retry can apply the cutover once.
 - [x] Catch local routing, Catalog, and Cdb failures and translate them to typed mutation responses.
 - [x] Preserve each error code's retryable flag and documentation URL in mutation wire responses.
 
@@ -102,7 +103,7 @@ The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lo
 - [ ] Add a versioned upgrade path for existing auth signatures instead of requiring pre-release Catalog recreation.
 - [x] Commit each auth write and every directly derivable old and new global, tenant, or principal epoch bump in one Catalog transaction.
 - [ ] Add placement metadata or explicit epoch-scope rules for indirect plugin relationships that lack conventional `organizationId` or `userId` fields.
-- [ ] Bound or replace the matched-row preload used to derive epoch scopes for bulk updates and deletes.
+- [x] Preflight auth bulk updates and deletes at 4,096 matched rows, 512 KiB of projected old and replacement scope values, and 512 KiB of mapped replacement values expanded across matched rows. Select only epoch-scope columns, fail with retryable `CDB_RATE_LIMITED` before base or epoch writes, and let `updateMany` skip full-row rereads.
 - [x] Make date and boolean serialization agree with the adapter's capability claims.
 - [ ] Implement adapter transactions for multi-write auth operations, or state and enforce the smaller supported auth profile.
 - [ ] Add integration tests for sign-up or anonymous sign-in, session lookup by token, organization creation, membership lookup, active organization selection, and logout.
@@ -123,6 +124,7 @@ The configured Gateway verifies JWT signatures and registered claims during `hel
 - [x] Reject missing, malformed, tampered, expired, not-yet-valid, wrong-issuer, wrong-audience, and disallowed-algorithm tokens.
 - [x] Admit only one `hello` or `updateAuth` operation per server connection id. Reject duplicates with retryable `CDB_RATE_LIMITED` before verification, Catalog access, attachment mutation, or refresh chaining. Release only the exact owning claim on every outcome. Keep an admitted `updateAuth` barrier visible to mutations and subscriptions while it drains admitted work, retires current durable registrations, and reports affected subscription ids through `mustRefetch`.
 - [x] On socket close, store a rejected attachment and fence authentication after every awaited verification, drain, alarm schedule, and invalidation, and before retirement or send, so queued work cannot dispatch after close.
+- [x] Serialize an authentication rejection before sending its error and closing the socket. Attempt close even if error send throws, preserve the send exception when both operations fail, propagate a lone close exception, and make repeated rejection an exactly-once no-op.
 - [x] Recheck token time bounds before every mutation, subscription, and presence operation.
 - [x] Stop deriving a principal from `clientId` for protected requests.
 - [x] Derive organization membership, role, roles, and auth epochs from Catalog for each declared organization mutation and exact-partition organization query. Treat the caller's validated organization only as the requested partition.
@@ -232,10 +234,12 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Reuse the original `mutId` when reconnect resends a mutation that remains pending, without resetting its deadline.
 - [x] Advance reconnect delay across every pre-welcome close from 250 ms through a 10-second cap. Reset to 250 ms only after an accepted `welcome`, not when the transport merely opens.
 - [x] Fence every client WebSocket callback and pending JWT continuation by terminal state, connection attempt, and exact socket identity. Revoke the current socket before processing error or close, ignore stale continuations and callbacks, and preserve the existing reconnect progression and welcome-only reset.
+- [x] Treat a thrown client `hello` send as a reconnectable socket failure. Revoke and close that attempt, retain queued subscriptions and mutations, then resend them once after a replacement socket receives `welcome`.
 - [x] On terminal client cleanup, clear each subscription's authoritative rows and optimistic history before its final empty listener notification. Continue clearing mutations, timers, socket, and broadcast state if one listener throws.
 - [x] Cap client pending mutation records at 32 across queued, in-flight, and reconnecting work. Validate refs first, then reject a valid 33rd immediately with retryable `CDB_RATE_LIMITED` before UUID allocation, timer creation, map insertion, or send. Preserve admitted ids and deadlines across reconnect and release capacity on every settlement and close path.
 - [x] Apply the strict 512 KiB, 4,096-member, 99-level JSON argument contract to client subscriptions as well as mutations. After ref validation, inspect descriptors and construct an owned snapshot in one traversal without invoking getters or rereading proxies. Finish this work before capacity checks, id allocation, mutation timers, record insertion, or send as applicable, then reuse the same owned payload and ids for immediate send, welcome flush, and reconnect.
 - [x] Keep direct clients eager while deferring provider-created client startup until the React effect commits. Close only clients the provider created, preserve a same-object transfer to borrowed ownership, and avoid WebSocket, JWT, or broadcast work for aborted renders and StrictMode rehearsals. Reset `useQuery` to pending when client, ref, or argument identity changes, and ignore late listeners from the previous identity. Keep public exports unchanged.
+- [x] When `ChardbProvider` receives an explicit stable `getJwt`, let an auth-prop-only update change session context without replacing its owned client, socket, subscriptions, or pending mutations. Keep auth-derived JWT clients dependent on the auth object and replace them when it changes.
 - [ ] Expose a public retry handle and define an automatic retry policy for terminal errors marked retryable.
 - [x] Preserve the last delivered nonempty cookie on mutation failures and across auth refresh.
 - [x] Return typed errors for malformed messages instead of accepting any object with a known `t` field.
