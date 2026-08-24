@@ -75,5 +75,14 @@ export function adaptSqlStorage(storage: SqlStorageLike | SqlStorage): SyncSql {
             }
             return row ? Number((row[0] as number | bigint) ?? 0) : 0;
         },
+        totalChanges() {
+            const c = s.exec("SELECT total_changes() AS total_changes");
+            let row: unknown[] | undefined;
+            for (const r of c.raw()) {
+                row = r;
+                break;
+            }
+            return row ? ((row[0] as number | bigint) ?? 0) : 0;
+        },
     };
 }

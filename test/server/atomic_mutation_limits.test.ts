@@ -1,10 +1,15 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { text } from "drizzle-orm/sqlite-core";
+import { eq, lte } from "drizzle-orm";
+import { integer, text } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../../src/errors.ts";
 import { OP_LOG_DDL } from "../../src/oplog/schema.ts";
 import { canonicalRequest, runWrappedMutation } from "../../src/oplog/wrapper.ts";
-import { executeAtomicMutation } from "../../src/server/atomic-mutation.ts";
+import {
+    CDB_MUTATION_MAX_ROWS_WRITTEN,
+    CDB_MUTATION_MAX_WRITE_OPERATIONS,
+    executeAtomicMutation,
+} from "../../src/server/atomic-mutation.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { globalScope } from "../../src/server/index.ts";
 import { CDB_RESULT_MAX_BYTES } from "../../src/server/result_limits.ts";
@@ -15,9 +20,10 @@ interface Cursor<T> extends Iterable<T> {
     raw(): IterableIterator<unknown[]>;
 }
 
-function sqlStorage(db: Database) {
+function sqlStorage(db: Database, onExec?: (query: string) => void) {
     return {
         exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): Cursor<T> {
+            onExec?.(query);
             const statement = db.prepare(query);
             const rows = statement.all(...(bindings as never[])) as Record<string, unknown>[];
             const columnNames = [...statement.columnNames];
@@ -39,16 +45,18 @@ const entries = cdbTable(
     {
         id: text("id").primaryKey(),
         value: text("value").notNull(),
+        ordinal: integer("ordinal").notNull(),
     },
-    { partitionBy: "id", roles: { member: { create: "*", read: "*" } } }
+    { partitionBy: "id", roles: { member: { create: "*", read: "*", update: "*", delete: true } } }
 );
 const schema = { entries };
 
-describe("atomic mutation result limits", () => {
+describe("atomic mutation limits", () => {
     let db: Database;
     let storage: DurableObjectStorage;
     let handlerRuns: number;
     let hookRuns: number;
+    let domainWriteExecutions: number;
 
     beforeEach(() => {
         db = new Database(":memory:");
@@ -57,9 +65,21 @@ describe("atomic mutation result limits", () => {
             .filter(Boolean)) {
             db.run(statement);
         }
-        db.run("CREATE TABLE mutation_limit_entries (id TEXT PRIMARY KEY, value TEXT NOT NULL)");
+        db.run(
+            "CREATE TABLE mutation_limit_entries (id TEXT PRIMARY KEY, value TEXT NOT NULL, ordinal INTEGER NOT NULL)"
+        );
+        domainWriteExecutions = 0;
         storage = {
-            sql: sqlStorage(db),
+            sql: sqlStorage(db, query => {
+                const normalized = query.replaceAll('"', "").trim().toLowerCase();
+                if (
+                    normalized.startsWith("insert into mutation_limit_entries") ||
+                    normalized.startsWith("update mutation_limit_entries") ||
+                    normalized.startsWith("delete from mutation_limit_entries")
+                ) {
+                    domainWriteExecutions++;
+                }
+            }),
             transactionSync: <T>(callback: () => T): T => db.transaction(callback)(),
         } as unknown as DurableObjectStorage;
         handlerRuns = 0;
@@ -89,7 +109,7 @@ describe("atomic mutation result limits", () => {
             nowMs: 1_700_000_000_000,
             handler: ({ db: mutationDb }, request) => {
                 handlerRuns++;
-                mutationDb.insert(entries).values({ id: request.id, value: "written" }).run();
+                mutationDb.insert(entries).values({ id: request.id, value: "written", ordinal: 0 }).run();
                 if (args.throwError) throw new Error("handler failure unchanged");
                 return args.result;
             },
@@ -103,6 +123,17 @@ describe("atomic mutation result limits", () => {
         const domain = db.query("SELECT COUNT(*) AS count FROM mutation_limit_entries").get() as { count: number };
         const opLog = db.query("SELECT COUNT(*) AS count FROM _chardb_op_log").get() as { count: number };
         return { domain: domain.count, opLog: opLog.count };
+    }
+
+    function expectTerminalInvariant(run: () => unknown, message: string): void {
+        let captured: unknown;
+        try {
+            run();
+        } catch (error) {
+            captured = error;
+        }
+        expect(captured).toBeInstanceOf(CdbError);
+        expect(captured).toMatchObject({ code: "CDB_INVARIANT", retryable: false, message });
     }
 
     test("accepts the exact byte boundary and replays the stored result without rerunning the handler", () => {
@@ -209,5 +240,295 @@ describe("atomic mutation result limits", () => {
         expect(handlerRuns).toBe(1);
         expect(hookRuns).toBe(0);
         expect(durableCounts()).toEqual({ domain: 0, opLog: 0 });
+    });
+
+    function executeWriteVolume(args: {
+        readonly mutId: string;
+        readonly handler: Parameters<typeof executeAtomicMutation<typeof schema, RawJson, RawJson>>[0]["handler"];
+    }) {
+        return executeAtomicMutation({
+            storage,
+            schema,
+            request: {
+                principalId: "mutation-limit-user",
+                mutId: args.mutId,
+                ref: "mutations.ts#writeVolume",
+                args: {},
+                auth: { userId: "mutation-limit-user", roles: ["member"], claims: {} },
+                schemaEpoch: 1,
+            },
+            cookie: `cookie:${args.mutId}`,
+            nowMs: 1_700_000_000_000,
+            handler: args.handler,
+            onWriteSet: () => {
+                hookRuns++;
+            },
+        });
+    }
+
+    test("accepts exactly 256 successful write statements and rejects the next one atomically", () => {
+        const atLimit = executeWriteVolume({
+            mutId: "operation-boundary",
+            handler: ({ db: mutationDb }) => {
+                for (let ordinal = 0; ordinal < CDB_MUTATION_MAX_WRITE_OPERATIONS; ordinal++) {
+                    mutationDb
+                        .insert(entries)
+                        .values({ id: `operation-${ordinal}`, value: "written", ordinal })
+                        .run();
+                }
+                return null;
+            },
+        });
+        expect(atLimit).toMatchObject({ ran: true, touchedTables: ["mutation_limit_entries"] });
+        expect(durableCounts()).toEqual({ domain: CDB_MUTATION_MAX_WRITE_OPERATIONS, opLog: 1 });
+        expect(hookRuns).toBe(1);
+
+        expectTerminalInvariant(
+            () =>
+                executeWriteVolume({
+                    mutId: "operation-over",
+                    handler: ({ db: mutationDb }) => {
+                        for (let ordinal = 0; ordinal <= CDB_MUTATION_MAX_WRITE_OPERATIONS; ordinal++) {
+                            mutationDb
+                                .insert(entries)
+                                .values({ id: `operation-over-${ordinal}`, value: "written", ordinal })
+                                .run();
+                        }
+                        return null;
+                    },
+                }),
+            `mutation exceeds the ${CDB_MUTATION_MAX_WRITE_OPERATIONS}-operation write limit`
+        );
+        expect(durableCounts()).toEqual({ domain: CDB_MUTATION_MAX_WRITE_OPERATIONS, opLog: 1 });
+        expect(hookRuns).toBe(1);
+    });
+
+    test("counts insert batches plus update and delete affected rows at the 4096-row boundary", () => {
+        const rows = Array.from({ length: CDB_MUTATION_MAX_ROWS_WRITTEN }, (_, ordinal) => ({
+            id: `row-${ordinal}`,
+            value: "initial",
+            ordinal,
+        }));
+        const atLimit = executeWriteVolume({
+            mutId: "row-boundary",
+            handler: ({ db: mutationDb }) => {
+                mutationDb.insert(entries).values(rows).run();
+                return null;
+            },
+        });
+        expect(atLimit).toMatchObject({ ran: true, rowsAffected: CDB_MUTATION_MAX_ROWS_WRITTEN });
+        expect(durableCounts()).toEqual({ domain: CDB_MUTATION_MAX_ROWS_WRITTEN, opLog: 1 });
+
+        expectTerminalInvariant(
+            () =>
+                executeWriteVolume({
+                    mutId: "row-over-update",
+                    handler: ({ db: mutationDb }) => {
+                        mutationDb.update(entries).set({ value: "updated" }).run();
+                        mutationDb
+                            .insert(entries)
+                            .values({ id: "row-over-update", value: "written", ordinal: CDB_MUTATION_MAX_ROWS_WRITTEN })
+                            .run();
+                        return null;
+                    },
+                }),
+            `mutation exceeds the ${CDB_MUTATION_MAX_ROWS_WRITTEN}-row write limit`
+        );
+        expect(db.query("SELECT COUNT(*) AS count FROM mutation_limit_entries WHERE value = 'updated'").get()).toEqual({
+            count: 0,
+        });
+        expect(durableCounts()).toEqual({ domain: CDB_MUTATION_MAX_ROWS_WRITTEN, opLog: 1 });
+
+        expectTerminalInvariant(
+            () =>
+                executeWriteVolume({
+                    mutId: "row-over-delete",
+                    handler: ({ db: mutationDb }) => {
+                        mutationDb
+                            .delete(entries)
+                            .where(lte(entries.ordinal, CDB_MUTATION_MAX_ROWS_WRITTEN - 1))
+                            .run();
+                        mutationDb
+                            .insert(entries)
+                            .values({ id: "row-over-delete", value: "written", ordinal: CDB_MUTATION_MAX_ROWS_WRITTEN })
+                            .run();
+                        return null;
+                    },
+                }),
+            `mutation exceeds the ${CDB_MUTATION_MAX_ROWS_WRITTEN}-row write limit`
+        );
+        expect(durableCounts()).toEqual({ domain: CDB_MUTATION_MAX_ROWS_WRITTEN, opLog: 1 });
+    });
+
+    test("blocks every write after a caught limit violation and rolls back only the 256 executed statements", () => {
+        let caughtLimitErrors = 0;
+        expectTerminalInvariant(
+            () =>
+                executeWriteVolume({
+                    mutId: "caught-limit",
+                    handler: ({ db: mutationDb }) => {
+                        mutationDb.insert(entries).values({ id: "caught-limit", value: "initial", ordinal: 0 }).run();
+                        for (let ordinal = 0; ordinal < CDB_MUTATION_MAX_WRITE_OPERATIONS + 32; ordinal++) {
+                            try {
+                                mutationDb
+                                    .update(entries)
+                                    .set({ value: `caught-${ordinal}` })
+                                    .where(eq(entries.id, "caught-limit"))
+                                    .run();
+                            } catch (error) {
+                                expect(error).toBeInstanceOf(CdbError);
+                                caughtLimitErrors++;
+                            }
+                        }
+                        return null;
+                    },
+                }),
+            `mutation exceeds the ${CDB_MUTATION_MAX_WRITE_OPERATIONS}-operation write limit`
+        );
+        expect(caughtLimitErrors).toBe(33);
+        expect(domainWriteExecutions).toBe(CDB_MUTATION_MAX_WRITE_OPERATIONS);
+        expect(db.query("SELECT value FROM mutation_limit_entries WHERE id = 'caught-limit'").get()).toBeNull();
+        expect(db.query("SELECT mut_id FROM _chardb_op_log WHERE mut_id = 'caught-limit'").get()).toBeNull();
+        expect(hookRuns).toBe(0);
+    });
+
+    test("blocks later SQL after a handler catches the post-execution row limit", () => {
+        const rows = Array.from({ length: CDB_MUTATION_MAX_ROWS_WRITTEN + 1 }, (_, ordinal) => ({
+            id: `caught-row-${ordinal}`,
+            value: "initial",
+            ordinal,
+        }));
+        let caughtLimitErrors = 0;
+        expectTerminalInvariant(
+            () =>
+                executeWriteVolume({
+                    mutId: "caught-row-limit",
+                    handler: ({ db: mutationDb }) => {
+                        try {
+                            mutationDb.insert(entries).values(rows).run();
+                        } catch (error) {
+                            expect(error).toBeInstanceOf(CdbError);
+                            caughtLimitErrors++;
+                        }
+                        for (let ordinal = 0; ordinal < 3; ordinal++) {
+                            try {
+                                mutationDb
+                                    .insert(entries)
+                                    .values({ id: `blocked-after-row-${ordinal}`, value: "blocked", ordinal })
+                                    .run();
+                            } catch (error) {
+                                expect(error).toBeInstanceOf(CdbError);
+                                caughtLimitErrors++;
+                            }
+                        }
+                        return null;
+                    },
+                }),
+            `mutation exceeds the ${CDB_MUTATION_MAX_ROWS_WRITTEN}-row write limit`
+        );
+        expect(caughtLimitErrors).toBe(4);
+        expect(domainWriteExecutions).toBe(1);
+        expect(durableCounts()).toEqual({ domain: 0, opLog: 0 });
+        expect(hookRuns).toBe(0);
+    });
+
+    test("counts trigger fanout at 4096 and poisons later writes after 4097", () => {
+        db.run("CREATE TABLE mutation_limit_audit (id TEXT PRIMARY KEY)");
+        db.run(`CREATE TRIGGER mutation_limit_audit_each
+                AFTER INSERT ON mutation_limit_entries
+                BEGIN
+                    INSERT INTO mutation_limit_audit (id) VALUES ('audit:' || NEW.id);
+                END`);
+        db.run(`CREATE TRIGGER mutation_limit_audit_extra
+                AFTER INSERT ON mutation_limit_entries
+                WHEN NEW.id = 'fanout-over-extra'
+                BEGIN
+                    INSERT INTO mutation_limit_audit (id) VALUES ('extra:' || NEW.id);
+                END`);
+
+        const boundaryRows = Array.from({ length: CDB_MUTATION_MAX_ROWS_WRITTEN / 2 }, (_, ordinal) => ({
+            id: `fanout-boundary-${ordinal}`,
+            value: "boundary",
+            ordinal,
+        }));
+        expect(
+            executeWriteVolume({
+                mutId: "fanout-boundary",
+                handler: ({ db: mutationDb }) => {
+                    mutationDb.insert(entries).values(boundaryRows).run();
+                    return null;
+                },
+            })
+        ).toMatchObject({ ran: true, rowsAffected: boundaryRows.length });
+        expect(durableCounts()).toEqual({ domain: boundaryRows.length, opLog: 1 });
+        expect(db.query("SELECT COUNT(*) AS count FROM mutation_limit_audit").get()).toEqual({
+            count: boundaryRows.length,
+        });
+
+        const overRows = Array.from({ length: CDB_MUTATION_MAX_ROWS_WRITTEN / 2 }, (_, ordinal) => ({
+            id: ordinal === 0 ? "fanout-over-extra" : `fanout-over-${ordinal}`,
+            value: "over",
+            ordinal,
+        }));
+        domainWriteExecutions = 0;
+        let caughtLimitErrors = 0;
+        expectTerminalInvariant(
+            () =>
+                executeWriteVolume({
+                    mutId: "fanout-over",
+                    handler: ({ db: mutationDb }) => {
+                        try {
+                            mutationDb.insert(entries).values(overRows).run();
+                        } catch (error) {
+                            expect(error).toBeInstanceOf(CdbError);
+                            caughtLimitErrors++;
+                        }
+                        for (let ordinal = 0; ordinal < 3; ordinal++) {
+                            try {
+                                mutationDb
+                                    .insert(entries)
+                                    .values({ id: `fanout-blocked-${ordinal}`, value: "blocked", ordinal })
+                                    .run();
+                            } catch (error) {
+                                expect(error).toBeInstanceOf(CdbError);
+                                caughtLimitErrors++;
+                            }
+                        }
+                        return null;
+                    },
+                }),
+            `mutation exceeds the ${CDB_MUTATION_MAX_ROWS_WRITTEN}-row write limit`
+        );
+        expect(caughtLimitErrors).toBe(4);
+        expect(domainWriteExecutions).toBe(1);
+        expect(durableCounts()).toEqual({ domain: boundaryRows.length, opLog: 1 });
+        expect(db.query("SELECT COUNT(*) AS count FROM mutation_limit_audit").get()).toEqual({
+            count: boundaryRows.length,
+        });
+        expect(hookRuns).toBe(1);
+    });
+
+    test("replay bypasses the handler and write-volume accounting", () => {
+        const first = executeWriteVolume({
+            mutId: "write-volume-replay",
+            handler: ({ db: mutationDb }) => {
+                mutationDb.insert(entries).values({ id: "write-volume-replay", value: "stored", ordinal: 0 }).run();
+                return { stored: true };
+            },
+        });
+        expect(first).toMatchObject({ ran: true, result: { stored: true } });
+        expect(hookRuns).toBe(1);
+
+        let replayHandlerRuns = 0;
+        const replay = executeWriteVolume({
+            mutId: "write-volume-replay",
+            handler: () => {
+                replayHandlerRuns++;
+                throw new Error("replay handler must not run");
+            },
+        });
+        expect(replay).toMatchObject({ ran: false, result: { stored: true }, touchedTables: [] });
+        expect(replayHandlerRuns).toBe(0);
+        expect(hookRuns).toBe(1);
     });
 });

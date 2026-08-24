@@ -10,6 +10,9 @@ import { assertCdbResultByteLimit } from "./result_limits.ts";
 
 export type AtomicMutationDb<TSchema extends Record<string, unknown>> = DrizzleSqliteDODatabase<TSchema>;
 
+export const CDB_MUTATION_MAX_WRITE_OPERATIONS = 256;
+export const CDB_MUTATION_MAX_ROWS_WRITTEN = 4_096;
+
 export interface AtomicMutationRequest<TArgs extends RawJson> {
     readonly principalId: string;
     readonly mutId: string;
@@ -77,7 +80,13 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
     const sql = adaptSqlStorage(input.storage.sql);
     const rawDb = drizzle(input.storage, { schema: input.schema });
     const touchedTables = new Set<string>();
-    const db = wrapMutationDb(rawDb, input.request.auth, tableName => touchedTables.add(tableName));
+    const writeVolume = mutationWriteVolume(sql, touchedTables);
+    const db = wrapMutationDb(
+        rawDb,
+        input.request.auth,
+        tableName => writeVolume.record(tableName),
+        () => writeVolume.beforeWrite()
+    );
     let wrappedResult: ReturnType<typeof runWrappedMutation<TResult>> | undefined;
     let committedTouchedTables: readonly string[] = [];
 
@@ -95,6 +104,7 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
                 if (isThenable(result)) {
                     throw asyncHandlerError();
                 }
+                writeVolume.assertWithinLimits();
                 const jsonResult = rawJsonResult(result, "mutation result");
                 assertCdbResultByteLimit(
                     jsonResult,
@@ -138,6 +148,100 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
         result: wrappedResult.envelope.result ?? null,
         rowsAffected: wrappedResult.envelope.rowsAffected,
         touchedTables: committedTouchedTables,
+    };
+}
+
+interface MutationWriteVolume {
+    beforeWrite(): () => void;
+    record(tableName: string): void;
+    assertWithinLimits(): void;
+}
+
+function mutationWriteVolume(sql: SyncSql, touchedTables: Set<string>): MutationWriteVolume {
+    let operations = 0;
+    let rows = 0n;
+    let violation: CdbError | undefined;
+    let totalChangesBeforeWrite: bigint | undefined;
+
+    const assertWithinLimits = (): void => {
+        if (violation) throw violation;
+    };
+
+    const readTotalChanges = (): bigint => {
+        let rawTotal: number | bigint;
+        try {
+            if (!sql.totalChanges) throw new TypeError("SQL adapter does not expose total_changes()");
+            rawTotal = sql.totalChanges();
+        } catch (cause) {
+            violation ??= new CdbError({
+                code: "CDB_INVARIANT",
+                message: "could not measure mutation write volume",
+                cause,
+            });
+            assertWithinLimits();
+            return 0n;
+        }
+        if (
+            (typeof rawTotal === "number" && (!Number.isSafeInteger(rawTotal) || rawTotal < 0)) ||
+            (typeof rawTotal === "bigint" && rawTotal < 0n)
+        ) {
+            violation ??= new CdbError({
+                code: "CDB_INVARIANT",
+                message: "mutation write volume returned an invalid total-change count",
+            });
+            assertWithinLimits();
+        }
+        return BigInt(rawTotal);
+    };
+
+    return {
+        beforeWrite() {
+            assertWithinLimits();
+            if (operations >= CDB_MUTATION_MAX_WRITE_OPERATIONS) {
+                violation = new CdbError({
+                    code: "CDB_INVARIANT",
+                    message: `mutation exceeds the ${CDB_MUTATION_MAX_WRITE_OPERATIONS}-operation write limit`,
+                    hint: "split the mutation into smaller atomic operations",
+                });
+                assertWithinLimits();
+            }
+            if (totalChangesBeforeWrite !== undefined) {
+                violation = new CdbError({
+                    code: "CDB_INVARIANT",
+                    message: "mutation write-volume measurement overlapped another statement",
+                });
+                assertWithinLimits();
+            }
+            totalChangesBeforeWrite = readTotalChanges();
+            return () => {
+                totalChangesBeforeWrite = undefined;
+            };
+        },
+        record(tableName) {
+            touchedTables.add(tableName);
+            operations++;
+            const before = totalChangesBeforeWrite;
+            const after = readTotalChanges();
+            totalChangesBeforeWrite = undefined;
+            if (before === undefined || after < before) {
+                violation ??= new CdbError({
+                    code: "CDB_INVARIANT",
+                    message: "mutation write volume returned an invalid total-change interval",
+                });
+                assertWithinLimits();
+                return;
+            }
+            rows += after - before;
+            if (rows > BigInt(CDB_MUTATION_MAX_ROWS_WRITTEN)) {
+                violation ??= new CdbError({
+                    code: "CDB_INVARIANT",
+                    message: `mutation exceeds the ${CDB_MUTATION_MAX_ROWS_WRITTEN}-row write limit`,
+                    hint: "split the mutation into smaller atomic operations",
+                });
+            }
+            assertWithinLimits();
+        },
+        assertWithinLimits,
     };
 }
 

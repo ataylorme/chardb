@@ -59,6 +59,8 @@ export interface SyncSql {
     all<T = Record<string, SqlValue>>(sql: string, ...params: SqlParam[]): T[];
     /** Number of rows affected by the last data-modifying statement on this connection. */
     changes(): number;
+    /** Total connection writes, including trigger programs and foreign-key actions. */
+    totalChanges?(): number | bigint;
 }
 
 export type SqlValue = string | number | bigint | Uint8Array | null;
