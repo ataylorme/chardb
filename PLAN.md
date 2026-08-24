@@ -113,7 +113,7 @@ The configured Gateway verifies JWT signatures and registered claims during `hel
 - [x] Stop deriving a principal from `clientId` for protected requests.
 - [x] Derive organization membership, role, roles, and auth epochs from Catalog for each declared organization mutation and exact-partition organization query. Treat the caller's validated organization only as the requested partition.
 - [x] Build mutation and initial-query `ctx.auth` only after JWT verification and Catalog membership resolution.
-- [ ] Define the anonymous query behavior explicitly.
+- [x] Define and prove the anonymous query contract. Subjectless Gateway queries stay closed. Better Auth anonymous accounts become authenticated principals after JWT issuance and organization membership. `publicRead` removes only the table-role requirement for selects, not JWT, membership, tenant isolation, writes, or cross-organization isolation. The 4/4 workerd proof covers an own-organization read, cross-organization denial, denial for a missing JWT, and denial for an invalid JWT.
 - [x] Test real signed tokens, tampering, expiry, not-before, issuer, audience, algorithm, subject refresh, and the Catalog resolver contract.
 - [x] Test the configured Gateway WebSocket dispatch under workerd with real Catalog SQLite cache and ES256 tokens.
 - [x] Prove a later revocation blocks the next mutation, while documenting that the Catalog authority read does not cancel an already-authorized in-flight Cdb call.
@@ -139,7 +139,7 @@ The database proxy now applies one explicit rule to registered-table inserts, up
 - [ ] Compile safe readable-column masks for projections and joins. Keep those shapes blocked until then.
 - [x] Block raw SQL, session and client access, relational shortcuts, plain-table CRUD, insert-select, conflict methods, `returning`, and unsupported pre-policy builder paths from application handlers.
 - [x] Prove in workerd that a raw escape after typed SQL rolls back both that SQL and the provisional op-log row.
-- [ ] Remove unused policy-digest and auth-epoch claims, or wire them into actual subscription identity and invalidation.
+- [x] Replace the unused generic policy-digest claim with a static digest of declared `cdbTable` row and column policy metadata and bind it to registered-query identity.
 - [ ] Add hostile two-tenant tests for every CRUD operation.
 - [ ] Test admin, member, self, public read, no matching role, forbidden columns, explicit tenant override, and membership revocation.
 
@@ -154,7 +154,7 @@ Protocol v3 subscription requests send a query reference and raw arguments. For 
 - [x] Evaluate the developer-declared intent callback on the server. Do not trust client-supplied intent or a client query hash.
 - [x] Canonicalize the query ref, validated arguments, and server-evaluated declared intent into a query hash used by persisted Cdb registrations and deploy-drift checks.
 - [x] Persist principal and organization identity on Cdb registrations and require freshly derived tenant authority when executing the registered-query RPC.
-- [ ] Add a real policy epoch or digest to registered-query identity once that value is derived and enforced.
+- [x] Derive and enforce the static `cdbTable` policy digest in Gateway and Cdb registered-query identity, including legacy-registration retirement and staged-snapshot send fencing.
 - [x] Route explicit organization queries only when the validated partition metadata and server-evaluated declared intent resolve to the same exact organization and one virtual shard.
 - [x] Enumerate distinct current Catalog shard ids for scatter routing instead of probing virtual shards.
 - [x] Construct `QueryCtx` with a read-only database and the auth carried by the internal request.
@@ -178,7 +178,7 @@ Do not start with incremental row patches. Re-run the affected query after a com
 - [x] Persist exact Cdb generation identity, principal, organization, query ref, arguments, query hash, tables, and intervals; retain retired tombstones so stale subscribe replays cannot reactivate a generation.
 - [x] Rebuild active Cdb generation identity and the in-memory interval index from SQLite when Cdb starts.
 - [x] Persist durable Gateway logical heads and generation rows with organization, logical shard, physical Cdb ID, schema epoch, three auth epochs, lifecycle, cookie, retry, and delivery fields.
-- [ ] Derive and persist a policy epoch or digest for Gateway registrations.
+- [x] Persist the static `cdbTable` policy digest on Gateway registrations and retire a generation when current metadata no longer matches it.
 - [x] Collect deterministic registered-table write sets inside successful newly-run atomic mutations without exposing them on the public mutation wire result.
 - [x] Advance the Cdb change clock and coalesce table-matched registrations into the invalidation outbox inside the same transaction as the domain write and op-log.
 - [x] Deliver bounded invalidation batches from Cdb to the physical Gateway ID with durable alarms, retries, conditional acknowledgement deletes, and dead-letter state.

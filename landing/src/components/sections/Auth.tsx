@@ -17,10 +17,12 @@ export function Auth() {
                 items={[
                     "Catalog-backed Better Auth models and signed Gateway identity",
                     "declared organization writes use current membership, roles, auth epochs, row predicates, and column rules",
+                    "publicRead still requires JWT identity, organization membership, and tenant isolation",
                     "dirty live reruns re-read membership and roles on long-lived sockets",
                     "tracked query tables must appear in the declared live intent",
+                    "registered queries bind to a static digest of declared table policy metadata",
                     "durable delivery retries until an exact client acknowledgement",
-                    "packed replay and cross-organization denial pass for two anonymous principals",
+                    "Better Auth anonymous accounts become JWT-authenticated principals",
                     "resume replay, packed restart, JWKS rotation, and migrations remain unfinished",
                 ]}
             />
