@@ -8,6 +8,7 @@ interface Env {
 }
 
 interface GatewayLiveState {
+    readonly instanceId: string;
     readonly registrations: readonly {
         readonly registrationId: string;
         readonly connectionId: string;
@@ -28,6 +29,7 @@ interface GatewayLiveState {
 }
 
 interface CdbLiveState {
+    readonly instanceId: string;
     readonly subscriptions: readonly {
         readonly gatewayId: string;
         readonly registrationId: string;
@@ -46,12 +48,29 @@ interface CdbLiveState {
 export { Catalog };
 
 export class Gateway extends ProductionGateway {
+    private readonly fixtureInstanceId = crypto.randomUUID();
+    private fixtureNowSequence: number[] = [];
+
     // Tests call fixtureDrain after they inspect each durable transition. Keep
     // workerd's alarm delivery from racing those assertions.
     override async alarm(): Promise<void> {}
 
+    protected override gatewayNowMs(): number {
+        return this.fixtureNowSequence.shift() ?? super.gatewayNowMs();
+    }
+
     async fixtureDrain(): Promise<void> {
         await super.alarm();
+    }
+
+    async fixtureStageOnly(): Promise<void> {
+        const nowMs = super.gatewayNowMs();
+        this.fixtureNowSequence = [nowMs, nowMs, nowMs + 1, nowMs, nowMs];
+        try {
+            await super.alarm();
+        } finally {
+            this.fixtureNowSequence = [];
+        }
     }
 
     fixtureLiveState(): GatewayLiveState {
@@ -84,6 +103,7 @@ export class Gateway extends ProductionGateway {
              ORDER BY g.created_at, g.registration_id`
         );
         return {
+            instanceId: this.fixtureInstanceId,
             registrations: rows.map(row => ({
                 registrationId: row.registration_id,
                 connectionId: row.connection_id,
@@ -106,9 +126,21 @@ export class Gateway extends ProductionGateway {
 }
 
 export class Cdb extends ProductionCdb {
+    private readonly fixtureInstanceId = crypto.randomUUID();
+
+    fixtureMatchOrganization(): CdbLiveState["subscriptions"] {
+        const matched = this.matchSubsForRow("gateway_writes", [
+            { indexName: "organization_id", key: ["workerd-org"] },
+        ]);
+        const state = this.fixtureLiveState();
+        const registrationIds = new Set(matched.map(subscription => subscription.registrationId));
+        return state.subscriptions.filter(subscription => registrationIds.has(subscription.registrationId));
+    }
+
     fixtureLiveState(): CdbLiveState {
         const sql = adaptSqlStorage(this.ctx.storage.sql);
         return {
+            instanceId: this.fixtureInstanceId,
             subscriptions: sql
                 .all<{
                     gateway_id: string;
@@ -147,17 +179,23 @@ export class Cdb extends ProductionCdb {
 
 interface GatewayFixtureRpc {
     fixtureDrain(): Promise<void>;
+    fixtureStageOnly(): Promise<void>;
     fixtureLiveState(): Promise<GatewayLiveState>;
 }
 
 interface CdbFixtureRpc {
+    fixtureMatchOrganization(): Promise<CdbLiveState["subscriptions"]>;
     fixtureLiveState(): Promise<CdbLiveState>;
 }
 
 export default {
     async fetch(request: Request, env: Env): Promise<Response> {
         const url = new URL(request.url);
-        if (url.pathname === "/live-gateway-drain" || url.pathname === "/live-gateway-state") {
+        if (
+            url.pathname === "/live-gateway-drain" ||
+            url.pathname === "/live-gateway-stage" ||
+            url.pathname === "/live-gateway-state"
+        ) {
             const clientId = url.searchParams.get("clientId");
             if (!clientId) return new Response("missing clientId", { status: 400 });
             const id = env.CDB_GATEWAY.idFromName(clientId.slice(0, 12));
@@ -166,13 +204,20 @@ export default {
                 await gateway.fixtureDrain();
                 return Response.json({ ok: true });
             }
+            if (url.pathname === "/live-gateway-stage") {
+                await gateway.fixtureStageOnly();
+                return Response.json({ ok: true });
+            }
             return Response.json(await gateway.fixtureLiveState());
         }
-        if (url.pathname === "/live-cdb-state") {
+        if (url.pathname === "/live-cdb-state" || url.pathname === "/live-cdb-match") {
             const shardId = url.searchParams.get("shardId");
             if (!shardId) return new Response("missing shardId", { status: 400 });
             const id = env.CDB_SHARD.idFromName(shardId);
             const cdb = env.CDB_SHARD.get(id) as unknown as CdbFixtureRpc;
+            if (url.pathname === "/live-cdb-match") {
+                return Response.json(await cdb.fixtureMatchOrganization());
+            }
             return Response.json(await cdb.fixtureLiveState());
         }
         return baseWorker.fetch(request, env);

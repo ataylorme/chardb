@@ -10,12 +10,14 @@ const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ENTRY = path.join(HERE, "gateway-live.entry.ts");
 const BUNDLE = path.join(process.env.TMPDIR ?? "/tmp", `chardb-gateway-live-${process.pid}.bundle.mjs`);
 const KID = "gateway-live-workerd-key";
+const WORKER_NAME = "gateway-live-restart-worker";
 const ISSUER = "https://issuer.example";
 const AUDIENCE = "chardb-workerd";
 const ORGANIZATION_A = "workerd-org";
 const ORGANIZATION_B = "workerd-org-b";
 
 interface GatewayLiveState {
+    readonly instanceId: string;
     readonly registrations: readonly {
         readonly registrationId: string;
         readonly connectionId: string;
@@ -36,6 +38,7 @@ interface GatewayLiveState {
 }
 
 interface CdbLiveState {
+    readonly instanceId: string;
     readonly subscriptions: readonly {
         readonly gatewayId: string;
         readonly registrationId: string;
@@ -176,6 +179,14 @@ async function drainGateway(clientId: string): Promise<void> {
     await fixtureFetch("/live-gateway-drain", { clientId });
 }
 
+async function stageGateway(clientId: string): Promise<void> {
+    await fixtureFetch("/live-gateway-stage", { clientId });
+}
+
+async function matchedCdbSubscriptions(): Promise<CdbLiveState["subscriptions"]> {
+    return fixtureFetch("/live-cdb-match", { shardId });
+}
+
 async function currentRegistration(
     clientId: string,
     subId: number
@@ -194,7 +205,8 @@ async function subscribe(
     opened: OpenedSocket,
     clientId: string,
     subId: number,
-    organizationId: string
+    organizationId: string,
+    body = "live-proof"
 ): Promise<Extract<Down, { t: "snapshot" }>> {
     if (!queryRef) throw new Error("query ref was not seeded");
     const snapshot = nextDown(opened.socket);
@@ -203,7 +215,7 @@ async function subscribe(
             t: "sub",
             subId: SubId(subId),
             ref: queryRef,
-            args: { organizationId, body: "live-proof" },
+            args: { organizationId, body },
         })
     );
     await currentRegistration(clientId, subId);
@@ -238,6 +250,7 @@ beforeAll(async () => {
     };
 
     mf = new Miniflare({
+        name: WORKER_NAME,
         modules: true,
         script: await buildWorker(),
         durableObjects: {
@@ -412,5 +425,111 @@ describe("public durable live queries in real workerd", () => {
         a2.socket.close();
         b.socket.close();
         mutator.socket.close();
+    });
+
+    test("Gateway and Cdb reconstruction preserves a staged replacement", async () => {
+        if (!mf || !mutationRef) throw new Error("live fixture was not initialized");
+        const clientId = "live-restart-05";
+        const opened = await openSocket(clientId, await signed("workerd-user"));
+        expect(opened.welcome.t).toBe("welcome");
+
+        const initial = await subscribe(opened, clientId, 9, ORGANIZATION_A, "restart-proof");
+        expect(initial.rows).toEqual([]);
+        acknowledge(opened.socket, initial);
+
+        const beforeMutation = await currentRegistration(clientId, 9);
+        const mutationResult = nextDown(opened.socket);
+        opened.socket.send(
+            encodeWire({
+                t: "mut",
+                mutId: MutId("live-restart-write"),
+                ref: mutationRef,
+                args: {
+                    id: "live-restart-row",
+                    organizationId: ORGANIZATION_A,
+                    body: "restart-proof",
+                    createdAt: 43,
+                },
+            })
+        );
+        await expect(mutationResult).resolves.toMatchObject({
+            t: "poke",
+            mutResults: [{ mutId: "live-restart-write", ok: true }],
+        });
+
+        const dirty = await currentRegistration(clientId, 9);
+        expect(dirty.dirtyVersion).toBeGreaterThan(beforeMutation.deliveredVersion);
+        await stageGateway(clientId);
+
+        const beforeEviction = await gatewayState(clientId);
+        const staged = beforeEviction.registrations.find(row => row.subId === 9 && row.currentHead);
+        expect(staged).toMatchObject({
+            registrationId: dirty.registrationId,
+            lifecycle: "active",
+            cdbState: "active",
+            dirtyVersion: dirty.dirtyVersion,
+            deliveredVersion: beforeMutation.deliveredVersion,
+            outboxTargetVersion: dirty.dirtyVersion,
+        });
+        expect(staged?.outboxCookie).toBeString();
+        if (!staged?.outboxCookie) throw new Error("Gateway did not stage the replacement snapshot");
+        const stagedCookie = staged.outboxCookie;
+
+        const cdbBeforeEviction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+        const cdbRegistration = cdbBeforeEviction.subscriptions.find(
+            subscription => subscription.registrationId === dirty.registrationId
+        );
+        expect(cdbRegistration).toMatchObject({
+            clientId,
+            subId: 9,
+            state: "active",
+            organizationId: ORGANIZATION_A,
+        });
+        if (!cdbRegistration) throw new Error("Cdb did not retain the live subscription");
+
+        await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", {
+            name: clientId.slice(0, 12),
+            webSockets: "hibernate",
+        });
+        await mf.unsafeEvictDurableObject(WORKER_NAME, "Cdb", { name: shardId });
+
+        const afterEviction = await gatewayState(clientId);
+        const cdbAfterEviction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+        expect(afterEviction.instanceId).not.toBe(beforeEviction.instanceId);
+        expect(afterEviction.registrations).toEqual(beforeEviction.registrations);
+        expect(cdbAfterEviction.instanceId).not.toBe(cdbBeforeEviction.instanceId);
+        expect(cdbAfterEviction.subscriptions).toEqual(cdbBeforeEviction.subscriptions);
+        expect(cdbAfterEviction.invalidations).toEqual(cdbBeforeEviction.invalidations);
+        expect(await matchedCdbSubscriptions()).toContainEqual(cdbRegistration);
+
+        const replacementMessage = nextDown(opened.socket);
+        await drainGateway(clientId);
+        const replacement = await replacementMessage;
+        expect(replacement).toMatchObject({
+            t: "snapshot",
+            subId: 9,
+            rows: [
+                {
+                    id: "live-restart-row",
+                    organizationId: ORGANIZATION_A,
+                    body: "restart-proof",
+                    viewerId: "workerd-user",
+                },
+            ],
+        });
+        if (replacement.t !== "snapshot") throw new Error("expected reconstructed snapshot delivery");
+        expect(String(replacement.cookie)).toBe(stagedCookie);
+        acknowledge(opened.socket, replacement);
+
+        const delivered = await currentRegistration(clientId, 9);
+        expect(delivered).toMatchObject({
+            dirtyVersion: dirty.dirtyVersion,
+            deliveredVersion: dirty.dirtyVersion,
+            lastCookie: replacement.cookie,
+            lastSnapshotCookie: replacement.cookie,
+            outboxCookie: null,
+            outboxTargetVersion: null,
+        });
+        opened.socket.close();
     });
 });
