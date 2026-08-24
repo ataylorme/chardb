@@ -257,6 +257,7 @@ async function openSocket(
         readonly clientId?: string;
         readonly routedClientId?: string | null;
         readonly resumeFromCookie?: string;
+        readonly protocolV?: number;
     } = {}
 ): Promise<OpenedSocket> {
     if (!workerdUrl) throw new Error("miniflare not initialized");
@@ -294,7 +295,9 @@ async function openSocket(
         ...(options.resumeFromCookie ? { resumeFromCookie: Cookie(options.resumeFromCookie) } : {}),
         jwt,
     };
-    socket.send(encodeWire(hello));
+    socket.send(
+        options.protocolV === undefined ? encodeWire(hello) : JSON.stringify({ ...hello, protocolV: options.protocolV })
+    );
     return { socket, first, closed };
 }
 
@@ -479,6 +482,21 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         });
         await expect(first).resolves.toMatchObject({ t: "error", code: "CDB_FORBIDDEN" });
         expect(await closed).toMatchObject({ code: 1008, reason: "CDB_FORBIDDEN" });
+    });
+
+    test("rejects an unsupported protocol before JWT verification", async () => {
+        const before = await jwksStats();
+        const { first, closed } = await openSocket("not-a-jwt", {
+            clientId: "protocol-mismatch",
+            protocolV: PROTOCOL_V + 1,
+        });
+
+        await expect(first).resolves.toEqual({ t: "mustRefetch", subIds: [], reason: "protocolMismatch" });
+        expect(await closed).toMatchObject({
+            code: 1002,
+            reason: `unsupported chardb protocol ${PROTOCOL_V + 1}`,
+        });
+        expect(await jwksStats()).toEqual(before);
     });
 
     test("a seeded Catalog membership permits the declared organization mutation", async () => {
