@@ -137,7 +137,7 @@ Scatter routing asks Catalog for the distinct physical shards that own current r
 
 Each Cdb also caps its coalesced invalidation outbox at 4,096 rows. Existing exact rows can coalesce at capacity, and acknowledged delivery releases them. A mutation selects at most 4,097 distinct registration targets with `LIMIT 4097`, accepts exactly 4,096, and rejects overflow with retryable `CDB_RATE_LIMITED`. That rejection rolls back the domain write, provisional op-log, change clock, and outbox work. Cdb invalidations and Gateway cleanup and retry work survive Durable Object reconstruction.
 
-Catalog publishes a range-cutover map to its in-memory routing cache only after the range update, schema epoch, and migration guard commit. A failed commit rolls back durable state and keeps the old cached route; retry can commit and publish the new shard and epoch once. Full Resharder orchestration and recovery remain experimental.
+Catalog publishes a range-cutover map to its in-memory routing cache only after the range update, schema epoch, and migration guard commit. A failed commit rolls back durable state and keeps the old cached route; retry can commit the new shard and epoch, then publish the new route once. Full Resharder orchestration and recovery remain experimental.
 
 The dependency audit is not clean. Compatible updates removed the reported `nanoid`, PostCSS, Sharp, SVGO, and `ws` advisories. Bun still reports five advisories on `miniflare@4.20260730.0 -> undici@7.28.0`; Miniflare 4 pins that version, while the fixed `undici@7.29.0` is currently available only through Miniflare 5 alpha.
 
