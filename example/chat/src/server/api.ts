@@ -3,8 +3,9 @@
 // exports separate policy values.
 
 import { api } from "chardb/server";
+import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { messages } from "./schema.ts";
+import { channels, messages } from "./schema.ts";
 
 export const postMessage = api.mutation({
     ref: "src/server/api.ts#postMessage",
@@ -20,6 +21,13 @@ export const postMessage = api.mutation({
     handler: (ctx, args) => {
         if (!ctx.auth.userId || !ctx.auth.tenantId || ctx.auth.tenantId !== args.organizationId) {
             throw new Error("CDB_FORBIDDEN: active organization does not match the routed partition");
+        }
+        const channel = ctx.db.select().from(channels).where(eq(channels.id, args.channelId)).get();
+        if (!channel) {
+            ctx.db
+                .insert(channels)
+                .values({ id: args.channelId, name: args.channelId, createdAt: args.clientCreatedAt })
+                .run();
         }
         ctx.db
             .insert(messages)

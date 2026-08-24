@@ -18,7 +18,10 @@ export const channels = cdbTable(
     },
     {
         publicRead: true,
-        roles: { admin: "*" },
+        roles: {
+            admin: "*",
+            member: { create: ["id", "name", "createdAt"] },
+        },
     }
 );
 
