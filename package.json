@@ -26,8 +26,11 @@
         "build:stub": "unbuild --stub",
         "prepack": "bun run build",
         "smoke:package": "bun scripts/smoke-packed-package.mjs",
-        "test": "bun test",
-        "test:watch": "bun test --watch",
+        "test": "bun scripts/test-correctness.mjs",
+        "test:correctness": "bun scripts/test-correctness.mjs",
+        "test:watch": "bun scripts/test-correctness.mjs --watch",
+        "test:scale": "bun test test/workerd/gateway-live.harness.test.ts --test-name-pattern 'scaled SDK'",
+        "bench:live": "bun run test:scale",
         "typecheck": "tsc --noEmit",
         "lint": "biome check .",
         "format": "biome format --write ."

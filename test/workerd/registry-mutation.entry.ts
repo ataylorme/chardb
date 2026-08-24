@@ -3,11 +3,12 @@ import { gte } from "drizzle-orm";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { isCdbError } from "../../src/errors.ts";
+import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import { chardb } from "../../src/server/chardb.ts";
 import { createApi } from "../../src/server/define.ts";
 import type { CdbMutationRequest, CdbMutationResponse } from "../../src/server/do/cdb.ts";
 import { globalScope } from "../../src/server/index.ts";
-import { manifestFromExports, routeMutation } from "../../src/server/manifest.ts";
+import { manifestFromExports, routeMutation, routeValidatedQuery } from "../../src/server/manifest.ts";
 import type {
     CdbRegisteredQueryRequest,
     CdbSubscriptionRequest,
@@ -16,7 +17,6 @@ import type {
     LiveSubscriptionId,
 } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
-import { stableJson } from "../../src/util/canonical.ts";
 
 const { cdbTable } = globalScope();
 const entries = cdbTable(
@@ -248,15 +248,9 @@ function subscriptionRequest(gatewayId: string): CdbSubscriptionRequest {
 
 function registeredSubscriptionRequest(gatewayId: string, registrationId: string): CdbSubscriptionRequest {
     const args = { organizationId: AUTH.tenantId, minimum: 60 };
-    const intent = {
-        kind: "select" as const,
-        tables: ["registry_entries"],
-        partitionKey: {
-            table: "registry_entries",
-            column: "organization_id",
-            values: [AUTH.tenantId],
-        },
-    };
+    const routed = routeValidatedQuery(manifest, { ref: registryEntries.__chardbRef, args }, tables =>
+        cdbPolicyDigest(schema, tables)
+    );
     return {
         subscription: {
             gatewayId,
@@ -268,9 +262,9 @@ function registeredSubscriptionRequest(gatewayId: string, registrationId: string
         principalId: PrincipalId(AUTH.userId),
         organizationId: TenantId(AUTH.tenantId),
         ref: registryEntries.__chardbRef,
-        args,
-        queryHash: stableJson({ ref: registryEntries.__chardbRef, args, intent }),
-        tables: ["registry_entries"],
+        args: routed.args,
+        queryHash: routed.queryHash,
+        tables: routed.intent.tables,
         intervals: [],
     };
 }
