@@ -20,12 +20,15 @@ import {
     AUTH_BULK_PRELOAD_MAX_ROWS,
     AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES,
     AUTH_BULK_REPLACEMENT_MAX_BYTES,
+    assertAuthIncrementInput,
     authCount,
     authCreate,
     authDelete,
     authFindFirstId,
+    authFindFirstIncrementId,
     authFindMany,
     authFindOne,
+    authIncrementOne,
     authPreloadScopeRows,
     authTableColumns,
     authTableName,
@@ -201,6 +204,67 @@ describe("auth/sql — render path against bun:sqlite", () => {
         expect(statements[0]).toContain("LIMIT 1");
         expect(statements[0]).not.toContain("wide_payload");
         expect(statements[0]).not.toContain("SELECT *");
+    });
+
+    test("atomically increments the deterministic guarded row through renamed columns", () => {
+        const { db } = bootstrap();
+        const statements: string[] = [];
+        const sql = bunSyncSql(db, statements);
+        const renamed = sqliteTable("increment_auth_target", {
+            id: text("db_id").primaryKey(),
+            bucket: text("bucket_name"),
+            count: integer("request_count"),
+            lastRequest: integer("last_request"),
+            marker: text("nullable_marker"),
+        });
+        sql.exec(
+            'CREATE TABLE "increment_auth_target" ("db_id" TEXT PRIMARY KEY, "bucket_name" TEXT, "request_count" INTEGER, "last_request" INTEGER, "nullable_marker" TEXT)'
+        );
+        for (const id of ["target-c", "target-a", "target-b"]) {
+            authCreate(sql, renamed, { id, bucket: "shared", count: 1, lastRequest: 100, marker: null });
+        }
+        const guards = [
+            { field: "bucket", operator: "eq" as const, value: "shared" },
+            { field: "count", operator: "lt" as const, value: 2 },
+            { field: "lastRequest", operator: "gte" as const, value: 100 },
+        ];
+        statements.length = 0;
+
+        expect(authFindFirstIncrementId(sql, renamed, guards)).toBe("target-a");
+        expect(
+            authIncrementOne(sql, renamed, "target-a", guards, { count: 1 }, { lastRequest: 200 }).row
+        ).toMatchObject({
+            id: "target-a",
+            count: 2,
+            lastRequest: 200,
+        });
+        expect(
+            authIncrementOne(sql, renamed, "target-b", [{ field: "marker", operator: "eq", value: null }], {
+                count: 1,
+            }).row
+        ).toMatchObject({ id: "target-b", count: 2 });
+        expect(
+            authIncrementOne(sql, renamed, "target-c", [{ field: "count", operator: "gt", value: 100 }], { count: 1 })
+        ).toEqual({ affected: 0, row: null });
+        expect(statements.some(statement => statement.includes('ORDER BY "db_id" ASC'))).toBe(true);
+        expect(
+            statements.some(
+                statement =>
+                    statement.includes('UPDATE "increment_auth_target"') &&
+                    statement.includes('"request_count" = COALESCE("request_count", 0) + ?') &&
+                    statement.includes('"last_request" = ?')
+            )
+        ).toBe(true);
+
+        statements.length = 0;
+        expect(() => assertAuthIncrementInput(renamed, guards, { missing: 1 })).toThrow(/not a column/);
+        expect(() => assertAuthIncrementInput(renamed, guards, { count: Number.NaN })).toThrow(/must be finite/);
+        expect(() =>
+            assertAuthIncrementInput(renamed, [{ field: "count", operator: "contains" as never, value: 1 }], {
+                count: 1,
+            })
+        ).toThrow(/operator.*not supported/);
+        expect(statements).toEqual([]);
     });
 
     test("findMany rejects invalid paging and sorting", () => {

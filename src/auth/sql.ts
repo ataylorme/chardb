@@ -50,6 +50,14 @@ interface TableInfo {
     readonly dataTypes: ReadonlyMap<string, Column["dataType"]>;
 }
 
+export type AuthIncrementWhereOperator = "eq" | "lt" | "lte" | "gt" | "gte";
+
+export interface AuthIncrementWhere {
+    readonly field: string;
+    readonly operator: AuthIncrementWhereOperator;
+    readonly value: RawJson;
+}
+
 const tableInfoCache = new WeakMap<AnySQLiteTable, TableInfo>();
 
 function infoOf(table: AnySQLiteTable): TableInfo {
@@ -117,6 +125,177 @@ function bindWhere(info: TableInfo, where: { readonly [k: string]: RawJson }): {
         params.push(toSqlValue(where[key] as RawJson));
     }
     return { sql: parts.join(" AND "), params };
+}
+
+function invalidIncrementInput(message: string): CdbError {
+    return new CdbError({ code: "CDB_INVALID_ARGS", message: `auth/sql: ${message}` });
+}
+
+function bindIncrementWhere(
+    info: TableInfo,
+    where: readonly AuthIncrementWhere[]
+): {
+    readonly sql: string;
+    readonly params: SqlValue[];
+} {
+    if (where.length === 0) return { sql: "1=1", params: [] };
+    const operators: Record<AuthIncrementWhereOperator, string> = {
+        eq: "=",
+        lt: "<",
+        lte: "<=",
+        gt: ">",
+        gte: ">=",
+    };
+    const parts: string[] = [];
+    const params: SqlValue[] = [];
+    for (const condition of where) {
+        const sqlName = info.columns.get(condition.field);
+        if (!sqlName) {
+            throw invalidIncrementInput(
+                `incrementOne where field "${condition.field}" is not a column on table ${info.name}`
+            );
+        }
+        const operator = operators[condition.operator];
+        if (!operator) {
+            throw new CdbError({
+                code: "CDB_UNSUPPORTED_FEATURE",
+                message: `auth/sql: incrementOne where operator ${JSON.stringify(condition.operator)} is not supported`,
+            });
+        }
+        if (condition.value === null) {
+            if (condition.operator !== "eq") {
+                throw invalidIncrementInput("incrementOne only supports null with the eq operator");
+            }
+            parts.push(`${quoteIdent(sqlName)} IS NULL`);
+            continue;
+        }
+        if (
+            typeof condition.value !== "string" &&
+            typeof condition.value !== "number" &&
+            typeof condition.value !== "boolean"
+        ) {
+            throw invalidIncrementInput("incrementOne comparison values must be scalar JSON values");
+        }
+        if (
+            typeof condition.value === "number" &&
+            (!Number.isFinite(condition.value) || Object.is(condition.value, -0))
+        ) {
+            throw invalidIncrementInput("incrementOne comparison numbers must be finite and not negative zero");
+        }
+        parts.push(`${quoteIdent(sqlName)} ${operator} ?`);
+        params.push(toSqlValue(condition.value));
+    }
+    return { sql: parts.join(" AND "), params };
+}
+
+export function assertAuthIncrementInput(
+    table: AnySQLiteTable,
+    where: readonly AuthIncrementWhere[],
+    increment: { readonly [k: string]: number },
+    set: { readonly [k: string]: RawJson } = {}
+): void {
+    const info = infoOf(table);
+    bindIncrementWhere(info, where);
+    const incrementKeys = Object.keys(increment);
+    const setKeys = Object.keys(set);
+    if (incrementKeys.length === 0 && setKeys.length === 0) {
+        throw invalidIncrementInput("incrementOne requires a non-empty increment or set payload");
+    }
+    for (const key of incrementKeys) {
+        if (!info.columns.has(key)) {
+            throw invalidIncrementInput(`incrementOne field "${key}" is not a column on table ${info.name}`);
+        }
+        if (info.dataTypes.get(key) !== "number") {
+            throw invalidIncrementInput(`incrementOne field "${key}" is not numeric on table ${info.name}`);
+        }
+        const delta = increment[key];
+        if (typeof delta !== "number" || !Number.isFinite(delta) || Object.is(delta, -0)) {
+            throw invalidIncrementInput(`incrementOne delta for "${key}" must be finite and not negative zero`);
+        }
+    }
+    for (const key of setKeys) {
+        if (!info.columns.has(key)) {
+            throw invalidIncrementInput(`incrementOne set field "${key}" is not a column on table ${info.name}`);
+        }
+    }
+}
+
+export function authFindFirstIncrementId(
+    sql: SyncSql,
+    table: AnySQLiteTable,
+    where: readonly AuthIncrementWhere[]
+): string | null {
+    const info = infoOf(table);
+    const idSqlName = info.columns.get("id");
+    if (!idSqlName) {
+        throw new CdbError({ code: "CDB_INVARIANT", message: `auth/sql: table ${info.name} has no id column` });
+    }
+    const quotedId = quoteIdent(idSqlName);
+    const w = bindIncrementWhere(info, where);
+    const row = sql.one<{ auth_target_id: unknown }>(
+        `SELECT ${quotedId} AS auth_target_id
+         FROM ${quoteIdent(info.name)}
+         WHERE ${w.sql}
+         ORDER BY ${quotedId} ASC
+         LIMIT 1`,
+        ...w.params
+    );
+    if (!row) return null;
+    if (typeof row.auth_target_id !== "string") {
+        throw new CdbError({
+            code: "CDB_INVARIANT",
+            message: `auth/sql: selected id on table ${info.name} is not a string`,
+        });
+    }
+    return row.auth_target_id;
+}
+
+export function authIncrementOne(
+    sql: SyncSql,
+    table: AnySQLiteTable,
+    targetId: string,
+    where: readonly AuthIncrementWhere[],
+    increment: { readonly [k: string]: number },
+    set: { readonly [k: string]: RawJson } = {}
+): { readonly affected: number; readonly row: Record<string, RawJson> | null } {
+    assertAuthIncrementInput(table, where, increment, set);
+    const info = infoOf(table);
+    const idSqlName = info.columns.get("id");
+    if (!idSqlName) {
+        throw new CdbError({ code: "CDB_INVARIANT", message: `auth/sql: table ${info.name} has no id column` });
+    }
+    const incrementKeys = new Set(Object.keys(increment));
+    const setters: string[] = [];
+    const params: SqlValue[] = [];
+    for (const key of Object.keys(set)) {
+        if (incrementKeys.has(key)) continue;
+        setters.push(`${quoteIdent(info.columns.get(key) as string)} = ?`);
+        params.push(toSqlValue(set[key] as RawJson));
+    }
+    for (const key of incrementKeys) {
+        const quoted = quoteIdent(info.columns.get(key) as string);
+        setters.push(`${quoted} = COALESCE(${quoted}, 0) + ?`);
+        params.push(increment[key] as number);
+    }
+    const w = bindIncrementWhere(info, where);
+    sql.exec(
+        `UPDATE ${quoteIdent(info.name)}
+         SET ${setters.join(", ")}
+         WHERE ${quoteIdent(idSqlName)} = ? AND ${w.sql}`,
+        ...params,
+        targetId,
+        ...w.params
+    );
+    const affected = sql.changes();
+    if (affected > 1) {
+        throw new CdbError({ code: "CDB_INVARIANT", message: "auth/sql: incrementOne updated more than one row" });
+    }
+    if (affected === 0) return { affected, row: null };
+    const nextId = Object.hasOwn(set, "id") ? set.id : targetId;
+    if (typeof nextId !== "string") {
+        throw invalidIncrementInput("incrementOne set id must be a string");
+    }
+    return { affected, row: authFindOne(sql, table, { id: nextId }) };
 }
 
 function checkedAggregate(value: unknown, subject: string): number {

@@ -32,12 +32,16 @@ import {
 } from "../../auth/jwks_cache.ts";
 import { getAuthRuntime, placementFor, tableFor } from "../../auth/runtime.ts";
 import {
+    type AuthIncrementWhere,
+    assertAuthIncrementInput,
     authCount,
     authCreate,
     authDelete,
     authFindFirstId,
+    authFindFirstIncrementId,
     authFindMany,
     authFindOne,
+    authIncrementOne,
     authPreloadScopeRows,
     authTableColumns,
     authUpdate,
@@ -428,6 +432,68 @@ export class Catalog extends DurableObject<CatalogEnv> {
             for (const scope of scopes.values()) bumpAuthEpochInSql(sql, scope.scope, scope.scopeId);
         });
         return { ok: true, row: row ?? null, affected };
+    }
+
+    /** Atomically apply Better Auth's guarded single-row numeric increment contract. */
+    async incrementAuth(args: {
+        readonly model: string;
+        readonly where: readonly AuthIncrementWhere[];
+        readonly increment: { readonly [k: string]: number };
+        readonly set?: { readonly [k: string]: RawJson };
+    }): Promise<{
+        readonly ok: true;
+        readonly row: Record<string, RawJson> | null;
+        readonly affected: number;
+    }> {
+        await this.bootstrap();
+        this.ensureAuthTables();
+        const table = tableFor(args.model);
+        const scopeColumns = authEpochScopeColumns(args.model, table);
+        const placement = placementFor(args.model);
+        const set = args.set ?? {};
+        let row: Record<string, RawJson> | null = null;
+        let affected = 0;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            assertAuthIncrementInput(table, args.where, args.increment, set);
+            const targetId = authFindFirstIncrementId(sql, table, args.where);
+            if (targetId === null) return;
+
+            const replacementAccounting = Object.create(null) as Record<string, RawJson>;
+            for (const key of Object.keys(set)) replacementAccounting[key] = set[key] as RawJson;
+            for (const [key, delta] of Object.entries(args.increment)) replacementAccounting[key] = delta;
+            const before = authPreloadScopeRows(
+                sql,
+                table,
+                { id: targetId },
+                scopeColumns,
+                scopeColumns.map(column => set[column]),
+                replacementAccounting
+            );
+            if (before.matchedRows !== 1) {
+                throw new CdbError({
+                    code: "CDB_INVARIANT",
+                    message: "Catalog incrementAuth selected a row that disappeared inside one transaction",
+                });
+            }
+
+            const result = authIncrementOne(sql, table, targetId, args.where, args.increment, set);
+            affected = result.affected;
+            row = result.row;
+            if (affected === 0) return;
+            if (!row) {
+                throw new CdbError({
+                    code: "CDB_INVARIANT",
+                    message: "Catalog incrementAuth updated a row but could not reload it",
+                });
+            }
+            const scopes = new Map<string, { scope: AuthEpochScope; scopeId: string }>();
+            if (placement.kind === "replicated") addEpochScope(scopes, "global", "global");
+            for (const previous of before.rows) addRowEpochScopes(scopes, args.model, previous);
+            addRowEpochScopes(scopes, args.model, row);
+            for (const scope of scopes.values()) bumpAuthEpochInSql(sql, scope.scope, scope.scopeId);
+        });
+        return { ok: true, row, affected };
     }
 
     /** Read Better Auth rows from Catalog-owned storage. */

@@ -26,6 +26,7 @@ import type { BetterAuthOptions } from "better-auth";
 import { createAdapterFactory } from "better-auth/adapters";
 import { CdbError } from "../errors.ts";
 import type { RawJson } from "../types.ts";
+import type { AuthIncrementWhere } from "./sql.ts";
 
 /**
  * Bindings the adapter needs at runtime. Provided by `mountChardb` /
@@ -52,6 +53,12 @@ interface CatalogRpc {
         sortBy?: { field: string; direction: "asc" | "desc" };
     }): Promise<readonly Record<string, RawJson>[]>;
     countAuth(args: { model: string; where: { [k: string]: RawJson } }): Promise<number>;
+    incrementAuth(args: {
+        model: string;
+        where: readonly AuthIncrementWhere[];
+        increment: { readonly [k: string]: number };
+        set?: { readonly [k: string]: RawJson };
+    }): Promise<{ ok: true; row: Record<string, RawJson> | null; affected: number }>;
 }
 
 export interface ChardbAuthAdapterOptions {
@@ -73,74 +80,165 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
             supportsNumericIds: false,
             transaction: false,
         },
-        adapter: () => ({
-            async create({ model, data }) {
-                const payload = data as { [k: string]: RawJson };
-                const r = await catalog().mutateAuth({ model, op: "create", payload });
-                return (r.row ?? payload) as never;
-            },
+        adapter: ({ getFieldName, schema }) => {
+            const canonicalModels = new Map<string, string>();
+            const canonicalFields = new Map<string, ReadonlyMap<string, string>>();
+            for (const [canonicalModel, modelSchema] of Object.entries(schema)) {
+                const physicalModel = modelSchema.modelName;
+                const existingModel = canonicalModels.get(physicalModel);
+                if (existingModel !== undefined) {
+                    throw incompatibleAuthMapping(
+                        `models "${existingModel}" and "${canonicalModel}" both map to "${physicalModel}"`
+                    );
+                }
+                canonicalModels.set(physicalModel, canonicalModel);
 
-            async findOne({ model, where }) {
-                const flat = whereToFlat(where);
-                const rows = await catalog().queryAuth({ model, where: flat, limit: 1 });
-                return (rows[0] ?? null) as never;
-            },
+                const fields = new Map<string, string>([["id", "id"]]);
+                for (const [canonicalField, fieldSchema] of Object.entries(modelSchema.fields)) {
+                    const physicalField = fieldSchema.fieldName ?? canonicalField;
+                    const existingField = fields.get(physicalField);
+                    if (existingField !== undefined) {
+                        throw incompatibleAuthMapping(
+                            `fields "${existingField}" and "${canonicalField}" on model "${canonicalModel}" both map to "${physicalField}"`
+                        );
+                    }
+                    fields.set(physicalField, canonicalField);
+                }
+                canonicalFields.set(canonicalModel, fields);
+            }
 
-            async findMany({ model, where, limit, offset, sortBy }) {
-                const flat = where ? whereToFlat(where) : {};
-                const rows = await catalog().queryAuth({
-                    model,
-                    where: flat,
-                    limit: limit ?? 100,
-                    ...(offset === undefined ? {} : { offset }),
-                    ...(sortBy === undefined ? {} : { sortBy }),
-                });
-                return rows as never;
-            },
+            const canonicalModelFor = (physicalModel: string): string => {
+                const canonicalModel = canonicalModels.get(physicalModel);
+                if (canonicalModel === undefined) {
+                    throw new CdbError({
+                        code: "CDB_INVALID_ARGS",
+                        message: `chardb auth adapter: unknown physical model "${physicalModel}"`,
+                    });
+                }
+                return canonicalModel;
+            };
+            const canonicalFieldFor = (canonicalModel: string, physicalField: string): string => {
+                const canonicalField = canonicalFields.get(canonicalModel)?.get(physicalField);
+                if (canonicalField === undefined) {
+                    throw new CdbError({
+                        code: "CDB_INVALID_ARGS",
+                        message: `chardb auth adapter: unknown physical field "${physicalField}" on model "${canonicalModel}"`,
+                    });
+                }
+                return canonicalField;
+            };
 
-            async count({ model, where }) {
-                const flat = where ? whereToFlat(where) : {};
-                return catalog().countAuth({ model, where: flat });
-            },
+            return {
+                async create({ model, data }) {
+                    const payload = data as { [k: string]: RawJson };
+                    const r = await catalog().mutateAuth({ model, op: "create", payload });
+                    return (r.row ?? payload) as never;
+                },
 
-            async update({ model, where, update }) {
-                const flat = whereToFlat(where);
-                const r = await catalog().mutateAuth({
-                    model,
-                    op: "update",
-                    where: flat,
-                    payload: update as { [k: string]: RawJson },
-                    returnRow: true,
-                    limitOne: true,
-                });
-                return (r.row ?? null) as never;
-            },
+                async findOne({ model, where }) {
+                    const flat = whereToFlat(where);
+                    const rows = await catalog().queryAuth({ model, where: flat, limit: 1 });
+                    return (rows[0] ?? null) as never;
+                },
 
-            async updateMany({ model, where, update }) {
-                const flat = whereToFlat(where);
-                const r = await catalog().mutateAuth({
-                    model,
-                    op: "update",
-                    where: flat,
-                    payload: update as { [k: string]: RawJson },
-                    returnRow: false,
-                    limitOne: false,
-                });
-                return r.affected ?? 0;
-            },
+                async findMany({ model, where, limit, offset, sortBy }) {
+                    const flat = where ? whereToFlat(where) : {};
+                    const rows = await catalog().queryAuth({
+                        model,
+                        where: flat,
+                        limit: limit ?? 100,
+                        ...(offset === undefined ? {} : { offset }),
+                        ...(sortBy === undefined ? {} : { sortBy }),
+                    });
+                    return rows as never;
+                },
 
-            async delete({ model, where }) {
-                const flat = whereToFlat(where);
-                await catalog().mutateAuth({ model, op: "delete", where: flat, limitOne: true });
-            },
+                async count({ model, where }) {
+                    const flat = where ? whereToFlat(where) : {};
+                    return catalog().countAuth({ model, where: flat });
+                },
 
-            async deleteMany({ model, where }) {
-                const flat = whereToFlat(where);
-                const r = await catalog().mutateAuth({ model, op: "delete", where: flat, limitOne: false });
-                return r.affected ?? 0;
-            },
-        }),
+                async update({ model, where, update }) {
+                    const flat = whereToFlat(where);
+                    const r = await catalog().mutateAuth({
+                        model,
+                        op: "update",
+                        where: flat,
+                        payload: update as { [k: string]: RawJson },
+                        returnRow: true,
+                        limitOne: true,
+                    });
+                    return (r.row ?? null) as never;
+                },
+
+                async updateMany({ model, where, update }) {
+                    const flat = whereToFlat(where);
+                    const r = await catalog().mutateAuth({
+                        model,
+                        op: "update",
+                        where: flat,
+                        payload: update as { [k: string]: RawJson },
+                        returnRow: false,
+                        limitOne: false,
+                    });
+                    return r.affected ?? 0;
+                },
+
+                async delete({ model, where }) {
+                    const flat = whereToFlat(where);
+                    await catalog().mutateAuth({ model, op: "delete", where: flat, limitOne: true });
+                },
+
+                async deleteMany({ model, where }) {
+                    const flat = whereToFlat(where);
+                    const r = await catalog().mutateAuth({ model, op: "delete", where: flat, limitOne: false });
+                    return r.affected ?? 0;
+                },
+
+                async incrementOne({ model, where, increment, set }) {
+                    const defaultModel = canonicalModelFor(model);
+                    const defaultField = (field: string): string => canonicalFieldFor(defaultModel, field);
+                    const guardedWhere = whereToIncrementGuards(where, defaultField);
+                    const ownedIncrement: Record<string, number> = Object.create(null);
+                    for (const [field, delta] of Object.entries(increment)) {
+                        if (typeof delta !== "number" || !Number.isFinite(delta) || Object.is(delta, -0)) {
+                            throw new CdbError({
+                                code: "CDB_INVALID_ARGS",
+                                message: `chardb auth adapter: increment delta for "${field}" must be finite and not negative zero`,
+                            });
+                        }
+                        ownedIncrement[defaultField(field)] = delta;
+                    }
+                    const ownedSet: Record<string, RawJson> | undefined =
+                        set === undefined ? undefined : Object.create(null);
+                    if (ownedSet) {
+                        for (const [field, value] of Object.entries(set ?? {})) {
+                            ownedSet[defaultField(field)] = value as RawJson;
+                        }
+                    }
+                    const r = await catalog().incrementAuth({
+                        model: defaultModel,
+                        where: guardedWhere,
+                        increment: ownedIncrement,
+                        ...(ownedSet === undefined ? {} : { set: ownedSet }),
+                    });
+                    if (!r.row) return null;
+                    const storageRow: Record<string, RawJson> = Object.create(null);
+                    for (const [field, value] of Object.entries(r.row)) {
+                        storageRow[getFieldName({ model: defaultModel, field })] = value;
+                    }
+                    return storageRow as never;
+                },
+            };
+        },
     }) as AdapterFactory<BetterAuthOptions>;
+}
+
+function incompatibleAuthMapping(message: string): CdbError {
+    return new CdbError({
+        code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+        message: `chardb auth adapter: ${message}`,
+    });
 }
 
 /**
@@ -165,6 +263,57 @@ function whereToFlat(where: CleanedWhere[]): { [k: string]: RawJson } {
             });
         }
         out[w.field] = normalize(w.value);
+    }
+    return out;
+}
+
+function whereToIncrementGuards(where: CleanedWhere[], defaultField: (field: string) => string): AuthIncrementWhere[] {
+    const out: AuthIncrementWhere[] = [];
+    for (const condition of where) {
+        if (condition.connector === "OR") {
+            throw new CdbError({
+                code: "CDB_UNSUPPORTED_FEATURE",
+                message: "chardb auth adapter: OR connectors are not supported in incrementOne guards",
+            });
+        }
+        if (condition.mode !== "sensitive") {
+            throw new CdbError({
+                code: "CDB_UNSUPPORTED_FEATURE",
+                message: "chardb auth adapter: case-insensitive incrementOne guards are not supported",
+            });
+        }
+        if (
+            condition.operator !== "eq" &&
+            condition.operator !== "lt" &&
+            condition.operator !== "lte" &&
+            condition.operator !== "gt" &&
+            condition.operator !== "gte"
+        ) {
+            throw new CdbError({
+                code: "CDB_UNSUPPORTED_FEATURE",
+                message: `chardb auth adapter: incrementOne where operator "${condition.operator}" is not supported`,
+            });
+        }
+        const value = normalize(condition.value);
+        if (value !== null && typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: "chardb auth adapter: incrementOne comparison values must be scalar",
+            });
+        }
+        if (value === null && condition.operator !== "eq") {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: "chardb auth adapter: incrementOne only supports null with the eq operator",
+            });
+        }
+        if (typeof value === "number" && (!Number.isFinite(value) || Object.is(value, -0))) {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: "chardb auth adapter: incrementOne comparison numbers must be finite and not negative zero",
+            });
+        }
+        out.push({ field: defaultField(condition.field), operator: condition.operator, value });
     }
     return out;
 }

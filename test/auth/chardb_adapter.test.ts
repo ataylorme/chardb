@@ -85,6 +85,20 @@ function namespaceFor(harness: CatalogHarness): DurableObjectNamespace {
 }
 
 const auth = defineAuth({});
+const rateLimitAuth = defineAuth({ rateLimit: { storage: "database" } });
+const renamedRateLimitAuth = defineAuth({
+    rateLimit: {
+        storage: "database",
+        modelName: "auth_rate_limits",
+        fields: { key: "rate_key", count: "rate_count", lastRequest: "last_request_at" },
+    },
+});
+const swappedRateLimitAuth = defineAuth({
+    rateLimit: {
+        storage: "database",
+        fields: { key: "rate_key", count: "lastRequest", lastRequest: "count" },
+    },
+});
 
 function bindRuntime(): void {
     resetAuthRuntime();
@@ -353,6 +367,274 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
 
         await expect(adapter.count({ model: "user", where: eq("name", "Counted") })).resolves.toBe(7);
         expect(requests).toEqual([{ model: "user", where: { name: "Counted" } }]);
+    });
+
+    test("routes incrementOne through the native Catalog RPC without fallback reads or writes", async () => {
+        const requests: unknown[] = [];
+        const catalog = {
+            async incrementAuth(request: unknown) {
+                requests.push(request);
+                return {
+                    ok: true,
+                    affected: 1,
+                    row: { id: "rate-native", key: "native", count: 2, lastRequest: 100 },
+                };
+            },
+            async queryAuth() {
+                throw new Error("incrementOne must not use the findMany fallback");
+            },
+            async mutateAuth() {
+                throw new Error("incrementOne must not use the updateMany fallback");
+            },
+        };
+        const namespace = {
+            idFromName: () => "global",
+            get: () => catalog,
+        } as unknown as DurableObjectNamespace;
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespace } })(renamedRateLimitAuth.options);
+
+        await expect(
+            adapter.incrementOne<Record<string, unknown>>({
+                model: "rateLimit",
+                where: [
+                    { field: "key", operator: "eq", value: "native" },
+                    { field: "lastRequest", operator: "gt", value: 50 },
+                    { field: "count", operator: "lt", value: 3 },
+                ],
+                increment: { count: 1 },
+            })
+        ).resolves.toMatchObject({ id: "rate-native", count: 2 });
+        expect(requests).toEqual([
+            {
+                model: "rateLimit",
+                where: [
+                    { field: "key", operator: "eq", value: "native" },
+                    { field: "lastRequest", operator: "gt", value: 50 },
+                    { field: "count", operator: "lt", value: 3 },
+                ],
+                increment: { count: 1 },
+            },
+        ]);
+    });
+
+    test("maps swapped physical incrementOne fields back to their canonical columns", async () => {
+        harness.close();
+        resetAuthRuntime();
+        bindAuthRuntime({
+            schema: synthesizeAuthSchema(swappedRateLimitAuth.options as never) as never,
+            options: swappedRateLimitAuth.options as { readonly [key: string]: unknown },
+        });
+        harness = new CatalogHarness();
+        await harness.ready();
+        await harness.catalog.mutateAuth({
+            model: "rateLimit",
+            op: "create",
+            payload: { id: "rate-swapped", key: "swapped", count: 1, lastRequest: 100 },
+        });
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(
+            swappedRateLimitAuth.options
+        );
+
+        await expect(
+            adapter.incrementOne<Record<string, unknown>>({
+                model: "rateLimit",
+                where: [
+                    { field: "key", operator: "eq", value: "swapped" },
+                    { field: "count", operator: "lt", value: 2 },
+                    { field: "lastRequest", operator: "gte", value: 100 },
+                ],
+                increment: { count: 1 },
+                set: { lastRequest: 200 },
+            })
+        ).resolves.toMatchObject({ id: "rate-swapped", key: "swapped", count: 2, lastRequest: 200 });
+        await expect(
+            harness.catalog.queryAuth({ model: "rateLimit", where: { id: "rate-swapped" }, limit: 1 })
+        ).resolves.toEqual([
+            expect.objectContaining({ id: "rate-swapped", key: "swapped", count: 2, lastRequest: 200 }),
+        ]);
+    });
+
+    test("rejects duplicate physical incrementOne mappings at adapter construction", () => {
+        expect(() =>
+            chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })({
+                rateLimit: {
+                    storage: "database",
+                    fields: { key: "duplicate", count: "duplicate" },
+                },
+            } as never)
+        ).toThrow(/both map to "duplicate"/);
+    });
+
+    test("atomically enforces rate-limit guards, resets, and concurrent maxima", async () => {
+        harness.close();
+        resetAuthRuntime();
+        bindAuthRuntime({
+            schema: synthesizeAuthSchema(rateLimitAuth.options as never) as never,
+            options: rateLimitAuth.options as { readonly [key: string]: unknown },
+        });
+        harness = new CatalogHarness();
+        await harness.ready();
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(rateLimitAuth.options);
+
+        await adapter.create({
+            model: "rateLimit",
+            forceAllowId: true,
+            data: { id: "rate-window", key: "window", count: 0, lastRequest: 100 },
+        });
+        const beforeIncrement = harness.catalog.authEpoch({}).global;
+        await expect(
+            adapter.incrementOne<Record<string, unknown>>({
+                model: "rateLimit",
+                where: [
+                    { field: "key", operator: "eq", value: "window" },
+                    { field: "lastRequest", operator: "gt", value: 50 },
+                    { field: "count", operator: "lt", value: 2 },
+                ],
+                increment: { count: 1 },
+            })
+        ).resolves.toMatchObject({ id: "rate-window", count: 1, lastRequest: 100 });
+        expect(harness.catalog.authEpoch({}).global).toBe(beforeIncrement + 1);
+
+        harness.sqlStatements.length = 0;
+        const beforeGuardMiss = harness.catalog.authEpoch({}).global;
+        await expect(
+            adapter.incrementOne({
+                model: "rateLimit",
+                where: [
+                    { field: "key", operator: "eq", value: "window" },
+                    { field: "count", operator: "lt", value: 1 },
+                ],
+                increment: { count: 1 },
+            })
+        ).resolves.toBeNull();
+        expect(harness.sqlStatements.some(statement => statement.startsWith('UPDATE "rateLimit"'))).toBe(false);
+        expect(harness.sqlStatements.some(statement => statement.startsWith("UPDATE catalog_epoch"))).toBe(false);
+        expect(harness.catalog.authEpoch({}).global).toBe(beforeGuardMiss);
+
+        await adapter.create({
+            model: "rateLimit",
+            forceAllowId: true,
+            data: { id: "rate-concurrent", key: "concurrent", count: 0, lastRequest: 100 },
+        });
+        const beforeConcurrent = harness.catalog.authEpoch({}).global;
+        const concurrent = await Promise.all(
+            Array.from({ length: 3 }, () =>
+                adapter.incrementOne<Record<string, unknown>>({
+                    model: "rateLimit",
+                    where: [
+                        { field: "key", operator: "eq", value: "concurrent" },
+                        { field: "count", operator: "lt", value: 2 },
+                    ],
+                    increment: { count: 1 },
+                })
+            )
+        );
+        expect(concurrent.filter(result => result !== null).map(result => result?.count)).toEqual([1, 2]);
+        expect(concurrent.filter(result => result === null)).toHaveLength(1);
+        expect(await adapter.findOne({ model: "rateLimit", where: eq("key", "concurrent") })).toMatchObject({
+            count: 2,
+        });
+        expect(harness.catalog.authEpoch({}).global).toBe(beforeConcurrent + 2);
+
+        await adapter.create({
+            model: "rateLimit",
+            forceAllowId: true,
+            data: { id: "rate-reset", key: "reset", count: 9, lastRequest: 10 },
+        });
+        await expect(
+            adapter.incrementOne<Record<string, unknown>>({
+                model: "rateLimit",
+                where: [
+                    { field: "key", operator: "eq", value: "reset" },
+                    { field: "lastRequest", operator: "lte", value: 10 },
+                ],
+                increment: {},
+                set: { count: 1, lastRequest: 200 },
+            })
+        ).resolves.toMatchObject({ id: "rate-reset", count: 1, lastRequest: 200 });
+
+        await adapter.create({
+            model: "rateLimit",
+            forceAllowId: true,
+            data: { id: "a-empty-guard", key: "empty-a", count: 4, lastRequest: 10 },
+        });
+        await adapter.create({
+            model: "rateLimit",
+            forceAllowId: true,
+            data: { id: "b-empty-guard", key: "empty-b", count: 8, lastRequest: 20 },
+        });
+        const beforeEmptyGuard = harness.catalog.authEpoch({}).global;
+        await expect(
+            adapter.incrementOne<Record<string, unknown>>({
+                model: "rateLimit",
+                where: [],
+                increment: { count: 1 },
+            })
+        ).resolves.toMatchObject({ id: "a-empty-guard", count: 5 });
+        expect(await adapter.findOne({ model: "rateLimit", where: eq("id", "a-empty-guard") })).toMatchObject({
+            count: 5,
+        });
+        expect(await adapter.findOne({ model: "rateLimit", where: eq("id", "b-empty-guard") })).toMatchObject({
+            count: 8,
+        });
+        expect(harness.catalog.authEpoch({}).global).toBe(beforeEmptyGuard + 1);
+    });
+
+    test("fails incrementOne closed on invalid operators, fields, and deltas before writes", async () => {
+        harness.close();
+        resetAuthRuntime();
+        bindAuthRuntime({
+            schema: synthesizeAuthSchema(rateLimitAuth.options as never) as never,
+            options: rateLimitAuth.options as { readonly [key: string]: unknown },
+        });
+        harness = new CatalogHarness();
+        await harness.ready();
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(rateLimitAuth.options);
+        await adapter.create({
+            model: "rateLimit",
+            forceAllowId: true,
+            data: { id: "rate-invalid", key: "invalid", count: 0, lastRequest: 100 },
+        });
+        harness.sqlStatements.length = 0;
+
+        await expect(
+            adapter.incrementOne({
+                model: "rateLimit",
+                where: [{ field: "key", operator: "contains", value: "invalid" }],
+                increment: { count: 1 },
+            })
+        ).rejects.toMatchObject({ code: "CDB_UNSUPPORTED_FEATURE", retryable: false });
+        await expect(
+            adapter.incrementOne({
+                model: "rateLimit",
+                where: eq("key", "invalid"),
+                increment: { count: Number.POSITIVE_INFINITY },
+            })
+        ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
+        await expect(
+            harness.catalog.incrementAuth({
+                model: "rateLimit",
+                where: [{ field: "missing", operator: "eq", value: "invalid" }],
+                increment: { count: 1 },
+            })
+        ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
+        await expect(
+            harness.catalog.incrementAuth({
+                model: "rateLimit",
+                where: [{ field: "key", operator: "eq", value: "invalid" }],
+                increment: { key: 1 },
+            })
+        ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
+        await expect(
+            harness.catalog.incrementAuth({
+                model: "rateLimit",
+                where: [{ field: "key", operator: "eq", value: "invalid" }],
+                increment: {},
+                set: { key: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES + 1) },
+            })
+        ).rejects.toMatchObject({ code: "CDB_RATE_LIMITED", retryable: true });
+        expect(harness.sqlStatements.some(statement => statement.startsWith('UPDATE "rateLimit"'))).toBe(false);
+        expect(harness.sqlStatements.some(statement => statement.startsWith("UPDATE catalog_epoch"))).toBe(false);
     });
 
     test("updates and deletes through non-owner lookups while preserving epoch bumps", async () => {
