@@ -99,6 +99,7 @@ The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lo
 - [x] Route Better Auth counts through a Catalog `COUNT(*)` RPC instead of materializing matching rows. Reuse the adapter's `eq` and `AND` validation, model and column checks, and bound equality predicates.
 - [x] Forward Better Auth `findMany` offset and sort through Catalog. Map model fields to schema column names, support validated ascending and descending order, add `id ASC` as the tie-breaker and paging default, and bind validated non-negative safe-integer limits and offsets.
 - [x] Make Better Auth single `update` and `delete` select the lowest matching schema-mapped id and mutate only that row. Treat an empty predicate or no match as a no-op, while leaving `updateMany` and `deleteMany` as all-match operations, including for an empty predicate.
+- [x] Implement Better Auth `incrementOne` as one atomic Catalog transaction. Resolve customized model and field names without collision, select the deterministic lowest matching id, repeat the guard on update, enforce mutation budgets, and bump epochs only after a successful write.
 - [x] Generate auth table and index DDL from the synthesized Drizzle schema, preserving keys, uniqueness, foreign keys, indexes, defaults, nullability, and SQLite types.
 - [x] Reject existing auth tables without matching `auth_ddl_v1` signatures instead of treating `CREATE TABLE IF NOT EXISTS` as an upgrade.
 - [ ] Add a versioned upgrade path for existing auth signatures instead of requiring pre-release Catalog recreation.
@@ -238,6 +239,8 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Fence every client WebSocket callback and pending JWT continuation by terminal state, connection attempt, and exact socket identity. Revoke the current socket before processing error or close, ignore stale continuations and callbacks, and preserve the existing reconnect progression and welcome-only reset.
 - [x] Treat a thrown client `hello` send as a reconnectable socket failure. Revoke and close that attempt, retain queued subscriptions and mutations, then resend them once after a replacement socket receives `welcome`.
 - [x] On terminal client cleanup, clear each subscription's authoritative rows and optimistic history before its final empty listener notification. Continue clearing mutations, timers, socket, and broadcast state if one listener throws.
+- [x] Propagate subscription lifecycle state to listeners and React without breaking one-argument listeners. Only an authoritative snapshot promotes a query to `live`; patches preserve `pending`, `refetching`, or `error`. Clear per-subscription snapshot deduplication on `mustRefetch` so a same-cookie rematerialization can restore `live` state.
+- [x] Route hibernatable WebSocket errors through the same exact attachment rejection, admission cleanup, registration retirement, and fallback reconciliation path as socket close.
 - [x] Cap client pending mutation records at 32 across queued, in-flight, and reconnecting work. Validate refs first, then reject a valid 33rd immediately with retryable `CDB_RATE_LIMITED` before UUID allocation, timer creation, map insertion, or send. Preserve admitted ids and deadlines across reconnect and release capacity on every settlement and close path.
 - [x] Apply the strict 512 KiB, 4,096-member, 99-level JSON argument contract to client subscriptions as well as mutations. After ref validation, inspect descriptors and construct an owned snapshot in one traversal without invoking getters or rereading proxies. Finish this work before capacity checks, id allocation, mutation timers, record insertion, or send as applicable, then reuse the same owned payload and ids for immediate send, welcome flush, and reconnect.
 - [x] Keep direct clients eager while deferring provider-created client startup until the React effect commits. Close only clients the provider created, preserve a same-object transfer to borrowed ownership, and avoid WebSocket, JWT, or broadcast work for aborted renders and StrictMode rehearsals. Reset `useQuery` to pending when client, ref, or argument identity changes, and ignore late listeners from the previous identity. Keep public exports unchanged.
@@ -262,7 +265,14 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Define and test snapshot acknowledgement, durable retry until exact acknowledgement, and client same-cookie deduplication with re-acknowledgement.
 - [ ] Apply backpressure or disconnect slow consumers.
 - [ ] Make disconnect and shutdown reject or retain pending mutations according to a documented rule.
-- [ ] Add failure tests for Worker RPC errors, Catalog errors, shard eviction, socket loss before acknowledgment, duplicate delivery, stale schema epoch, and protocol mismatch.
+- [x] Cover malformed and throwing Catalog authority responses in the configured Gateway workerd harness.
+- [x] Add default-small, environment-scalable SDK workerd scenarios for two-tenant mutation fanout and selective subscription refresh. Assert exact rows, durable convergence, drained outboxes, and cleanup; emit timing telemetry without performance thresholds.
+- [x] Use one correctness command that runs ordinary tests together and every workerd harness serially, with process-tree cleanup on timeout or cancellation.
+- [x] Add a manual scale workflow with bounded workload inputs, reproducible run metadata, and machine-readable benchmark artifacts.
+- [ ] Prove through configured workerd that a socket lost after snapshot delivery but before acknowledgement reconnects, receives the same staged cookie, acknowledges once, and continues.
+- [ ] Add configured workerd proofs for stale schema epochs and protocol mismatch. Keep focused fake-runtime coverage, but do not count it as configured-runtime evidence.
+- [ ] Add remaining Worker RPC failure and shard-eviction cases that are not already covered by Gateway and Cdb reconstruction tests.
+- [ ] Establish performance targets only after repeated benchmark runs on a declared platform. Do not turn local Miniflare timing into a product claim.
 
 ## 10. Make one real example
 
@@ -298,7 +308,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Remove placeholder React hooks from public exports until implemented.
 - [x] Remove placeholder file and vector APIs from the main product description.
 - [x] Run each workerd harness in a separate sequential CI process to avoid shared Miniflare ports.
-- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 4/4, `gateway-jwt` 21/21, and `gateway-snapshot` 1/1. Give the snapshot reconstruction case a 15-second test budget because it starts workerd twice. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
+- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 6/6 including the two default-small scale scenarios, `gateway-jwt` 21/21, and `gateway-snapshot` 1/1. Give the snapshot reconstruction case a 15-second test budget because it starts workerd twice. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
 - [ ] Add one command that starts the example locally with migrations applied.
 
 ## 12. Fix package and repository hygiene

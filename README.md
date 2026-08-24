@@ -59,11 +59,11 @@ Catalog's authority read is the authorization linearization point. A revocation 
 
 The JWT tests use real signatures and the Catalog resolver contract. Miniflare workerd tests drive the configured Gateway Durable Object and WebSocket with ES256 tokens, a real Catalog SQLite cache, Catalog membership resolution, and configured Cdb mutation and query handlers. The live test gives two org-A clients initial snapshots and acknowledgements, commits a public mutation, drains the Cdb invalidation outbox, delivers replacement snapshots and acknowledgements, keeps an org-B query empty under policy, then reconnects and subscribes again. It also evicts Gateway and Cdb with a hibernated socket and a staged replacement, reconstructs both objects, and delivers the same snapshot cookie. Another test imports refs from a real emitted Vite browser chunk and compares them with the independently bundled workerd Worker. A configured Catalog workerd test creates a user, session, organization, and member, evicts the Catalog Durable Object, proves a new instance started, and reads identical stored auth rows and canonical organization authority after reconstruction. Catalog now owns JWKS refresh and scopes cache entries, leases, and cooldowns by URL. It enforces a 5-second fetch and read deadline, a 256 KiB document limit, at most 32 keys, a 256-byte `kid`, and a 2,048-byte URL. A durable 10-second lease coordinates refresh. A successful document caches absent keys for 5 seconds, while failures cool down exponentially from 1 to 60 seconds. Refresh never returns an expired key or falls back to the unscoped legacy cache, and it atomically removes keys absent from the new document. The configured workerd test proves fail-closed outbound errors, cooldown suppression, recovery, retired and unknown key rejection, rotated-key acceptance, and Catalog-derived authority despite forged tenant and role claims. Other focused tests seed JWK and auth rows through test-only routes. The separate packed chat smoke runs actual Better Auth anonymous sign-ins and token issue for two principals. Catalog auth DDL preserves constraints and indexes for new storage. Existing tables need exact matching `auth_ddl_v1` signatures; no versioned upgrade path exists.
 
-A local listener-capable host passes the current real-workerd suites: `gateway-live` 4/4, `gateway-jwt` 21/21, and `gateway-snapshot` 1/1. The snapshot reconstruction test has a 15-second budget because it starts Miniflare/workerd twice around a persisted restart; this is test budget, not a product latency promise. Restricted-sandbox failures to bind ephemeral port 0 happen before application code and are environmental, not product evidence. These focused passes do not make Chardb production-ready.
+A real-workerd compatibility run requires a host that permits local listeners. The snapshot reconstruction test has a 15-second budget because it starts Miniflare/workerd twice around a persisted restart; this is test budget, not a product latency promise. Restricted-sandbox failures to bind ephemeral port 0 happen before application code and are environmental, not product evidence. Focused passes do not make Chardb production-ready.
 
 Each server-generated connection id owns at most one in-flight `hello` or `updateAuth` operation. A duplicate receives retryable `CDB_RATE_LIMITED` before JWT verification, Catalog access, attachment mutation, or refresh chaining. Every outcome releases only the exact owning claim. An admitted `updateAuth` barrier remains visible to mutation and subscription admission while Gateway drains prior work, retires that connection's current durable registrations, and reports affected subscription ids through `mustRefetch`. It does not replay those subscriptions.
 
-Socket close stores a rejected attachment and fences every post-await authentication step through verification, drain, alarm scheduling, retirement, invalidation, attachment mutation, and send. Late continuations cannot dispatch queued work or replace the rejected state. Failed refreshes also store a terminal rejected attachment before closing the socket.
+Socket close or a hibernatable socket error stores a rejected attachment, releases in-memory admission state, and drives the same exact durable retirement and fallback reconciliation path. Every post-await authentication, drain, alarm, retirement, invalidation, attachment mutation, and send step is fenced. Late continuations cannot dispatch queued work or replace the rejected state. Failed refreshes also store a terminal rejected attachment before closing the socket.
 
 If a verified `hello` cannot send `welcome`, Gateway marks that exact connection rejected and attempts a 1011 close with reason `welcome delivery failed`. An unsupported protocol is rejected before verification; Gateway attempts the mismatch frame, then closes with 1002 and reason `unsupported chardb protocol <version>` even if that send fails.
 
@@ -124,6 +124,8 @@ Retired Cdb subscription-tombstone total bytes and its compaction watermark, pre
 Better Auth counts use a Catalog scalar `COUNT(*)` RPC instead of materializing matching rows. They keep the same `eq` and `AND` where validation, model and column checks, and bound equality predicates as row lookup. `findMany` forwards offset and sort through Catalog. Model sort fields map through the synthesized schema, direction accepts validated `ASC` or `DESC`, and `id ASC` breaks ties or supplies the default paging order. Limit and offset accept only non-negative safe integers and go to SQL as bindings. Each auth mutation commits with every directly derivable old and new global, tenant, or principal epoch bump.
 
 Single Better Auth `update` and `delete` select the lowest matching schema-mapped id and mutate only that row. An empty predicate or no match is a no-op. `updateMany` and `deleteMany` retain all-match behavior, including for an empty predicate, and keep their existing bulk bounds.
+
+Better Auth `incrementOne` is native rather than a read-then-update fallback. Catalog maps customized model and field names in both directions, deterministically selects one row, repeats its guards in the exact update, applies increment and set values atomically, and bumps auth epochs only when the update succeeds. Invalid mappings, guards, fields, deltas, or projected write volume fail before base or epoch writes.
 
 Bulk auth update and delete preflight accepts exactly 4,096 matched rows and 512 KiB of projected old and replacement scope values. Update also accepts exactly 512 KiB of schema-mapped replacement values after multiplying their SQL byte cost by the matched row count. Catalog loads only placement, organization, and user scope columns. Overflow returns retryable `CDB_RATE_LIMITED` before the base write or epoch bump, and `updateMany` performs no full-row preload or reread. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. Indirect plugin relationships without placement metadata or conventional `organizationId` or `userId` fields may lack a secondary scope. These cases have Bun fake-Durable-Object coverage, not workerd coverage.
 
@@ -191,11 +193,11 @@ Install Bun, then run:
 ```bash
 bun install --frozen-lockfile
 bun run typecheck
-bun test
+bun run test:correctness
 bun run build
 ```
 
-The workerd tests open local ports. Run them separately if the full test runner contends over Miniflare startup:
+`test:correctness` runs ordinary tests together, then starts each workerd harness in a separate process. The workerd tests open local ports. Individual harnesses remain available for focused diagnosis:
 
 ```bash
 bun test test/workerd/catalog.harness.test.ts
@@ -204,6 +206,14 @@ bun test test/workerd/gateway-live.harness.test.ts
 bun test test/workerd/gateway-jwt.harness.test.ts
 bun test test/workerd/gateway-snapshot.harness.test.ts
 ```
+
+The `gateway-live` harness also contains two default-small SDK scale scenarios. They assert tenant isolation, exact filtered rows, durable convergence, outbox drain, and cleanup. They emit JSON timing telemetry but impose no latency or throughput threshold. Run just those scenarios with:
+
+```bash
+bun run bench:live
+```
+
+The manual `Live scale benchmark` GitHub Actions workflow accepts larger bounded workloads and uploads workload metadata, full output, and two NDJSON metric records. These measurements are Miniflare regression telemetry, not production capacity claims.
 
 The landing page is a separate workspace:
 
