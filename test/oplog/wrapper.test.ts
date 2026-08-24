@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { CdbError } from "../../src/errors.ts";
 import { OP_LOG_DDL } from "../../src/oplog/schema.ts";
 import { type SyncSql, canonicalRequest, runWrappedMutation } from "../../src/oplog/wrapper.ts";
-import { Cookie, MutId, PrincipalId } from "../../src/types.ts";
+import { Cookie, MutId, PrincipalId, type RawJson } from "../../src/types.ts";
 
 let db: Database;
 let sql: SyncSql;
@@ -56,7 +56,7 @@ afterEach(() => db.close());
 const PRINCIPAL = PrincipalId("user-1");
 const MUT_ID = MutId("01H0000000000000000000");
 
-function runOnce(args: { sameMutId?: boolean; payload?: { x: number } } = {}) {
+function runOnce(args: { sameMutId?: boolean; payload?: RawJson } = {}) {
     let ran = 0;
     const result = db.transaction(() => {
         return runWrappedMutation({
@@ -132,6 +132,28 @@ describe("op-log wrapper — D3 idempotency", () => {
         const a = canonicalRequest("ref", { a: 1, b: 2 } as never);
         const b = canonicalRequest("ref", { b: 2, a: 1 } as never);
         expect(b).toBe(a);
+    });
+
+    test("canonicalRequest preserves own __proto__ data for replay identity", () => {
+        const payload = (value: string): RawJson => {
+            const object = { stable: true } as Record<string, RawJson>;
+            Object.defineProperty(object, "__proto__", {
+                value: { value },
+                enumerable: true,
+                writable: true,
+                configurable: true,
+            });
+            return object;
+        };
+
+        expect(canonicalRequest("ref", payload("a"))).toBe(
+            '{"ref":"ref","args":{"__proto__":{"value":"a"},"stable":true}}'
+        );
+        expect(runOnce({ sameMutId: true, payload: payload("a") }).result.ran).toBe(true);
+        expect(runOnce({ sameMutId: true, payload: payload("a") })).toMatchObject({ ran: 0, result: { ran: false } });
+        expect(() => runOnce({ sameMutId: true, payload: payload("b") })).toThrowError(
+            expect.objectContaining({ code: "CDB_MUT_ID_COLLISION" })
+        );
     });
 
     test("concurrent in-flight: row with empty payload_enc raises CDB_TXN_ABORTED_EVICTION", () => {

@@ -277,7 +277,7 @@ export function canonicalRequest(ref: string, args: RawJson): string {
 function canonicalize(value: RawJson): RawJson {
     if (Array.isArray(value)) return value.map(canonicalize) as RawJson[];
     if (value && typeof value === "object") {
-        const out: { [k: string]: RawJson } = {};
+        const out = Object.create(null) as { [k: string]: RawJson };
         for (const k of Object.keys(value).sort())
             out[k] = canonicalize((value as { [k: string]: RawJson })[k] as RawJson);
         return out;

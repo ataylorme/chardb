@@ -38,7 +38,6 @@
 import { CdbError } from "../errors.ts";
 import type { Brand, ChardbRef, RawJson } from "../types.ts";
 import { stableJson } from "../util/canonical.ts";
-import { rawJsonResult } from "../util/raw_json.ts";
 import type { CdbIntent } from "../wire.ts";
 import type { MutationAuthority } from "./define.ts";
 import type { ChardbFunctionKind } from "./refs.ts";
@@ -47,6 +46,7 @@ import {
     CDB_QUERY_ARGS_MAX_BYTES,
     CDB_QUERY_ARGS_MAX_DEPTH,
     snapshotCdbJsonByteLimit,
+    snapshotCdbMutationArgs,
     snapshotCdbQueryArgs,
 } from "./result_limits.ts";
 
@@ -335,14 +335,14 @@ export function routeMutation(
       }
     | { readonly ok: false; readonly error: ReturnType<CdbError["toJSON"]> } {
     try {
+        const rawArgs = snapshotCdbMutationArgs(input.args);
         const desc = resolveMutation(manifest, input.ref as ChardbRef);
-        const argsObj = rawJsonResult(
-            desc.validateArgs ? desc.validateArgs(input.args) : input.args,
-            "mutation arguments",
-            "CDB_INVALID_ARGS"
+        const validatedArgs = snapshotCdbMutationArgs(
+            (desc.validateArgs ? desc.validateArgs(rawArgs) : rawArgs) as RawJson
         );
         let key: string | number | bigint | undefined;
-        if (desc.extractPartitionKey) key = desc.extractPartitionKey(argsObj);
+        if (desc.extractPartitionKey) key = desc.extractPartitionKey(snapshotCdbMutationArgs(validatedArgs));
+        const args = snapshotCdbMutationArgs(validatedArgs);
         if (desc.authority === "organization" && (typeof key !== "string" || key.length === 0)) {
             throw new CdbError({
                 code: "CDB_INVALID_ARGS",
@@ -355,13 +355,13 @@ export function routeMutation(
                 message: `mutation ${input.ref} declared singlePartition without resolvable partitionKey`,
             });
         }
-        const scalar = key === undefined ? JSON.stringify(argsObj) : String(key);
+        const scalar = key === undefined ? stableJson(args) : String(key);
         return {
             ok: true,
             vshard: Number(vshardOf([scalar])),
             authority: desc.authority ?? null,
             partitionKey: key === undefined ? null : String(key),
-            args: argsObj,
+            args,
         };
     } catch (err) {
         if (err instanceof CdbError) return { ok: false, error: err.toJSON() };

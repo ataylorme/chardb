@@ -12,7 +12,11 @@ import {
 } from "../../src/server/do/gateway.ts";
 import { manifestFromExports, routeMutation } from "../../src/server/manifest.ts";
 import { CDB_JSON_MAX_AGGREGATE_MEMBERS, CDB_MUTATION_ARGS_MAX_DEPTH } from "../../src/server/result_limits.ts";
-import type { CdbMutationRequest, TrustedMutationDispatchRequest } from "../../src/server/rpc.ts";
+import type {
+    CdbMutationRequest,
+    MutationRouteResponse,
+    TrustedMutationDispatchRequest,
+} from "../../src/server/rpc.ts";
 import {
     ChardbRef,
     ClientId,
@@ -23,7 +27,7 @@ import {
     SubId,
     TenantId,
 } from "../../src/types.ts";
-import { vshardOf } from "../../src/vshard.ts";
+import { VSHARD_COUNT, vshardOf } from "../../src/vshard.ts";
 import { decodeWire, encodeWire } from "../../src/wire.ts";
 
 const request: TrustedMutationDispatchRequest = {
@@ -248,6 +252,154 @@ describe("trusted Gateway mutation dispatch", () => {
             });
         }
         expect({ localRoutes, catalogCalls, cdbCalls }).toEqual({ localRoutes: 0, catalogCalls: 0, cdbCalls: 0 });
+    });
+
+    test("rejects oversized custom-route output before Catalog or Cdb work", async () => {
+        let catalogCalls = 0;
+        let cdbCalls = 0;
+        const deps: TrustedMutationDispatchDeps = {
+            routeMutation: () => ({
+                ok: true,
+                vshard: 73,
+                authority: "organization",
+                partitionKey: "org-1",
+                args: { value: "x".repeat(512 * 1_024) },
+            }),
+            catalog: {
+                async resolveOrganizationAuthority() {
+                    catalogCalls += 1;
+                    return authority;
+                },
+                async route() {
+                    catalogCalls += 1;
+                    return { shardId: ShardId("unused"), schemaEpoch: 1 };
+                },
+            },
+            cdb: () => {
+                cdbCalls += 1;
+                throw new Error("Cdb must not be selected");
+            },
+        };
+        await expect(dispatchTrustedMutation(deps, request)).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVALID_ARGS", retryable: false },
+        });
+        expect({ catalogCalls, cdbCalls }).toEqual({ catalogCalls: 0, cdbCalls: 0 });
+    });
+
+    test("rejects invalid custom-route vshards before external work", async () => {
+        let catalogCalls = 0;
+        let cdbCalls = 0;
+        for (const vshard of [-1, 0.5, VSHARD_COUNT]) {
+            const deps: TrustedMutationDispatchDeps = {
+                routeMutation: input => ({
+                    ok: true,
+                    vshard,
+                    authority: "organization",
+                    partitionKey: "org-1",
+                    args: input.args,
+                }),
+                catalog: {
+                    async resolveOrganizationAuthority() {
+                        catalogCalls += 1;
+                        return authority;
+                    },
+                    async route() {
+                        catalogCalls += 1;
+                        return { shardId: ShardId("unused"), schemaEpoch: 1 };
+                    },
+                },
+                cdb: () => {
+                    cdbCalls += 1;
+                    throw new Error("Cdb must not be selected");
+                },
+            };
+            await expect(dispatchTrustedMutation(deps, request)).resolves.toMatchObject({
+                ok: false,
+                error: { code: "CDB_INVARIANT", retryable: false },
+            });
+        }
+        expect({ catalogCalls, cdbCalls }).toEqual({ catalogCalls: 0, cdbCalls: 0 });
+    });
+
+    test("keeps the routed result and projected auth stable while Catalog routing is held", async () => {
+        let releaseRoute!: () => void;
+        let routeStarted!: () => void;
+        const started = new Promise<void>(resolve => {
+            routeStarted = resolve;
+        });
+        const held = new Promise<void>(resolve => {
+            releaseRoute = resolve;
+        });
+        const routeArgs = { organizationId: "org-1", body: "original" };
+        const routed = {
+            ok: true,
+            vshard: 73,
+            authority: "organization",
+            partitionKey: "org-1",
+            args: routeArgs,
+        } as Extract<MutationRouteResponse, { readonly ok: true }>;
+        const mutableRouted = routed as {
+            ok: true;
+            vshard: number;
+            authority: "organization" | null;
+            partitionKey: string | null;
+            args: RawJson;
+        };
+        const authorityResponse = {
+            ...authority,
+            roles: [...authority.roles] as string[],
+            authEpochs: {
+                global: Number(authority.authEpochs.global),
+                tenant: Number(authority.authEpochs.tenant),
+                principal: Number(authority.authEpochs.principal),
+            },
+        };
+        let cdbArgs: RawJson | undefined;
+        let cdbAuth: CdbMutationRequest["auth"] | undefined;
+        const deps: TrustedMutationDispatchDeps = {
+            routeMutation: () => routed,
+            catalog: {
+                async resolveOrganizationAuthority() {
+                    return authorityResponse;
+                },
+                async route(vshard) {
+                    expect(vshard).toBe(73);
+                    routeStarted();
+                    await held;
+                    return { shardId: ShardId("shard-a"), schemaEpoch: 9 };
+                },
+            },
+            cdb: () => ({
+                mutate(input) {
+                    cdbArgs = input.args;
+                    cdbAuth = input.auth;
+                    return { ok: true, cookie: "cookie-owned", ran: true, result: null, rowsAffected: 0 };
+                },
+            }),
+        };
+        const pending = dispatchTrustedMutation(deps, request);
+        await started;
+        routeArgs.organizationId = "org-mutated";
+        routeArgs.body = "mutated";
+        Object.assign(routeArgs, { oversized: "x".repeat(512 * 1_024) });
+        mutableRouted.vshard = 99;
+        mutableRouted.authority = null;
+        mutableRouted.partitionKey = "org-mutated";
+        mutableRouted.args = { organizationId: "org-mutated", body: "replaced" };
+        authorityResponse.roles.splice(0, authorityResponse.roles.length, "mutated");
+        authorityResponse.authEpochs.global = 99;
+        releaseRoute();
+        await expect(pending).resolves.toMatchObject({ ok: true });
+        expect(cdbArgs).toEqual({ organizationId: "org-1", body: "original" });
+        expect(cdbAuth).toEqual({
+            userId: "user-1",
+            tenantId: "org-1",
+            role: "admin,member",
+            roles: ["admin", "member"],
+            authEpochs: { global: 2, tenant: 3, principal: 4 },
+            claims: {},
+        });
     });
 
     test("preserves a typed local routing rejection", async () => {

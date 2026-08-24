@@ -32,11 +32,16 @@ import { type QueryReadRangeObservation, wrapQueryDb } from "../cdb-db-proxy.ts"
 import { cdbPolicyDigest } from "../cdb-policy.ts";
 import { collectCdbTables } from "../cdb-table-registry.ts";
 import { resolveCdbMeta } from "../cdb-table.ts";
+import type { AuthCtx } from "../define.ts";
 import { type ChardbManifest, emptyManifest, resolveMutation, resolveQuery, routeValidatedQuery } from "../manifest.ts";
 import {
+    CDB_JSON_MAX_AGGREGATE_MEMBERS,
+    CDB_MUTATION_ARGS_MAX_BYTES,
+    CDB_MUTATION_ARGS_MAX_DEPTH,
     CDB_QUERY_RESULT_MAX_ROWS,
-    assertCdbMutationArgsByteLimit,
     assertCdbResultByteLimit,
+    snapshotCdbJsonByteLimit,
+    snapshotCdbMutationArgs,
     snapshotCdbQueryArgs,
 } from "../result_limits.ts";
 import type {
@@ -648,6 +653,96 @@ function readOnlyQueryDb<TDb extends object>(db: TDb): TDb {
     });
 }
 
+function snapshotMutationAuth(input: AuthCtx): AuthCtx {
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) {
+        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "mutation auth payload is malformed" });
+    }
+    const field = (key: keyof AuthCtx): unknown => {
+        const descriptor = Object.getOwnPropertyDescriptor(input, key);
+        if (!descriptor) return undefined;
+        if (!descriptor.enumerable || !("value" in descriptor)) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "mutation auth payload is malformed" });
+        }
+        return descriptor.value;
+    };
+    const userId = field("userId");
+    const tenantId = field("tenantId");
+    const role = field("role");
+    const roles = field("roles");
+    const authEpochs = field("authEpochs");
+    const activeTeamId = field("activeTeamId");
+    const claims = field("claims");
+    const projected = {
+        userId,
+        ...(tenantId === undefined ? {} : { tenantId }),
+        ...(role === undefined ? {} : { role }),
+        ...(roles === undefined ? {} : { roles }),
+        ...(authEpochs === undefined ? {} : { authEpochs }),
+        ...(activeTeamId === undefined ? {} : { activeTeamId }),
+        claims,
+    };
+    const snapshot = snapshotCdbJsonByteLimit(
+        projected as unknown as RawJson,
+        CDB_MUTATION_ARGS_MAX_BYTES,
+        {
+            code: "CDB_INVALID_ARGS",
+            subject: "mutation auth payload",
+            hint: "reduce mutation auth metadata",
+        },
+        {
+            maxAggregateMembers: CDB_JSON_MAX_AGGREGATE_MEMBERS,
+            maxDepth: CDB_MUTATION_ARGS_MAX_DEPTH,
+        }
+    );
+    if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot)) {
+        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "mutation auth payload is malformed" });
+    }
+    const auth = snapshot as Record<string, RawJson>;
+    if (
+        typeof auth.userId !== "string" ||
+        (auth.tenantId !== undefined && typeof auth.tenantId !== "string") ||
+        (auth.role !== undefined && typeof auth.role !== "string") ||
+        (auth.activeTeamId !== undefined && typeof auth.activeTeamId !== "string") ||
+        (auth.roles !== undefined &&
+            (!Array.isArray(auth.roles) || !auth.roles.every(role => typeof role === "string"))) ||
+        typeof auth.claims !== "object" ||
+        auth.claims === null ||
+        Array.isArray(auth.claims)
+    ) {
+        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "mutation auth payload is malformed" });
+    }
+    const epochs = auth.authEpochs;
+    if (
+        epochs !== undefined &&
+        (typeof epochs !== "object" ||
+            epochs === null ||
+            Array.isArray(epochs) ||
+            ![epochs.global, epochs.tenant, epochs.principal].every(
+                epoch => typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch >= 0
+            ))
+    ) {
+        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "mutation auth payload is malformed" });
+    }
+    return {
+        userId: auth.userId,
+        ...(auth.tenantId === undefined ? {} : { tenantId: auth.tenantId }),
+        ...(auth.role === undefined ? {} : { role: auth.role }),
+        ...(auth.roles === undefined ? {} : { roles: auth.roles as string[] }),
+        ...(epochs === undefined
+            ? {}
+            : {
+                  authEpochs: {
+                      global: epochs.global as number,
+                      tenant: epochs.tenant as number,
+                      principal: epochs.principal as number,
+                  },
+              }),
+        ...(auth.activeTeamId === undefined ? {} : { activeTeamId: auth.activeTeamId }),
+        claims: auth.claims as Record<string, RawJson>,
+    };
+}
+
 export interface CdbRuntimeConfig<TSchema extends Record<string, unknown>> {
     readonly schema: () => TSchema;
     readonly manifest: () => ChardbManifest;
@@ -1088,10 +1183,23 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     /** Resolve and run a registered mutation entirely inside this shard isolate. */
-    async mutate(request: CdbMutationRequest): Promise<CdbMutationResponse> {
+    async mutate(input: CdbMutationRequest): Promise<CdbMutationResponse> {
         let response: CdbMutationResponse;
         try {
-            assertCdbMutationArgsByteLimit(request.args);
+            const principalId = input.principalId;
+            const mutId = input.mutId;
+            const ref = input.ref;
+            const schemaEpoch = input.schemaEpoch;
+            const auth = snapshotMutationAuth(input.auth);
+            const args = snapshotCdbMutationArgs(input.args);
+            const request: CdbMutationRequest = {
+                principalId,
+                mutId,
+                ref,
+                args,
+                auth,
+                schemaEpoch,
+            };
             const descriptor = resolveMutation(this.mutationManifest(), request.ref as ChardbRef);
             try {
                 await this.ctx.storage.setAlarm(this.invalidationNowMs() + 1);

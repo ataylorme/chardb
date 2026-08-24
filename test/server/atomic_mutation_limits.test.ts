@@ -93,6 +93,7 @@ describe("atomic mutation limits", () => {
         readonly id: string;
         readonly result: RawJson;
         throwError?: boolean;
+        mutateResultInMicrotask?: boolean;
     }) {
         return executeAtomicMutation({
             storage,
@@ -111,6 +112,11 @@ describe("atomic mutation limits", () => {
                 handlerRuns++;
                 mutationDb.insert(entries).values({ id: request.id, value: "written", ordinal: 0 }).run();
                 if (args.throwError) throw new Error("handler failure unchanged");
+                if (args.mutateResultInMicrotask) {
+                    queueMicrotask(() => {
+                        (args.result as { value: string }).value = "mutated-after-transaction";
+                    });
+                }
                 return args.result;
             },
             onWriteSet: () => {
@@ -150,6 +156,71 @@ describe("atomic mutation limits", () => {
         expect(handlerRuns).toBe(1);
         expect(hookRuns).toBe(1);
         expect(durableCounts()).toEqual({ domain: 1, opLog: 1 });
+    });
+
+    test("owns a fresh result before a retained object mutates in a microtask", async () => {
+        const retained = { value: "original" };
+        const request = {
+            mutId: "owned-result",
+            id: "owned-result",
+            result: retained,
+            mutateResultInMicrotask: true,
+        };
+        const first = execute(request);
+        await Promise.resolve();
+        expect(retained).toEqual({ value: "mutated-after-transaction" });
+        expect(first).toMatchObject({ ran: true, result: { value: "original" } });
+
+        expect(execute(request)).toMatchObject({ ran: false, result: { value: "original" } });
+        expect(handlerRuns).toBe(1);
+    });
+
+    test("snapshots object and array Proxy results once without property reads", () => {
+        for (const [index, target] of [{ kind: "object", nested: { value: 1 } }, ["array", { value: 2 }]].entries()) {
+            let ownKeysRuns = 0;
+            let getterRuns = 0;
+            const result = new Proxy(target, {
+                ownKeys(value) {
+                    ownKeysRuns += 1;
+                    return Reflect.ownKeys(value);
+                },
+                getOwnPropertyDescriptor: Reflect.getOwnPropertyDescriptor,
+                get() {
+                    getterRuns += 1;
+                    throw new Error("mutation result getters must not run");
+                },
+            }) as unknown as RawJson;
+            const expected = index === 0 ? { kind: "object", nested: { value: 1 } } : ["array", { value: 2 }];
+            const beforeRuns = handlerRuns;
+            const request = { mutId: `proxy-result-${index}`, id: `proxy-result-${index}`, result };
+
+            expect(execute(request)).toMatchObject({ ran: true, result: expected });
+            expect(execute(request)).toMatchObject({ ran: false, result: expected });
+            expect(ownKeysRuns).toBe(1);
+            expect(getterRuns).toBe(0);
+            expect(handlerRuns).toBe(beforeRuns + 1);
+        }
+    });
+
+    test("rejects a cyclic Proxy prototype without hanging", () => {
+        let cyclic!: RawJson;
+        cyclic = new Proxy(
+            {},
+            {
+                getPrototypeOf: () => cyclic as object,
+            }
+        ) as RawJson;
+        let captured: unknown;
+        try {
+            execute({ mutId: "cyclic-prototype", id: "cyclic-prototype", result: cyclic });
+        } catch (error) {
+            captured = error;
+        }
+        expect(captured).toMatchObject({
+            code: "CDB_INVARIANT",
+            message: "mutation result is not JSON-compatible",
+        });
+        expect(durableCounts()).toEqual({ domain: 0, opLog: 0 });
     });
 
     test("rejects one byte over and rolls back the domain write and provisional op-log row", () => {

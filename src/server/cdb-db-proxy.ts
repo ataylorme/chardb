@@ -91,6 +91,7 @@ interface AutoFillPlan {
     readonly policies: ReturnType<typeof compileCdbPolicies>;
     readonly onWrite: ((tableName: string) => void) | undefined;
     readonly beforeWrite: (() => undefined | (() => void)) | undefined;
+    readonly transactionGuard: MutationDbTransactionGuard | undefined;
     readonly bindings: ReadonlyArray<{
         readonly jsKey: string;
         readonly value: string;
@@ -106,6 +107,7 @@ interface SelectPlan {
     readonly queryBoundary: boolean;
     readonly rangeObserver: QueryReadRangeObserver | undefined;
     readonly rangeState: QueryReadRangeState;
+    readonly transactionGuard: MutationDbTransactionGuard | undefined;
 }
 
 interface SelectRootPlan {
@@ -113,6 +115,7 @@ interface SelectRootPlan {
     readonly fullRow: boolean;
     readonly queryBoundary: boolean;
     readonly onRead: ((tableName: string) => void) | undefined;
+    readonly transactionGuard: MutationDbTransactionGuard | undefined;
     readonly rangeObserver: QueryReadRangeObserver | undefined;
 }
 
@@ -167,7 +170,8 @@ function buildPlan(
     auth: AuthCtx,
     operation: "insert" | "update" | "delete" = "insert",
     onWrite?: (tableName: string) => void,
-    beforeWrite?: () => undefined | (() => void)
+    beforeWrite?: () => undefined | (() => void),
+    transactionGuard?: MutationDbTransactionGuard
 ): AutoFillPlan {
     const bindings: Array<{ jsKey: string; value: string; authority: "tenant" | "self" }> = [];
     const sqlToJs = sqlToJsMap(table);
@@ -204,7 +208,16 @@ function buildPlan(
         }
     }
 
-    return { table, tableName: meta.name, auth, policies: compileCdbPolicies(table), onWrite, beforeWrite, bindings };
+    return {
+        table,
+        tableName: meta.name,
+        auth,
+        policies: compileCdbPolicies(table),
+        onWrite,
+        beforeWrite,
+        transactionGuard,
+        bindings,
+    };
 }
 
 function applyPlan<T extends Record<string, unknown>>(plan: AutoFillPlan, row: T): T {
@@ -294,9 +307,10 @@ function buildWritePlan(
     auth: AuthCtx,
     operation: "update" | "delete",
     onWrite?: (tableName: string) => void,
-    beforeWrite?: () => undefined | (() => void)
+    beforeWrite?: () => undefined | (() => void),
+    transactionGuard?: MutationDbTransactionGuard
 ): AutoFillPlan {
-    const plan = buildPlan(table, meta, auth, operation, onWrite, beforeWrite);
+    const plan = buildPlan(table, meta, auth, operation, onWrite, beforeWrite, transactionGuard);
     const authorityRow: Record<string, unknown> = {};
     const jsToSql = jsToSqlMap(table);
     for (const binding of plan.bindings) authorityRow[jsToSql.get(binding.jsKey) ?? binding.jsKey] = binding.value;
@@ -389,6 +403,7 @@ function wrapSelectFromBuilder(builder: unknown, root: SelectRootPlan): unknown 
                     queryBoundary,
                     rangeObserver: root.rangeObserver,
                     rangeState: undefined,
+                    transactionGuard: root.transactionGuard,
                 });
             };
         },
@@ -413,6 +428,7 @@ function scopeSelectBuilder(
 }
 
 function observeSelectExecution(plan: SelectPlan): void {
+    assertMutationTransactionActive(plan.transactionGuard);
     plan.rangeObserver?.({
         token: {},
         tableName: resolveCdbMeta(plan.table).name,
@@ -678,8 +694,9 @@ function writeExecutionMethod(
     if (typeof value !== "function") throw unsupportedWrite(operation, prop);
     const onWrite = plan.onWrite;
     const beforeWrite = plan.beforeWrite;
-    if (prop !== "run" || (!onWrite && !beforeWrite)) return value.bind(target);
+    if (prop !== "run" || (!onWrite && !beforeWrite && !plan.transactionGuard)) return value.bind(target);
     return (...args: readonly unknown[]) => {
+        assertMutationTransactionActive(plan.transactionGuard);
         const writeFailed = beforeWrite?.();
         let result: unknown;
         try {
@@ -772,9 +789,23 @@ export function wrapMutationDb<TDb extends object>(
     db: TDb,
     auth: AuthCtx,
     onWrite?: (tableName: string) => void,
-    beforeWrite?: () => undefined | (() => void)
+    beforeWrite?: () => undefined | (() => void),
+    transactionGuard?: MutationDbTransactionGuard
 ): TDb {
-    return wrapDbInternal(db, auth, false, onWrite, undefined, undefined, beforeWrite);
+    return wrapDbInternal(db, auth, false, onWrite, undefined, undefined, beforeWrite, transactionGuard);
+}
+
+export interface MutationDbTransactionGuard {
+    active: boolean;
+}
+
+function assertMutationTransactionActive(guard: MutationDbTransactionGuard | undefined): void {
+    if (guard && !guard.active) {
+        throw new CdbError({
+            code: "CDB_INVARIANT",
+            message: "mutation database execution escaped its transaction",
+        });
+    }
 }
 
 function wrapDbInternal<TDb extends object>(
@@ -784,7 +815,8 @@ function wrapDbInternal<TDb extends object>(
     onWrite: ((tableName: string) => void) | undefined,
     onRead: ((tableName: string) => void) | undefined,
     rangeObserver?: QueryReadRangeObserver,
-    beforeWrite?: () => undefined | (() => void)
+    beforeWrite?: () => undefined | (() => void),
+    transactionGuard?: MutationDbTransactionGuard
 ): TDb {
     return new Proxy(db, {
         get(target, prop, receiver) {
@@ -811,6 +843,7 @@ function wrapDbInternal<TDb extends object>(
                         queryBoundary,
                         onRead,
                         rangeObserver,
+                        transactionGuard,
                     });
                 };
             }
@@ -818,7 +851,7 @@ function wrapDbInternal<TDb extends object>(
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
                     if (!meta) throw unsupportedWrite("insert", "plain table");
-                    const plan = buildPlan(table, meta, auth, "insert", onWrite, beforeWrite);
+                    const plan = buildPlan(table, meta, auth, "insert", onWrite, beforeWrite, transactionGuard);
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
                     return wrapInsertBuilder(builder, plan);
                 };
@@ -827,7 +860,7 @@ function wrapDbInternal<TDb extends object>(
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
                     if (!meta) throw unsupportedWrite("update", "plain table");
-                    const plan = buildWritePlan(table, meta, auth, "update", onWrite, beforeWrite);
+                    const plan = buildWritePlan(table, meta, auth, "update", onWrite, beforeWrite, transactionGuard);
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
                     return wrapUpdateBuilder(builder, plan);
                 };
@@ -836,15 +869,27 @@ function wrapDbInternal<TDb extends object>(
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
                     if (!meta) throw unsupportedWrite("delete", "plain table");
-                    const plan = buildWritePlan(table, meta, auth, "delete", onWrite, beforeWrite);
+                    const plan = buildWritePlan(table, meta, auth, "delete", onWrite, beforeWrite, transactionGuard);
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
                     return scopePolicyBuilder(builder, plan, "delete");
                 };
             }
             if (prop === "transaction") {
                 return (callback: (tx: TDb) => Promise<unknown>, ...rest: readonly unknown[]) => {
+                    assertMutationTransactionActive(transactionGuard);
                     const wrapped = (tx: TDb) =>
-                        callback(wrapDbInternal(tx, auth, queryBoundary, onWrite, onRead, rangeObserver, beforeWrite));
+                        callback(
+                            wrapDbInternal(
+                                tx,
+                                auth,
+                                queryBoundary,
+                                onWrite,
+                                onRead,
+                                rangeObserver,
+                                beforeWrite,
+                                transactionGuard
+                            )
+                        );
                     return (v as (cb: (tx: TDb) => Promise<unknown>, ...r: readonly unknown[]) => unknown).call(
                         target,
                         wrapped,

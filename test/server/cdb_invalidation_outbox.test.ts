@@ -91,6 +91,38 @@ const failAfterWrite = api.mutation({
     },
 });
 
+let lateWriteError: unknown;
+let lateReadError: unknown;
+let lateTransactionError: unknown;
+const queueLateWrite = api.mutation({
+    args: z.object({ syncId: z.string(), lateId: z.string() }),
+    handler: function queueLateWriteHandler(ctx, args) {
+        ctx.db.insert(messages).values({ id: args.syncId, value: 1 }).run();
+        queueMicrotask(() => {
+            try {
+                ctx.db.insert(messages).values({ id: args.lateId, value: 2 }).run();
+            } catch (error) {
+                lateWriteError = error;
+            }
+            try {
+                ctx.db.select().from(messages).all();
+            } catch (error) {
+                lateReadError = error;
+            }
+            try {
+                ctx.db.transaction(tx => {
+                    tx.insert(messages)
+                        .values({ id: `${args.lateId}-transaction`, value: 3 })
+                        .run();
+                });
+            } catch (error) {
+                lateTransactionError = error;
+            }
+        });
+        return args.syncId;
+    },
+});
+
 let hostileHandlerRuns = 0;
 const acceptHostileArgs = api.mutation({
     args: z.any(),
@@ -101,7 +133,14 @@ const acceptHostileArgs = api.mutation({
     },
 });
 
-const manifest = manifestFromExports({ putMessage, putBoth, inspectMessages, failAfterWrite, acceptHostileArgs });
+const manifest = manifestFromExports({
+    putMessage,
+    putBoth,
+    inspectMessages,
+    failAfterWrite,
+    queueLateWrite,
+    acceptHostileArgs,
+});
 const ConfiguredCdb = configureCdbRuntime({ schema: () => schema, manifest: () => manifest });
 const AUTH = {
     userId: "user-1",
@@ -197,13 +236,13 @@ describe("Cdb invalidation outbox", () => {
             calls: GatewayInvalidationRequest[];
             behavior: (request: GatewayInvalidationRequest) => unknown | Promise<unknown>;
         };
-        readonly alarm: { fail: boolean };
+        readonly alarm: { fail: boolean; beforeSet?: () => Promise<void> };
     }> {
         const db = new Database(":memory:");
         databases.push(db);
         const clock = { value: 10_000 };
         const alarms: number[] = [];
-        const alarm = { fail: false };
+        const alarm: { fail: boolean; beforeSet?: () => Promise<void> } = { fail: false };
         const gateway = {
             calls: [] as GatewayInvalidationRequest[],
             behavior: (() => {
@@ -228,6 +267,7 @@ describe("Cdb invalidation outbox", () => {
                 transactionSync: <T>(callback: () => T): T => db.transaction(callback)(),
                 setAlarm: async (scheduledTime: number | Date): Promise<void> => {
                     if (alarm.fail) throw new Error("alarm unavailable");
+                    if (alarm.beforeSet) await alarm.beforeSet();
                     alarms.push(scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime);
                 },
             },
@@ -315,6 +355,159 @@ describe("Cdb invalidation outbox", () => {
         expect(hostileHandlerRuns).toBe(0);
         expect(db.prepare("SELECT * FROM outbox_messages").all()).toEqual([]);
         expect(db.prepare("SELECT * FROM _chardb_op_log").all()).toEqual([]);
+    });
+
+    test("owns direct mutation args before a held alarm and keys replay to the owned payload", async () => {
+        const { db, cdb, alarm } = await setup();
+        let releaseAlarm!: () => void;
+        let alarmStarted!: () => void;
+        const started = new Promise<void>(resolve => {
+            alarmStarted = resolve;
+        });
+        const held = new Promise<void>(resolve => {
+            releaseAlarm = resolve;
+        });
+        let firstAlarm = true;
+        alarm.beforeSet = async () => {
+            if (!firstAlarm) return;
+            firstAlarm = false;
+            alarmStarted();
+            await held;
+        };
+        const callerArgs = { id: "owned-before-alarm", value: 7 };
+        const callerAuth = {
+            userId: "user-1",
+            tenantId: undefined,
+            role: undefined,
+            roles: ["member"],
+            authEpochs: { global: 1, tenant: 2, principal: 3 },
+            activeTeamId: undefined,
+            claims: { source: "original" },
+        };
+        const callerRequest = {
+            principalId: "user-1",
+            mutId: "owned-before-alarm",
+            ref: putMessage.__chardbRef,
+            args: callerArgs as RawJson,
+            auth: callerAuth,
+            schemaEpoch: 1,
+        };
+        let ownKeysRuns = 0;
+        callerRequest.args = new Proxy(callerArgs, {
+            ownKeys(target) {
+                ownKeysRuns += 1;
+                callerRequest.principalId = "mutated-by-own-keys";
+                callerRequest.mutId = "mutated-by-own-keys";
+                callerRequest.ref = ChardbRef("missing.ts#mutated");
+                callerRequest.schemaEpoch = 99;
+                callerAuth.userId = "mutated-by-own-keys";
+                callerAuth.roles.splice(0);
+                callerAuth.authEpochs.global = 99;
+                callerAuth.claims.source = "mutated-by-own-keys";
+                return Reflect.ownKeys(target);
+            },
+            getOwnPropertyDescriptor: Reflect.getOwnPropertyDescriptor,
+        }) as unknown as RawJson;
+        const pending = cdb.mutate(callerRequest);
+        await started;
+        callerArgs.id = "mutated-during-alarm";
+        callerArgs.value = 99;
+        Object.assign(callerArgs, { oversized: "x".repeat(512 * 1_024) });
+        callerRequest.principalId = "mutated-during-alarm";
+        callerRequest.mutId = "mutated-during-alarm";
+        callerRequest.ref = ChardbRef("missing.ts#during-alarm");
+        callerRequest.schemaEpoch = 100;
+        callerAuth.userId = "mutated-during-alarm";
+        callerAuth.roles.push("mutated");
+        callerAuth.authEpochs.tenant = 100;
+        callerAuth.claims.source = "mutated-during-alarm";
+        releaseAlarm();
+
+        await expect(pending).resolves.toMatchObject({ ok: true, ran: true, result: "owned-before-alarm" });
+        expect(ownKeysRuns).toBe(1);
+        expect(db.prepare("SELECT id, value FROM outbox_messages").all()).toEqual([
+            { id: "owned-before-alarm", value: 7 },
+        ]);
+        const stored = db
+            .prepare(
+                `SELECT payload_hash, principal_id, mut_id, schema_epoch
+                 FROM _chardb_op_log WHERE principal_id = ? AND mut_id = ?`
+            )
+            .get("user-1", "owned-before-alarm") as {
+            payload_hash: Uint8Array;
+            principal_id: string;
+            mut_id: string;
+            schema_epoch: number;
+        };
+        expect(stored).toMatchObject({
+            principal_id: "user-1",
+            mut_id: "owned-before-alarm",
+            schema_epoch: 1,
+        });
+
+        await expect(
+            cdb.mutate(mutation(putMessage, "owned-before-alarm", { value: 7, id: "owned-before-alarm" }))
+        ).resolves.toMatchObject({ ok: true, ran: false, result: "owned-before-alarm" });
+        expect(
+            db
+                .prepare(
+                    `SELECT payload_hash, principal_id, mut_id, schema_epoch
+                     FROM _chardb_op_log WHERE principal_id = ? AND mut_id = ?`
+                )
+                .get("user-1", "owned-before-alarm")
+        ).toEqual(stored);
+        await expect(
+            cdb.mutate(mutation(putMessage, "owned-before-alarm", { id: "changed", value: 99 }))
+        ).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_MUT_ID_COLLISION", retryable: false },
+        });
+        expect(
+            db
+                .prepare(
+                    `SELECT payload_hash, principal_id, mut_id, schema_epoch
+                     FROM _chardb_op_log WHERE principal_id = ? AND mut_id = ?`
+                )
+                .get("user-1", "owned-before-alarm")
+        ).toEqual(stored);
+    });
+
+    test("rejects a ctx.db write queued after the atomic transaction", async () => {
+        const { db, cdb } = await setup();
+        lateWriteError = undefined;
+        lateReadError = undefined;
+        lateTransactionError = undefined;
+        const registration = identity("late-write", 1);
+        await cdb.subscribe(subscription(registration, ["outbox_messages"]));
+
+        await expect(
+            cdb.mutate(
+                mutation(queueLateWrite, "late-write", {
+                    syncId: "sync-write",
+                    lateId: "late-write",
+                })
+            )
+        ).resolves.toMatchObject({ ok: true, ran: true, result: "sync-write" });
+        await Promise.resolve();
+
+        expect(lateWriteError).toMatchObject({
+            code: "CDB_INVARIANT",
+            message: "mutation database execution escaped its transaction",
+        });
+        expect(lateReadError).toMatchObject({
+            code: "CDB_INVARIANT",
+            message: "mutation database execution escaped its transaction",
+        });
+        expect(lateTransactionError).toMatchObject({
+            code: "CDB_INVARIANT",
+            message: "mutation database execution escaped its transaction",
+        });
+        expect(db.prepare("SELECT id, value FROM outbox_messages ORDER BY id").all()).toEqual([
+            { id: "sync-write", value: 1 },
+        ]);
+        expect(db.prepare("SELECT mut_id FROM _chardb_op_log").all()).toEqual([{ mut_id: "late-write" }]);
+        expect(changeSeq(db)).toBe(1);
+        expect(outbox(db)).toEqual([{ gateway_id: "gateway-1", registration_id: "late-write", change_seq: 1 }]);
     });
 
     test("advances once per committed write set and coalesces matching registrations", async () => {

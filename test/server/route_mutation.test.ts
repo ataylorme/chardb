@@ -3,7 +3,13 @@ import type { StandardSchemaV1 } from "@standard-schema/spec";
 import { z } from "zod";
 import { defineMutation } from "../../src/server/define.ts";
 import { manifestFromExports, routeMutation } from "../../src/server/manifest.ts";
+import {
+    CDB_JSON_MAX_AGGREGATE_MEMBERS,
+    CDB_MUTATION_ARGS_MAX_BYTES,
+    CDB_MUTATION_ARGS_MAX_DEPTH,
+} from "../../src/server/result_limits.ts";
 import type { RawJson } from "../../src/types.ts";
+import { stableJson } from "../../src/util/canonical.ts";
 import { vshardOf } from "../../src/vshard.ts";
 
 type PostArgs = { readonly orgId: string; readonly body: string } & {
@@ -30,6 +36,12 @@ const singlePartitionWithoutKey = defineMutation<unknown, BroadcastArgs, void>(
 );
 
 const manifest = manifestFromExports({ postMessage, broadcast, singlePartitionWithoutKey });
+
+function nestedArray(depth: number): RawJson {
+    let value: RawJson = null;
+    for (let level = 0; level < depth; level++) value = [value];
+    return value;
+}
 
 describe("routeMutation — pure routing decision", () => {
     test("singlePartition + partitionKey → vshard equals vshardOf([key])", () => {
@@ -90,6 +102,34 @@ describe("routeMutation — pure routing decision", () => {
         expect(r.ok).toBe(true);
         if (!r.ok) throw new Error("unreachable");
         expect(r).toMatchObject({ authority: null, partitionKey: null });
+    });
+
+    test("keyless routing is stable across nested object key order", () => {
+        const first = routeMutation(
+            manifest,
+            { ref: broadcast.__chardbRef, args: { msg: "ping", nested: { a: 1, b: 2 } } as never },
+            vshardOf
+        );
+        const second = routeMutation(
+            manifest,
+            { ref: broadcast.__chardbRef, args: { nested: { b: 2, a: 1 }, msg: "ping" } as never },
+            vshardOf
+        );
+        expect(first).toMatchObject({ ok: true });
+        expect(second).toMatchObject({ ok: true });
+        if (!first.ok || !second.ok) throw new Error("unreachable");
+        expect(second.vshard).toBe(first.vshard);
+    });
+
+    test("stableJson preserves an own __proto__ data property", () => {
+        const value = { stable: true } as Record<string, RawJson>;
+        Object.defineProperty(value, "__proto__", {
+            value: { source: "owned" },
+            enumerable: true,
+            writable: true,
+            configurable: true,
+        });
+        expect(stableJson(value)).toBe('{"__proto__":{"source":"owned"},"stable":true}');
     });
 
     test("organization authority rejects missing and non-string partition keys as invalid args", () => {
@@ -166,5 +206,124 @@ describe("routeMutation — pure routing decision", () => {
             );
             expect(result).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS" } });
         }
+    });
+
+    test("owns raw and transformed Proxy arguments without invoking getters", () => {
+        let ownKeysRuns = 0;
+        let getterRuns = 0;
+        const proxied = new Proxy(
+            { orgId: "org-proxy", body: "safe" },
+            {
+                ownKeys(target) {
+                    ownKeysRuns += 1;
+                    return Reflect.ownKeys(target);
+                },
+                getOwnPropertyDescriptor: Reflect.getOwnPropertyDescriptor,
+                get() {
+                    getterRuns += 1;
+                    throw new Error("property getters must not run during mutation admission");
+                },
+            }
+        ) as unknown as RawJson;
+        const raw = routeMutation(manifest, { ref: postMessage.__chardbRef, args: proxied }, vshardOf);
+        expect(raw).toMatchObject({
+            ok: true,
+            partitionKey: "org-proxy",
+            args: { orgId: "org-proxy", body: "safe" },
+        });
+
+        const schema = {
+            "~standard": {
+                version: 1,
+                vendor: "test",
+                validate: () => ({ value: proxied }),
+            },
+        } as unknown as StandardSchemaV1<unknown, PostArgs>;
+        const transformed = defineMutation({
+            ref: "api/proxy#post",
+            args: schema,
+            authority: "organization",
+            partitionKey: args => args.orgId,
+            handler: () => null,
+        });
+        const routed = routeMutation(
+            manifestFromExports({ transformed }),
+            { ref: transformed.__chardbRef, args: {} },
+            vshardOf
+        );
+        expect(routed).toMatchObject({
+            ok: true,
+            partitionKey: "org-proxy",
+            args: { orgId: "org-proxy", body: "safe" },
+        });
+        expect(getterRuns).toBe(0);
+        expect(ownKeysRuns).toBe(2);
+    });
+
+    test("caps transformed mutation arguments before partition extraction or canonical routing", () => {
+        let partitionCalls = 0;
+        const outputs: Record<string, RawJson>[] = [
+            { value: "x".repeat(CDB_MUTATION_ARGS_MAX_BYTES) },
+            { value: Array.from({ length: CDB_JSON_MAX_AGGREGATE_MEMBERS + 1 }, () => null) },
+            { value: nestedArray(CDB_MUTATION_ARGS_MAX_DEPTH + 1) },
+        ];
+        for (const [index, output] of outputs.entries()) {
+            const schema = {
+                "~standard": {
+                    version: 1,
+                    vendor: "test",
+                    validate: () => ({ value: output }),
+                },
+            } as StandardSchemaV1<unknown, Record<string, RawJson>>;
+            const transformed = defineMutation({
+                ref: `api/oversized#${index}`,
+                args: schema,
+                partitionKey: () => {
+                    partitionCalls += 1;
+                    return "must-not-route";
+                },
+                handler: () => null,
+            });
+            expect(
+                routeMutation(
+                    manifestFromExports({ transformed }),
+                    { ref: transformed.__chardbRef, args: {} },
+                    vshardOf
+                )
+            ).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } });
+        }
+        expect(partitionCalls).toBe(0);
+    });
+
+    test("does not forward the partition extractor's mutable argument copy", () => {
+        const mutation = defineMutation<unknown, PostArgs, null>(
+            function mutation() {
+                return null;
+            },
+            {
+                ref: "api/mutating-partition#post",
+                authority: "organization",
+                partitionKey: args => {
+                    const key = args.orgId;
+                    const mutable = args as { orgId: string; body: string; injected?: string };
+                    mutable.orgId = "org-mutated";
+                    mutable.body = "mutated";
+                    mutable.injected = "mutated";
+                    return key;
+                },
+            }
+        );
+        const routed = routeMutation(
+            manifestFromExports({ mutation }),
+            { ref: mutation.__chardbRef, args: { orgId: "org-original", body: "original" } },
+            vshardOf
+        );
+        expect(routed).toEqual({
+            ok: true,
+            vshard: Number(vshardOf(["org-original"])),
+            authority: "organization",
+            partitionKey: "org-original",
+            args: { orgId: "org-original", body: "original" },
+        });
     });
 });

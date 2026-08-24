@@ -21,7 +21,7 @@ function canonicalize(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(canonicalize);
     if (typeof value === "object") {
         const v = value as Record<string, unknown>;
-        const out: Record<string, unknown> = {};
+        const out = Object.create(null) as Record<string, unknown>;
         for (const k of Object.keys(v).sort()) out[k] = canonicalize(v[k]);
         return out;
     }

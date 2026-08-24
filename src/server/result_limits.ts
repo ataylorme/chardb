@@ -228,8 +228,28 @@ export function assertCdbResultByteLimit(result: RawJson, subject: string, hint:
     assertCdbJsonByteLimit(result, CDB_RESULT_MAX_BYTES, { code: "CDB_INVARIANT", subject, hint });
 }
 
+export function snapshotCdbResultByteLimit(result: RawJson, subject: string, hint: string): RawJson {
+    return snapshotCdbJsonByteLimit(result, CDB_RESULT_MAX_BYTES, { code: "CDB_INVARIANT", subject, hint });
+}
+
 export function assertCdbMutationArgsByteLimit(args: RawJson): void {
     assertCdbJsonByteLimit(
+        args,
+        CDB_MUTATION_ARGS_MAX_BYTES,
+        {
+            code: "CDB_INVALID_ARGS",
+            subject: "mutation argument payload",
+            hint: `Reduce mutation arguments to at most ${CDB_MUTATION_ARGS_MAX_BYTES} serialized bytes.`,
+        },
+        {
+            maxAggregateMembers: CDB_JSON_MAX_AGGREGATE_MEMBERS,
+            maxDepth: CDB_MUTATION_ARGS_MAX_DEPTH,
+        }
+    );
+}
+
+export function snapshotCdbMutationArgs(args: RawJson): RawJson {
+    return snapshotCdbJsonByteLimit(
         args,
         CDB_MUTATION_ARGS_MAX_BYTES,
         {

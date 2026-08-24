@@ -2,11 +2,10 @@ import { type DrizzleSqliteDODatabase, drizzle } from "drizzle-orm/durable-sqlit
 import { CdbError } from "../errors.ts";
 import { type MutationOutcome, type SyncSql, canonicalRequest, runWrappedMutation } from "../oplog/wrapper.ts";
 import { Cookie, MutId, PrincipalId, type RawJson } from "../types.ts";
-import { rawJsonResult } from "../util/raw_json.ts";
-import { wrapMutationDb } from "./cdb-db-proxy.ts";
+import { type MutationDbTransactionGuard, wrapMutationDb } from "./cdb-db-proxy.ts";
 import type { AuthCtx, MutationCtx } from "./define.ts";
 import { adaptSqlStorage } from "./do/sql_adapter.ts";
-import { assertCdbResultByteLimit } from "./result_limits.ts";
+import { assertCdbResultByteLimit, snapshotCdbResultByteLimit } from "./result_limits.ts";
 
 export type AtomicMutationDb<TSchema extends Record<string, unknown>> = DrizzleSqliteDODatabase<TSchema>;
 
@@ -81,57 +80,62 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
     const rawDb = drizzle(input.storage, { schema: input.schema });
     const touchedTables = new Set<string>();
     const writeVolume = mutationWriteVolume(sql, touchedTables);
+    const transactionGuard: MutationDbTransactionGuard = { active: true };
     const db = wrapMutationDb(
         rawDb,
         input.request.auth,
         tableName => writeVolume.record(tableName),
-        () => writeVolume.beforeWrite()
+        () => writeVolume.beforeWrite(),
+        transactionGuard
     );
     let wrappedResult: ReturnType<typeof runWrappedMutation<TResult>> | undefined;
     let committedTouchedTables: readonly string[] = [];
 
-    input.storage.transactionSync(() => {
-        wrappedResult = runWrappedMutation({
-            sql,
-            principalId: PrincipalId(input.request.principalId),
-            mutId: MutId(input.request.mutId),
-            canonicalRequest: canonicalRequest(input.request.ref, input.request.args as RawJson),
-            schemaEpoch: input.request.schemaEpoch,
-            nowMs: input.nowMs ?? Date.now(),
-            cookie,
-            run: (): MutationOutcome<TResult> => {
-                const result = input.handler({ db, auth: input.request.auth }, input.request.args);
-                if (isThenable(result)) {
-                    throw asyncHandlerError();
-                }
-                writeVolume.assertWithinLimits();
-                const jsonResult = rawJsonResult(result, "mutation result");
+    try {
+        input.storage.transactionSync(() => {
+            wrappedResult = runWrappedMutation({
+                sql,
+                principalId: PrincipalId(input.request.principalId),
+                mutId: MutId(input.request.mutId),
+                canonicalRequest: canonicalRequest(input.request.ref, input.request.args as RawJson),
+                schemaEpoch: input.request.schemaEpoch,
+                nowMs: input.nowMs ?? Date.now(),
+                cookie,
+                run: (): MutationOutcome<TResult> => {
+                    const result = input.handler({ db, auth: input.request.auth }, input.request.args);
+                    if (isThenable(result)) {
+                        throw asyncHandlerError();
+                    }
+                    writeVolume.assertWithinLimits();
+                    const jsonResult = snapshotCdbResultByteLimit(
+                        result as RawJson,
+                        "mutation result",
+                        "return less data from the mutation and read larger results with a paginated query"
+                    );
+                    return {
+                        status: "ok",
+                        result: jsonResult as TResult,
+                        rowsAffected: sql.changes(),
+                    };
+                },
+            });
+            if (wrappedResult.envelope.status === "ok") {
                 assertCdbResultByteLimit(
-                    jsonResult,
+                    wrappedResult.envelope.result ?? null,
                     "mutation result",
                     "return less data from the mutation and read larger results with a paginated query"
                 );
-                return {
-                    status: "ok",
-                    result: jsonResult as TResult,
-                    rowsAffected: sql.changes(),
-                };
-            },
+            }
+            if (wrappedResult.ran && wrappedResult.envelope.status === "ok" && touchedTables.size > 0) {
+                const sortedTables = Object.freeze([...touchedTables].sort());
+                const hookResult = input.onWriteSet?.({ touchedTables: sortedTables, sql });
+                if (isThenable(hookResult)) throw asyncWriteSetHookError();
+                committedTouchedTables = sortedTables;
+            }
         });
-        if (wrappedResult.envelope.status === "ok") {
-            assertCdbResultByteLimit(
-                wrappedResult.envelope.result ?? null,
-                "mutation result",
-                "return less data from the mutation and read larger results with a paginated query"
-            );
-        }
-        if (wrappedResult.ran && wrappedResult.envelope.status === "ok" && touchedTables.size > 0) {
-            const sortedTables = Object.freeze([...touchedTables].sort());
-            const hookResult = input.onWriteSet?.({ touchedTables: sortedTables, sql });
-            if (isThenable(hookResult)) throw asyncWriteSetHookError();
-            committedTouchedTables = sortedTables;
-        }
-    });
+    } finally {
+        transactionGuard.active = false;
+    }
 
     if (!wrappedResult) {
         throw new CdbError({ code: "CDB_INVARIANT", message: "atomic mutation completed without an outcome" });
@@ -250,11 +254,21 @@ function assertSynchronousHandler(handler: (...args: never[]) => unknown): void 
 }
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
-    return (
-        (typeof value === "object" || typeof value === "function") &&
-        value !== null &&
-        typeof (value as { then?: unknown }).then === "function"
-    );
+    if ((typeof value !== "object" && typeof value !== "function") || value === null) return false;
+    const seen = new WeakSet<object>();
+    let current: object | null = value;
+    let depth = 0;
+    while (current !== null) {
+        if (seen.has(current) || depth >= 100) {
+            return false;
+        }
+        seen.add(current);
+        depth += 1;
+        const descriptor = Object.getOwnPropertyDescriptor(current, "then");
+        if (descriptor) return !("value" in descriptor) || typeof descriptor.value === "function";
+        current = Object.getPrototypeOf(current);
+    }
+    return false;
 }
 
 function asyncHandlerError(): CdbError {

@@ -34,7 +34,7 @@ import {
 import type { Vshard } from "../../types.ts";
 import { stableJson } from "../../util/canonical.ts";
 import { rawJsonResult } from "../../util/raw_json.ts";
-import { vshardOf } from "../../vshard.ts";
+import { VSHARD_COUNT, vshardOf } from "../../vshard.ts";
 import {
     type CdbIntent,
     type Down,
@@ -55,7 +55,7 @@ import {
     routeMutation as resolveMutationRoute,
     routeQuery as resolveQueryRoute,
 } from "../manifest.ts";
-import { assertCdbMutationArgsByteLimit, snapshotCdbQueryArgs } from "../result_limits.ts";
+import { assertCdbMutationArgsByteLimit, snapshotCdbMutationArgs, snapshotCdbQueryArgs } from "../result_limits.ts";
 import type {
     CatalogMutationRpc,
     CatalogOrganizationAuthorityRpc,
@@ -644,7 +644,7 @@ export function projectOrganizationMutationAuth(
             userId: authority.principalId,
             tenantId: authority.organizationId,
             role: authority.role,
-            roles,
+            roles: [...roles],
             authEpochs: {
                 global: epochRecord.global as number,
                 tenant: epochRecord.tenant as number,
@@ -2590,8 +2590,12 @@ export async function dispatchTrustedMutation(
     deps: TrustedMutationDispatchDeps,
     request: TrustedMutationDispatchRequest
 ): Promise<CdbMutationResponse> {
+    const principalId = request.principalId;
+    const mutId = request.mutId;
+    const ref = request.ref;
+    let rawArgs: RawJson;
     try {
-        assertCdbMutationArgsByteLimit(request.args);
+        rawArgs = snapshotCdbMutationArgs(request.args);
     } catch (error) {
         return mutationFailure(
             error instanceof CdbError ? error.code : "CDB_INVARIANT",
@@ -2600,38 +2604,45 @@ export async function dispatchTrustedMutation(
     }
     let routed: MutationRouteResponse;
     try {
-        routed = deps.routeMutation({ ref: request.ref, args: request.args });
+        routed = deps.routeMutation({ ref, args: rawArgs });
     } catch {
         return mutationFailure("CDB_INVARIANT", "local mutation routing failed");
     }
     if (!routed.ok) return routed;
+    const routeAuthority = routed.authority;
+    const partitionKey = routed.partitionKey;
+    const vshard = routed.vshard;
+    let routedArgs: RawJson;
     try {
-        assertCdbMutationArgsByteLimit(routed.args);
+        routedArgs = snapshotCdbMutationArgs(routed.args);
     } catch (error) {
         return mutationFailure(
             error instanceof CdbError ? error.code : "CDB_INVARIANT",
             error instanceof Error ? error.message : "routed mutation argument sizing failed"
         );
     }
-    if (routed.authority !== "organization") {
+    if (!Number.isSafeInteger(vshard) || vshard < 0 || vshard >= VSHARD_COUNT) {
+        return mutationFailure("CDB_INVARIANT", "local mutation routing returned an invalid vshard");
+    }
+    if (routeAuthority !== "organization") {
         return mutationFailure("CDB_AUTH_NOT_BOUND", "mutation has no declared organization authority");
     }
-    if (!routed.partitionKey) {
+    if (typeof partitionKey !== "string" || partitionKey.length === 0) {
         return mutationFailure("CDB_INVALID_ARGS", "organization mutation has no organization partition key");
     }
 
     let authority: Awaited<ReturnType<CatalogOrganizationAuthorityRpc["resolveOrganizationAuthority"]>>;
     try {
         authority = await deps.catalog.resolveOrganizationAuthority({
-            principalId: request.principalId,
-            organizationId: TenantId(routed.partitionKey),
+            principalId,
+            organizationId: TenantId(partitionKey),
         });
     } catch {
         return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog organization authority RPC failed");
     }
     const projected = projectOrganizationMutationAuth(authority, {
-        principalId: request.principalId,
-        organizationId: TenantId(routed.partitionKey),
+        principalId,
+        organizationId: TenantId(partitionKey),
     });
     if (!projected.ok) return mutationFailure(projected.code, projected.message);
     // This Catalog read is the authorization linearization point. A later
@@ -2640,17 +2651,17 @@ export async function dispatchTrustedMutation(
 
     let location: Awaited<ReturnType<CatalogMutationRpc["route"]>>;
     try {
-        location = await deps.catalog.route(routed.vshard);
+        location = await deps.catalog.route(vshard);
     } catch {
         return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog routing RPC failed");
     }
 
     try {
         const response = await deps.cdb(location.shardId).mutate({
-            principalId: request.principalId,
-            mutId: request.mutId,
-            ref: request.ref,
-            args: routed.args,
+            principalId,
+            mutId,
+            ref,
+            args: routedArgs,
             auth: projected.auth,
             schemaEpoch: location.schemaEpoch,
         });
