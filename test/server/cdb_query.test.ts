@@ -13,8 +13,8 @@ import type {
     CdbSubscriptionRequest,
     LiveSubscriptionId,
 } from "../../src/server/rpc.ts";
-import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
-import { stableJson } from "../../src/util/canonical.ts";
+import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId, TenantId } from "../../src/types.ts";
+import { stableHashHex, stableJson } from "../../src/util/canonical.ts";
 import type { WireEndpoint, WireInterval } from "../../src/wire.ts";
 
 interface Cursor<T> extends Iterable<T> {
@@ -442,6 +442,11 @@ const transactionAttempt = api.query(async function transactionAttemptHandler(ct
     ctx.db.transaction(() => null);
     return null;
 });
+let argumentProbeRuns = 0;
+const argumentProbe = api.query(async function argumentProbeHandler() {
+    argumentProbeRuns++;
+    return [];
+});
 
 const manifest = manifestFromExports({
     listRecords,
@@ -472,6 +477,7 @@ const manifest = manifestFromExports({
     deleteAttempt,
     rawAttempt,
     transactionAttempt,
+    argumentProbe,
 });
 const ConfiguredCdb = configureCdbRuntime({ schema: () => schema, manifest: () => manifest });
 const PolicyDriftCdb = configureCdbRuntime({
@@ -582,6 +588,7 @@ describe("Cdb registered query execution", () => {
 
     async function setup(): Promise<{ readonly db: Database; readonly cdb: Cdb }> {
         registeredProbeRuns = 0;
+        argumentProbeRuns = 0;
         registeredQueryPause = undefined;
         const db = new Database(":memory:");
         databases.push(db);
@@ -633,6 +640,86 @@ describe("Cdb registered query execution", () => {
             ],
         });
         expect(registeredProbeRuns).toBe(1);
+    });
+
+    test("caps direct query arguments before descriptor lookup or handler invocation", async () => {
+        const { cdb } = await setup();
+        await expect(
+            cdb.query({
+                ref: argumentProbe.__chardbRef,
+                args: { value: "é".repeat(262_138) },
+                auth: AUTH,
+            })
+        ).resolves.toEqual({ ok: true, result: [] });
+        expect(argumentProbeRuns).toBe(1);
+
+        await expect(
+            cdb.query({
+                ref: ChardbRef("queries.ts#missing-before-query-arg-limit"),
+                args: { value: "é".repeat(262_139) },
+                auth: AUTH,
+            })
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } });
+        expect(argumentProbeRuns).toBe(1);
+    });
+
+    test("keeps a deeply nested legacy registration invalidatable without bricking a valid sibling", async () => {
+        const { db, cdb } = await setup();
+        const subscription = liveIdentity({ registrationId: "registration-legacy-oversized-args" });
+        const stored = liveRequest(subscription);
+        await cdb.subscribe(stored);
+        const sibling = liveIdentity({ registrationId: "registration-valid-sibling", subId: SubId(2) });
+        await cdb.subscribe(liveRequest(sibling));
+        let args: RawJson = null;
+        for (let depth = 0; depth < 100; depth++) args = { value: args };
+        const policyDigest = cdbPolicyDigest(schema, stored.tables);
+        const payloadHash = stableHashHex({
+            connectionId: subscription.connectionId,
+            clientId: subscription.clientId,
+            subId: subscription.subId,
+            principalId: stored.principalId,
+            organizationId: stored.organizationId,
+            ref: stored.ref,
+            args,
+            policyDigest,
+            queryHash: stored.queryHash,
+            tables: stored.tables,
+            intervals: stored.intervals,
+        });
+        db.run(
+            `UPDATE _chardb_live_subscriptions
+             SET args_json = ?, payload_hash = ?
+             WHERE gateway_id = ? AND registration_id = ?`,
+            [JSON.stringify(args), payloadHash, subscription.gatewayId, subscription.registrationId]
+        );
+        registeredProbeRuns = 0;
+        const reconstructed = construct(ConfiguredCdb, db);
+        await reconstructed.ready;
+
+        await expect(reconstructed.cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVALID_ARGS", retryable: false },
+        });
+        expect(registeredProbeRuns).toBe(0);
+        await expect(reconstructed.cdb.queryRegistered(registeredQuery(sibling))).resolves.toMatchObject({ ok: true });
+        expect(
+            db
+                .query("SELECT state, args_json AS argsJson FROM _chardb_live_subscriptions ORDER BY registration_id")
+                .all()
+        ).toEqual([
+            { state: "active", argsJson: JSON.stringify(args) },
+            { state: "active", argsJson: JSON.stringify(stored.args) },
+        ]);
+        expect(
+            db
+                .query(
+                    "SELECT registration_id AS registrationId, table_name AS tableName FROM _chardb_live_subscription_tables ORDER BY registration_id"
+                )
+                .all()
+        ).toEqual([
+            { registrationId: subscription.registrationId, tableName: "query_records" },
+            { registrationId: sibling.registrationId, tableName: "query_records" },
+        ]);
     });
 
     test("accepts empty, small, and exact query result limits", async () => {

@@ -170,6 +170,88 @@ describe("chardb({…})", () => {
         expect(result).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS" } });
     });
 
+    test("query routing caps raw and transformed arguments before downstream callbacks", async () => {
+        let rawValidatorRuns = 0;
+        let rawIntentRuns = 0;
+        const rawGuarded = defineQuery({
+            ref: "api/items#rawArgumentLimit",
+            args: z.unknown().transform(value => {
+                rawValidatorRuns++;
+                return value as { organizationId: string };
+            }),
+            handler: async () => [],
+            intent: args => {
+                rawIntentRuns++;
+                return {
+                    kind: "select" as const,
+                    tables: ["items"],
+                    partitionKey: { table: "items", column: "organization_id", values: [args.organizationId] },
+                };
+            },
+        });
+        let transformedIntentRuns = 0;
+        const transformedGuarded = defineQuery({
+            ref: "api/items#transformedArgumentLimit",
+            args: z.object({ organizationId: z.string() }).transform(args => ({
+                ...args,
+                padding: "é".repeat(262_139),
+            })),
+            handler: async () => [],
+            intent: args => {
+                transformedIntentRuns++;
+                return {
+                    kind: "select" as const,
+                    tables: ["items"],
+                    partitionKey: { table: "items", column: "organization_id", values: [args.organizationId] },
+                };
+            },
+        });
+        let callbackIntent: { kind: "select"; tables: string[] } | undefined;
+        const callbackGuarded = defineQuery<unknown, { value: string } & Record<string, RawJson>, readonly []>({
+            ref: "api/items#callbackArgumentOwnership",
+            handler: async () => [],
+            intent: args => {
+                args.value = "callback-mutated";
+                callbackIntent = { kind: "select", tables: ["items"] };
+                return callbackIntent;
+            },
+        });
+        const app = chardb({
+            auth,
+            schema: { items },
+            api: { rawGuarded, transformedGuarded, callbackGuarded },
+        });
+        const gateway = Object.create(app.Gateway.prototype) as InstanceType<typeof app.Gateway>;
+
+        await expect(
+            gateway.routeQuery({
+                ref: rawGuarded.__chardbRef,
+                args: { value: "é".repeat(262_139) },
+            })
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } });
+        expect(rawValidatorRuns).toBe(0);
+        expect(rawIntentRuns).toBe(0);
+
+        await expect(
+            gateway.routeQuery({
+                ref: transformedGuarded.__chardbRef,
+                args: { organizationId: "org-7" },
+            })
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } });
+        expect(transformedIntentRuns).toBe(0);
+
+        const callerArgs = { value: "caller-owned" };
+        const callbackRouted = await gateway.routeQuery({ ref: callbackGuarded.__chardbRef, args: callerArgs });
+        expect(callbackRouted).toMatchObject({
+            ok: true,
+            args: { value: "callback-mutated" },
+            intent: { kind: "select", tables: ["items"] },
+        });
+        expect(callerArgs).toEqual({ value: "caller-owned" });
+        callbackIntent?.tables.splice(0, 1, "hostile-after-return");
+        expect(callbackRouted).toMatchObject({ intent: { tables: ["items"] } });
+    });
+
     test("`auth` is the pre-built bundle when supplied", () => {
         const app = chardb({ auth, schema: { items } });
         expect(app.auth).toBe(auth);

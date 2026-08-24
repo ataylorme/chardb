@@ -6,14 +6,16 @@ export const CDB_QUERY_RESULT_MAX_ROWS = 4_096;
 export const CDB_MUTATION_ARGS_MAX_BYTES = 512 * 1_024;
 export const CDB_JSON_MAX_AGGREGATE_MEMBERS = 4_096;
 export const CDB_MUTATION_ARGS_MAX_DEPTH = 99;
+export const CDB_QUERY_ARGS_MAX_BYTES = CDB_MUTATION_ARGS_MAX_BYTES;
+export const CDB_QUERY_ARGS_MAX_DEPTH = CDB_MUTATION_ARGS_MAX_DEPTH;
 
-/** Check exact JSON UTF-8 size and structure without building a second serialized payload. */
-export function assertCdbJsonByteLimit(
+function inspectCdbJsonByteLimit(
     value: RawJson,
     maxBytes: number,
     error: { readonly code: CdbErrorCode; readonly subject: string; readonly hint: string },
-    structure?: { readonly maxAggregateMembers: number; readonly maxDepth: number }
-): void {
+    structure: { readonly maxAggregateMembers: number; readonly maxDepth: number } | undefined,
+    copy: boolean
+): RawJson | undefined {
     let bytes = 0;
     let members = 0;
     const fail = (message: string): never => {
@@ -60,10 +62,29 @@ export function assertCdbJsonByteLimit(
         return (descriptor as PropertyDescriptor & { readonly value: unknown }).value;
     };
     type Frame =
-        | { readonly kind: "value"; readonly value: unknown; readonly depth: number }
+        | {
+              readonly kind: "value";
+              readonly value: unknown;
+              readonly depth: number;
+              readonly assign?: (value: RawJson) => void;
+          }
         | { readonly kind: "exit"; readonly value: object };
     const ancestors = new WeakSet<object>();
-    const stack: Frame[] = [{ kind: "value", value, depth: 0 }];
+    let ownedRoot: RawJson | undefined;
+    const stack: Frame[] = [
+        {
+            kind: "value",
+            value,
+            depth: 0,
+            ...(copy
+                ? {
+                      assign: (owned: RawJson) => {
+                          ownedRoot = owned;
+                      },
+                  }
+                : {}),
+        },
+    ];
     while (stack.length > 0) {
         const frame = stack.pop() as Frame;
         if (frame.kind === "exit") {
@@ -73,15 +94,19 @@ export function assertCdbJsonByteLimit(
         const item = frame.value;
         if (item === null) {
             add(4);
+            frame.assign?.(null);
         } else if (typeof item === "string") {
             addString(item);
+            frame.assign?.(item);
         } else if (typeof item === "number") {
             if (!Number.isFinite(item) || Object.is(item, -0)) {
                 fail(`${error.subject} is not JSON-compatible`);
             }
             add(JSON.stringify(item).length);
+            frame.assign?.(item);
         } else if (typeof item === "boolean") {
             add(item ? 4 : 5);
+            frame.assign?.(item);
         } else if (typeof item === "object") {
             const depth = frame.depth + 1;
             if (structure && depth > structure.maxDepth) {
@@ -92,16 +117,39 @@ export function assertCdbJsonByteLimit(
             stack.push({ kind: "exit", value: item });
             if (Array.isArray(item)) {
                 const ownKeys = Reflect.ownKeys(item);
-                if (ownKeys.some(key => typeof key === "symbol") || ownKeys.length !== item.length + 1) {
+                if (ownKeys.some(key => typeof key === "symbol")) {
                     fail(`${error.subject} is not JSON-compatible`);
                 }
-                members += item.length;
+                const lengthDescriptor = Object.getOwnPropertyDescriptor(item, "length");
+                if (!lengthDescriptor || !("value" in lengthDescriptor)) {
+                    return fail(`${error.subject} is not JSON-compatible`);
+                }
+                const length = lengthDescriptor.value;
+                if (!Number.isSafeInteger(length) || length < 0 || ownKeys.length !== length + 1) {
+                    fail(`${error.subject} is not JSON-compatible`);
+                }
+                members += length;
                 if (structure && members > structure.maxAggregateMembers) {
                     fail(`${error.subject} exceeds the ${structure.maxAggregateMembers}-member aggregate limit`);
                 }
-                add(2 + Math.max(0, item.length - 1));
-                for (let index = item.length - 1; index >= 0; index--) {
-                    stack.push({ kind: "value", value: dataProperty(item, String(index)), depth });
+                const entries: unknown[] = [];
+                for (let index = 0; index < length; index++) entries.push(dataProperty(item, String(index)));
+                const owned: RawJson[] | undefined = copy ? [] : undefined;
+                if (owned) frame.assign?.(owned);
+                add(2 + Math.max(0, length - 1));
+                for (let index = entries.length - 1; index >= 0; index--) {
+                    stack.push({
+                        kind: "value",
+                        value: entries[index],
+                        depth,
+                        ...(owned
+                            ? {
+                                  assign: (child: RawJson) => {
+                                      owned[index] = child;
+                                  },
+                              }
+                            : {}),
+                    });
                 }
                 continue;
             }
@@ -110,29 +158,70 @@ export function assertCdbJsonByteLimit(
                 fail(`${error.subject} is not JSON-compatible`);
             }
             const ownKeys = Reflect.ownKeys(item);
+            members += ownKeys.length;
+            if (structure && members > structure.maxAggregateMembers) {
+                fail(`${error.subject} exceeds the ${structure.maxAggregateMembers}-member aggregate limit`);
+            }
             if (ownKeys.some(key => typeof key === "symbol")) fail(`${error.subject} is not JSON-compatible`);
             const entries = ownKeys.map(key => {
                 const stringKey = key as string;
                 return [stringKey, dataProperty(item, stringKey)] as const;
             });
-            const keys = entries.map(([key]) => key);
-            members += keys.length;
-            if (structure && members > structure.maxAggregateMembers) {
-                fail(`${error.subject} exceeds the ${structure.maxAggregateMembers}-member aggregate limit`);
-            }
+            const owned: Record<string, RawJson> | undefined = copy
+                ? prototype === null
+                    ? Object.create(null)
+                    : {}
+                : undefined;
+            if (owned) frame.assign?.(owned);
             add(2);
-            for (let index = 0; index < keys.length; index++) {
+            for (let index = 0; index < entries.length; index++) {
                 if (index > 0) add(1);
-                addString(keys[index] as string);
+                addString((entries[index] as readonly [string, unknown])[0]);
                 add(1);
             }
             for (let index = entries.length - 1; index >= 0; index--) {
-                stack.push({ kind: "value", value: (entries[index] as readonly [string, unknown])[1], depth });
+                const [key, child] = entries[index] as readonly [string, unknown];
+                stack.push({
+                    kind: "value",
+                    value: child,
+                    depth,
+                    ...(owned
+                        ? {
+                              assign: (ownedChild: RawJson) =>
+                                  Object.defineProperty(owned, key, {
+                                      value: ownedChild,
+                                      enumerable: true,
+                                      writable: true,
+                                      configurable: true,
+                                  }),
+                          }
+                        : {}),
+                });
             }
         } else {
             fail(`${error.subject} is not JSON-compatible`);
         }
     }
+    return ownedRoot;
+}
+
+/** Check exact JSON UTF-8 size and structure without building a second serialized payload. */
+export function assertCdbJsonByteLimit(
+    value: RawJson,
+    maxBytes: number,
+    error: { readonly code: CdbErrorCode; readonly subject: string; readonly hint: string },
+    structure?: { readonly maxAggregateMembers: number; readonly maxDepth: number }
+): void {
+    inspectCdbJsonByteLimit(value, maxBytes, error, structure, false);
+}
+
+export function snapshotCdbJsonByteLimit(
+    value: RawJson,
+    maxBytes: number,
+    error: { readonly code: CdbErrorCode; readonly subject: string; readonly hint: string },
+    structure?: { readonly maxAggregateMembers: number; readonly maxDepth: number }
+): RawJson {
+    return inspectCdbJsonByteLimit(value, maxBytes, error, structure, true) as RawJson;
 }
 
 export function assertCdbResultByteLimit(result: RawJson, subject: string, hint: string): void {
@@ -151,6 +240,38 @@ export function assertCdbMutationArgsByteLimit(args: RawJson): void {
         {
             maxAggregateMembers: CDB_JSON_MAX_AGGREGATE_MEMBERS,
             maxDepth: CDB_MUTATION_ARGS_MAX_DEPTH,
+        }
+    );
+}
+
+export function assertCdbQueryArgsByteLimit(args: RawJson): void {
+    assertCdbJsonByteLimit(
+        args,
+        CDB_QUERY_ARGS_MAX_BYTES,
+        {
+            code: "CDB_INVALID_ARGS",
+            subject: "query argument payload",
+            hint: `Reduce query arguments to at most ${CDB_QUERY_ARGS_MAX_BYTES} serialized bytes.`,
+        },
+        {
+            maxAggregateMembers: CDB_JSON_MAX_AGGREGATE_MEMBERS,
+            maxDepth: CDB_QUERY_ARGS_MAX_DEPTH,
+        }
+    );
+}
+
+export function snapshotCdbQueryArgs(args: RawJson): RawJson {
+    return snapshotCdbJsonByteLimit(
+        args,
+        CDB_QUERY_ARGS_MAX_BYTES,
+        {
+            code: "CDB_INVALID_ARGS",
+            subject: "query argument payload",
+            hint: `Reduce query arguments to at most ${CDB_QUERY_ARGS_MAX_BYTES} serialized bytes.`,
+        },
+        {
+            maxAggregateMembers: CDB_JSON_MAX_AGGREGATE_MEMBERS,
+            maxDepth: CDB_QUERY_ARGS_MAX_DEPTH,
         }
     );
 }

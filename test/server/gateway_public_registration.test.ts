@@ -9,7 +9,7 @@ import {
 } from "../../src/server/do/gateway.ts";
 import type { QueryRouteResponse } from "../../src/server/manifest.ts";
 import type { CdbSubscriptionRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
-import { ChardbRef, ClientId, Cookie, PrincipalId, ShardId, SubId, TenantId } from "../../src/types.ts";
+import { ChardbRef, ClientId, Cookie, PrincipalId, type RawJson, ShardId, SubId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -76,6 +76,8 @@ describe("Gateway public durable registration", () => {
     let subscribeCalls: CdbSubscriptionRequest[];
     let unsubscribeCalls: LiveSubscriptionId[];
     let registeredQueryCalls: unknown[];
+    let routeCalls: number;
+    let routeBehavior: () => QueryRouteResponse | Promise<QueryRouteResponse>;
     let subscribeBehavior: (request: CdbSubscriptionRequest) => unknown | Promise<unknown>;
 
     const route: QueryRouteResponse = {
@@ -103,6 +105,8 @@ describe("Gateway public durable registration", () => {
         subscribeCalls = [];
         unsubscribeCalls = [];
         registeredQueryCalls = [];
+        routeCalls = 0;
+        routeBehavior = () => route;
         socket = new FakeSocket({
             kind: "verified",
             connectionId: "connection-1",
@@ -215,7 +219,8 @@ describe("Gateway public durable registration", () => {
             }
 
             override routeQuery(): Promise<QueryRouteResponse> {
-                return Promise.resolve(route);
+                routeCalls++;
+                return Promise.resolve(routeBehavior());
             }
         }
         return new TestGateway(state, env);
@@ -246,17 +251,58 @@ describe("Gateway public durable registration", () => {
         );
     }
 
-    function subscribe(subId = SubId(1)): Promise<void> {
+    function subscribe(subId = SubId(1), args: RawJson = { organizationId: "org-1" }): Promise<void> {
         return gateway.webSocketMessage(
             socket as unknown as WebSocket,
             JSON.stringify({
                 t: "sub",
                 subId,
                 ref: ChardbRef("queries.ts#messages"),
-                args: { organizationId: "org-1" },
+                args,
             })
         );
     }
+
+    test("rejects hostile query arguments before routing, capacity, RPC, or durable work and then recovers", async () => {
+        for (const [subId, args] of [
+            [SubId(101), { value: "é".repeat(262_139) }],
+            [SubId(102), Array.from({ length: 2_048 }, (_, index) => (index === 0 ? [null, null] : [null]))],
+        ] as const) {
+            await subscribe(subId, args);
+            expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
+                t: "error",
+                subId,
+                code: "CDB_INVALID_ARGS",
+                retryable: false,
+            });
+        }
+        expect(routeCalls).toBe(0);
+        expect(subscribeCalls).toEqual([]);
+        expect(generation()).toBeNull();
+        expect(head()).toBeNull();
+
+        await subscribe(SubId(103), { organizationId: "org-1" });
+        await waitFor(() => generation()?.lifecycle === "active", "valid subscription after argument rejection");
+        expect(routeCalls).toBe(1);
+        expect(subscribeCalls).toHaveLength(1);
+    });
+
+    test("rejects oversized args returned by an overridden route before Catalog, RPC, or durable work", async () => {
+        routeBehavior = () => ({ ...route, args: { value: "é".repeat(262_139) } });
+
+        await subscribe(SubId(104));
+
+        expect(routeCalls).toBe(1);
+        expect(subscribeCalls).toEqual([]);
+        expect(generation()).toBeNull();
+        expect(head()).toBeNull();
+        expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
+            t: "error",
+            subId: 104,
+            code: "CDB_INVALID_ARGS",
+            retryable: false,
+        });
+    });
 
     test("installs and pre-arms before subscribe, activates a zero clock, and does not query or send directly", async () => {
         subscribeBehavior = request => {

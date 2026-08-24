@@ -55,7 +55,7 @@ import {
     routeMutation as resolveMutationRoute,
     routeQuery as resolveQueryRoute,
 } from "../manifest.ts";
-import { assertCdbMutationArgsByteLimit } from "../result_limits.ts";
+import { assertCdbMutationArgsByteLimit, snapshotCdbQueryArgs } from "../result_limits.ts";
 import type {
     CatalogMutationRpc,
     CatalogOrganizationAuthorityRpc,
@@ -3974,6 +3974,13 @@ export class Gateway extends DurableObject<GatewayEnv> {
             this.sendError(ws, "CDB_FORBIDDEN", msg.subId);
             return;
         }
+        let ownedMsg: Extract<Up, { t: "sub" }>;
+        try {
+            ownedMsg = { ...msg, args: snapshotCdbQueryArgs(msg.args) };
+        } catch (error) {
+            this.sendError(ws, error instanceof CdbError ? error.code : "CDB_INVARIANT", msg.subId);
+            return;
+        }
         const operationKey = `${attachment.connectionId}:${msg.subId}`;
         const previous = this.pendingSubscriptions.get(operationKey);
         if (previous?.queued) {
@@ -4033,13 +4040,13 @@ export class Gateway extends DurableObject<GatewayEnv> {
             }
             if (succeeded && !pending.cancelled) {
                 pending.queued = false;
-                await this.admitSubscription(ws, msg, pending, operationKey);
+                await this.admitSubscription(ws, ownedMsg, pending, operationKey);
             } else if (this.pendingSubscriptions.get(operationKey) === pending) {
                 this.pendingSubscriptions.delete(operationKey);
             }
             return;
         }
-        await this.admitSubscription(ws, msg, pending, operationKey);
+        await this.admitSubscription(ws, ownedMsg, pending, operationKey);
     }
 
     private hasRegistrationCapacity(attachment: VerifiedGwAttachment, subId: SubId, capacityKey: string): boolean {
@@ -4130,10 +4137,17 @@ export class Gateway extends DurableObject<GatewayEnv> {
         msg: Extract<Up, { t: "sub" }>,
         pending: PendingSubscription
     ): Promise<void> {
-        const routed = await this.routeQuery({ ref: msg.ref, args: msg.args });
+        const routedResult = await this.routeQuery({ ref: msg.ref, args: msg.args });
         if (pending.cancelled) return;
-        if (!routed.ok) {
-            this.sendError(ws, routed.error.code, msg.subId);
+        if (!routedResult.ok) {
+            this.sendError(ws, routedResult.error.code, msg.subId);
+            return;
+        }
+        let routed: Extract<QueryRouteResponse, { readonly ok: true }>;
+        try {
+            routed = { ...routedResult, args: snapshotCdbQueryArgs(routedResult.args) };
+        } catch (error) {
+            this.sendError(ws, error instanceof CdbError ? error.code : "CDB_INVARIANT", msg.subId);
             return;
         }
         if (routed.authority !== "organization") {

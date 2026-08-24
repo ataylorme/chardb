@@ -239,6 +239,37 @@ describe("Cdb live subscription identity", () => {
         });
     });
 
+    test("rejects oversized query arguments before durable registration or interval installation", async () => {
+        const intervalRegistrations = spyOn(IntervalMap.prototype, "register");
+        const identity = subscription("gateway-query-args", "client-query-args");
+        try {
+            for (const args of [
+                { value: "é".repeat(262_139) },
+                Array.from({ length: 2_048 }, (_, index) => (index === 0 ? [null, null] : [null])),
+            ] as CdbSubscriptionRequest["args"][]) {
+                await expect(cdb.subscribe(request(identity, { args }))).rejects.toMatchObject({
+                    code: "CDB_INVALID_ARGS",
+                    retryable: false,
+                });
+            }
+            expect(intervalRegistrations).not.toHaveBeenCalled();
+            expect(durableLiveState(db)).toEqual({ registrations: [], tables: [], invalidations: [] });
+
+            await expect(cdb.subscribe(request(identity))).resolves.toEqual({
+                ok: true,
+                subscription: identity,
+                changeSeq: 0,
+            });
+            expect(durableLiveState(db)).toEqual({
+                registrations: [durableRegistration(identity, "active")],
+                tables: [durableTable(identity)],
+                invalidations: [],
+            });
+        } finally {
+            intervalRegistrations.mockRestore();
+        }
+    });
+
     test("enforces the fixed active cap across reconstruction, replay, release, and legacy over-cap state", async () => {
         const active = Array.from({ length: 4_096 }, (_, index) =>
             subscription("gateway-do-capacity", `capacity-${index}`, `registration-capacity-${index}`)
@@ -276,7 +307,38 @@ describe("Cdb live subscription identity", () => {
             change_seq: 0,
         });
 
-        await reconstruct();
+        const storageSql = state.storage.sql as unknown as {
+            exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): Cursor<T>;
+        };
+        const originalExec = storageSql.exec.bind(storageSql) as typeof storageSql.exec;
+        const rebuildInstall = spyOn(IntervalMap.prototype, "register");
+        let observedIncrementalInstall = false;
+        storageSql.exec = function exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): Cursor<T> {
+            const cursor = originalExec<T>(query, ...bindings);
+            if (!query.includes("SELECT gateway_id, registration_id, connection_id")) return cursor;
+            return {
+                columnNames: cursor.columnNames,
+                raw: () => cursor.raw(),
+                *[Symbol.iterator]() {
+                    let index = 0;
+                    for (const row of cursor) {
+                        if (index === 1) {
+                            expect(rebuildInstall).toHaveBeenCalled();
+                            observedIncrementalInstall = true;
+                        }
+                        index += 1;
+                        yield row;
+                    }
+                },
+            };
+        };
+        try {
+            await reconstruct();
+        } finally {
+            storageSql.exec = originalExec;
+            rebuildInstall.mockRestore();
+        }
+        expect(observedIncrementalInstall).toBe(true);
         const first = active[0] as LiveSubscriptionId;
         await expect(cdb.subscribe(request(first))).resolves.toEqual({
             ok: true,

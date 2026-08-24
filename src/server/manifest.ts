@@ -42,6 +42,13 @@ import { rawJsonResult } from "../util/raw_json.ts";
 import type { CdbIntent } from "../wire.ts";
 import type { MutationAuthority } from "./define.ts";
 import type { ChardbFunctionKind } from "./refs.ts";
+import {
+    CDB_JSON_MAX_AGGREGATE_MEMBERS,
+    CDB_QUERY_ARGS_MAX_BYTES,
+    CDB_QUERY_ARGS_MAX_DEPTH,
+    snapshotCdbJsonByteLimit,
+    snapshotCdbQueryArgs,
+} from "./result_limits.ts";
 
 interface RefMarked {
     readonly __chardbRef: Brand<string, "ChardbRef">;
@@ -241,6 +248,7 @@ export function routeValidatedQuery(
     input: { readonly ref: string; readonly args: RawJson },
     policyDigestForTables: (tableNames: readonly string[]) => string
 ): Extract<QueryRouteResponse, { readonly ok: true }> {
+    const callbackArgs = snapshotCdbQueryArgs(input.args);
     const descriptor = resolveQuery(manifest, input.ref as ChardbRef);
     if (!descriptor.extractIntent) {
         throw new CdbError({
@@ -248,9 +256,20 @@ export function routeValidatedQuery(
             message: `query ${input.ref} has no server intent extractor`,
         });
     }
-    const intent = descriptor.extractIntent(input.args);
+    const intentCandidate = descriptor.extractIntent(callbackArgs);
+    const key = descriptor.extractPartitionKey?.(callbackArgs);
+    const args = snapshotCdbQueryArgs(callbackArgs);
+    const intent = snapshotCdbJsonByteLimit(
+        intentCandidate as unknown as RawJson,
+        CDB_QUERY_ARGS_MAX_BYTES,
+        {
+            code: "CDB_INVARIANT",
+            subject: "query intent",
+            hint: "reduce query intent metadata",
+        },
+        { maxAggregateMembers: CDB_JSON_MAX_AGGREGATE_MEMBERS, maxDepth: CDB_QUERY_ARGS_MAX_DEPTH }
+    ) as unknown as CdbIntent;
     const policyDigest = policyDigestForTables(intent.tables);
-    const key = descriptor.extractPartitionKey?.(input.args);
     if (descriptor.authority === "organization" && (typeof key !== "string" || key.length === 0)) {
         throw new CdbError({
             code: "CDB_INVALID_ARGS",
@@ -259,10 +278,10 @@ export function routeValidatedQuery(
     }
     return {
         ok: true,
-        args: input.args,
+        args,
         intent,
         policyDigest,
-        queryHash: stableJson({ ref: input.ref, args: input.args, intent, policyDigest }),
+        queryHash: stableJson({ ref: input.ref, args, intent, policyDigest }),
         authority: descriptor.authority ?? null,
         partitionKey: key === undefined ? null : String(key),
     };
@@ -275,6 +294,7 @@ export async function routeQuery(
     policyDigestForTables: (tableNames: readonly string[]) => string
 ): Promise<QueryRouteResponse> {
     try {
+        const rawArgs = snapshotCdbQueryArgs(input.args);
         const descriptor = resolveQuery(manifest, input.ref as ChardbRef);
         if (!descriptor.extractIntent) {
             throw new CdbError({
@@ -282,10 +302,8 @@ export async function routeQuery(
                 message: `query ${input.ref} has no server intent extractor`,
             });
         }
-        const validatedArgs = rawJsonResult(
-            descriptor.validateArgs ? await descriptor.validateArgs(input.args) : input.args,
-            "query arguments",
-            "CDB_INVALID_ARGS"
+        const validatedArgs = snapshotCdbQueryArgs(
+            (descriptor.validateArgs ? await descriptor.validateArgs(rawArgs) : rawArgs) as RawJson
         );
         return routeValidatedQuery(manifest, { ref: input.ref, args: validatedArgs }, policyDigestForTables);
     } catch (error) {

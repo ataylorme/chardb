@@ -37,6 +37,7 @@ import {
     CDB_QUERY_RESULT_MAX_ROWS,
     assertCdbMutationArgsByteLimit,
     assertCdbResultByteLimit,
+    snapshotCdbQueryArgs,
 } from "../result_limits.ts";
 import type {
     CdbMutationRequest,
@@ -406,11 +407,11 @@ function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionReq
         throw subscriptionInvariant("active live subscription is missing its persisted payload");
     }
 
-    let args: RawJson;
+    let parsedArgs: unknown;
     let tables: unknown;
     let intervals: unknown;
     try {
-        args = rawJsonResult(JSON.parse(row.args_json), "persisted live subscription arguments");
+        parsedArgs = JSON.parse(row.args_json);
         tables = JSON.parse(row.tables_json);
         intervals = JSON.parse(row.intervals_json);
     } catch (error) {
@@ -418,6 +419,7 @@ function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionReq
             `active live subscription payload is corrupt: ${error instanceof Error ? error.message : "invalid JSON"}`
         );
     }
+    const args = snapshotCdbQueryArgs(parsedArgs as RawJson);
     if (!Array.isArray(tables) || tables.some(table => typeof table !== "string")) {
         throw subscriptionInvariant("active live subscription tables payload is corrupt");
     }
@@ -445,6 +447,40 @@ function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionReq
         throw subscriptionInvariant("active live subscription payload hash does not match its persisted payload");
     }
     return request;
+}
+
+function parseStoredSubscriptionRouting(row: StoredSubscriptionRow): {
+    readonly subscription: LiveSubscriptionId;
+    readonly tables: readonly string[];
+    readonly intervals: CdbSubscriptionRequest["intervals"];
+} {
+    if (row.state !== "active" || row.tables_json === null || row.intervals_json === null) {
+        throw subscriptionInvariant("active live subscription is missing its persisted routing metadata");
+    }
+    let tables: unknown;
+    let intervals: unknown;
+    try {
+        tables = JSON.parse(row.tables_json);
+        intervals = JSON.parse(row.intervals_json);
+    } catch (error) {
+        throw subscriptionInvariant(
+            `active live subscription routing metadata is corrupt: ${error instanceof Error ? error.message : "invalid JSON"}`
+        );
+    }
+    if (!Array.isArray(tables) || tables.some(table => typeof table !== "string") || !Array.isArray(intervals)) {
+        throw subscriptionInvariant("active live subscription routing metadata is corrupt");
+    }
+    return {
+        subscription: {
+            gatewayId: row.gateway_id,
+            registrationId: row.registration_id,
+            connectionId: row.connection_id,
+            clientId: ClientId(row.client_id),
+            subId: SubId(row.sub_id),
+        },
+        tables,
+        intervals: intervals as CdbSubscriptionRequest["intervals"],
+    };
 }
 
 function enqueueInvalidations(sql: SyncSql, touchedTables: readonly string[]): number {
@@ -661,7 +697,16 @@ export class Cdb extends DurableObject<CdbEnv> {
              ORDER BY gateway_id, registration_id`
         );
         for (const row of cursor) {
-            const request = parseStoredSubscription(row);
+            let request: CdbSubscriptionRequest;
+            try {
+                request = parseStoredSubscription(row);
+            } catch (error) {
+                if (!(error instanceof CdbError) || error.code !== "CDB_INVALID_ARGS") throw error;
+                const routing = parseStoredSubscriptionRouting(row);
+                assertSubscriptionTables(sql, routing.subscription, [...new Set(routing.tables)].sort());
+                this.installSubscription(routing.subscription, this.prepareIntervals(routing));
+                continue;
+            }
             assertSubscriptionTables(sql, request.subscription, [...new Set(request.tables)].sort());
             this.installSubscription(request.subscription, this.prepareIntervals(request));
         }
@@ -731,7 +776,7 @@ export class Cdb extends DurableObject<CdbEnv> {
         });
     }
 
-    private prepareIntervals(args: CdbSubscriptionRequest): PreparedInterval[] {
+    private prepareIntervals(args: { readonly intervals: CdbSubscriptionRequest["intervals"] }): PreparedInterval[] {
         return args.intervals.map(block => ({
             table: block.table,
             indexName: block.indexName,
@@ -901,7 +946,8 @@ export class Cdb extends DurableObject<CdbEnv> {
     /**
      * Register a live-query subscription on this shard. Caller is the Gateway DO.
      */
-    async subscribe(args: SubscribeArgs): Promise<CdbSubscriptionResponse> {
+    async subscribe(input: SubscribeArgs): Promise<CdbSubscriptionResponse> {
+        const args = { ...input, args: snapshotCdbQueryArgs(input.args) };
         const intervals = this.prepareIntervals(args);
         const policyDigest = cdbPolicyDigest(this.mutationSchema(), args.tables);
         const payloadHash = subscriptionPayloadHash(args, policyDigest);
@@ -1086,8 +1132,9 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     /** Execute a registered shard-local query without exposing it through Gateway yet. */
-    async query(request: CdbQueryRequest): Promise<CdbQueryResponse> {
+    async query(input: CdbQueryRequest): Promise<CdbQueryResponse> {
         try {
+            const request = { ...input, args: snapshotCdbQueryArgs(input.args) };
             const descriptor = resolveQuery(this.mutationManifest(), request.ref);
             const declaredIntent = descriptor.extractIntent ? descriptor.extractIntent(request.args) : undefined;
             const readTables = new Set<string>();
