@@ -188,7 +188,8 @@ Do not start with incremental row patches. Re-run the affected query after a com
 - [x] Persist a token-owned `run_target_version` separately from `delivered_version`; beginning a query does not claim delivery, and guarded settlement advances only the stored target while preserving newer dirtiness.
 - [x] Wire public `onSub`, `onUnsub`, auth replacement, cancellation, and disconnect paths to install, retire, unsubscribe, and clean up exact durable generations.
 - [x] Commit logical-head retirement and its cleanup alarm in one storage transaction so an alarm failure rolls both changes back.
-- [ ] Define cleanup liveness for a quiet abandoned registration when the retirement transaction fails and no client returns to supersede the active head.
+- [x] After a close-time retirement failure, best-effort schedule a separate reconciliation alarm. Scan active heads in durable rowid pages of 32, preserve only exact current verified socket identities, retire missing, stale, or mismatched attachments, and run exact Cdb cleanup without resetting an in-progress cursor.
+- [ ] Guarantee prompt cleanup when both the original atomic retirement and the fallback alarm transaction fail. A quiet abandoned head can otherwise persist until another event or bootstrap reaches the Gateway.
 - [x] Re-run subscriptions whose table set intersects the touched tables.
 - [x] Send replacement snapshots with a new cookie.
 - [x] Add the replacement-query runner that owns run tokens, consumes coalesced dirtiness, and stages an immutable snapshot before delivery settlement.
