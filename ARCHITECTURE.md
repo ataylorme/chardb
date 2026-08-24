@@ -82,6 +82,8 @@ The transaction core exists in [`executeAtomicMutation`](src/server/atomic-mutat
 
 The op-log key is the principal and mutation id. A retry with the same canonical request returns the stored result without rerunning the handler. Reusing the id with a different request raises a collision error. An exception rolls back both application rows and the provisional op-log row.
 
+Mutation results accept the exact 512 KiB serialized JSON boundary. For a newly run mutation, the executor checks the result inside `transactionSync` before the op-log finalizes its success row and before the write-set hook runs. A larger result returns `CDB_INVARIANT` with guidance to return less data and read larger results through a paginated query. That exception rolls back the handler's domain SQL and provisional op-log row, and the hook does not run. Replay checks the stored result through the same byte limit. An oversized legacy row is rejected without invoking the handler or hook and without changing that row. A result within the limit replays unchanged.
+
 The browser client bounds each mutation promise with `mutationTimeoutMs`, which defaults to 60 seconds. The deadline starts when the mutation becomes pending and does not reset during reconnect. While the mutation remains pending, each reconnect sends the original request and `mutId`, so the server op-log can deduplicate a committed first attempt. If the deadline expires, the client rejects with nonretryable `CDB_MUTATION_OUTCOME_UNKNOWN` because it cannot tell whether the server committed the request. A synchronous send failure, client close, session failure, or terminal mutation result removes the pending record and clears its timer. `ChardbProvider` forwards `mutationTimeoutMs` to the client. There is no public retry handle or automatic retry policy for terminal errors.
 
 Gateway separately reserves capacity for at most 32 unsettled mutations on one verified connection and 256 across one Gateway object. The reservation covers work queued behind auth refresh and remains held until dispatch settles. Excess mutations receive retryable `CDB_RATE_LIMITED` before dispatch. Typed failures, thrown failures, stale socket settlement, and send failure all release the reservation.
@@ -92,7 +94,7 @@ The browser client keeps at most 64 active subscription records. A valid subscri
 
 Each Gateway admits at most 256 aggregate current and pending logical registrations. The admission check counts durable current heads from SQLite, so restart does not reset capacity. A replacement with the same principal, client, and subscription key reuses its slot. A second pending request for that key on another connection receives retryable `CDB_RATE_LIMITED` instead of racing the first installation. New work over the aggregate cap is rejected before query routing, Catalog authority or placement reads, Cdb RPCs, or durable installation.
 
-The remaining resource work includes client inbound row and patch limits, durable total-byte limits, presence state, other queues, slow-consumer backpressure, and retention watermarks.
+The remaining resource work includes independent mutation-argument and write-volume bounds, client inbound row and patch limits, durable total-byte limits, presence state, other queues, slow-consumer backpressure, and retention watermarks.
 
 Durable Object SQLite transactions cannot span `await`. The atomic executor rejects native async handlers and thenables. Input validation and any external I/O must finish before entering the transaction.
 

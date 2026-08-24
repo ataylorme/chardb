@@ -28,6 +28,8 @@ The public mutation path is open only for definitions with an explicit stable re
 - [x] Invoke the handler inside the chosen transaction boundary.
 - [x] Return the handler's exact result. Do not reconstruct it from `returning[0]`.
 - [x] Validate that mutation results are JSON before committing them.
+- [x] Accept mutation results through the exact 512 KiB serialized JSON boundary and reject larger results with `CDB_INVARIANT` inside the atomic transaction before op-log finalization or the write-set hook.
+- [x] Prove a fresh oversized result rolls back domain SQL and its provisional op-log row. Reject an oversized legacy replay without running the handler or hook or changing the stored row, while accepted replays remain unchanged.
 - [x] Store the exact result in the op-log replay envelope.
 - [x] Return that stored result when the client repeats the same `mutId`.
 - [x] Keep collision detection for a repeated `mutId` with different arguments.
@@ -219,6 +221,7 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Cap active client subscription records at 64. Reject excess work synchronously with retryable `CDB_RATE_LIMITED` before allocating an id, changing state, or sending. Preserve the same records across reconnect, release capacity on unsubscribe, clear all records on terminal session failure, roll back a failed subscribe send, and close the session when unsubscribe send fails.
 - [x] Cap each Gateway at 256 aggregate current and pending logical registrations. Count durable heads after restart, allow same-key replacement without extra capacity, deny duplicate pending races, and return retryable `CDB_RATE_LIMITED` before routing, Catalog, Cdb, or installation work.
 - [x] Cap direct and registered Cdb query results at 4,096 top-level rows and exactly 512 KiB of serialized JSON. Apply the registered limit only after the generation fence and return `CDB_INVARIANT` with limit or pagination guidance.
+- [ ] Bound mutation arguments and domain write volume independently of the public frame and result caps.
 - [ ] Bound client inbound rows and patches, durable total bytes, presence state, other queues, and retention watermarks.
 - [x] Define and test snapshot acknowledgement, durable retry until exact acknowledgement, and client same-cookie deduplication with re-acknowledgement.
 - [ ] Apply backpressure or disconnect slow consumers.
