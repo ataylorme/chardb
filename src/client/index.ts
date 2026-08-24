@@ -163,6 +163,17 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         }
     }
 
+    function acknowledgeSnapshot(cookie: Cookie): void {
+        const socket = ws;
+        if (!socket || state !== "open" || socket.readyState !== WebSocket.OPEN) return;
+        try {
+            const acknowledgement: Up = { t: "ack", cookie };
+            socket.send(encodeWire(acknowledgement));
+        } catch {
+            // Snapshot acknowledgements are retryable by duplicate delivery.
+        }
+    }
+
     function onClose(): void {
         if (state === "closed") return;
         state = "reconnecting";
@@ -231,13 +242,17 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             case "snapshot": {
                 const sub = subs.get(msg.subId);
                 if (!sub) return;
-                if (sub.lastSnapshotCookie === msg.cookie) return;
+                if (sub.lastSnapshotCookie === msg.cookie) {
+                    acknowledgeSnapshot(msg.cookie);
+                    return;
+                }
                 lastCookie = msg.cookie;
                 sub.rows = [...msg.rows];
                 sub.optimisticPatches = [];
                 sub.lastSnapshotCookie = msg.cookie;
                 sub.state = "live";
                 notify(sub);
+                acknowledgeSnapshot(msg.cookie);
                 return;
             }
             case "mustRefetch":

@@ -28,12 +28,17 @@ class FakeWS {
     onmessage: ((ev: { data: string }) => void) | null = null;
     onerror: (() => void) | null = null;
     readyState: number = FakeWS.OPEN;
+    failNextSend = false;
     static instances: FakeWS[] = [];
     constructor(public readonly url: string) {
         FakeWS.instances.push(this);
         queueMicrotask(() => this.onopen?.());
     }
     send(raw: string): void {
+        if (this.failNextSend) {
+            this.failNextSend = false;
+            throw new Error("forced send failure");
+        }
         this.sent.push(raw);
     }
     close(): void {
@@ -339,6 +344,7 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
 
         expect(seen).toEqual([[]]);
+        expect(ws.sent.map(raw => JSON.parse(raw) as Up)).toContainEqual({ t: "ack", cookie: Cookie("c-1:1") });
         c.close();
     });
 
@@ -422,6 +428,7 @@ describe("createChardbClient — wire round-trip", () => {
             });
             await flush();
             expect(seen).toEqual([[{ id: "base" }]]);
+            expect(ws.sent.filter(raw => (JSON.parse(raw) as Up).t === "ack")).toHaveLength(2);
 
             TestBroadcastChannel.instance?.emit({
                 kind: "optimistic",
@@ -439,6 +446,7 @@ describe("createChardbClient — wire round-trip", () => {
             await flush();
             expect(seen).toHaveLength(2);
             expect(seen.at(-1)).toEqual([{ id: "base" }, { id: "optimistic", __key: "local" }]);
+            expect(ws.sent.filter(raw => (JSON.parse(raw) as Up).t === "ack")).toHaveLength(3);
 
             ws.emit({
                 t: "snapshot",
@@ -449,6 +457,12 @@ describe("createChardbClient — wire round-trip", () => {
             await flush();
             expect(seen).toHaveLength(3);
             expect(seen.at(-1)).toEqual([{ id: "replacement" }]);
+            expect(
+                ws.sent
+                    .map(raw => JSON.parse(raw) as Up)
+                    .filter((message): message is Extract<Up, { t: "ack" }> => message.t === "ack")
+                    .map(message => message.cookie)
+            ).toEqual([Cookie("c-1:1"), Cookie("c-1:1"), Cookie("c-1:1"), Cookie("c-1:2")]);
             c.close();
         } finally {
             if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
@@ -456,14 +470,22 @@ describe("createChardbClient — wire round-trip", () => {
         }
     });
 
-    test("snapshot for an unknown subscription is ignored", async () => {
+    test("snapshots for unknown or unsubscribed subscriptions are not acknowledged", async () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
         await welcome(ws);
         const seen: unknown[][] = [];
-        c.subscribe("queries.ts#listMessages", {}, rows => seen.push([...rows]));
+        const subscription = c.subscribe("queries.ts#listMessages", {}, rows => seen.push([...rows]));
         await flush();
+
+        subscription.unsubscribe();
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:98"),
+            rows: [{ id: "for-unsubscribed-sub" }],
+        });
 
         ws.emit({
             t: "snapshot",
@@ -474,6 +496,7 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
 
         expect(seen).toEqual([]);
+        expect(ws.sent.some(raw => (JSON.parse(raw) as Up).t === "ack")).toBe(false);
         expect(c.state).toBe("open");
         ws.close();
         await new Promise(resolve => setTimeout(resolve, 350));
@@ -482,6 +505,49 @@ describe("createChardbClient — wire round-trip", () => {
         const hello = reconnected.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "hello");
         if (!hello || hello.t !== "hello") throw new Error("expected hello on reconnect");
         expect(hello.resumeFromCookie).toBe(Cookie("c-test:0"));
+        c.close();
+    });
+
+    test("a failed snapshot acknowledgement is retried on duplicate delivery after reconnect", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: unknown[][] = [];
+        c.subscribe("queries.ts#listMessages", {}, rows => seen.push([...rows]));
+        await flush();
+
+        ws.failNextSend = true;
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:1"),
+            rows: [{ id: "applied-before-ack-failure" }],
+        });
+        await flush();
+        expect(c.state).toBe("open");
+        expect(seen).toEqual([[{ id: "applied-before-ack-failure" }]]);
+        expect(ws.sent.some(raw => (JSON.parse(raw) as Up).t === "ack")).toBe(false);
+
+        ws.close();
+        await new Promise(resolve => setTimeout(resolve, 350));
+        const reconnected = fakeWebSocket(1);
+        await flush();
+        await welcome(reconnected, "c-1:1");
+        reconnected.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:1"),
+            rows: [{ id: "duplicate-must-not-reapply" }],
+        });
+        await flush();
+
+        expect(c.state).toBe("open");
+        expect(seen).toEqual([[{ id: "applied-before-ack-failure" }]]);
+        expect(reconnected.sent.map(raw => JSON.parse(raw) as Up)).toContainEqual({
+            t: "ack",
+            cookie: Cookie("c-1:1"),
+        });
         c.close();
     });
 
