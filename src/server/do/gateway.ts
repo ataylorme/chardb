@@ -2284,11 +2284,16 @@ export async function shardsForIntent(catalog: CatalogRoutingRpc, intent: CdbInt
 }
 
 export class Gateway extends DurableObject<GatewayEnv> {
+    private static readonly MAX_UNSETTLED_MUTATIONS_PER_CONNECTION = 32;
+    private static readonly MAX_UNSETTLED_MUTATIONS = 256;
+
     private bootstrapped = false;
     private alarmScheduler: Promise<void> = Promise.resolve();
     private readonly authRefreshBarriers = new Map<string, Promise<boolean>>();
     private readonly activeOperations = new Map<string, Set<Promise<void>>>();
     private readonly pendingSubscriptions = new Map<string, PendingSubscription>();
+    private readonly unsettledMutationsByConnection = new Map<string, number>();
+    private unsettledMutationCount = 0;
 
     constructor(state: DurableObjectState, env: GatewayEnv) {
         super(state, env);
@@ -3878,12 +3883,53 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     private async onMut(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): Promise<void> {
         const attachment = ws.deserializeAttachment() as GwAttachment | null;
-        const barrier = attachment ? this.authRefreshBarriers.get(attachment.connectionId) : undefined;
-        if (barrier) {
-            if (await barrier) await this.admitMutation(ws, msg);
+        if (!isVerifiedAttachment(attachment) || !isCurrentVerifiedAttachment(attachment)) {
+            await this.admitMutation(ws, msg);
             return;
         }
-        await this.admitMutation(ws, msg);
+        if (!this.reserveMutation(attachment.connectionId)) {
+            const current = ws.deserializeAttachment() as GwAttachment | null;
+            this.sendMutFailure(
+                ws,
+                msg.mutId,
+                new CdbError({ code: "CDB_RATE_LIMITED", message: "too many unsettled mutations" }).toJSON(),
+                isVerifiedAttachment(current) ? current.lastCookie : attachment.lastCookie
+            );
+            return;
+        }
+        try {
+            const barrier = this.authRefreshBarriers.get(attachment.connectionId);
+            if (barrier) {
+                if (await barrier) await this.admitMutation(ws, msg);
+                return;
+            }
+            await this.admitMutation(ws, msg);
+        } finally {
+            this.releaseMutation(attachment.connectionId);
+        }
+    }
+
+    private reserveMutation(connectionId: string): boolean {
+        const connectionCount = this.unsettledMutationsByConnection.get(connectionId) ?? 0;
+        if (
+            connectionCount >= Gateway.MAX_UNSETTLED_MUTATIONS_PER_CONNECTION ||
+            this.unsettledMutationCount >= Gateway.MAX_UNSETTLED_MUTATIONS
+        ) {
+            return false;
+        }
+        this.unsettledMutationsByConnection.set(connectionId, connectionCount + 1);
+        this.unsettledMutationCount += 1;
+        return true;
+    }
+
+    private releaseMutation(connectionId: string): void {
+        const connectionCount = this.unsettledMutationsByConnection.get(connectionId);
+        if (connectionCount === undefined || connectionCount <= 0 || this.unsettledMutationCount <= 0) {
+            throw new CdbError({ code: "CDB_INVARIANT", message: "Gateway mutation admission counter underflow" });
+        }
+        if (connectionCount === 1) this.unsettledMutationsByConnection.delete(connectionId);
+        else this.unsettledMutationsByConnection.set(connectionId, connectionCount - 1);
+        this.unsettledMutationCount -= 1;
     }
 
     private async admitMutation(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): Promise<void> {
