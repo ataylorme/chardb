@@ -2,9 +2,11 @@ import { type DrizzleSqliteDODatabase, drizzle } from "drizzle-orm/durable-sqlit
 import { CdbError } from "../errors.ts";
 import { type MutationOutcome, type SyncSql, canonicalRequest, runWrappedMutation } from "../oplog/wrapper.ts";
 import { Cookie, MutId, PrincipalId, type RawJson } from "../types.ts";
+import { rawJsonResult } from "../util/raw_json.ts";
 import { wrapMutationDb } from "./cdb-db-proxy.ts";
 import type { AuthCtx, MutationCtx } from "./define.ts";
 import { adaptSqlStorage } from "./do/sql_adapter.ts";
+import { assertCdbResultByteLimit } from "./result_limits.ts";
 
 export type AtomicMutationDb<TSchema extends Record<string, unknown>> = DrizzleSqliteDODatabase<TSchema>;
 
@@ -93,13 +95,26 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
                 if (isThenable(result)) {
                     throw asyncHandlerError();
                 }
+                const jsonResult = rawJsonResult(result, "mutation result");
+                assertCdbResultByteLimit(
+                    jsonResult,
+                    "mutation result",
+                    "return less data from the mutation and read larger results with a paginated query"
+                );
                 return {
                     status: "ok",
-                    result,
+                    result: jsonResult as TResult,
                     rowsAffected: sql.changes(),
                 };
             },
         });
+        if (wrappedResult.envelope.status === "ok") {
+            assertCdbResultByteLimit(
+                wrappedResult.envelope.result ?? null,
+                "mutation result",
+                "return less data from the mutation and read larger results with a paginated query"
+            );
+        }
         if (wrappedResult.ran && wrappedResult.envelope.status === "ok" && touchedTables.size > 0) {
             const sortedTables = Object.freeze([...touchedTables].sort());
             const hookResult = input.onWriteSet?.({ touchedTables: sortedTables, sql });

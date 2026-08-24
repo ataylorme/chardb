@@ -33,6 +33,7 @@ import { cdbPolicyDigest } from "../cdb-policy.ts";
 import { collectCdbTables } from "../cdb-table-registry.ts";
 import { resolveCdbMeta } from "../cdb-table.ts";
 import { type ChardbManifest, emptyManifest, resolveMutation, resolveQuery, routeValidatedQuery } from "../manifest.ts";
+import { CDB_QUERY_RESULT_MAX_ROWS, assertCdbResultByteLimit } from "../result_limits.ts";
 import type {
     CdbMutationRequest,
     CdbMutationResponse,
@@ -186,8 +187,6 @@ const INVALIDATION_BATCH_SIZE = 64;
 const INVALIDATION_MAX_ATTEMPTS = 8;
 const INVALIDATION_BASE_RETRY_MS = 1_000;
 const INVALIDATION_MAX_RETRY_MS = 60_000;
-const CDB_QUERY_RESULT_MAX_ROWS = 4_096;
-const CDB_QUERY_RESULT_MAX_BYTES = 512 * 1_024;
 
 function assertCdbQueryResultLimits(result: RawJson, subject: string): void {
     if (Array.isArray(result) && result.length > CDB_QUERY_RESULT_MAX_ROWS) {
@@ -198,73 +197,7 @@ function assertCdbQueryResultLimits(result: RawJson, subject: string): void {
         });
     }
 
-    let bytes = 0;
-    const add = (amount: number): void => {
-        bytes += amount;
-        if (bytes > CDB_QUERY_RESULT_MAX_BYTES) {
-            throw new CdbError({
-                code: "CDB_INVARIANT",
-                message: `${subject} exceeds the ${CDB_QUERY_RESULT_MAX_BYTES}-byte serialized limit`,
-                hint: "select fewer rows or columns, or paginate the result",
-            });
-        }
-    };
-    const addString = (value: string): void => {
-        add(2);
-        for (let index = 0; index < value.length; index++) {
-            const code = value.charCodeAt(index);
-            if (code === 34 || code === 92 || code === 8 || code === 9 || code === 10 || code === 12 || code === 13) {
-                add(2);
-            } else if (code <= 31) {
-                add(6);
-            } else if (code <= 127) {
-                add(1);
-            } else if (code <= 2_047) {
-                add(2);
-            } else if (code >= 55_296 && code <= 56_319) {
-                const next = value.charCodeAt(index + 1);
-                if (next >= 56_320 && next <= 57_343) {
-                    add(4);
-                    index++;
-                } else {
-                    add(6);
-                }
-            } else if (code >= 56_320 && code <= 57_343) {
-                add(6);
-            } else {
-                add(3);
-            }
-        }
-    };
-    const visit = (value: RawJson): void => {
-        if (value === null) {
-            add(4);
-        } else if (typeof value === "string") {
-            addString(value);
-        } else if (typeof value === "number") {
-            add(JSON.stringify(value).length);
-        } else if (typeof value === "boolean") {
-            add(value ? 4 : 5);
-        } else if (Array.isArray(value)) {
-            add(2);
-            for (let index = 0; index < value.length; index++) {
-                if (index > 0) add(1);
-                visit(value[index] as RawJson);
-            }
-        } else {
-            add(2);
-            let first = true;
-            for (const key in value) {
-                if (!Object.hasOwn(value, key)) continue;
-                if (!first) add(1);
-                first = false;
-                addString(key);
-                add(1);
-                visit(value[key] as RawJson);
-            }
-        }
-    };
-    visit(result);
+    assertCdbResultByteLimit(result, subject, "select fewer rows or columns, or paginate the result");
 }
 
 function subscriptionKey(subscription: LiveSubscriptionId): string {
