@@ -15,6 +15,7 @@ import { Miniflare } from "miniflare";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ENTRY = path.join(HERE, "catalog.entry.ts");
+const WORKER_NAME = "catalog-restart-worker";
 
 let mf: Miniflare | undefined;
 
@@ -35,6 +36,7 @@ async function buildWorker(): Promise<string> {
 beforeAll(async () => {
     const workerSource = await buildWorker();
     mf = new Miniflare({
+        name: WORKER_NAME,
         modules: true,
         script: workerSource,
         durableObjects: { CATALOG: { className: "Catalog", useSQLite: true } },
@@ -71,6 +73,22 @@ interface OpenBarrierResult {
 interface OpenBarriersEntry {
     readonly barrierId: string;
     readonly missing: readonly string[];
+}
+
+interface AuthRow {
+    readonly [key: string]: unknown;
+}
+
+interface OrganizationAuthority {
+    readonly principalId: string;
+    readonly organizationId: string;
+    readonly role: string;
+    readonly roles: readonly string[];
+    readonly authEpochs: {
+        readonly global: number;
+        readonly tenant: number;
+        readonly principal: number;
+    };
 }
 
 describe("workerd Catalog barrier flow", () => {
@@ -140,5 +158,113 @@ describe("workerd Catalog barrier flow", () => {
             bookmark: 0,
         })) as { complete: boolean };
         expect(result.complete).toBe(false);
+    });
+
+    test("Catalog reconstruction keeps auth tables and stored authority rows", async () => {
+        if (!mf) throw new Error("miniflare not initialized");
+        const now = Date.parse("2026-08-23T00:00:00Z");
+        const expiresAt = Date.parse("2026-08-24T00:00:00Z");
+
+        for (const input of [
+            {
+                model: "user",
+                op: "create",
+                payload: {
+                    id: "restart-user",
+                    name: "Restart User",
+                    email: "catalog-restart@example.com",
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            },
+            {
+                model: "session",
+                op: "create",
+                payload: {
+                    id: "restart-session",
+                    token: "catalog-restart-token",
+                    userId: "restart-user",
+                    expiresAt,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            },
+            {
+                model: "organization",
+                op: "create",
+                payload: {
+                    id: "restart-org",
+                    name: "Restart Org",
+                    slug: "catalog-restart-org",
+                    createdAt: now,
+                },
+            },
+            {
+                model: "member",
+                op: "create",
+                payload: {
+                    id: "restart-member",
+                    organizationId: "restart-org",
+                    userId: "restart-user",
+                    role: "owner,member",
+                    createdAt: now,
+                },
+            },
+        ] as const) {
+            await call("mutateAuth", input);
+        }
+
+        const queryOne = async (model: string, where: Record<string, string>): Promise<AuthRow> => {
+            const rows = (await call("queryAuth", { model, where, limit: 1 })) as readonly AuthRow[];
+            expect(rows).toHaveLength(1);
+            const row = rows[0];
+            if (!row) throw new Error(`missing stored ${model} row`);
+            return row;
+        };
+        const readStoredAuth = async () => ({
+            session: await queryOne("session", { token: "catalog-restart-token" }),
+            organization: await queryOne("organization", { slug: "catalog-restart-org" }),
+            membership: await queryOne("member", {
+                organizationId: "restart-org",
+                userId: "restart-user",
+            }),
+            authority: (await call("resolveOrganizationAuthority", {
+                principalId: "restart-user",
+                organizationId: "restart-org",
+            })) as OrganizationAuthority,
+        });
+
+        const before = await readStoredAuth();
+        expect(before.session).toMatchObject({
+            id: "restart-session",
+            token: "catalog-restart-token",
+            userId: "restart-user",
+            expiresAt: new Date(expiresAt).toISOString(),
+        });
+        expect(before.organization).toMatchObject({
+            id: "restart-org",
+            name: "Restart Org",
+            slug: "catalog-restart-org",
+        });
+        expect(before.membership).toMatchObject({
+            id: "restart-member",
+            organizationId: "restart-org",
+            userId: "restart-user",
+            role: "owner,member",
+        });
+        expect(before.authority).toMatchObject({
+            principalId: "restart-user",
+            organizationId: "restart-org",
+            role: "member,owner",
+            roles: ["member", "owner"],
+        });
+
+        const firstInstanceId = (await call("fixtureInstanceId")) as string;
+        await mf.unsafeEvictDurableObject(WORKER_NAME, "Catalog", { name: "global" });
+        const secondInstanceId = (await call("fixtureInstanceId")) as string;
+        expect(secondInstanceId).not.toBe(firstInstanceId);
+
+        expect(await readStoredAuth()).toEqual(before);
     });
 });

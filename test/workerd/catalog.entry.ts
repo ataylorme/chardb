@@ -1,17 +1,40 @@
 /**
- * Test worker entry for the workerd Catalog harness — re-exports
- * `Catalog` and proxies its RPCs over plain HTTP. Mirrors
- * `worker.entry.ts` (Cdb harness) but binds the Catalog DO instead.
+ * Test worker entry for the workerd Catalog harness. It configures auth
+ * before Catalog construction and proxies the RPCs under test over HTTP.
  */
-import { Catalog } from "../../src/server/do/catalog.ts";
+import { bindAuthRuntime } from "../../src/auth/runtime.ts";
+import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
+import { Catalog as ProductionCatalog } from "../../src/server/do/catalog.ts";
 
-export { Catalog };
+const auth = defineAuth({ appName: "catalog-workerd-test" });
+bindAuthRuntime({
+    schema: synthesizeAuthSchema(auth.options as never) as never,
+    options: auth.options as { readonly [key: string]: unknown },
+});
+
+export class Catalog extends ProductionCatalog {
+    private readonly fixtureId = crypto.randomUUID();
+
+    fixtureInstanceId(): string {
+        return this.fixtureId;
+    }
+}
 
 interface Env {
     CATALOG: DurableObjectNamespace;
 }
 
-type Op = "openBarrier" | "ackBarrier" | "openBarriers" | "cutover" | "route" | "splitRange";
+type Op =
+    | "openBarrier"
+    | "ackBarrier"
+    | "openBarriers"
+    | "cutover"
+    | "route"
+    | "splitRange"
+    | "mutateAuth"
+    | "queryAuth"
+    | "resolveOrganizationAuthority"
+    | "fixtureInstanceId";
 
 export default {
     async fetch(req: Request, env: Env): Promise<Response> {
@@ -25,11 +48,14 @@ export default {
             return new Response(`unknown op: ${op}`, { status: 404 });
         }
         try {
-            // openBarrier takes a positional `now` arg, unlike the others.
-            const result =
-                op === "openBarrier"
-                    ? await stubAny.openBarrier((body ?? { now: Date.now() }).now as number)
-                    : await stubAny[op](body);
+            let result: unknown;
+            if (op === "openBarrier") {
+                result = await stubAny.openBarrier((body ?? { now: Date.now() }).now as number);
+            } else if (op === "fixtureInstanceId") {
+                result = await stubAny.fixtureInstanceId();
+            } else {
+                result = await stubAny[op](body);
+            }
             return Response.json(result ?? { ok: true });
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
