@@ -134,6 +134,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
     let reconnectBackoff = RECONNECT_INITIAL_BACKOFF_MS;
     let lastDisconnectAt = 0;
     let started = false;
+    let connectionAttempt = 0;
 
     // BroadcastChannel
     // (https://developer.mozilla.org/en-US/docs/Web/API/BroadcastChannel)
@@ -160,15 +161,17 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         }
     }
 
-    async function connect(): Promise<void> {
-        if (terminated) return;
+    async function connect(attempt: number): Promise<void> {
+        if (terminated || attempt !== connectionAttempt) return;
         state = "connecting";
         const jwt = await opts.getJwt();
-        if (terminated) return;
+        if (terminated || attempt !== connectionAttempt) return;
         const url = new URL(opts.endpoint);
         url.searchParams.set("clientId", clientId);
-        ws = new WebSocket(url.toString());
-        ws.onopen = () => {
+        const socket = new WebSocket(url.toString());
+        ws = socket;
+        socket.onopen = () => {
+            if (terminated || attempt !== connectionAttempt || ws !== socket) return;
             const hello: Up = {
                 t: "hello",
                 protocolV: PROTOCOL_V,
@@ -176,15 +179,37 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                 ...(lastCookie ? { resumeFromCookie: lastCookie } : {}),
                 jwt,
             };
-            ws?.send(encodeWire(hello));
+            socket.send(encodeWire(hello));
         };
-        ws.onmessage = ev => receiveWire(ev.data);
-        ws.onclose = () => onClose();
-        ws.onerror = () => ws?.close();
+        socket.onmessage = ev => {
+            if (terminated || attempt !== connectionAttempt || ws !== socket) return;
+            receiveWire(ev.data);
+        };
+        socket.onclose = () => {
+            if (!revokeSocket(attempt, socket)) return;
+            onClose();
+        };
+        socket.onerror = () => {
+            if (!revokeSocket(attempt, socket)) return;
+            try {
+                socket.close();
+            } finally {
+                onClose();
+            }
+        };
+    }
+
+    function revokeSocket(attempt: number, socket: WebSocket): boolean {
+        if (terminated || attempt !== connectionAttempt || ws !== socket) return false;
+        connectionAttempt += 1;
+        ws = null;
+        return true;
     }
 
     function startConnect(): void {
-        void connect().catch(() => {
+        const attempt = ++connectionAttempt;
+        void connect(attempt).catch(() => {
+            if (terminated || attempt !== connectionAttempt) return;
             failSession("CDB_INVARIANT", "failed to establish Chardb client session");
         });
     }
@@ -251,6 +276,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
     }
 
     function receiveWire(raw: unknown): void {
+        if (terminated) return;
         try {
             if (typeof raw !== "string") throw new TypeError("server sent a non-text WebSocket message");
             // UTF-8 is never shorter than the JavaScript code-unit count. Reject
@@ -753,6 +779,8 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         subs.clear();
         for (const sub of subscriptions) {
             sub.state = subState;
+            sub.rows = [];
+            sub.optimisticPatches = [];
             for (const listener of sub.listeners) {
                 try {
                     listener(cloneRawJson(sub.rows) as RawJson[]);

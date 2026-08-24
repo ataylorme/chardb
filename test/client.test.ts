@@ -18,7 +18,7 @@ import {
     createDeferredChardbClientController,
 } from "../src/client/index.ts";
 import { CdbError } from "../src/errors.ts";
-import { ChardbRef, ClientId, Cookie, type RawJson, SubId } from "../src/types.ts";
+import { ChardbRef, ClientId, Cookie, MutId, type RawJson, SubId } from "../src/types.ts";
 import { type Down, PROTOCOL_V, type Up, decodeWire, encodeWire } from "../src/wire.ts";
 
 class FakeWS {
@@ -33,10 +33,12 @@ class FakeWS {
     onerror: (() => void) | null = null;
     readyState: number = FakeWS.OPEN;
     failNextSend = false;
+    closeCalls = 0;
     static instances: FakeWS[] = [];
+    static autoOpen = true;
     constructor(public readonly url: string) {
         FakeWS.instances.push(this);
-        queueMicrotask(() => this.onopen?.());
+        if (FakeWS.autoOpen) queueMicrotask(() => this.onopen?.());
     }
     send(raw: string): void {
         if (this.failNextSend) {
@@ -46,6 +48,7 @@ class FakeWS {
         this.sent.push(raw);
     }
     close(): void {
+        this.closeCalls += 1;
         this.readyState = FakeWS.CLOSED;
         queueMicrotask(() => this.onclose?.());
     }
@@ -62,6 +65,7 @@ const realBC = (globalThis as { BroadcastChannel?: unknown }).BroadcastChannel;
 
 beforeEach(() => {
     FakeWS.instances.length = 0;
+    FakeWS.autoOpen = true;
     (globalThis as { WebSocket: unknown }).WebSocket = FakeWS;
     // BroadcastChannel exists in Bun by default. Disable cross-tab in client opts
     // (crossTab: false) below so the test stays hermetic.
@@ -432,22 +436,75 @@ describe("createChardbClient — wire round-trip", () => {
     });
 
     test("a malformed established-session message settles in-flight work instead of escaping the callback", async () => {
-        const c = client();
-        await flush();
-        const ws = fakeWebSocket();
-        await welcome(ws);
-        let subscriptionNotifications = 0;
-        c.subscribe("queries.ts#listMessages", {}, () => subscriptionNotifications++);
-        const mutationError = c.mutate("src/api.ts#post", {}).catch(error => error);
-        ws.onmessage?.({ data: "{" });
-        await flush();
+        class MalformedBroadcastChannel {
+            static instance: MalformedBroadcastChannel | undefined;
+            onmessage: ((event: { data: unknown }) => void) | null = null;
+            closeCalls = 0;
 
-        expect(c.state).toBe("closed");
-        expect(subscriptionNotifications).toBe(1);
-        await expect(mutationError).resolves.toMatchObject({
-            code: "CDB_INVARIANT",
-            message: "server sent an invalid Chardb session message",
+            constructor(_name: string) {
+                MalformedBroadcastChannel.instance = this;
+            }
+
+            close(): void {
+                this.closeCalls += 1;
+            }
+            emit(data: unknown): void {
+                this.onmessage?.({ data });
+            }
+        }
+
+        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = MalformedBroadcastChannel;
+        const timeoutSpy = spyOnClearTimeout();
+        const c = createChardbClient({
+            endpoint: "wss://example.com/ws",
+            getJwt: async () => "jwt-stub",
+            clientId: "c-malformed-session",
+            logicalDb: "malformed-session",
         });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const seen: RawJson[][] = [];
+            c.subscribe("queries.ts#listMessages", {}, rows => seen.push(rows));
+            ws.emit({
+                t: "snapshot",
+                subId: SubId(1),
+                cookie: Cookie("c-malformed:1"),
+                rows: [{ secret: "authoritative" }],
+            });
+            MalformedBroadcastChannel.instance?.emit({
+                kind: "optimistic",
+                patches: [{ op: "put", subId: 1, rowKey: "local", row: { secret: "optimistic" } }],
+            });
+            const mutationError = c.mutate("src/api.ts#post", {}).catch(error => error);
+            expect(seen.at(-1)).toEqual([{ secret: "authoritative" }, { secret: "optimistic", __key: "local" }]);
+
+            ws.onmessage?.({ data: "{" });
+            await flush();
+
+            expect(c.state).toBe("closed");
+            expect(seen.at(-1)).toEqual([]);
+            expect(seen).toHaveLength(3);
+            await expect(mutationError).resolves.toMatchObject({
+                code: "CDB_INVARIANT",
+                message: "server sent an invalid Chardb session message",
+            });
+            expect(timeoutSpy.calls).toHaveLength(1);
+            expect(ws.readyState).toBe(FakeWS.CLOSED);
+            expect(MalformedBroadcastChannel.instance?.closeCalls).toBe(1);
+
+            ws.onmessage?.({ data: "{" });
+            ws.onclose?.();
+            await flush();
+            expect(seen).toHaveLength(3);
+            expect(MalformedBroadcastChannel.instance?.closeCalls).toBe(1);
+        } finally {
+            c.close();
+            timeoutSpy.restore();
+            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
+            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
+        }
     });
 
     test("accepts an ignored inbound text envelope at the exact 1 MiB transport limit", async () => {
@@ -971,6 +1028,9 @@ describe("createChardbClient — wire round-trip", () => {
             close(): void {
                 this.closeCalls += 1;
             }
+            emit(data: unknown): void {
+                this.onmessage?.({ data });
+            }
         }
 
         (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = ClosingBroadcastChannel;
@@ -985,18 +1045,38 @@ describe("createChardbClient — wire round-trip", () => {
             await flush();
             const ws = fakeWebSocket();
             await welcome(ws);
-            c.subscribe("queries.ts#throwing", {}, () => {
-                throw new Error("listener failed");
+            c.subscribe("queries.ts#throwing", {}, rows => {
+                if (rows.length === 0) throw new Error("listener failed");
             });
-            let remainingNotifications = 0;
-            c.subscribe("queries.ts#remaining", {}, () => remainingNotifications++);
+            const remainingSeen: RawJson[][] = [];
+            c.subscribe("queries.ts#remaining", {}, rows => remainingSeen.push(rows));
+            ws.emit({
+                t: "snapshot",
+                subId: SubId(2),
+                cookie: Cookie("c-listener-cleanup:1"),
+                rows: [{ secret: "authoritative" }],
+            });
+            ClosingBroadcastChannel.instance?.emit({
+                kind: "optimistic",
+                patches: [{ op: "put", subId: 2, rowKey: "local", row: { secret: "optimistic" } }],
+            });
+            expect(remainingSeen.at(-1)).toEqual([
+                { secret: "authoritative" },
+                { secret: "optimistic", __key: "local" },
+            ]);
             const mutationError = c.mutate("mutations.ts#pending", {}).catch(error => error);
 
             expect(() => c.close()).not.toThrow();
             await expect(mutationError).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
-            expect(remainingNotifications).toBe(1);
+            expect(remainingSeen.at(-1)).toEqual([]);
+            expect(remainingSeen).toHaveLength(3);
             expect(timeoutSpy.calls).toHaveLength(1);
             expect(ws.readyState).toBe(FakeWS.CLOSED);
+            expect(ClosingBroadcastChannel.instance?.closeCalls).toBe(1);
+
+            c.close();
+            ws.onclose?.();
+            expect(remainingSeen).toHaveLength(3);
             expect(ClosingBroadcastChannel.instance?.closeCalls).toBe(1);
         } finally {
             timeoutSpy.restore();
@@ -1300,8 +1380,10 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
 
         expect(c.state).toBe("closed");
-        expect(seen.get(16)?.at(-1)).toEqual(before16);
-        expect(seen.get(17)?.at(-1)).toEqual(before17);
+        expect(seen.get(16)?.at(-2)).toEqual(before16);
+        expect(seen.get(17)?.at(-2)).toEqual(before17);
+        expect(seen.get(16)?.at(-1)).toEqual([]);
+        expect(seen.get(17)?.at(-1)).toEqual([]);
     });
 
     test("accepts 4096 snapshot rows and terminates before storing one over", async () => {
@@ -1327,7 +1409,9 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
         expect(c.state).toBe("closed");
         expect(ws.readyState).toBe(FakeWS.CLOSED);
-        expect(seen.at(-1)).toHaveLength(4_096);
+        expect(seen.at(-2)).toHaveLength(4_096);
+        expect(seen.at(-1)).toEqual([]);
+        expect(seen).toHaveLength(2);
         expect(ws.sent.map(raw => JSON.parse(raw) as Up)).not.toContainEqual({
             t: "ack",
             cookie: Cookie("c-test:rows-over"),
@@ -1356,7 +1440,9 @@ describe("createChardbClient — wire round-trip", () => {
         });
         await flush();
         expect(c.state).toBe("closed");
-        expect(seen.at(-1)).toEqual([exact]);
+        expect(seen.at(-2)).toEqual([exact]);
+        expect(seen.at(-1)).toEqual([]);
+        expect(seen).toHaveLength(2);
     });
 
     test("applies patch batches atomically and terminates before a 4097th cached row", async () => {
@@ -1392,9 +1478,11 @@ describe("createChardbClient — wire round-trip", () => {
         });
         await flush();
         expect(c.state).toBe("closed");
-        expect(seen.at(-1)).toHaveLength(4_096);
-        expect((seen.at(-1)?.[0] as { value?: unknown }).value).toBe(0);
-        expect(seen.at(-1)?.some(row => (row as { __key?: string }).__key === "row-over")).toBe(false);
+        expect(seen.at(-2)).toHaveLength(4_096);
+        expect((seen.at(-2)?.[0] as { value?: unknown }).value).toBe(0);
+        expect(seen.at(-2)?.some(row => (row as { __key?: string }).__key === "row-over")).toBe(false);
+        expect(seen.at(-1)).toEqual([]);
+        expect(seen).toHaveLength(2);
         await expect(pendingMutation).resolves.toMatchObject({ code: "CDB_INVARIANT" });
     });
 
@@ -1453,7 +1541,7 @@ describe("createChardbClient — wire round-trip", () => {
         expect(malformed.state).toBe("closed");
     });
 
-    test("commits every affected subscription before notifying a throwing listener", async () => {
+    test("a throwing listener does not block later terminal empty notifications", async () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
@@ -1474,7 +1562,7 @@ describe("createChardbClient — wire round-trip", () => {
         });
         await flush();
         expect(c.state).toBe("closed");
-        expect(secondSeen).toEqual([[{ value: 2, __key: "second" }]]);
+        expect(secondSeen).toEqual([[]]);
     });
 
     test("a duplicate snapshot is re-acknowledged before sizing and does not regress the connection cookie", async () => {
@@ -1713,7 +1801,9 @@ describe("createChardbClient — wire round-trip", () => {
             });
             expect(c.state).toBe("closed");
             expect(ws.readyState).toBe(FakeWS.CLOSED);
-            expect(seen.at(-1)).toEqual([{ value: 4_095, __key: "same-row" }]);
+            expect(seen.at(-2)).toEqual([{ value: 4_095, __key: "same-row" }]);
+            expect(seen.at(-1)).toEqual([]);
+            expect(seen).toHaveLength(2);
             expect(BoundedBroadcastChannel.instance?.closeCalls).toBe(1);
         } finally {
             if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
@@ -2609,6 +2699,257 @@ describe("createChardbClient — wire round-trip", () => {
         });
         await new Promise(resolve => setTimeout(resolve, 300));
         expect(FakeWS.instances).toHaveLength(1);
+    });
+
+    test("fences every queued socket callback after terminal close", async () => {
+        class ClosingBroadcastChannel {
+            static instance: ClosingBroadcastChannel | undefined;
+            onmessage: ((event: { data: unknown }) => void) | null = null;
+            closeCalls = 0;
+
+            constructor(_name: string) {
+                ClosingBroadcastChannel.instance = this;
+            }
+
+            close(): void {
+                this.closeCalls += 1;
+            }
+        }
+
+        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = ClosingBroadcastChannel;
+        const timers = installManualTimers();
+        FakeWS.autoOpen = false;
+        try {
+            const c = client({ mutationTimeoutMs: 1_000, crossTab: true, logicalDb: "late-terminal" });
+            await flush();
+            const ws = fakeWebSocket();
+            const lateOpen = ws.onopen;
+            const lateMessage = ws.onmessage;
+            const lateError = ws.onerror;
+            const lateClose = ws.onclose;
+            const seen: RawJson[][] = [];
+            c.subscribe("queries.ts#late-terminal", {}, rows => seen.push(rows));
+            let rejectionCount = 0;
+            const mutationError = c.mutate("mutations.ts#late-terminal", {}).catch(error => {
+                rejectionCount += 1;
+                return error;
+            });
+
+            c.close();
+            lateOpen?.();
+            lateMessage?.({
+                data: encodeWire({
+                    t: "welcome",
+                    protocolV: PROTOCOL_V,
+                    baseCookie: Cookie("c-late:1"),
+                    region: "test",
+                }),
+            });
+            lateMessage?.({
+                data: encodeWire({
+                    t: "poke",
+                    cookie: Cookie("c-late:2"),
+                    patches: [{ op: "put", subId: SubId(1), rowKey: "late", row: { value: "must-not-apply" } }],
+                    mutResults: [
+                        {
+                            mutId: MutId("00000000-0000-4000-8000-000000000000"),
+                            ok: true,
+                            result: "late",
+                            cookie: Cookie("c-late:2"),
+                        },
+                    ],
+                }),
+            });
+            lateError?.();
+            lateClose?.();
+            await flush();
+
+            expect(c.state).toBe("closed");
+            expect(seen).toEqual([[]]);
+            expect(rejectionCount).toBe(1);
+            await expect(mutationError).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(ws.sent).toEqual([]);
+            expect(ws.closeCalls).toBe(1);
+            expect(ClosingBroadcastChannel.instance?.closeCalls).toBe(1);
+            expect(FakeWS.instances).toHaveLength(1);
+        } finally {
+            FakeWS.autoOpen = true;
+            timers.restore();
+            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
+            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
+        }
+    });
+
+    test("revokes a socket before error-driven backoff begins", async () => {
+        const timers = installManualTimers();
+        let c: ReturnType<typeof client> | undefined;
+        try {
+            c = client();
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const seen: RawJson[][] = [];
+            c.subscribe("queries.ts#error-backoff", {}, rows => seen.push(rows));
+            const staleOpen = ws.onopen;
+            const staleMessage = ws.onmessage;
+            const staleError = ws.onerror;
+            const staleClose = ws.onclose;
+            const sentBeforeError = ws.sent.length;
+
+            staleError?.();
+            staleOpen?.();
+            staleMessage?.({
+                data: encodeWire({
+                    t: "welcome",
+                    protocolV: PROTOCOL_V,
+                    baseCookie: Cookie("c-stale-error:1"),
+                    region: "test",
+                }),
+            });
+            staleMessage?.({
+                data: encodeWire({
+                    t: "poke",
+                    cookie: Cookie("c-stale-error:2"),
+                    patches: [{ op: "put", subId: SubId(1), rowKey: "stale", row: { value: true } }],
+                }),
+            });
+            staleClose?.();
+            staleClose?.();
+            staleError?.();
+            await flush();
+
+            expect(c.state).toBe("reconnecting");
+            expect(seen).toEqual([]);
+            expect(ws.sent).toHaveLength(sentBeforeError);
+            expect(ws.closeCalls).toBe(1);
+            expect(timers.scheduledDelays()).toEqual([250]);
+            expect(FakeWS.instances).toHaveLength(1);
+        } finally {
+            c?.close();
+            timers.restore();
+        }
+    });
+
+    test("keeps a closed socket fenced while reconnect JWT is pending", async () => {
+        const timers = installManualTimers();
+        let resolveReconnectJwt: ((jwt: string) => void) | undefined;
+        const reconnectJwt = new Promise<string>(resolve => {
+            resolveReconnectJwt = resolve;
+        });
+        let jwtCalls = 0;
+        let c: ReturnType<typeof client> | undefined;
+        try {
+            c = client({
+                getJwt: () => {
+                    jwtCalls += 1;
+                    return jwtCalls === 1 ? Promise.resolve("jwt-initial") : reconnectJwt;
+                },
+            });
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+            const seen: RawJson[][] = [];
+            c.subscribe("queries.ts#held-reconnect", {}, rows => seen.push(rows));
+            const staleOpen = first.onopen;
+            const staleMessage = first.onmessage;
+            const staleError = first.onerror;
+            const staleClose = first.onclose;
+            const sentBeforeClose = first.sent.length;
+
+            first.close();
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([250]);
+            timers.runDelay(250);
+            await flush();
+            expect(jwtCalls).toBe(2);
+            expect(c.state).toBe("connecting");
+            expect(FakeWS.instances).toHaveLength(1);
+
+            staleOpen?.();
+            staleMessage?.({
+                data: encodeWire({
+                    t: "welcome",
+                    protocolV: PROTOCOL_V,
+                    baseCookie: Cookie("c-held-stale:1"),
+                    region: "test",
+                }),
+            });
+            staleMessage?.({
+                data: encodeWire({
+                    t: "poke",
+                    cookie: Cookie("c-held-stale:2"),
+                    patches: [{ op: "put", subId: SubId(1), rowKey: "stale", row: { value: true } }],
+                }),
+            });
+            staleError?.();
+            staleClose?.();
+            staleClose?.();
+            await flush();
+
+            expect(c.state).toBe("connecting");
+            expect(seen).toEqual([]);
+            expect(first.sent).toHaveLength(sentBeforeClose);
+            expect(first.closeCalls).toBe(1);
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(FakeWS.instances).toHaveLength(1);
+
+            resolveReconnectJwt?.("jwt-reconnect");
+            await flush();
+            expect(FakeWS.instances).toHaveLength(2);
+        } finally {
+            c?.close();
+            timers.restore();
+        }
+    });
+
+    test("ignores callbacks from a superseded socket after reconnect", async () => {
+        const timers = installManualTimers();
+        let c: ReturnType<typeof client> | undefined;
+        try {
+            c = client();
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+            const seen: RawJson[][] = [];
+            c.subscribe("queries.ts#stale-socket", {}, rows => seen.push(rows));
+            const staleOpen = first.onopen;
+            const staleMessage = first.onmessage;
+            const staleError = first.onerror;
+            const staleClose = first.onclose;
+
+            first.close();
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([250]);
+            timers.runDelay(250);
+            await flush();
+            const second = fakeWebSocket(1);
+            await welcome(second, "c-current:1");
+            const currentSentCount = second.sent.length;
+
+            staleOpen?.();
+            staleMessage?.({
+                data: encodeWire({
+                    t: "poke",
+                    cookie: Cookie("c-stale:2"),
+                    patches: [{ op: "put", subId: SubId(1), rowKey: "stale", row: { value: true } }],
+                }),
+            });
+            staleError?.();
+            staleClose?.();
+            await flush();
+
+            expect(c.state).toBe("open");
+            expect(seen).toEqual([]);
+            expect(second.sent).toHaveLength(currentSentCount);
+            expect(first.closeCalls).toBe(1);
+            expect(second.closeCalls).toBe(0);
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(FakeWS.instances).toHaveLength(2);
+        } finally {
+            c?.close();
+            timers.restore();
+        }
     });
 
     test("close clears every pending mutation deadline", async () => {
