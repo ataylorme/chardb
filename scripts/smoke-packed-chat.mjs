@@ -103,6 +103,22 @@ async function connectGateway(origin, clientId, jwt) {
     return { socket, next };
 }
 
+async function closeSocket(socket) {
+    if (socket.readyState === WebSocket.CLOSED) return;
+    await new Promise(resolvePromise => {
+        const timeout = setTimeout(resolvePromise, 5_000);
+        socket.addEventListener(
+            "close",
+            () => {
+                clearTimeout(timeout);
+                resolvePromise();
+            },
+            { once: true }
+        );
+        socket.close();
+    });
+}
+
 async function bundleWorker(consumer, bundlePath) {
     run(
         "bun",
@@ -135,6 +151,7 @@ async function bundleWorker(consumer, bundlePath) {
 async function main() {
     const scratch = await mkdtemp(join(tmpdir(), "chardb-packed-chat-"));
     const consumer = join(scratch, "consumer");
+    const persistencePath = join(scratch, "durable-objects");
     let mf;
     const sockets = [];
     try {
@@ -173,19 +190,22 @@ async function main() {
 
         const bundlePath = join(scratch, "chat-worker.mjs");
         const worker = await bundleWorker(consumer, bundlePath);
-        mf = new Miniflare({
-            modules: true,
-            script: worker,
-            bindings: { BETTER_AUTH_SECRET: "packed-chat-secret-that-is-at-least-32-characters" },
-            durableObjects: {
-                CDB_CATALOG: { className: "Catalog", useSQLite: true },
-                CDB_GATEWAY: { className: "Gateway", useSQLite: true },
-                CDB_SHARD: { className: "Cdb", useSQLite: true },
-            },
-            compatibilityDate: "2025-09-01",
-            compatibilityFlags: ["nodejs_compat", "nodejs_compat_populate_process_env"],
-        });
-        const origin = await mf.ready;
+        const startMiniflare = () =>
+            new Miniflare({
+                modules: true,
+                script: worker,
+                bindings: { BETTER_AUTH_SECRET: "packed-chat-secret-that-is-at-least-32-characters" },
+                durableObjects: {
+                    CDB_CATALOG: { className: "Catalog", useSQLite: true },
+                    CDB_GATEWAY: { className: "Gateway", useSQLite: true },
+                    CDB_SHARD: { className: "Cdb", useSQLite: true },
+                },
+                durableObjectsPersist: persistencePath,
+                compatibilityDate: "2025-09-01",
+                compatibilityFlags: ["nodejs_compat", "nodejs_compat_populate_process_env"],
+            });
+        mf = startMiniflare();
+        let origin = await mf.ready;
 
         const signIn = await mf.dispatchFetch(new URL("/api/auth/sign-in/anonymous", origin), {
             method: "POST",
@@ -211,8 +231,8 @@ async function main() {
             `JWT issue failed: ${JSON.stringify(tokenBody)}`
         );
 
-        const primary = await connectGateway(origin, "packed-chat-client", tokenBody.token);
-        const { socket, next } = primary;
+        let primary = await connectGateway(origin, "packed-chat-client", tokenBody.token);
+        let { socket, next } = primary;
         sockets.push(socket);
 
         const queryArgs = { organizationId: "demo-org", channelId: "general", limit: 50 };
@@ -253,6 +273,36 @@ async function main() {
             `live replacement failed: ${JSON.stringify(replacement)}`
         );
         socket.send(JSON.stringify({ t: "ack", cookie: replacement.cookie }));
+
+        await closeSocket(socket);
+        await mf.dispose();
+        mf = startMiniflare();
+        origin = await mf.ready;
+
+        const reconstructedSession = await mf.dispatchFetch(new URL("/api/auth/get-session", origin), {
+            headers: { cookie },
+        });
+        const reconstructedSessionBody = await reconstructedSession.json();
+        assert(
+            reconstructedSession.ok &&
+                reconstructedSessionBody?.user?.id === sessionBody.user.id &&
+                reconstructedSessionBody?.session?.id === sessionBody.session.id &&
+                reconstructedSessionBody?.session?.activeOrganizationId === "demo-org",
+            `packed session did not survive Miniflare restart: ${JSON.stringify(reconstructedSessionBody)}`
+        );
+
+        const reconstructedTokenResponse = await mf.dispatchFetch(new URL("/api/auth/token", origin), {
+            headers: { cookie },
+        });
+        const reconstructedTokenBody = await reconstructedTokenResponse.json();
+        assert(
+            reconstructedTokenResponse.ok && typeof reconstructedTokenBody?.token === "string",
+            `JWT issue from the reconstructed session failed: ${JSON.stringify(reconstructedTokenBody)}`
+        );
+
+        primary = await connectGateway(origin, "packed-chat-client", reconstructedTokenBody.token);
+        ({ socket, next } = primary);
+        sockets.push(socket);
 
         socket.send(JSON.stringify(mutationRequest));
         const replay = await next(
@@ -359,10 +409,13 @@ async function main() {
         isolated.socket.send(JSON.stringify({ t: "ack", cookie: isolatedSnapshot.cookie }));
         console.log(`packed chat proof passed with chardb ${installed.version}`);
     } finally {
-        for (const socket of sockets) socket.close();
-        await mf?.dispose();
-        await rm(scratch, { recursive: true, force: true });
-        await rm(tarball, { force: true });
+        try {
+            await Promise.allSettled(sockets.map(closeSocket));
+            await mf?.dispose();
+        } finally {
+            await rm(scratch, { recursive: true, force: true });
+            await rm(tarball, { force: true });
+        }
     }
 }
 
