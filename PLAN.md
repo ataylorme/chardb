@@ -152,11 +152,13 @@ The database proxy now applies one explicit rule to registered-table inserts, up
 
 ## 7. Implement narrow organization queries
 
-Protocol v3 subscription requests send a query reference and raw arguments. For an explicit organization query with a stable ref, partition key, developer-declared server-side intent, and `authority: "organization"`, Gateway validates the arguments and requires the partition and intent to resolve to the same exact organization and one virtual shard. It derives current authority from Catalog, installs a durable generation before `Cdb.subscribe`, reruns the exact registered query, and sends snapshots. For supported full-row queries, Cdb conservatively records `cdbTable` dependencies and compares them with declared `intent.tables` before returning rows. Each terminal query execution also records its typed predicate after the row-policy floor is applied. Each declared interval bundle's union must contain every observed range for its table and index. Raw or untracked predicates, embedded subqueries, and callback predicates or ordering remain blocked. General query shapes remain closed. Resume cookies do not replay missed changes.
+Protocol v3 subscription requests send a query reference and raw arguments. Query arguments use strict owned snapshots through raw Gateway admission, validator output, routed output, `Cdb.subscribe`, and direct or registered Cdb execution. For an explicit organization query with a stable ref, partition key, developer-declared server-side intent, and `authority: "organization"`, Gateway requires the partition and intent to resolve to the same exact organization and one virtual shard. It derives current authority from Catalog, installs a durable generation before `Cdb.subscribe`, reruns the exact registered query, and sends snapshots. For supported full-row queries, Cdb conservatively records `cdbTable` dependencies and compares them with declared `intent.tables` before returning rows. Each terminal query execution also records its typed predicate after the row-policy floor is applied. Each declared interval bundle's union must contain every observed range for its table and index. Raw or untracked predicates, embedded subqueries, and callback predicates or ordering remain blocked. General query shapes remain closed. Resume cookies do not replay missed changes.
 
 - [x] Change the wire protocol so `sub` carries the query reference and raw arguments.
 - [x] Increment the protocol version and enforce it during `hello` and `welcome`.
 - [x] Validate query arguments with the query's Standard Schema validator before intent extraction.
+- [x] Enforce the exact 512 KiB UTF-8, 4,096-member, and 99-level strict JSON query-argument contract at raw Gateway admission, after validation, after declared routing callbacks, on an overridden route result, at `Cdb.subscribe`, and before direct or registered Cdb execution.
+- [x] Build each server query-argument snapshot in one descriptor traversal without invoking getters or rereading a proxy. Snapshot validator results, callback-mutated arguments, returned intent, and routed arguments at their ownership seams so later mutation cannot change downstream work.
 - [x] Resolve the query reference inside the Cdb isolate.
 - [x] Evaluate the developer-declared intent callback on the server. Do not trust client-supplied intent or a client query hash.
 - [x] Canonicalize the query ref, validated arguments, and server-evaluated declared intent into a query hash used by persisted Cdb registrations and deploy-drift checks.
@@ -176,6 +178,8 @@ Protocol v3 subscription requests send a query reference and raw arguments. For 
 - [x] Conservatively record every `cdbTable` dependency exposed by supported full-row queries and reject results when a recorded table is absent from developer-declared `intent.tables`.
 - [x] At each supported full-row query execution, record the actual typed predicate with the row-policy floor and require each declared interval bundle's union to contain every observed range for its table and index.
 - [x] Connect public authorized registration to `onSub`, installing the exact Gateway generation before `Cdb.subscribe` and pre-arming durable recovery before the RPC.
+- [x] Rebuild 4,096 active Cdb registrations incrementally from the storage cursor. Keep a legacy active row with over-limit arguments in its table and interval maps so invalidation still reaches it, but reject its registered execution with terminal `CDB_INVALID_ARGS` before the handler.
+- [ ] Add dedicated Gateway snapshot-runner integration coverage for terminal execution of a reconstructed legacy registration with over-limit arguments.
 
 ## 8. Implement live updates with simple invalidation first
 
