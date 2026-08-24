@@ -1,6 +1,15 @@
 /** Convert in-process Interval values to/from the wire encoding. */
 
-import { type Endpoint, FULL, type Interval, type IntervalKey, type IntervalScalar, IntervalSet } from "./intervals.ts";
+import {
+    type Endpoint,
+    FULL,
+    type Interval,
+    type IntervalKey,
+    type IntervalScalar,
+    IntervalSet,
+    cmpEndpoint,
+    cmpKey,
+} from "./intervals.ts";
 import type { RawJson } from "./types.ts";
 import type { WireEndpoint, WireInterval } from "./wire.ts";
 
@@ -62,4 +71,50 @@ export function intervalSetFromWire(arr: readonly WireInterval[]): IntervalSet {
     const s = new IntervalSet();
     for (const iv of arr) s.add(intervalFromWire(iv));
     return s;
+}
+
+function intervalCovers(declared: Interval, observed: Interval): boolean {
+    return cmpEndpoint(declared.lo, observed.lo, "lo") <= 0 && cmpEndpoint(declared.hi, observed.hi, "hi") >= 0;
+}
+
+function intervalsTouchOrOverlap(left: Interval, right: Interval): boolean {
+    if (left.hi.kind === "pos_inf" || right.lo.kind === "neg_inf") return true;
+    if (left.hi.kind === "neg_inf" || right.lo.kind === "pos_inf") return false;
+    const order = cmpKey(left.hi.value, right.lo.value);
+    if (order !== 0) return order > 0;
+    return left.hi.inclusive || right.lo.inclusive;
+}
+
+function mergedIntervals(intervals: readonly Interval[]): Interval[] {
+    const sorted = [...intervals].sort((a, b) => cmpEndpoint(a.lo, b.lo, "lo"));
+    const merged: Interval[] = [];
+    for (const interval of sorted) {
+        const previous = merged.at(-1);
+        if (!previous || !intervalsTouchOrOverlap(previous, interval)) {
+            merged.push(interval);
+            continue;
+        }
+        if (cmpEndpoint(interval.hi, previous.hi, "hi") > 0) {
+            merged[merged.length - 1] = { lo: previous.lo, hi: interval.hi };
+        }
+    }
+    return merged;
+}
+
+/** True when every observed interval is wholly contained by the union of the declared intervals. */
+export function wireIntervalsCover(
+    declared: readonly WireInterval[],
+    observed: readonly WireInterval[] | "full"
+): boolean {
+    if (declared.some(interval => interval.kind === "full")) return true;
+    if (observed === "full") return false;
+    try {
+        const declaredIntervals = mergedIntervals(declared.map(intervalFromWire));
+        return observed.every(candidate => {
+            const actual = intervalFromWire(candidate);
+            return declaredIntervals.some(interval => intervalCovers(interval, actual));
+        });
+    } catch {
+        return false;
+    }
 }

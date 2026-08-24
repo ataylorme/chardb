@@ -37,6 +37,8 @@ interface PartitionInfo {
     readonly intervals: readonly WireInterval[] | "full";
 }
 
+export type ObservedPredicateIntervals = readonly WireInterval[] | "full";
+
 const NEG_INF: WireEndpoint = { kind: "neg_inf" };
 const POS_INF: WireEndpoint = { kind: "pos_inf" };
 const FULL_INFO: PartitionInfo = { values: undefined, intervals: "full" };
@@ -298,6 +300,14 @@ function walk(sql: SQL, table: string, column: string): Predicate {
     }
 
     return { kind: "other" };
+}
+
+/**
+ * Conservatively project one typed Drizzle predicate onto one SQL column.
+ * Unsupported shapes return `"full"`, never a guessed narrow interval.
+ */
+export function intervalsForColumnPredicate(predicate: SQL, table: string, column: string): ObservedPredicateIntervals {
+    return predicateInfo(walk(predicate, table, column)).intervals;
 }
 
 function matchConjunction(chunks: readonly SQLChunk[]): { op: "and" | "or"; children: SQL[] } | undefined {

@@ -11,6 +11,16 @@ import {
     point,
     prefixRange,
 } from "../src/intervals.ts";
+import { wireIntervalsCover } from "../src/intervals_wire.ts";
+import type { WireInterval } from "../src/wire.ts";
+
+function wireRange(lo: number, hi: number, loInclusive: boolean, hiInclusive: boolean): WireInterval {
+    return {
+        kind: "range",
+        lo: { kind: "value", value: [lo], inclusive: loInclusive },
+        hi: { kind: "value", value: [hi], inclusive: hiInclusive },
+    };
+}
 
 describe("interval comparisons", () => {
     test("cmpKey lex orders strings and numbers", () => {
@@ -83,6 +93,24 @@ describe("IntervalSet", () => {
         const b = IntervalSet.of(closedRange([5], [15]));
         expect(a.intersects(b)).toBe(true);
         expect(a.intersects(IntervalSet.of(closedRange([20], [30])))).toBe(false);
+    });
+});
+
+describe("wire interval coverage", () => {
+    test("covers an observed range with the union of touching declared ranges", () => {
+        const observed = [wireRange(1, 3, true, true)];
+
+        expect(wireIntervalsCover([wireRange(1, 2, true, true), wireRange(2, 3, false, true)], observed)).toBe(true);
+        expect(wireIntervalsCover([wireRange(1, 2, true, false), wireRange(2, 3, true, true)], observed)).toBe(true);
+    });
+
+    test("rejects a declared union with an exclusive hole at the shared boundary", () => {
+        expect(
+            wireIntervalsCover(
+                [wireRange(1, 2, true, false), wireRange(2, 3, false, true)],
+                [wireRange(1, 3, true, true)]
+            )
+        ).toBe(false);
     });
 });
 

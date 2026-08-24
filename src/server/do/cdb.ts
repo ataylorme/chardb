@@ -15,9 +15,10 @@
 import { DurableObject } from "cloudflare:workers";
 import { drizzle } from "drizzle-orm/durable-sqlite";
 import { renderSqliteTableDdl } from "../../auth/ddl.ts";
+import { intervalsForColumnPredicate } from "../../drizzle/walker.ts";
 import { CdbError, isCdbError, isCdbErrorCode } from "../../errors.ts";
 import { type IntervalKey, IntervalMap, type IntervalSet } from "../../intervals.ts";
-import { intervalSetFromWire } from "../../intervals_wire.ts";
+import { intervalSetFromWire, wireIntervalsCover } from "../../intervals_wire.ts";
 import { SHARD_BOOTSTRAP_DDL } from "../../oplog/schema.ts";
 import { type JsonText, type SyncSql, parseJsonColumn } from "../../oplog/wrapper.ts";
 import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/range.ts";
@@ -25,8 +26,9 @@ import { type TableSpec, renderRowApply, renderTableTriggers } from "../../resha
 import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId, TenantId } from "../../types.ts";
 import { stableHashHex } from "../../util/canonical.ts";
 import { rawJsonResult } from "../../util/raw_json.ts";
+import type { CdbIntent } from "../../wire.ts";
 import { executeAtomicMutation } from "../atomic-mutation.ts";
-import { wrapQueryDb } from "../cdb-db-proxy.ts";
+import { type QueryReadRangeObservation, wrapQueryDb } from "../cdb-db-proxy.ts";
 import { cdbPolicyDigest } from "../cdb-policy.ts";
 import { collectCdbTables } from "../cdb-table-registry.ts";
 import { resolveCdbMeta } from "../cdb-table.ts";
@@ -222,6 +224,29 @@ function assertQueryIntentCoversReads(
         message: `query ${ref} read undeclared cdbTable${omitted.length === 1 ? "" : "s"}: ${omitted.join(", ")}`,
         hint: "add every table read by the handler to intent.tables",
     });
+}
+
+function assertQueryIntentCoversRanges(
+    ref: ChardbRef,
+    intent: CdbIntent,
+    observations: ReadonlyMap<object, QueryReadRangeObservation>
+): void {
+    if (!intent.intervals) return;
+    for (const observation of observations.values()) {
+        for (const declared of intent.intervals.filter(bundle => bundle.table === observation.tableName)) {
+            const observed = intervalsForColumnPredicate(
+                observation.predicate,
+                observation.tableName,
+                declared.indexName
+            );
+            if (wireIntervalsCover(declared.intervals, observed)) continue;
+            throw new CdbError({
+                code: "CDB_INVARIANT",
+                message: `query ${ref} read outside declared interval for ${declared.table}.${declared.indexName}`,
+                hint: "widen intent.intervals to cover every range the handler and row policy can read",
+            });
+        }
+    }
 }
 
 function ensureInvalidationOutboxColumns(sql: SyncSql): void {
@@ -969,18 +994,23 @@ export class Cdb extends DurableObject<CdbEnv> {
     async query(request: CdbQueryRequest): Promise<CdbQueryResponse> {
         try {
             const descriptor = resolveQuery(this.mutationManifest(), request.ref);
-            const declaredTables = descriptor.extractIntent ? descriptor.extractIntent(request.args).tables : undefined;
+            const declaredIntent = descriptor.extractIntent ? descriptor.extractIntent(request.args) : undefined;
             const readTables = new Set<string>();
+            const readRanges = new Map<object, QueryReadRangeObservation>();
             const database = wrapQueryDb(
                 drizzle(this.ctx.storage, { schema: this.mutationSchema() }),
                 request.auth,
-                tableName => readTables.add(tableName)
+                tableName => readTables.add(tableName),
+                observation => readRanges.set(observation.token, observation)
             );
             const result = rawJsonResult(
                 await descriptor.invokeValidated({ db: readOnlyQueryDb(database), auth: request.auth }, request.args),
                 "query result"
             );
-            if (declaredTables) assertQueryIntentCoversReads(request.ref, declaredTables, readTables);
+            if (declaredIntent) {
+                assertQueryIntentCoversReads(request.ref, declaredIntent.tables, readTables);
+                assertQueryIntentCoversRanges(request.ref, declaredIntent, readRanges);
+            }
             return { ok: true, result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
@@ -1036,10 +1066,12 @@ export class Cdb extends DurableObject<CdbEnv> {
 
             const descriptor = resolveQuery(this.mutationManifest(), subscription.ref);
             const readTables = new Set<string>();
+            const readRanges = new Map<object, QueryReadRangeObservation>();
             const database = wrapQueryDb(
                 drizzle(this.ctx.storage, { schema: this.mutationSchema() }),
                 request.auth,
-                tableName => readTables.add(tableName)
+                tableName => readTables.add(tableName),
+                observation => readRanges.set(observation.token, observation)
             );
             const result = rawJsonResult(
                 await descriptor.invokeValidated(
@@ -1052,6 +1084,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 throw subscriptionInvariant("registered query result must be an array");
             }
             assertQueryIntentCoversReads(subscription.ref, routed.intent.tables, readTables);
+            assertQueryIntentCoversRanges(subscription.ref, routed.intent, readRanges);
 
             const current = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,

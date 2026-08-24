@@ -103,6 +103,8 @@ interface SelectPlan {
     readonly policies: ReturnType<typeof compileCdbPolicies>;
     readonly onRead: ((tableName: string) => void) | undefined;
     readonly queryBoundary: boolean;
+    readonly rangeObserver: QueryReadRangeObserver | undefined;
+    readonly rangeState: QueryReadRangeState;
 }
 
 interface SelectRootPlan {
@@ -110,6 +112,19 @@ interface SelectRootPlan {
     readonly fullRow: boolean;
     readonly queryBoundary: boolean;
     readonly onRead: ((tableName: string) => void) | undefined;
+    readonly rangeObserver: QueryReadRangeObserver | undefined;
+}
+
+export interface QueryReadRangeObservation {
+    readonly token: object;
+    readonly tableName: string;
+    readonly predicate: SQL;
+}
+
+export type QueryReadRangeObserver = (observation: QueryReadRangeObservation) => void;
+
+interface QueryReadRangeState {
+    predicate: SQL;
 }
 
 const UNSUPPORTED_SELECT_METHODS = new Set<PropertyKey>([
@@ -369,25 +384,37 @@ function wrapSelectFromBuilder(builder: unknown, root: SelectRootPlan): unknown 
                     policies: compileCdbPolicies(table),
                     onRead: root.onRead,
                     queryBoundary,
+                    rangeObserver: root.rangeObserver,
+                    rangeState: undefined,
                 });
             };
         },
     });
 }
 
-function scopeSelectBuilder(builder: unknown, plan: SelectPlan): unknown {
+function scopeSelectBuilder(
+    builder: unknown,
+    plan: Omit<SelectPlan, "rangeState"> & { rangeState: undefined }
+): unknown {
     const where = Reflect.get(builder as object, "where");
     if (typeof where !== "function") throw unsupportedSelect("select builder does not expose a WHERE stage");
-    const scoped = where.call(
-        builder,
-        applyPoliciesToWhere({
-            op: "select",
-            auth: plan.auth,
-            table: plan.table,
-            policies: plan.policies,
-        })
-    );
-    return wrapScopedSelectBuilder(scoped, plan);
+    const predicate = applyPoliciesToWhere({
+        op: "select",
+        auth: plan.auth,
+        table: plan.table,
+        policies: plan.policies,
+    });
+    if (!predicate) throw unsupportedSelect("select policy did not produce a predicate");
+    const scoped = where.call(builder, predicate);
+    return wrapScopedSelectBuilder(scoped, { ...plan, rangeState: { predicate } });
+}
+
+function observeSelectExecution(plan: SelectPlan): void {
+    plan.rangeObserver?.({
+        token: {},
+        tableName: resolveCdbMeta(plan.table).name,
+        predicate: plan.rangeState.predicate,
+    });
 }
 
 function wrapScopedSelectBuilder(builder: unknown, plan: SelectPlan): unknown {
@@ -396,6 +423,9 @@ function wrapScopedSelectBuilder(builder: unknown, plan: SelectPlan): unknown {
             const value = Reflect.get(target, prop, receiver);
             if (prop === "where" && typeof value === "function") {
                 return (userWhere: import("drizzle-orm").SQL) => {
+                    if (plan.queryBoundary && !is(userWhere, SQL)) {
+                        throw unsupportedSelect("live query WHERE callbacks and empty predicates are unavailable");
+                    }
                     if (plan.queryBoundary) assertTrackedSql(userWhere, plan.onRead);
                     const combined = applyPoliciesToWhere({
                         op: "select",
@@ -404,7 +434,11 @@ function wrapScopedSelectBuilder(builder: unknown, plan: SelectPlan): unknown {
                         userWhere,
                         policies: plan.policies,
                     });
-                    return wrapScopedSelectBuilder((value as (where: unknown) => unknown).call(target, combined), plan);
+                    if (!combined) throw unsupportedSelect("select policy did not produce a predicate");
+                    const next = (value as (where: unknown) => unknown).call(target, combined);
+                    const rangeState = next === target ? plan.rangeState : { predicate: combined };
+                    rangeState.predicate = combined;
+                    return wrapScopedSelectBuilder(next, { ...plan, rangeState });
                 };
             }
             if (UNSUPPORTED_SELECT_METHODS.has(prop)) {
@@ -422,27 +456,33 @@ function wrapScopedSelectBuilder(builder: unknown, plan: SelectPlan): unknown {
                             assertTrackedSql(arg, plan.onRead);
                         }
                     }
-                    return wrapScopedSelectBuilder(
-                        (value as (...args: readonly unknown[]) => unknown).call(target, ...args),
-                        plan
-                    );
+                    const next = (value as (...args: readonly unknown[]) => unknown).call(target, ...args);
+                    const rangeState = next === target ? plan.rangeState : { predicate: plan.rangeState.predicate };
+                    return wrapScopedSelectBuilder(next, { ...plan, rangeState });
                 };
             }
             if ((prop === "all" || prop === "execute") && typeof value === "function") {
-                return (...args: readonly unknown[]) =>
-                    mapMaybePromise((value as (...args: readonly unknown[]) => unknown).call(target, ...args), rows =>
-                        maskSelectRows(plan, rows)
+                return (...args: readonly unknown[]) => {
+                    observeSelectExecution(plan);
+                    return mapMaybePromise(
+                        (value as (...args: readonly unknown[]) => unknown).call(target, ...args),
+                        rows => maskSelectRows(plan, rows)
                     );
+                };
             }
             if (prop === "get" && typeof value === "function") {
-                return (...args: readonly unknown[]) =>
-                    mapMaybePromise((value as (...args: readonly unknown[]) => unknown).call(target, ...args), row =>
-                        maskSelectGet(plan, row)
+                return (...args: readonly unknown[]) => {
+                    observeSelectExecution(plan);
+                    return mapMaybePromise(
+                        (value as (...args: readonly unknown[]) => unknown).call(target, ...args),
+                        row => maskSelectGet(plan, row)
                     );
+                };
             }
             if (prop === "then" && typeof value === "function") {
-                return (onFulfilled?: (rows: unknown) => unknown, onRejected?: (error: unknown) => unknown) =>
-                    (value as (...args: readonly unknown[]) => unknown).call(
+                return (onFulfilled?: (rows: unknown) => unknown, onRejected?: (error: unknown) => unknown) => {
+                    observeSelectExecution(plan);
+                    return (value as (...args: readonly unknown[]) => unknown).call(
                         target,
                         (rows: unknown) => {
                             const masked = maskSelectRows(plan, rows);
@@ -450,17 +490,27 @@ function wrapScopedSelectBuilder(builder: unknown, plan: SelectPlan): unknown {
                         },
                         onRejected
                     );
+                };
             }
             if (prop === "catch" && typeof value === "function") {
-                return (onRejected?: (error: unknown) => unknown) =>
-                    (Reflect.get(target, "then") as (...args: readonly unknown[]) => unknown).call(
+                return (onRejected?: (error: unknown) => unknown) => {
+                    observeSelectExecution(plan);
+                    return (Reflect.get(target, "then") as (...args: readonly unknown[]) => unknown).call(
                         target,
                         (rows: unknown) => maskSelectRows(plan, rows),
                         onRejected
                     );
+                };
             }
             if (prop === "finally" && typeof value === "function") {
-                return (onFinally?: () => void) => Promise.resolve(proxy as PromiseLike<unknown>).finally(onFinally);
+                return (onFinally?: () => void) => {
+                    observeSelectExecution(plan);
+                    const result = (Reflect.get(target, "then") as (...args: readonly unknown[]) => unknown).call(
+                        target,
+                        (rows: unknown) => maskSelectRows(plan, rows)
+                    );
+                    return Promise.resolve(result).finally(onFinally);
+                };
             }
             if (prop === "toSQL" || prop === "getSQL" || prop === "getUsedTables") {
                 return typeof value === "function" ? value.bind(target) : value;
@@ -691,8 +741,13 @@ export function wrapDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
     return wrapDbInternal(db, auth, false, undefined, undefined);
 }
 
-export function wrapQueryDb<TDb extends object>(db: TDb, auth: AuthCtx, onRead?: (tableName: string) => void): TDb {
-    return wrapDbInternal(db, auth, true, undefined, onRead);
+export function wrapQueryDb<TDb extends object>(
+    db: TDb,
+    auth: AuthCtx,
+    onRead?: (tableName: string) => void,
+    rangeObserver?: QueryReadRangeObserver
+): TDb {
+    return wrapDbInternal(db, auth, true, undefined, onRead, rangeObserver);
 }
 
 /** Internal mutation wrapper used by the atomic executor to collect committed table names. */
@@ -705,7 +760,8 @@ function wrapDbInternal<TDb extends object>(
     auth: AuthCtx,
     queryBoundary: boolean,
     onWrite: ((tableName: string) => void) | undefined,
-    onRead: ((tableName: string) => void) | undefined
+    onRead: ((tableName: string) => void) | undefined,
+    rangeObserver?: QueryReadRangeObserver
 ): TDb {
     return new Proxy(db, {
         get(target, prop, receiver) {
@@ -731,6 +787,7 @@ function wrapDbInternal<TDb extends object>(
                         fullRow: prop === "select" && args.length === 0,
                         queryBoundary,
                         onRead,
+                        rangeObserver,
                     });
                 };
             }
@@ -763,7 +820,8 @@ function wrapDbInternal<TDb extends object>(
             }
             if (prop === "transaction") {
                 return (callback: (tx: TDb) => Promise<unknown>, ...rest: readonly unknown[]) => {
-                    const wrapped = (tx: TDb) => callback(wrapDbInternal(tx, auth, queryBoundary, onWrite, onRead));
+                    const wrapped = (tx: TDb) =>
+                        callback(wrapDbInternal(tx, auth, queryBoundary, onWrite, onRead, rangeObserver));
                     return (v as (cb: (tx: TDb) => Promise<unknown>, ...r: readonly unknown[]) => unknown).call(
                         target,
                         wrapped,

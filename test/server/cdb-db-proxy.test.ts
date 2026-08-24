@@ -22,7 +22,7 @@ import { type SQL, asc, desc, eq, sql } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import type { BaseSQLiteDatabase, SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../../src/errors.ts";
-import { wrapMutationDb, wrapQueryDb } from "../../src/server/cdb-db-proxy.ts";
+import { type QueryReadRangeObservation, wrapMutationDb, wrapQueryDb } from "../../src/server/cdb-db-proxy.ts";
 import type { RoleValue } from "../../src/server/cdb-table-types.ts";
 import type { AuthCtx } from "../../src/server/define.ts";
 import { forOrg, forUser, wrapDb } from "../../src/server/index.ts";
@@ -962,6 +962,23 @@ describe("wrapQueryDb / read observation", () => {
                 return builder;
             },
             all,
+            get() {
+                const rows = all();
+                return Array.isArray(rows) ? rows[0] : undefined;
+            },
+            execute() {
+                return all();
+            },
+            // biome-ignore lint/suspicious/noThenProperty: Drizzle select builders are intentionally thenable.
+            then(onFulfilled?: (rows: unknown) => unknown, onRejected?: (error: unknown) => unknown) {
+                return Promise.resolve().then(all).then(onFulfilled, onRejected);
+            },
+            catch(onRejected?: (error: unknown) => unknown) {
+                return Promise.resolve().then(all).catch(onRejected);
+            },
+            finally(onFinally?: () => void) {
+                return Promise.resolve().then(all).finally(onFinally);
+            },
             orderBy(..._expressions: readonly unknown[]) {
                 return builder;
             },
@@ -1004,6 +1021,29 @@ describe("wrapQueryDb / read observation", () => {
 
         expect(() => wrapped.select().from(records).all()).toThrow("read failed");
         expect(readTables).toEqual(["observed_reads"]);
+    });
+
+    test("observes each execution surface once without observing SQL inspection", async () => {
+        const observations: QueryReadRangeObservation[] = [];
+        const query = wrapQueryDb(selectDb(), baseAuth, undefined, observation => observations.push(observation))
+            .select()
+            .from(records);
+
+        query.toSQL();
+        expect(observations).toHaveLength(0);
+        query.all();
+        expect(observations).toHaveLength(1);
+        query.get();
+        expect(observations).toHaveLength(2);
+        query.execute();
+        expect(observations).toHaveLength(3);
+        await (query as PromiseLike<unknown>);
+        expect(observations).toHaveLength(4);
+        await query.catch();
+        expect(observations).toHaveLength(5);
+        await query.finally();
+        expect(observations).toHaveLength(6);
+        expect(new Set(observations.map(observation => observation.token)).size).toBe(6);
     });
 
     test("shares the observer with transaction callback wrappers", () => {

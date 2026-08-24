@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { and, eq, exists, sql } from "drizzle-orm";
+import { and, between, eq, exists, gt, gte, sql } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import { createApi } from "../../src/server/define.ts";
@@ -15,6 +15,7 @@ import type {
 } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 import { stableJson } from "../../src/util/canonical.ts";
+import type { WireEndpoint, WireInterval } from "../../src/wire.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -271,6 +272,99 @@ const rawPredicateAttempt = api.query({
         return ctx.db.select().from(records).where(sql.raw('EXISTS (SELECT 1 FROM "query_public_records")')).all();
     },
 });
+type RangeCoverageMode =
+    | "point-ok"
+    | "point-outside"
+    | "partial-range"
+    | "open-covered"
+    | "closed-missed"
+    | "unfiltered-narrow"
+    | "broad-then-narrow"
+    | "discarded-outside"
+    | "tenant-floor"
+    | "hostile-tenant";
+const endpoint = (value: number | string, inclusive: boolean): WireEndpoint => ({
+    kind: "value",
+    value: [value],
+    inclusive,
+});
+const declaredRange = (
+    lo: number | string,
+    hi: number | string,
+    loInclusive = true,
+    hiInclusive = true
+): WireInterval => ({
+    kind: "range",
+    lo: endpoint(lo, loInclusive),
+    hi: endpoint(hi, hiInclusive),
+});
+const registeredRangeCoverage = api.query({
+    ref: "queries.ts#registeredRangeCoverage",
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: (args: { organizationId: string; mode: RangeCoverageMode }) => {
+        const onOrganization = args.mode === "tenant-floor" || args.mode === "hostile-tenant";
+        const intervals: readonly WireInterval[] =
+            args.mode === "point-outside"
+                ? [declaredRange(2, 2)]
+                : args.mode === "partial-range"
+                  ? [declaredRange(2, 3)]
+                  : args.mode === "open-covered"
+                    ? [{ kind: "range", lo: endpoint(1, true), hi: { kind: "pos_inf" } }]
+                    : args.mode === "closed-missed"
+                      ? [{ kind: "range", lo: endpoint(1, false), hi: { kind: "pos_inf" } }]
+                      : args.mode === "unfiltered-narrow"
+                        ? [declaredRange(1, 1)]
+                        : onOrganization
+                          ? [declaredRange(args.organizationId, args.organizationId)]
+                          : [declaredRange(1, 1)];
+        return {
+            kind: "select" as const,
+            tables: ["query_records"],
+            partitionKey: {
+                table: "query_records",
+                column: "organization_id",
+                values: [args.organizationId],
+            },
+            intervals: [
+                {
+                    table: "query_records",
+                    indexName: onOrganization ? "organization_id" : "value",
+                    intervals,
+                },
+            ],
+        };
+    },
+    handler: async function registeredRangeCoverageHandler(
+        ctx,
+        args: { organizationId: string; mode: RangeCoverageMode }
+    ) {
+        const query = ctx.db.select().from(records);
+        switch (args.mode) {
+            case "unfiltered-narrow":
+                return query.all();
+            case "tenant-floor":
+                return query.where(eq(records.groupId, "group-a")).all();
+            case "hostile-tenant":
+                return query.where(eq(records.organizationId, "org-b")).all();
+            case "partial-range":
+                return query.where(between(records.value, 1, 3)).all();
+            case "open-covered":
+                return query.where(gt(records.value, 1)).all();
+            case "closed-missed":
+                return query.where(gte(records.value, 1)).all();
+            case "discarded-outside":
+                await query.where(eq(records.value, 99)).all();
+                return query.where(eq(records.value, 1)).all();
+            case "broad-then-narrow":
+                await query.all();
+                return query.where(eq(records.value, 1)).all();
+            case "point-ok":
+            case "point-outside":
+                return query.where(eq(records.value, 1)).all();
+        }
+    },
+});
 const listPrivateRecords = api.query(async function listPrivateRecordsHandler(ctx) {
     return ctx.db.select().from(privateRecords).all();
 });
@@ -338,6 +432,7 @@ const manifest = manifestFromExports({
     registeredIntentCoverage,
     subqueryAttempt,
     rawPredicateAttempt,
+    registeredRangeCoverage,
     listPrivateRecords,
     listPublicRecords,
     projectionAttempt,
@@ -431,6 +526,24 @@ function intentCoverageLiveRequest(subscription: LiveSubscriptionId, mode: Inten
             indexName: "by_id",
             intervals: [{ kind: "full" as const }],
         })),
+    };
+}
+
+function rangeCoverageLiveRequest(subscription: LiveSubscriptionId, mode: RangeCoverageMode): CdbSubscriptionRequest {
+    const args = { organizationId: "org-a", mode };
+    const descriptor = resolveQuery(manifest, registeredRangeCoverage.__chardbRef);
+    const intent = descriptor.extractIntent?.(args);
+    if (!intent) throw new Error("range coverage query has no intent");
+    const policyDigest = cdbPolicyDigest(schema, intent.tables);
+    return {
+        subscription,
+        principalId: PrincipalId("user-1"),
+        organizationId: TenantId("org-a"),
+        ref: registeredRangeCoverage.__chardbRef,
+        args,
+        queryHash: stableJson({ ref: registeredRangeCoverage.__chardbRef, args, intent, policyDigest }),
+        tables: intent.tables,
+        intervals: intent.intervals ?? [],
     };
 }
 
@@ -562,6 +675,97 @@ describe("Cdb registered query execution", () => {
             ok: false,
             error: { code: "CDB_INVARIANT", message: "intent coverage handler failed" },
         });
+    });
+
+    test("requires declared point and range intervals to contain the policy-scoped read", async () => {
+        const { cdb } = await setup();
+        for (const mode of ["point-ok", "open-covered"] as const) {
+            await expect(
+                cdb.query({
+                    ref: registeredRangeCoverage.__chardbRef,
+                    args: { organizationId: "org-a", mode },
+                    auth: AUTH,
+                })
+            ).resolves.toMatchObject({ ok: true });
+        }
+
+        for (const mode of ["point-outside", "partial-range", "closed-missed", "unfiltered-narrow"] as const) {
+            await expect(
+                cdb.query({
+                    ref: registeredRangeCoverage.__chardbRef,
+                    args: { organizationId: "org-a", mode },
+                    auth: AUTH,
+                })
+            ).resolves.toMatchObject({
+                ok: false,
+                error: {
+                    code: "CDB_INVARIANT",
+                    message: expect.stringContaining("read outside declared interval"),
+                },
+            });
+        }
+    });
+
+    test("applies interval coverage to persisted registered queries", async () => {
+        const { cdb } = await setup();
+        const accepted = liveIdentity({ registrationId: "registration-range-accepted" });
+        await cdb.subscribe(rangeCoverageLiveRequest(accepted, "point-ok"));
+        await expect(cdb.queryRegistered(registeredQuery(accepted))).resolves.toMatchObject({ ok: true });
+
+        const rejected = liveIdentity({ registrationId: "registration-range-rejected" });
+        await cdb.subscribe(rangeCoverageLiveRequest(rejected, "point-outside"));
+        await expect(cdb.queryRegistered(registeredQuery(rejected))).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT", message: expect.stringContaining("read outside declared interval") },
+        });
+    });
+
+    test("retains every executed predicate when an empty outside read is discarded before a narrow result", async () => {
+        const { cdb } = await setup();
+        const response = await cdb.query({
+            ref: registeredRangeCoverage.__chardbRef,
+            args: { organizationId: "org-a", mode: "discarded-outside" },
+            auth: AUTH,
+        });
+
+        expect(response).toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT", message: expect.stringContaining("read outside declared interval") },
+        });
+        expect(response).not.toHaveProperty("result");
+    });
+
+    test("retains a broad tenant-scoped execution followed by an allowed narrow result", async () => {
+        const { cdb } = await setup();
+        const response = await cdb.query({
+            ref: registeredRangeCoverage.__chardbRef,
+            args: { organizationId: "org-a", mode: "broad-then-narrow" },
+            auth: AUTH,
+        });
+
+        expect(response).toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT", message: expect.stringContaining("read outside declared interval") },
+        });
+        expect(response).not.toHaveProperty("result");
+    });
+
+    test("tracks the tenant floor and keeps a hostile cross-tenant predicate empty", async () => {
+        const { cdb } = await setup();
+        await expect(
+            cdb.query({
+                ref: registeredRangeCoverage.__chardbRef,
+                args: { organizationId: "org-a", mode: "tenant-floor" },
+                auth: AUTH,
+            })
+        ).resolves.toMatchObject({ ok: true, result: [{ organizationId: "org-a" }, { organizationId: "org-a" }] });
+        await expect(
+            cdb.query({
+                ref: registeredRangeCoverage.__chardbRef,
+                args: { organizationId: "org-a", mode: "hostile-tenant" },
+                auth: AUTH,
+            })
+        ).resolves.toEqual({ ok: true, result: [] });
     });
 
     test("blocks embedded select builders even when intent declares the inner table", async () => {
