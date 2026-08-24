@@ -205,8 +205,9 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [ ] Either implement replay from a valid cookie or always issue `mustRefetch` after reconnect.
 - [ ] Do not claim read-your-writes resume until missed updates can actually be recovered.
 - [ ] Connect replacement snapshots to a durable cookie coordinate and prove cookie replay after missed invalidations.
-- [ ] Add mutation timeouts and retry only errors marked retryable.
-- [ ] Reuse the same `mutId` when retrying the same mutation.
+- [x] Bound pending mutation settlement with `mutationTimeoutMs`, defaulting to 60 seconds and returning nonretryable `CDB_MUTATION_OUTCOME_UNKNOWN` when the server may already have committed.
+- [x] Reuse the original `mutId` when reconnect resends a mutation that remains pending, without resetting its deadline.
+- [ ] Expose a public retry handle and define an automatic retry policy for terminal errors marked retryable.
 - [x] Preserve the last delivered nonempty cookie on mutation failures and across auth refresh.
 - [x] Return typed errors for malformed messages instead of accepting any object with a known `t` field.
 - [x] Validate every wire message field.

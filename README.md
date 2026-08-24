@@ -25,6 +25,7 @@ Implemented and tested in isolation:
 - Public organization-authorized mutations with explicit stable refs
 - Catalog-derived membership, roles, and auth epochs for each declared organization mutation
 - Single-pass mutation argument validation and transformation before partition routing
+- Client mutation settlement bounded by a configurable timeout across reconnects
 - Schema-first insert, update, delete, and full-row select authorization, including writable-column checks and readable-column masks
 - A fail-closed database wrapper that rejects raw, session, client, plain-table, insert-select, conflict, returning, and unsupported builder paths
 - Read-only shard-local query execution with JSON result validation
@@ -46,6 +47,7 @@ Still missing from the application path:
 - Applying domain migrations across shards
 - Canonicalizing query identity with verified auth and policy epochs
 - Adding versioned auth-schema upgrades
+- Exposing a public mutation retry handle and defining an automatic retry policy
 
 Files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding remain experiments. They are not supported product features.
 
@@ -56,6 +58,8 @@ Catalog's authority read is the authorization linearization point. A revocation 
 The JWT tests use real signatures and the Catalog resolver contract. Miniflare workerd tests drive the configured Gateway Durable Object and WebSocket with ES256 tokens, a real Catalog SQLite cache, Catalog membership resolution, and configured Cdb mutation and query handlers. The live test gives two org-A clients initial snapshots and acknowledgements, commits a public mutation, drains the Cdb invalidation outbox, delivers replacement snapshots and acknowledgements, keeps an org-B query empty under policy, then reconnects and subscribes again. It also evicts Gateway and Cdb with a hibernated socket and a staged replacement, reconstructs both objects, and delivers the same snapshot cookie. Another test imports refs from a real emitted Vite browser chunk and compares them with the independently bundled workerd Worker. A configured Catalog workerd test creates a user, session, organization, and member, evicts the Catalog Durable Object, proves a new instance started, and reads identical stored auth rows and canonical organization authority after reconstruction. These focused tests seed JWK and auth rows through test-only routes. The separate packed chat smoke runs actual Better Auth anonymous sign-ins and token issue for two principals. Outbound JWKS fetch, cache refresh, and key rotation remain untested. Catalog auth DDL preserves constraints and indexes for new storage. Existing tables need exact matching `auth_ddl_v1` signatures; no versioned upgrade path exists.
 
 Auth refreshes serialize per server-generated connection id. Gateway drains already admitted work, retires that connection's current durable registrations, reports affected subscription ids through `mustRefetch`, and gates later work behind the refresh result. It does not replay those subscriptions. Failed refreshes serialize a terminal rejected attachment before closing the socket, so queued work cannot run against stale identity.
+
+The client option `mutationTimeoutMs` defaults to 60 seconds and covers the full pending lifetime, including reconnects. A reconnect resends a pending mutation with its original `mutId` without resetting the deadline. If that deadline expires, the promise rejects with nonretryable `CDB_MUTATION_OUTCOME_UNKNOWN` because the server may already have committed the mutation. A synchronous send failure, client close, session failure, or terminal server result clears the timer. `ChardbProvider` forwards the same option. The client does not expose a retry handle or automatically retry terminal errors.
 
 Each auth mutation commits with every directly derivable old and new global, tenant, or principal epoch bump. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. Bulk updates and deletes preload matched rows to derive epoch scopes. Indirect plugin relationships without placement metadata or conventional `organizationId` or `userId` fields may lack a secondary scope. These cases have Bun fake-Durable-Object coverage, not workerd coverage.
 

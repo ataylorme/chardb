@@ -226,6 +226,8 @@ The repository's focused workerd harnesses prove that refs imported from a real 
 
 The separate packed smoke copies this example into a clean temporary consumer, installs chardb 0.1.0 from its tarball, and builds the Vite client with both stable refs. Its first Better Auth principal confirms the demo organization hook selected `demo-org`, acknowledges an empty initial snapshot, executes `postMessage`, acknowledges the live replacement, replays the same `mutId`, and reads exactly one row through a second subscription. A second principal moves to another organization. Its `demo-org` query receives `CDB_FORBIDDEN`, while its own organization returns an empty snapshot. The smoke does not restart the Worker or Durable Objects and does not cover outbound JWKS rotation, resume replay, or migrations. Presence, upload, stream, and vector hooks are not exported.
 
+Client mutations use `mutationTimeoutMs`, which defaults to 60 seconds and is also accepted by `ChardbProvider`. The original deadline continues across reconnects, and each resend uses the same pending `mutId`. Timeout rejects with nonretryable `CDB_MUTATION_OUTCOME_UNKNOWN` because the server may have committed the request. Synchronous send failure, client close or session failure, and a terminal server result clear the timer. The public API does not expose a retry handle or automatic retry policy.
+
 ## Running
 
 ```bash
