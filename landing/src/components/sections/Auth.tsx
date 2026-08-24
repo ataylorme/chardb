@@ -23,8 +23,8 @@ export function Auth() {
                     "registered queries bind to a static digest of declared table policy metadata",
                     "durable delivery retries until an exact client acknowledgement",
                     "Better Auth anonymous accounts become JWT-authenticated principals",
-                    "configured JWKS cold fetch, Catalog cache refresh, and rotated-key acceptance",
-                    "resume replay, packed restart, JWKS failure backoff, and migrations remain unfinished",
+                    "Catalog-owned JWKS refresh with URL-scoped cache, leases, bounds, and cooldowns",
+                    "resume replay, packed restart, and migrations remain unfinished",
                 ]}
             />
 

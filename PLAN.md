@@ -107,7 +107,8 @@ The configured Gateway verifies JWT signatures and registered claims during `hel
 - [x] Pin issuer, audience, and accepted algorithms from the configured Better Auth JWT plugin, with a bounded 30-second default clock tolerance.
 - [x] Resolve JWKS through the Catalog-backed resolver contract.
 - [x] Prove the configured Gateway fetches the exact remote JWKS URL on a cold key lookup, reuses the Catalog cache, refreshes after cache expiry, rejects retired and unknown keys, accepts a rotated key, and derives authority from Catalog instead of forged token claims.
-- [ ] Define and test outbound JWKS failure handling and bounded retry or backoff before production use.
+- [x] Move URL-scoped JWKS refresh ownership into Catalog. Enforce a 5-second deadline, 256 KiB document limit, 32-key limit, 256-byte `kid` limit, and 2,048-byte URL limit. Coordinate refresh with a durable 10-second lease, cache missing keys for 5 seconds after success, and persist exponential failure cooldown from 1 to 60 seconds.
+- [x] Fail closed without stale keys or the unscoped legacy cache, replace each URL's key set atomically so absent keys retire, and prove failure cooldown plus rotation through the configured workerd Gateway.
 - [x] Reject missing, malformed, tampered, expired, not-yet-valid, wrong-issuer, wrong-audience, and disallowed-algorithm tokens.
 - [x] Serialize `updateAuth` per server connection id, drain admitted work, retire current durable registrations before replacing the subject, report affected subscription ids through `mustRefetch`, and store a terminal rejected attachment on failure.
 - [x] Recheck token time bounds before every mutation, subscription, and presence operation.
@@ -146,7 +147,7 @@ The database proxy now applies one explicit rule to registered-table inserts, up
 
 ## 7. Implement narrow organization queries
 
-Protocol v3 subscription requests send a query reference and raw arguments. For an explicit organization query with a stable ref, partition key, developer-declared server-side intent, and `authority: "organization"`, Gateway validates the arguments and requires the partition and intent to resolve to the same exact organization and one virtual shard. It derives current authority from Catalog, installs a durable generation before `Cdb.subscribe`, reruns the exact registered query, and sends snapshots. For supported full-row queries, Cdb conservatively records `cdbTable` dependencies and compares them with declared `intent.tables` before returning rows. Raw or untracked predicates, embedded subqueries, and `orderBy` callbacks remain blocked. General query shapes remain closed. Resume cookies do not replay missed changes.
+Protocol v3 subscription requests send a query reference and raw arguments. For an explicit organization query with a stable ref, partition key, developer-declared server-side intent, and `authority: "organization"`, Gateway validates the arguments and requires the partition and intent to resolve to the same exact organization and one virtual shard. It derives current authority from Catalog, installs a durable generation before `Cdb.subscribe`, reruns the exact registered query, and sends snapshots. For supported full-row queries, Cdb conservatively records `cdbTable` dependencies and compares them with declared `intent.tables` before returning rows. Each terminal query execution also records its typed predicate after the row-policy floor is applied. Each declared interval bundle's union must contain every observed range for its table and index. Raw or untracked predicates, embedded subqueries, and callback predicates or ordering remain blocked. General query shapes remain closed. Resume cookies do not replay missed changes.
 
 - [x] Change the wire protocol so `sub` carries the query reference and raw arguments.
 - [x] Increment the protocol version and enforce it during `hello` and `welcome`.
@@ -168,7 +169,7 @@ Protocol v3 subscription requests send a query reference and raw arguments. For 
 - [ ] Define ordering and stable row keys for collection results.
 - [x] Reject undeclared, mismatched, scatter, and cross-partition queries instead of silently routing them.
 - [x] Conservatively record every `cdbTable` dependency exposed by supported full-row queries and reject results when a recorded table is absent from developer-declared `intent.tables`.
-- [ ] Derive or verify that declared intent intervals cover every range the handler can read.
+- [x] At each supported full-row query execution, record the actual typed predicate with the row-policy floor and require each declared interval bundle's union to contain every observed range for its table and index.
 - [x] Connect public authorized registration to `onSub`, installing the exact Gateway generation before `Cdb.subscribe` and pre-arming durable recovery before the RPC.
 
 ## 8. Implement live updates with simple invalidation first
