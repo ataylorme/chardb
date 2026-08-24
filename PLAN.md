@@ -26,13 +26,17 @@ The public mutation path is open only for definitions with an explicit stable re
 - [x] Construct a real Drizzle database over a Cdb `SqlStorage` inside the atomic executor.
 - [x] Construct `MutationCtx` with that Drizzle database and an auth context inside the atomic executor.
 - [x] Invoke the handler inside the chosen transaction boundary.
-- [x] Return the handler's exact result. Do not reconstruct it from `returning[0]`.
+- [x] Return an owned snapshot of the handler's exact JSON result. Do not reconstruct it from `returning[0]`.
 - [x] Validate that mutation results are JSON before committing them.
 - [x] Accept mutation results through the exact 512 KiB serialized JSON boundary and reject larger results with `CDB_INVARIANT` inside the atomic transaction before op-log finalization or the write-set hook.
 - [x] Prove a fresh oversized result rolls back domain SQL and its provisional op-log row. Reject an oversized legacy replay without running the handler or hook or changing the stored row, while accepted replays remain unchanged.
 - [x] Enforce the mutation argument contract in the client, Gateway, trusted dispatcher, and Cdb: strict JSON data properties without invoking getters, exactly 512 KiB of serialized UTF-8, 4,096 aggregate members, and 99 argument levels because the wire envelope consumes one level. Return `CDB_INVALID_ARGS` from mutation-specific validation before UUID, timer, admission, auth-refresh waiting, Catalog authorization, routing, alarm, handler, op-log, or domain work as applicable.
+- [x] Own server mutation arguments at raw dispatch, validator output, partition extraction, custom route output, and Cdb entry. Copy custom-route arguments and capture route authority, partition key, vshard, projected auth primitives, role arrays, and epochs across Catalog awaits, then snapshot Cdb args and auth before the recovery-alarm await.
+- [x] Keep keyless mutation routing stable across object key order. Preserve an own `__proto__` data property in canonical JSON and op-log request hashing so routing and replay collision identity include it without prototype mutation.
 - [x] Cap each newly executed atomic mutation at 256 successful typed write statements and 4,096 total direct, trigger, and foreign-key affected rows measured through `total_changes()` deltas. Treat a caught violation as a terminal poisoned `CDB_INVARIANT`, roll back domain SQL and the provisional op-log row, suppress the write-set hook, and let replay bypass the handler and write accounting.
-- [x] Store the exact result in the op-log replay envelope.
+- [x] Snapshot a fresh mutation result inside the transaction before op-log finalization. Return and store that owned value so fresh execution and replay remain identical even if the handler retains and later mutates its object.
+- [x] Guard the mutation database for the lifetime of its owning `transactionSync`. Allow supported nested wrappers while active, but reject retained-context reads, writes, and nested transaction entry after exit with `CDB_INVARIANT`.
+- [x] Store the owned result in the op-log replay envelope.
 - [x] Return that stored result when the client repeats the same `mutId`.
 - [x] Keep collision detection for a repeated `mutId` with different arguments.
 - [x] Settle admitted public mutations once across local routing, Catalog authority and routing, Cdb RPC, malformed response, and policy failures.
