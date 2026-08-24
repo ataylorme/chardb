@@ -4606,12 +4606,18 @@ export class Gateway extends DurableObject<GatewayEnv> {
         } catch {
             ack = mutationFailure("CDB_INVARIANT", "mutation dispatch failed unexpectedly");
         }
+        const current = ws.deserializeAttachment() as GwAttachment | null;
+        if (
+            !isVerifiedAttachment(current) ||
+            current.connectionId !== att.connectionId ||
+            current.clientId !== att.clientId ||
+            current.principalId !== att.principalId
+        ) {
+            return;
+        }
         if (ack.ok) {
             const cookie = Cookie(ack.cookie);
-            const current = ws.deserializeAttachment() as GwAttachment | null;
-            if (isVerifiedAttachment(current)) {
-                ws.serializeAttachment({ ...current, lastCookie: cookie } satisfies VerifiedGwAttachment);
-            }
+            ws.serializeAttachment({ ...current, lastCookie: cookie } satisfies VerifiedGwAttachment);
             this.send(ws, {
                 t: "poke",
                 cookie,
@@ -4619,9 +4625,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 mutResults: [{ mutId: msg.mutId, ok: true, result: ack.result, cookie }],
             });
         } else {
-            const current = ws.deserializeAttachment() as GwAttachment | null;
-            const lastCookie = isVerifiedAttachment(current) ? current.lastCookie : att.lastCookie;
-            this.sendMutFailure(ws, msg.mutId, ack.error, lastCookie);
+            this.sendMutFailure(ws, msg.mutId, ack.error, current.lastCookie);
         }
     }
 

@@ -106,6 +106,26 @@ describe("Gateway unsettled mutation admission", () => {
                 setAlarm: async (value: number | Date) => {
                     alarm = value instanceof Date ? value.getTime() : value;
                 },
+                transaction: async <T>(callback: (transaction: DurableObjectTransaction) => Promise<T>) => {
+                    const originalAlarm = alarm;
+                    let stagedAlarm = alarm;
+                    db.exec("BEGIN IMMEDIATE");
+                    try {
+                        const result = await callback({
+                            getAlarm: async () => stagedAlarm,
+                            setAlarm: async (value: number | Date) => {
+                                stagedAlarm = value instanceof Date ? value.getTime() : value;
+                            },
+                        } as DurableObjectTransaction);
+                        db.exec("COMMIT");
+                        alarm = stagedAlarm;
+                        return result;
+                    } catch (error) {
+                        db.exec("ROLLBACK");
+                        alarm = originalAlarm;
+                        throw error;
+                    }
+                },
             },
             getWebSockets: () => [] as WebSocket[],
             blockConcurrencyWhile: (callback: () => Promise<unknown>) => {
@@ -219,7 +239,7 @@ describe("Gateway unsettled mutation admission", () => {
         expect(internals.unsettledMutationsByConnection.size).toBe(0);
     });
 
-    test("releases admission after typed, thrown, stale, and send-failed settlements", async () => {
+    test("releases admission after typed, thrown, and send-failed settlements", async () => {
         const internals = gateway as unknown as GatewayInternals;
         const socket = new FakeSocket(attachment("connection-1", "cookie-base"));
         const typedFailure: CdbMutationResponse = {
@@ -237,21 +257,67 @@ describe("Gateway unsettled mutation admission", () => {
         await mutation(gateway, socket, "thrown");
         expect(internals.unsettledMutationCount).toBe(0);
 
-        let releaseStale: () => void = () => {};
-        internals.routeMut = () =>
-            new Promise(resolve => {
-                releaseStale = () => resolve(typedFailure);
-            });
-        const stale = mutation(gateway, socket, "stale");
-        socket.attachment = attachment("replacement-connection", "cookie-replacement");
-        releaseStale();
-        await stale;
-        expect(internals.unsettledMutationCount).toBe(0);
-
         socket.attachment = attachment("connection-1", "cookie-send-failure");
         socket.failSend = true;
         internals.routeMut = async () => typedFailure;
         await mutation(gateway, socket, "send-failed");
+        expect(internals.unsettledMutationCount).toBe(0);
+        expect(internals.unsettledMutationsByConnection.size).toBe(0);
+    });
+
+    test("does not deliver a held success after its socket closes", async () => {
+        const internals = gateway as unknown as GatewayInternals;
+        const socket = new FakeSocket(attachment("connection-1", "cookie-base"));
+        let release!: () => void;
+        internals.routeMut = () =>
+            new Promise(resolve => {
+                release = () =>
+                    resolve({ ok: true, cookie: "cookie-success", ran: true, result: null, rowsAffected: 0 });
+            });
+
+        const pending = mutation(gateway, socket, "closed-success");
+        await Promise.resolve();
+        await gateway.webSocketClose(socket as unknown as WebSocket);
+        const rejectedAttachment = socket.attachment;
+        expect(rejectedAttachment).toMatchObject({ kind: "rejected", connectionId: "connection-1" });
+
+        release();
+        await pending;
+
+        expect(socket.sent).toEqual([]);
+        expect(socket.attachment).toBe(rejectedAttachment);
+        expect(internals.unsettledMutationCount).toBe(0);
+        expect(internals.unsettledMutationsByConnection.size).toBe(0);
+    });
+
+    test("does not deliver a held failure to a different verified identity", async () => {
+        const internals = gateway as unknown as GatewayInternals;
+        const socket = new FakeSocket(attachment("connection-1", "cookie-base"));
+        const typedFailure: CdbMutationResponse = {
+            ok: false,
+            error: new CdbError({ code: "CDB_SHARD_UNAVAILABLE", message: "typed failure" }).toJSON(),
+        };
+        let release!: () => void;
+        internals.routeMut = () =>
+            new Promise(resolve => {
+                release = () => resolve(typedFailure);
+            });
+
+        const pending = mutation(gateway, socket, "replaced-failure");
+        await Promise.resolve();
+        const replacement = {
+            ...attachment("replacement-connection", "cookie-replacement"),
+            clientId: ClientId("client-2"),
+            principalId: PrincipalId("principal-2"),
+        };
+        socket.attachment = replacement;
+
+        release();
+        await pending;
+
+        expect(socket.sent).toEqual([]);
+        expect(socket.attachment).toBe(replacement);
+        expect(socket.attachment.lastCookie).toBe(Cookie("cookie-replacement"));
         expect(internals.unsettledMutationCount).toBe(0);
         expect(internals.unsettledMutationsByConnection.size).toBe(0);
     });
