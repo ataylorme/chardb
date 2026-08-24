@@ -188,9 +188,58 @@ interface CdbFixtureRpc {
     fixtureLiveState(): Promise<CdbLiveState>;
 }
 
+type MembershipMutation =
+    | { readonly action: "delete"; readonly organizationId: string; readonly userId: string }
+    | {
+          readonly action: "upsert";
+          readonly organizationId: string;
+          readonly userId: string;
+          readonly role: string;
+      };
+
+interface CatalogFixtureRpc {
+    mutateAuth(args: {
+        readonly model: string;
+        readonly op: "create" | "update" | "delete";
+        readonly where?: { readonly [key: string]: string };
+        readonly payload?: { readonly [key: string]: string | number };
+    }): Promise<{ readonly affected?: number }>;
+}
+
 export default {
     async fetch(request: Request, env: Env): Promise<Response> {
         const url = new URL(request.url);
+        if (url.pathname === "/live-membership") {
+            const mutation = (await request.json()) as MembershipMutation;
+            const id = env.CDB_CATALOG.idFromName("global");
+            const catalog = env.CDB_CATALOG.get(id) as unknown as CatalogFixtureRpc;
+            const where = {
+                organizationId: mutation.organizationId,
+                userId: mutation.userId,
+            };
+            if (mutation.action === "delete") {
+                return Response.json(await catalog.mutateAuth({ model: "member", op: "delete", where }));
+            }
+            const updated = await catalog.mutateAuth({
+                model: "member",
+                op: "update",
+                where,
+                payload: { role: mutation.role },
+            });
+            if ((updated.affected ?? 0) > 0) return Response.json(updated);
+            return Response.json(
+                await catalog.mutateAuth({
+                    model: "member",
+                    op: "create",
+                    payload: {
+                        id: `fixture-${mutation.organizationId}-${mutation.userId}`,
+                        ...where,
+                        role: mutation.role,
+                        createdAt: Date.parse("2026-08-23T00:00:00Z"),
+                    },
+                })
+            );
+        }
         if (
             url.pathname === "/live-gateway-drain" ||
             url.pathname === "/live-gateway-stage" ||

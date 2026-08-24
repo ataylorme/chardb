@@ -171,6 +171,22 @@ async function fixtureFetch<T>(pathname: string, search: Record<string, string>)
     return (await response.json()) as T;
 }
 
+async function mutateMembership(action: "delete" | "upsert", role?: string): Promise<{ readonly affected?: number }> {
+    if (!mf) throw new Error("Miniflare is not initialized");
+    const response = await mf.dispatchFetch("http://example.com/live-membership", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            action,
+            organizationId: ORGANIZATION_A,
+            userId: "workerd-user",
+            ...(role === undefined ? {} : { role }),
+        }),
+    });
+    if (!response.ok) throw new Error(`membership mutation failed: ${response.status} ${await response.text()}`);
+    return (await response.json()) as { readonly affected?: number };
+}
+
 async function gatewayState(clientId: string): Promise<GatewayLiveState> {
     return fixtureFetch("/live-gateway-state", { clientId });
 }
@@ -227,6 +243,24 @@ async function subscribe(
 
 function acknowledge(socket: WebSocket, snapshot: Extract<Down, { t: "snapshot" }>): void {
     socket.send(encodeWire({ t: "ack", cookie: snapshot.cookie }));
+}
+
+async function expectNoDown(socket: WebSocket, waitMs = 100): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+        const cleanup = () => {
+            clearTimeout(timeout);
+            socket.removeEventListener("message", onMessage);
+        };
+        const onMessage = (event: MessageEvent) => {
+            cleanup();
+            reject(new Error(`received unexpected Gateway message: ${String(event.data)}`));
+        };
+        const timeout = setTimeout(() => {
+            cleanup();
+            resolve();
+        }, waitMs);
+        socket.addEventListener("message", onMessage);
+    });
 }
 
 async function signed(subject: string): Promise<string> {
@@ -425,6 +459,16 @@ describe("public durable live queries in real workerd", () => {
         a2.socket.close();
         b.socket.close();
         mutator.socket.close();
+        await Promise.all([reconnected.closed, a2.closed, b.closed, mutator.closed]);
+        await Promise.all([
+            drainGateway(clientA1),
+            drainGateway(clientA2),
+            drainGateway(clientB),
+            drainGateway(mutatorId),
+        ]);
+        expect((await gatewayState(clientA1)).registrations.every(row => !row.currentHead)).toBe(true);
+        expect((await gatewayState(clientA2)).registrations.every(row => !row.currentHead)).toBe(true);
+        expect((await gatewayState(clientB)).registrations.every(row => !row.currentHead)).toBe(true);
     });
 
     test("Gateway and Cdb reconstruction preserves a staged replacement", async () => {
@@ -531,5 +575,116 @@ describe("public durable live queries in real workerd", () => {
             outboxTargetVersion: null,
         });
         opened.socket.close();
+        await opened.closed;
+        await drainGateway(clientId);
+        expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
+    });
+
+    test("a dirty rerun re-reads membership authority on a long-lived socket", async () => {
+        if (!mutationRef) throw new Error("mutation ref was not seeded");
+        const writeRef = mutationRef;
+        const clientId = "live-revoke-06";
+        const writerId = "authority-writer-07";
+        const opened = await openSocket(clientId, await signed("workerd-user"));
+        const writer = await openSocket(writerId, await signed("workerd-user-2"));
+        expect(opened.welcome.t).toBe("welcome");
+        expect(writer.welcome.t).toBe("welcome");
+
+        const write = async (mutId: string, id: string): Promise<void> => {
+            const result = nextDown(writer.socket);
+            writer.socket.send(
+                encodeWire({
+                    t: "mut",
+                    mutId: MutId(mutId),
+                    ref: writeRef,
+                    args: {
+                        id,
+                        organizationId: ORGANIZATION_A,
+                        body: "authority-proof",
+                        createdAt: 44,
+                    },
+                })
+            );
+            expect(await result).toMatchObject({
+                t: "poke",
+                mutResults: [{ mutId, ok: true }],
+            });
+        };
+
+        await write("live-authority-seed", "live-authority-row-1");
+        const initial = await subscribe(opened, clientId, 12, ORGANIZATION_A, "authority-proof");
+        expect(initial.rows).toEqual([
+            expect.objectContaining({
+                id: "live-authority-row-1",
+                organizationId: ORGANIZATION_A,
+                viewerId: "workerd-user",
+            }),
+        ]);
+        acknowledge(opened.socket, initial);
+
+        expect((await mutateMembership("upsert", "viewer")).affected).toBe(1);
+        const beforeDowngrade = await currentRegistration(clientId, 12);
+        await write("live-authority-downgrade", "live-authority-row-2");
+        const dirtyAfterDowngrade = await currentRegistration(clientId, 12);
+        expect(dirtyAfterDowngrade.dirtyVersion).toBeGreaterThan(beforeDowngrade.deliveredVersion);
+        const downgradedMessage = nextDown(opened.socket);
+        await drainGateway(clientId);
+        const downgraded = await downgradedMessage;
+        expect(downgraded).toMatchObject({ t: "snapshot", subId: 12, rows: [] });
+        if (downgraded.t !== "snapshot") throw new Error("expected role downgrade replacement snapshot");
+        acknowledge(opened.socket, downgraded);
+
+        expect((await mutateMembership("upsert", "member")).affected).toBe(1);
+        await write("live-authority-restore-role", "live-authority-row-3");
+        const restoredMessage = nextDown(opened.socket);
+        await drainGateway(clientId);
+        const restored = await restoredMessage;
+        expect(restored).toMatchObject({
+            t: "snapshot",
+            subId: 12,
+            rows: [
+                { id: "live-authority-row-1", organizationId: ORGANIZATION_A, viewerId: "workerd-user" },
+                { id: "live-authority-row-2", organizationId: ORGANIZATION_A, viewerId: "workerd-user" },
+                { id: "live-authority-row-3", organizationId: ORGANIZATION_A, viewerId: "workerd-user" },
+            ],
+        });
+        if (restored.t !== "snapshot") throw new Error("expected restored-role replacement snapshot");
+        acknowledge(opened.socket, restored);
+
+        expect((await mutateMembership("delete")).affected).toBe(1);
+        await write("live-authority-revoke", "live-authority-row-4");
+        const revokedMessage = nextDown(opened.socket);
+        await drainGateway(clientId);
+        await expect(revokedMessage).resolves.toMatchObject({
+            t: "error",
+            subId: 12,
+            code: "CDB_FORBIDDEN",
+            retryable: false,
+        });
+        expect((await gatewayState(clientId)).registrations.some(row => row.subId === 12 && row.currentHead)).toBe(
+            false
+        );
+
+        const noReplacement = expectNoDown(opened.socket);
+        await write("live-authority-after-revoke", "live-authority-row-5");
+        await drainGateway(clientId);
+        await noReplacement;
+
+        expect((await mutateMembership("upsert", "member")).affected).toBe(1);
+        const fresh = await subscribe(opened, clientId, 12, ORGANIZATION_A, "authority-proof");
+        expect(fresh.rows).toHaveLength(5);
+        expect(fresh.rows).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({ id: "live-authority-row-1", viewerId: "workerd-user" }),
+                expect.objectContaining({ id: "live-authority-row-5", viewerId: "workerd-user" }),
+            ])
+        );
+        acknowledge(opened.socket, fresh);
+
+        opened.socket.close();
+        writer.socket.close();
+        await Promise.all([opened.closed, writer.closed]);
+        await Promise.all([drainGateway(clientId), drainGateway(writerId)]);
+        expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
     });
 });
