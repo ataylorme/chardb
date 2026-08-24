@@ -17,7 +17,8 @@ export function Auth() {
                 items={[
                     "Catalog-backed Better Auth models and signed Gateway identity",
                     "declared organization writes use current membership, roles, auth epochs, row predicates, and column rules",
-                    "declared exact-partition queries return policy-filtered initial and replacement snapshots",
+                    "dirty live reruns re-read membership and roles on long-lived sockets",
+                    "tracked query tables must appear in the declared live intent",
                     "durable delivery retries until an exact client acknowledgement",
                     "packed replay and cross-organization denial pass for two anonymous principals",
                     "resume replay, packed restart, JWKS rotation, and migrations remain unfinished",
