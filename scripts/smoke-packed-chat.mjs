@@ -235,16 +235,59 @@ async function main() {
         let { socket, next } = primary;
         sockets.push(socket);
 
+        const secondSignIn = await mf.dispatchFetch(new URL("/api/auth/sign-in/anonymous", origin), {
+            method: "POST",
+            headers: { "content-type": "application/json", origin: origin.origin },
+            body: "{}",
+        });
+        const secondSignInText = await secondSignIn.text();
+        assert(secondSignIn.ok, `second anonymous sign-in failed (${secondSignIn.status}): ${secondSignInText}`);
+        const secondCookie = sessionCookies(secondSignIn.headers);
+        assert(secondCookie.length > 0, "second anonymous sign-in returned no session cookie");
+        const secondSession = await mf.dispatchFetch(new URL("/api/auth/get-session", origin), {
+            headers: { cookie: secondCookie },
+        });
+        const secondSessionBody = await secondSession.json();
+        assert(
+            secondSession.ok &&
+                typeof secondSessionBody?.user?.id === "string" &&
+                secondSessionBody.user.id !== sessionBody.user.id &&
+                secondSessionBody?.session?.activeOrganizationId === "demo-org",
+            `second session did not start in demo-org: ${JSON.stringify(secondSessionBody)}`
+        );
+        const secondUserId = secondSessionBody.user.id;
+        const secondTokenResponse = await mf.dispatchFetch(new URL("/api/auth/token", origin), {
+            headers: { cookie: secondCookie },
+        });
+        const secondTokenBody = await secondTokenResponse.json();
+        assert(
+            secondTokenResponse.ok && typeof secondTokenBody?.token === "string",
+            `second JWT issue failed: ${JSON.stringify(secondTokenBody)}`
+        );
+        const observer = await connectGateway(origin, "packed-chat-observer", secondTokenBody.token);
+        sockets.push(observer.socket);
+
         const queryArgs = { organizationId: "demo-org", channelId: "general", limit: 50 };
         socket.send(JSON.stringify({ t: "sub", subId: 1, ref: "src/server/queries.ts#listMessages", args: queryArgs }));
+        observer.socket.send(
+            JSON.stringify({ t: "sub", subId: 1, ref: "src/server/queries.ts#listMessages", args: queryArgs })
+        );
         const initial = await next(
+            message => (message.t === "snapshot" && message.subId === 1) || message.t === "error"
+        );
+        const observerInitial = await observer.next(
             message => (message.t === "snapshot" && message.subId === 1) || message.t === "error"
         );
         assert(
             initial.t === "snapshot" && initial.rows.length === 0,
             `initial snapshot failed: ${JSON.stringify(initial)}`
         );
+        assert(
+            observerInitial.t === "snapshot" && observerInitial.rows.length === 0,
+            `second client initial snapshot failed: ${JSON.stringify(observerInitial)}`
+        );
         socket.send(JSON.stringify({ t: "ack", cookie: initial.cookie }));
+        observer.socket.send(JSON.stringify({ t: "ack", cookie: observerInitial.cookie }));
 
         const mutationRequest = {
             t: "mut",
@@ -268,13 +311,26 @@ async function main() {
             message =>
                 (message.t === "snapshot" && message.subId === 1 && message.rows.length === 1) || message.t === "error"
         );
+        const observerReplacement = await observer.next(
+            message =>
+                (message.t === "snapshot" && message.subId === 1 && message.rows.length === 1) || message.t === "error"
+        );
         assert(
             replacement.t === "snapshot" && replacement.rows[0]?.body === "packed hello",
             `live replacement failed: ${JSON.stringify(replacement)}`
         );
+        assert(
+            observerReplacement.t === "snapshot" &&
+                observerReplacement.rows.length === 1 &&
+                observerReplacement.rows[0]?.id === "packed-message-1" &&
+                observerReplacement.rows[0]?.organizationId === "demo-org" &&
+                observerReplacement.rows[0]?.body === "packed hello",
+            `second same-organization client missed the live replacement: ${JSON.stringify(observerReplacement)}`
+        );
         socket.send(JSON.stringify({ t: "ack", cookie: replacement.cookie }));
+        observer.socket.send(JSON.stringify({ t: "ack", cookie: observerReplacement.cookie }));
 
-        await closeSocket(socket);
+        await Promise.all([closeSocket(socket), closeSocket(observer.socket)]);
         await mf.dispose();
         mf = startMiniflare();
         origin = await mf.ready;
@@ -327,15 +383,16 @@ async function main() {
         );
         socket.send(JSON.stringify({ t: "ack", cookie: readback.cookie }));
 
-        const secondSignIn = await mf.dispatchFetch(new URL("/api/auth/sign-in/anonymous", origin), {
-            method: "POST",
-            headers: { "content-type": "application/json", origin: origin.origin },
-            body: "{}",
+        const reconstructedSecondSession = await mf.dispatchFetch(new URL("/api/auth/get-session", origin), {
+            headers: { cookie: secondCookie },
         });
-        const secondSignInText = await secondSignIn.text();
-        assert(secondSignIn.ok, `second anonymous sign-in failed (${secondSignIn.status}): ${secondSignInText}`);
-        const secondCookie = sessionCookies(secondSignIn.headers);
-        assert(secondCookie.length > 0, "second anonymous sign-in returned no session cookie");
+        const reconstructedSecondSessionBody = await reconstructedSecondSession.json();
+        assert(
+            reconstructedSecondSession.ok &&
+                reconstructedSecondSessionBody?.user?.id === secondUserId &&
+                reconstructedSecondSessionBody?.session?.activeOrganizationId === "demo-org",
+            `second packed session did not survive Miniflare restart: ${JSON.stringify(reconstructedSecondSessionBody)}`
+        );
 
         const leaveDemo = await mf.dispatchFetch(new URL("/api/auth/organization/leave", origin), {
             method: "POST",
@@ -356,27 +413,26 @@ async function main() {
             `second organization creation failed: ${JSON.stringify(isolationOrganization)}`
         );
 
-        const secondSession = await mf.dispatchFetch(new URL("/api/auth/get-session", origin), {
+        const isolatedSession = await mf.dispatchFetch(new URL("/api/auth/get-session", origin), {
             headers: { cookie: secondCookie },
         });
-        const secondSessionBody = await secondSession.json();
+        const isolatedSessionBody = await isolatedSession.json();
         assert(
-            secondSession.ok &&
-                typeof secondSessionBody?.user?.id === "string" &&
-                secondSessionBody?.user?.id !== sessionBody.user.id &&
-                secondSessionBody?.session?.activeOrganizationId === isolationOrganization.id,
-            `second session did not select its organization: ${JSON.stringify(secondSessionBody)}`
+            isolatedSession.ok &&
+                isolatedSessionBody?.user?.id === secondUserId &&
+                isolatedSessionBody?.session?.activeOrganizationId === isolationOrganization.id,
+            `second session did not select its organization: ${JSON.stringify(isolatedSessionBody)}`
         );
-        const secondTokenResponse = await mf.dispatchFetch(new URL("/api/auth/token", origin), {
+        const isolatedTokenResponse = await mf.dispatchFetch(new URL("/api/auth/token", origin), {
             headers: { cookie: secondCookie },
         });
-        const secondTokenBody = await secondTokenResponse.json();
+        const isolatedTokenBody = await isolatedTokenResponse.json();
         assert(
-            secondTokenResponse.ok && typeof secondTokenBody?.token === "string",
-            `second JWT issue failed: ${JSON.stringify(secondTokenBody)}`
+            isolatedTokenResponse.ok && typeof isolatedTokenBody?.token === "string",
+            `second JWT issue after organization move failed: ${JSON.stringify(isolatedTokenBody)}`
         );
 
-        const isolated = await connectGateway(origin, "packed-chat-isolated-client", secondTokenBody.token);
+        const isolated = await connectGateway(origin, "packed-chat-isolated-client", isolatedTokenBody.token);
         sockets.push(isolated.socket);
         isolated.socket.send(
             JSON.stringify({ t: "sub", subId: 1, ref: "src/server/queries.ts#listMessages", args: queryArgs })
