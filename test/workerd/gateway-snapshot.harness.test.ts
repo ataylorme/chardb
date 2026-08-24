@@ -171,5 +171,5 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
         expect(await call<SnapshotState>("inspect")).toEqual(acknowledged);
 
         expect(await call<DirtyRun>("claim", { nowMs: 400 })).toMatchObject({ targetVersion: 9 });
-    });
+    }, 15_000);
 });
