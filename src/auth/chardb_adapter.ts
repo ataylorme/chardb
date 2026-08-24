@@ -46,6 +46,8 @@ interface CatalogRpc {
         model: string;
         where: { [k: string]: RawJson };
         limit?: number;
+        offset?: number;
+        sortBy?: { field: string; direction: "asc" | "desc" };
     }): Promise<readonly Record<string, RawJson>[]>;
     countAuth(args: { model: string; where: { [k: string]: RawJson } }): Promise<number>;
 }
@@ -82,9 +84,15 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                 return (rows[0] ?? null) as never;
             },
 
-            async findMany({ model, where, limit }) {
+            async findMany({ model, where, limit, offset, sortBy }) {
                 const flat = where ? whereToFlat(where) : {};
-                const rows = await catalog().queryAuth({ model, where: flat, limit: limit ?? 100 });
+                const rows = await catalog().queryAuth({
+                    model,
+                    where: flat,
+                    limit: limit ?? 100,
+                    ...(offset === undefined ? {} : { offset }),
+                    ...(sortBy === undefined ? {} : { sortBy }),
+                });
                 return rows as never;
             },
 

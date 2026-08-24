@@ -8,6 +8,7 @@
 import { Database as BunSqlite } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { organization } from "better-auth/plugins/organization";
+import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import {
     type AuthPartitionRule,
     bindAuthRuntime,
@@ -138,6 +139,52 @@ describe("auth/sql — render path against bun:sqlite", () => {
         for (let i = 0; i < 5; i++) authCreate(sql, t, { id: `u${i}`, name: "x" });
         expect(authFindMany(sql, t, { name: "x" }).length).toBe(5);
         expect(authCount(sql, t, { name: "x" })).toBe(5);
+    });
+
+    test("findMany maps sort fields to renamed SQL columns", () => {
+        const { sql } = bootstrap();
+        const renamed = sqliteTable("renamed_auth", {
+            id: text("auth_id"),
+            displayName: text("display_name"),
+        });
+        sql.exec('CREATE TABLE "renamed_auth" ("auth_id" TEXT, "display_name" TEXT)');
+        for (const [id, displayName] of [
+            ["d", "Delta"],
+            ["a", "Alpha"],
+            ["c", "Charlie"],
+            ["b", "Bravo"],
+        ] as const) {
+            authCreate(sql, renamed, { id, displayName });
+        }
+
+        expect(
+            authFindMany(sql, renamed, {}, 2, 1, { field: "displayName", direction: "asc" }).map(row => row.displayName)
+        ).toEqual(["Bravo", "Charlie"]);
+        expect(
+            authFindMany(sql, renamed, {}, 2, 1, { field: "displayName", direction: "desc" }).map(
+                row => row.displayName
+            )
+        ).toEqual(["Charlie", "Bravo"]);
+    });
+
+    test("findMany rejects invalid paging and sorting", () => {
+        resetAuthRuntime();
+        bindAuthRuntime({ schema: defineAuth({ plugins: [] }) as never, options: {} });
+        const { sql } = bootstrap();
+        const t = tableFor("user");
+        const cfg = authTableColumns(t);
+        const colDDL = [...cfg.entries()].map(([_, n]) => `"${n}" TEXT`).join(", ");
+        sql.exec(`CREATE TABLE "user" (${colDDL})`);
+
+        expect(() => authFindMany(sql, t, {}, -1)).toThrow(/limit must be a non-negative safe integer/);
+        expect(() => authFindMany(sql, t, {}, 1.5)).toThrow(/limit must be a non-negative safe integer/);
+        expect(() => authFindMany(sql, t, {}, 1, -1)).toThrow(/offset must be a non-negative safe integer/);
+        expect(() => authFindMany(sql, t, {}, 1, 0, { field: "missing", direction: "asc" })).toThrow(
+            /sort field "missing" is not a column/
+        );
+        expect(() => authFindMany(sql, t, {}, 1, 0, { field: "name", direction: "sideways" } as never)).toThrow(
+            /invalid sort direction/
+        );
     });
 
     test("rejects where keys that are not columns", () => {

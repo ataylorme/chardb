@@ -381,16 +381,14 @@ export class Catalog extends DurableObject<CatalogEnv> {
         readonly model: string;
         readonly where: { readonly [k: string]: RawJson };
         readonly limit?: number;
+        readonly offset?: number;
+        readonly sortBy?: { readonly field: string; readonly direction: "asc" | "desc" };
     }): Promise<readonly Record<string, RawJson>[]> {
         await this.bootstrap();
         this.ensureAuthTables();
         const table = tableFor(args.model);
         const sql = adaptSqlStorage(this.ctx.storage.sql);
-        if (args.limit === 1) {
-            const one = authFindOne(sql, table, args.where);
-            return one ? [one] : [];
-        }
-        return authFindMany(sql, table, args.where, args.limit);
+        return authFindMany(sql, table, args.where, args.limit, args.offset, args.sortBy);
     }
 
     /** Count Better Auth rows without materializing them across the Catalog RPC. */

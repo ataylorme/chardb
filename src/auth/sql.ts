@@ -16,7 +16,7 @@
  *   - delete  → `DELETE FROM t WHERE ...`. Returns the affected row
  *               count.
  *   - findOne → `SELECT * FROM t WHERE ... LIMIT 1`.
- *   - findMany → `SELECT * FROM t WHERE ... LIMIT ?`.
+ *   - findMany → `SELECT * FROM t WHERE ... ORDER BY ... LIMIT ? OFFSET ?`.
  *
  * Where-clauses are restricted to a flat AND of equalities. Better-auth's
  * own query surface only emits these for the model-store path; richer
@@ -202,14 +202,57 @@ export function authFindMany(
     sql: SyncSql,
     table: AnySQLiteTable,
     where: { readonly [k: string]: RawJson },
-    limit?: number
+    limit?: number,
+    offset?: number,
+    sortBy?: { readonly field: string; readonly direction: "asc" | "desc" }
 ): Record<string, RawJson>[] {
     const info = infoOf(table);
     const w = bindWhere(info, where);
-    const limitClause = limit !== undefined && limit > 0 ? ` LIMIT ${Math.floor(limit)}` : "";
+    const params = [...w.params];
+
+    let orderClause = "";
+    const idSqlName = info.columns.get("id");
+    if (sortBy !== undefined) {
+        const sqlName = info.columns.get(sortBy.field);
+        if (!sqlName) {
+            throw new Error(`auth/sql: sort field "${sortBy.field}" is not a column on table ${info.name}`);
+        }
+        if (sortBy.direction !== "asc" && sortBy.direction !== "desc") {
+            throw new Error(`auth/sql: invalid sort direction ${JSON.stringify(sortBy.direction)}`);
+        }
+        orderClause = ` ORDER BY ${quoteIdent(sqlName)} ${sortBy.direction === "asc" ? "ASC" : "DESC"}`;
+        if (sortBy.field !== "id") {
+            if (!idSqlName) throw new Error(`auth/sql: table ${info.name} has no id column for deterministic paging`);
+            orderClause += `, ${quoteIdent(idSqlName)} ASC`;
+        }
+    } else if (limit !== undefined || offset !== undefined) {
+        if (!idSqlName) throw new Error(`auth/sql: table ${info.name} has no id column for deterministic paging`);
+        orderClause = ` ORDER BY ${quoteIdent(idSqlName)} ASC`;
+    }
+
+    if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0)) {
+        throw new Error("auth/sql: limit must be a non-negative safe integer");
+    }
+    if (offset !== undefined && (!Number.isSafeInteger(offset) || offset < 0)) {
+        throw new Error("auth/sql: offset must be a non-negative safe integer");
+    }
+
+    let pageClause = "";
+    if (limit !== undefined) {
+        pageClause = " LIMIT ?";
+        params.push(limit);
+        if (offset !== undefined) {
+            pageClause += " OFFSET ?";
+            params.push(offset);
+        }
+    } else if (offset !== undefined) {
+        pageClause = " LIMIT ? OFFSET ?";
+        params.push(-1, offset);
+    }
+
     const rows = sql.all<Record<string, unknown>>(
-        `SELECT * FROM ${quoteIdent(info.name)} WHERE ${w.sql}${limitClause}`,
-        ...w.params
+        `SELECT * FROM ${quoteIdent(info.name)} WHERE ${w.sql}${orderClause}${pageClause}`,
+        ...params
     );
     return rows.map(r => projectRow(info, r));
 }

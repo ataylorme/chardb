@@ -231,6 +231,104 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(harness.sqlStatements.some(statement => statement.includes('SELECT * FROM "user"'))).toBe(false);
     });
 
+    test("honors findMany sort and offset across stable pages", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const now = new Date("2026-08-23T00:00:00Z");
+        for (const [id, name] of [
+            ["sorted-user-d", "Delta"],
+            ["sorted-user-a", "Alpha"],
+            ["sorted-user-c", "Charlie"],
+            ["sorted-user-b", "Bravo"],
+        ] as const) {
+            await adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id,
+                    name,
+                    email: `${id}@example.com`,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+        }
+        harness.sqlStatements.length = 0;
+
+        const firstPage = await adapter.findMany<Record<string, unknown>>({
+            model: "user",
+            limit: 2,
+            offset: 0,
+            sortBy: { field: "name", direction: "asc" },
+        });
+        const secondPage = await adapter.findMany<Record<string, unknown>>({
+            model: "user",
+            limit: 2,
+            offset: 2,
+            sortBy: { field: "name", direction: "asc" },
+        });
+        const descendingMiddle = await adapter.findMany<Record<string, unknown>>({
+            model: "user",
+            limit: 2,
+            offset: 1,
+            sortBy: { field: "name", direction: "desc" },
+        });
+        const offsetWithoutSort = await adapter.findMany<Record<string, unknown>>({
+            model: "user",
+            limit: 2,
+            offset: 1,
+        });
+
+        expect(firstPage.map(row => row.name)).toEqual(["Alpha", "Bravo"]);
+        expect(secondPage.map(row => row.name)).toEqual(["Charlie", "Delta"]);
+        expect(descendingMiddle.map(row => row.name)).toEqual(["Charlie", "Bravo"]);
+        expect(offsetWithoutSort.map(row => row.id)).toEqual(["sorted-user-b", "sorted-user-c"]);
+        expect(harness.sqlStatements).toContain(
+            'SELECT * FROM "user" WHERE 1=1 ORDER BY "name" ASC, "id" ASC LIMIT ? OFFSET ?'
+        );
+        expect(harness.sqlStatements).toContain(
+            'SELECT * FROM "user" WHERE 1=1 ORDER BY "name" DESC, "id" ASC LIMIT ? OFFSET ?'
+        );
+        expect(harness.sqlStatements).toContain('SELECT * FROM "user" WHERE 1=1 ORDER BY "id" ASC LIMIT ? OFFSET ?');
+    });
+
+    test("uses id as a stable tie-breaker across sorted pages", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const now = new Date("2026-08-23T00:00:00Z");
+        for (const id of ["tied-user-d", "tied-user-a", "tied-user-c", "tied-user-b"] as const) {
+            await adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id,
+                    name: "Tied",
+                    email: `${id}@example.com`,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+        }
+
+        const firstPage = await adapter.findMany<Record<string, unknown>>({
+            model: "user",
+            where: eq("name", "Tied"),
+            limit: 2,
+            offset: 0,
+            sortBy: { field: "name", direction: "asc" },
+        });
+        const secondPage = await adapter.findMany<Record<string, unknown>>({
+            model: "user",
+            where: eq("name", "Tied"),
+            limit: 2,
+            offset: 2,
+            sortBy: { field: "name", direction: "asc" },
+        });
+
+        expect(firstPage.map(row => row.id)).toEqual(["tied-user-a", "tied-user-b"]);
+        expect(secondPage.map(row => row.id)).toEqual(["tied-user-c", "tied-user-d"]);
+    });
+
     test("routes adapter counts to countAuth without falling back to queryAuth", async () => {
         const requests: Array<{ model: string; where: Record<string, unknown> }> = [];
         const catalog = {
