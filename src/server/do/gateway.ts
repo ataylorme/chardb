@@ -122,6 +122,10 @@ CREATE TABLE IF NOT EXISTS _gw_registration_heads (
   UNIQUE (registration_id),
   FOREIGN KEY (registration_id) REFERENCES _gw_registration_generations(registration_id)
 );
+CREATE TABLE IF NOT EXISTS _gw_maintenance_state (
+  key TEXT PRIMARY KEY,
+  integer_value INTEGER NOT NULL CHECK (integer_value >= 0)
+);
 CREATE TABLE IF NOT EXISTS _gw_snapshot_outbox (
   registration_id TEXT PRIMARY KEY,
   cookie TEXT NOT NULL UNIQUE,
@@ -175,6 +179,7 @@ export const PRESENCE_TTL_DEFAULT_MS = 30_000 as const;
 export const MAX_INITIAL_SNAPSHOTS_PER_CONNECTION = 64 as const;
 export const MAX_GATEWAY_INVALIDATIONS_PER_REQUEST = 64 as const;
 export const GATEWAY_CLEANUP_BATCH_SIZE = 32 as const;
+export const GATEWAY_ABANDONED_REGISTRATION_BATCH_SIZE = 32 as const;
 export const GATEWAY_CLEANUP_BASE_RETRY_MS = 1_000 as const;
 export const GATEWAY_CLEANUP_MAX_RETRY_MS = 60_000 as const;
 export const GATEWAY_CLEANUP_MAX_RETRY_COUNT = 30 as const;
@@ -184,6 +189,8 @@ export const GATEWAY_SEND_BATCH_SIZE = 32 as const;
 export const GATEWAY_QUERY_LEASE_MS = 30_000 as const;
 export const GATEWAY_SEND_LEASE_MS = 10_000 as const;
 export const GATEWAY_SUBSCRIBE_RECOVERY_MS = 30_000 as const;
+
+const GATEWAY_ABANDONED_REGISTRATION_CURSOR_KEY = "abandoned-registration-cursor" as const;
 
 interface PendingGwAttachment {
     readonly kind: "pending";
@@ -776,6 +783,15 @@ interface StoredGatewayCleanupRow {
     readonly connection_id: string;
     readonly source_cdb_id: string | null;
     readonly retry_count: number;
+}
+
+interface StoredGatewayActiveHead {
+    readonly generation_rowid: number;
+    readonly principal_id: string;
+    readonly client_id: string;
+    readonly sub_id: number;
+    readonly registration_id: string;
+    readonly connection_id: string;
 }
 
 interface StoredGatewayRunCandidate {
@@ -2950,6 +2966,89 @@ export class Gateway extends DurableObject<GatewayEnv> {
         );
     }
 
+    /** Best-effort fallback after a close event could not commit retirement. */
+    private async scheduleAbandonedGatewayReconciliation(nowMs: number): Promise<void> {
+        const alarmAt = nowMs + 1;
+        await this.serializeGatewayAlarmOperation(() =>
+            this.ctx.storage.transaction(async transaction => {
+                const current = await transaction.getAlarm();
+                if (current === null || alarmAt < current) await transaction.setAlarm(alarmAt);
+                adaptSqlStorage(this.ctx.storage.sql).exec(
+                    `INSERT INTO _gw_maintenance_state (key, integer_value) VALUES (?, 0)
+                     ON CONFLICT (key) DO NOTHING`,
+                    GATEWAY_ABANDONED_REGISTRATION_CURSOR_KEY
+                );
+            })
+        );
+    }
+
+    /**
+     * Reconcile one durable page of active heads against exact live socket
+     * attachments. The rowid cursor prevents live heads from starving later
+     * abandoned heads across bounded alarm passes.
+     */
+    private reconcileAbandonedGatewayRegistrations(nowMs: number): boolean {
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        const cursor =
+            sql.one<{ integer_value: number }>(
+                "SELECT integer_value FROM _gw_maintenance_state WHERE key = ?",
+                GATEWAY_ABANDONED_REGISTRATION_CURSOR_KEY
+            )?.integer_value ?? 0;
+        const rows = sql.all<StoredGatewayActiveHead>(
+            `SELECT g.rowid AS generation_rowid, g.principal_id, g.client_id, g.sub_id,
+                    g.registration_id, g.connection_id
+             FROM _gw_registration_generations g
+             INNER JOIN _gw_registration_heads h
+               ON h.registration_id = g.registration_id
+              AND h.principal_id = g.principal_id
+              AND h.client_id = g.client_id
+              AND h.sub_id = g.sub_id
+             WHERE g.rowid > ? AND g.lifecycle = 'active' AND g.cdb_state = 'active'
+             ORDER BY g.rowid
+             LIMIT ?`,
+            cursor,
+            GATEWAY_ABANDONED_REGISTRATION_BATCH_SIZE + 1
+        );
+        const candidates = rows.slice(0, GATEWAY_ABANDONED_REGISTRATION_BATCH_SIZE);
+        const hasMore = rows.length > GATEWAY_ABANDONED_REGISTRATION_BATCH_SIZE;
+        const abandoned = candidates.filter(candidate => {
+            const identity = {
+                principalId: PrincipalId(candidate.principal_id),
+                clientId: ClientId(candidate.client_id),
+                subId: SubId(candidate.sub_id),
+                registrationId: candidate.registration_id,
+                connectionId: candidate.connection_id,
+            };
+            return this.exactGatewaySocket(identity, nowMs).status === "terminal";
+        });
+        if (abandoned.length === 0 && !hasMore && cursor === 0) return false;
+        this.ctx.storage.transactionSync(() => {
+            const transactionSql = adaptSqlStorage(this.ctx.storage.sql);
+            for (const candidate of abandoned) {
+                retireGatewayRegistration(
+                    transactionSql,
+                    {
+                        principalId: PrincipalId(candidate.principal_id),
+                        clientId: ClientId(candidate.client_id),
+                        subId: SubId(candidate.sub_id),
+                    },
+                    candidate.registration_id,
+                    nowMs
+                );
+            }
+            const nextCursor = hasMore ? (candidates.at(-1)?.generation_rowid ?? cursor) : 0;
+            if (nextCursor !== cursor) {
+                transactionSql.exec(
+                    `INSERT INTO _gw_maintenance_state (key, integer_value) VALUES (?, ?)
+                     ON CONFLICT (key) DO UPDATE SET integer_value = excluded.integer_value`,
+                    GATEWAY_ABANDONED_REGISTRATION_CURSOR_KEY,
+                    nextCursor
+                );
+            }
+        });
+        return hasMore;
+    }
+
     private async drainGatewayWork(): Promise<void> {
         const nowMs = this.gatewayNowMs();
         for (const recovery of this.dueGatewayInstallRecoveries(nowMs)) {
@@ -3014,6 +3113,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
     }
 
     override async alarm(): Promise<void> {
+        const reconciliationAt = this.gatewayNowMs();
+        if (this.reconcileAbandonedGatewayRegistrations(reconciliationAt)) {
+            await this.scheduleGatewayAlarm(reconciliationAt + 1);
+        }
         await this.drainGatewayWork();
     }
 
@@ -3190,13 +3293,18 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 if (pending.connectionId === attachment.connectionId) pending.cancelled = true;
             }
             const nowMs = this.gatewayNowMs();
-            await this.retireGatewayStateWithCleanupAlarm(nowMs, () => {
-                retireCurrentGatewayRegistrationsForConnection(
-                    adaptSqlStorage(this.ctx.storage.sql),
-                    attachment.connectionId,
-                    nowMs
-                );
-            });
+            try {
+                await this.retireGatewayStateWithCleanupAlarm(nowMs, () => {
+                    retireCurrentGatewayRegistrationsForConnection(
+                        adaptSqlStorage(this.ctx.storage.sql),
+                        attachment.connectionId,
+                        nowMs
+                    );
+                });
+            } catch (error) {
+                await this.scheduleAbandonedGatewayReconciliation(nowMs).catch(() => {});
+                throw error;
+            }
         }
     }
 

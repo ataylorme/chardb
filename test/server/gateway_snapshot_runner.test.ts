@@ -12,6 +12,7 @@ import {
     installGatewayRegistration,
     stageGatewaySnapshot,
 } from "../../src/server/do/gateway.ts";
+import type { LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, ShardId, SubId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
@@ -111,6 +112,7 @@ describe("Gateway active snapshot runner", () => {
     let events: string[];
     let sockets: FakeSocket[];
     let queryCalls: unknown[];
+    let unsubscribeCalls: LiveSubscriptionId[];
     let queryBehavior: () => unknown | Promise<unknown>;
     let authorityBehavior: () => unknown | Promise<unknown>;
     let routePhysicalId: string;
@@ -128,6 +130,7 @@ describe("Gateway active snapshot runner", () => {
         events = [];
         sockets = [];
         queryCalls = [];
+        unsubscribeCalls = [];
         queryBehavior = () => ({ ok: true, result: [{ id: 1, body: "hello" }] });
         authorityBehavior = () => ({
             principalId: PrincipalId("principal-1"),
@@ -160,7 +163,9 @@ describe("Gateway active snapshot runner", () => {
                 events.push("query");
                 return await queryBehavior();
             },
-            async unsubscribe() {},
+            async unsubscribe(subscription: LiveSubscriptionId) {
+                unsubscribeCalls.push(subscription);
+            },
         };
         const catalogNamespace = {
             idFromName: () => ({ toString: () => "catalog-global" }),
@@ -615,15 +620,25 @@ describe("Gateway active snapshot runner", () => {
         expect(currentAlarm).toBe(101);
     });
 
-    test("retires missing or stale socket identity and arms exact cleanup", async () => {
-        installActive();
+    test("retires and exactly cleans a missing socket identity in the same alarm", async () => {
+        const input = registration();
+        installActive(input);
 
         await fireAlarm();
 
         expect(queryCalls).toEqual([]);
         expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
-        expect(generationState()).toMatchObject({ lifecycle: "retiring" });
-        expect(currentAlarm).toBe(101);
+        expect(generationState()).toBeNull();
+        expect(unsubscribeCalls).toEqual([
+            {
+                gatewayId: "gateway-do-1",
+                registrationId: input.registrationId,
+                connectionId: input.connectionId,
+                clientId: input.clientId,
+                subId: input.subId,
+            },
+        ]);
+        expect(currentAlarm).toBeNull();
     });
 
     test("rechecks JWT time after a held query and retires before staging or send", async () => {

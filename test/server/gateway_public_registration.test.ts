@@ -1,6 +1,11 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { Gateway, type GatewayEnv, type VerifiedGwAttachment } from "../../src/server/do/gateway.ts";
+import {
+    GATEWAY_ABANDONED_REGISTRATION_BATCH_SIZE,
+    Gateway,
+    type GatewayEnv,
+    type VerifiedGwAttachment,
+} from "../../src/server/do/gateway.ts";
 import type { QueryRouteResponse } from "../../src/server/manifest.ts";
 import type { CdbSubscriptionRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, ShardId, SubId, TenantId } from "../../src/types.ts";
@@ -62,6 +67,7 @@ describe("Gateway public durable registration", () => {
     let currentAlarm: number | null;
     let alarmFailures: number;
     let transactionCommitFailures: number;
+    let socketConnected: boolean;
     let subscribeCalls: CdbSubscriptionRequest[];
     let unsubscribeCalls: LiveSubscriptionId[];
     let registeredQueryCalls: unknown[];
@@ -90,6 +96,7 @@ describe("Gateway public durable registration", () => {
         currentAlarm = null;
         alarmFailures = 0;
         transactionCommitFailures = 0;
+        socketConnected = true;
         subscribeCalls = [];
         unsubscribeCalls = [];
         registeredQueryCalls = [];
@@ -187,7 +194,7 @@ describe("Gateway public durable registration", () => {
                     }
                 },
             },
-            getWebSockets: () => [socket] as unknown as WebSocket[],
+            getWebSockets: () => (socketConnected ? [socket] : []) as unknown as WebSocket[],
             blockConcurrencyWhile: (callback: () => Promise<unknown>) => {
                 ready = callback();
             },
@@ -393,6 +400,7 @@ describe("Gateway public durable registration", () => {
         await waitFor(() => subscribeCalls.length === 1, "subscribe RPC");
         const subscription = subscribeCalls[0]?.subscription as LiveSubscriptionId;
 
+        socketConnected = false;
         await gateway.webSocketClose(socket as unknown as WebSocket);
         release({ subscription, changeSeq: 0 });
         await subscriptionTask;
@@ -449,27 +457,206 @@ describe("Gateway public durable registration", () => {
         expect(currentAlarm).toBeNull();
     });
 
-    test("socket close does not retire the head unless it owns a cleanup alarm", async () => {
+    test("socket close commit failure falls back to an alarm that reconciles the abandoned head", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        const subscription = subscribeCalls[0]?.subscription;
+        if (!subscription) throw new Error("subscribe call was not recorded");
+        currentAlarm = null;
+        transactionCommitFailures = 1;
+        socketConnected = false;
+
+        await expect(gateway.webSocketClose(socket as unknown as WebSocket)).rejects.toThrow(
+            "transaction commit unavailable"
+        );
+
+        expect(head()).not.toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "active", cdb_state: "active", retry_at: null });
+        expect(currentAlarm as number | null).toBe(101);
+        expect(unsubscribeCalls).toEqual([]);
+
+        clock = 101;
+        currentAlarm = null;
+        await gateway.alarm();
+        expect(unsubscribeCalls).toEqual([subscription]);
+        expect(generation()).toBeNull();
+    });
+
+    test("socket close recovers a transient transactional alarm failure with its fallback alarm", async () => {
         await subscribe();
         await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
         const subscription = subscribeCalls[0]?.subscription;
         if (!subscription) throw new Error("subscribe call was not recorded");
         currentAlarm = null;
         alarmFailures = 1;
+        socketConnected = false;
 
         await expect(gateway.webSocketClose(socket as unknown as WebSocket)).rejects.toThrow("alarm unavailable");
 
         expect(head()).not.toBeNull();
         expect(generation()).toMatchObject({ lifecycle: "active", cdb_state: "active", retry_at: null });
-        expect(currentAlarm).toBeNull();
-        expect(unsubscribeCalls).toEqual([]);
-
-        await gateway.webSocketClose(socket as unknown as WebSocket);
-        expect(head()).toBeNull();
-        expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "retiring", retry_at: 100 });
         expect(currentAlarm as number | null).toBe(101);
 
         clock = 101;
+        currentAlarm = null;
+        await gateway.alarm();
+        expect(unsubscribeCalls).toEqual([subscription]);
+        expect(generation()).toBeNull();
+    });
+
+    test("abandoned-head reconciliation preserves an exact verified live socket", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        currentAlarm = null;
+        clock = 101;
+
+        await gateway.alarm();
+
+        expect(head()).not.toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "active", cdb_state: "active" });
+        expect(unsubscribeCalls).toEqual([]);
+    });
+
+    test("a socket with the wrong connection identity does not protect an abandoned head", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        const subscription = subscribeCalls[0]?.subscription;
+        if (!subscription) throw new Error("subscribe call was not recorded");
+        socket.attachment = { ...socket.attachment, connectionId: "connection-2" };
+        currentAlarm = null;
+        clock = 101;
+
+        await gateway.alarm();
+
+        expect(head()).toBeNull();
+        expect(generation()).toBeNull();
+        expect(unsubscribeCalls).toEqual([subscription]);
+    });
+
+    test("a stale verified attachment does not protect an abandoned head", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        const subscription = subscribeCalls[0]?.subscription;
+        if (!subscription) throw new Error("subscribe call was not recorded");
+        socket.attachment = { ...socket.attachment, jwtExp: 0 };
+        currentAlarm = null;
+        clock = 101;
+
+        await gateway.alarm();
+
+        expect(head()).toBeNull();
+        expect(generation()).toBeNull();
+        expect(unsubscribeCalls).toEqual([subscription]);
+    });
+
+    test("abandoned-head reconciliation re-arms until it passes the batch cap", async () => {
+        const total = GATEWAY_ABANDONED_REGISTRATION_BATCH_SIZE + 1;
+        for (let subId = 1; subId <= total; subId++) await subscribe(SubId(subId));
+        await waitFor(
+            () =>
+                (db.query("SELECT COUNT(*) AS count FROM _gw_registration_heads").get() as { count: number }).count ===
+                total,
+            "subscription batch activation"
+        );
+        socketConnected = false;
+        currentAlarm = null;
+        clock = 101;
+
+        await gateway.alarm();
+
+        expect(currentAlarm as number | null).toBe(102);
+        expect(
+            (
+                db
+                    .query("SELECT integer_value FROM _gw_maintenance_state WHERE key = ?")
+                    .get("abandoned-registration-cursor") as { integer_value: number }
+            ).integer_value
+        ).toBeGreaterThan(0);
+
+        clock = 102;
+        currentAlarm = null;
+        await gateway.alarm();
+        expect(head()).toBeNull();
+        expect(generation()).toBeNull();
+        expect(unsubscribeCalls).toHaveLength(total);
+        expect(
+            (
+                db
+                    .query("SELECT integer_value FROM _gw_maintenance_state WHERE key = ?")
+                    .get("abandoned-registration-cursor") as { integer_value: number }
+            ).integer_value
+        ).toBe(0);
+    });
+
+    test("another close fallback preserves an in-progress sweep cursor", async () => {
+        const total = GATEWAY_ABANDONED_REGISTRATION_BATCH_SIZE + 1;
+        for (let subId = 1; subId <= total; subId++) await subscribe(SubId(subId));
+        await waitFor(
+            () =>
+                (db.query("SELECT COUNT(*) AS count FROM _gw_registration_heads").get() as { count: number }).count ===
+                total,
+            "subscription batch activation"
+        );
+        db.exec(
+            "UPDATE _gw_registration_generations SET initial_snapshot_pending = 0, delivered_version = dirty_version"
+        );
+        socket.attachment = {
+            ...socket.attachment,
+            snapshotSubIds: (socket.attachment.snapshotSubIds ?? []).slice(
+                0,
+                GATEWAY_ABANDONED_REGISTRATION_BATCH_SIZE
+            ),
+        };
+        currentAlarm = null;
+        clock = 101;
+
+        await gateway.alarm();
+        const cursor = (
+            db
+                .query("SELECT integer_value FROM _gw_maintenance_state WHERE key = ?")
+                .get("abandoned-registration-cursor") as { integer_value: number }
+        ).integer_value;
+        expect(cursor).toBeGreaterThan(0);
+
+        await (
+            gateway as unknown as { scheduleAbandonedGatewayReconciliation(nowMs: number): Promise<void> }
+        ).scheduleAbandonedGatewayReconciliation(clock);
+        expect(
+            (
+                db
+                    .query("SELECT integer_value FROM _gw_maintenance_state WHERE key = ?")
+                    .get("abandoned-registration-cursor") as { integer_value: number }
+            ).integer_value
+        ).toBe(cursor);
+
+        clock = 102;
+        currentAlarm = null;
+        await gateway.alarm();
+        const abandoned = subscribeCalls.at(-1)?.subscription;
+        if (!abandoned) throw new Error("last subscribe call was not recorded");
+        expect(unsubscribeCalls).toContainEqual(abandoned);
+        expect(
+            db
+                .query("SELECT registration_id FROM _gw_registration_generations WHERE registration_id = ?")
+                .get(abandoned.registrationId)
+        ).toBeNull();
+    });
+
+    test("close fallback preserves an earlier alarm", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        const subscription = subscribeCalls[0]?.subscription;
+        if (!subscription) throw new Error("subscribe call was not recorded");
+        currentAlarm = 100;
+        transactionCommitFailures = 1;
+        socketConnected = false;
+
+        await expect(gateway.webSocketClose(socket as unknown as WebSocket)).rejects.toThrow(
+            "transaction commit unavailable"
+        );
+
+        expect(currentAlarm as number | null).toBe(100);
+        expect(head()).not.toBeNull();
         currentAlarm = null;
         await gateway.alarm();
         expect(unsubscribeCalls).toEqual([subscription]);
