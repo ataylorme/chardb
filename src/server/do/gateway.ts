@@ -11,7 +11,12 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { createCatalogJwksResolver } from "../../auth/jwks_cache.ts";
+import {
+    type CatalogJwkResolution,
+    type CatalogJwkResolutionRequest,
+    createCatalogJwksResolver,
+    createCatalogOwnedJwksResolver,
+} from "../../auth/jwks_cache.ts";
 import { verifyJwt } from "../../auth/jwt.ts";
 import { CdbError, docsUrlFor, isCdbErrorCode, isRetryable } from "../../errors.ts";
 import type { SyncSql } from "../../oplog/wrapper.ts";
@@ -297,6 +302,7 @@ function hasAsciiControlCharacter(value: string): boolean {
 interface CatalogJwksRpc extends CatalogMutationRpc {
     getJwk(kid: string): Promise<{ jwkJson: string; expiresAt: number } | null>;
     putJwk(kid: string, jwkJson: string, ttlMs: number): Promise<void>;
+    resolveJwk?(request: CatalogJwkResolutionRequest): Promise<CatalogJwkResolution>;
 }
 
 function mutationFailure(
@@ -2141,8 +2147,14 @@ export async function verifyGatewayJwt(request: GatewayJwtVerificationRequest): 
             `${request.config.authBasePath.replace(/\/$/, "")}${request.config.jwksPath}`,
             `${request.authOrigin}/`
         ).toString();
+    const resolver = request.catalog.resolveJwk
+        ? createCatalogOwnedJwksResolver(
+              { resolveJwk: value => (request.catalog.resolveJwk as NonNullable<CatalogJwksRpc["resolveJwk"]>)(value) },
+              jwksUrl
+          )
+        : createCatalogJwksResolver({ catalog: request.catalog, jwksUrl });
     const claims = await verifyJwt(request.jwt, {
-        resolver: createCatalogJwksResolver({ catalog: request.catalog, jwksUrl }),
+        resolver,
         issuer,
         audience,
         algorithms: request.config.algorithms,

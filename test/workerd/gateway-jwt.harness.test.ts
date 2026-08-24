@@ -18,6 +18,7 @@ const ROTATED_KID = "gateway-workerd-key-rotated";
 const UNKNOWN_KID = "gateway-workerd-key-unknown";
 const ISSUER = "https://issuer.example";
 const AUDIENCE = "chardb-workerd";
+const JWKS_URL = "https://unreachable.invalid/jwks";
 const WRITE_REF = "test/workerd/gateway-jwt.entry.ts#writeOrganizationRow";
 const CLOSED_REF = "test/workerd/gateway-jwt.entry.ts#closedOrganizationWrite";
 const LIST_REF = "test/workerd/gateway-jwt.entry.ts#listOrganizationRows";
@@ -45,6 +46,7 @@ const JWKS_WORKER = `
 let keys;
 let fetchCount = 0;
 let lastUrl = null;
+let mode = "ok";
 
 export default {
     async fetch(request, env) {
@@ -53,11 +55,21 @@ export default {
         if (url.pathname === "/jwks") {
             fetchCount += 1;
             lastUrl = request.url;
+            if (mode === "throw") throw new Error("forced JWKS network failure");
+            if (mode === "status") return new Response("unavailable", { status: 503 });
+            if (mode === "invalid-json") return new Response("{");
+            if (mode === "malformed") return Response.json({ keys: [null] });
+            if (mode === "empty") return Response.json({ keys: [] });
             return Response.json({ keys });
         }
         if (url.pathname === "/__control/rotate" && request.method === "POST") {
             const document = await request.json();
             keys = document.keys;
+            return Response.json({ ok: true });
+        }
+        if (url.pathname === "/__control/mode" && request.method === "POST") {
+            const body = await request.json();
+            mode = body.mode;
             return Response.json({ ok: true });
         }
         if (url.pathname === "/__control/stats") {
@@ -348,12 +360,35 @@ async function rotateJwks(): Promise<void> {
     if (!response.ok) throw new Error(`failed to rotate JWKS: ${response.status}`);
 }
 
+type JwksMode = "ok" | "throw" | "status" | "invalid-json" | "malformed" | "empty";
+
+async function setJwksMode(mode: JwksMode): Promise<void> {
+    if (!mf) throw new Error("miniflare not initialized");
+    const worker = await mf.getWorker("jwks");
+    const response = await worker.fetch("http://jwks.test/__control/mode", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ mode }),
+    });
+    if (!response.ok) throw new Error(`failed to set JWKS mode: ${response.status}`);
+}
+
+async function releaseJwksCooldown(): Promise<void> {
+    if (!mf) throw new Error("miniflare not initialized");
+    const response = await mf.dispatchFetch("http://example.com/release-jwks-cooldown", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jwksUrl: JWKS_URL }),
+    });
+    if (!response.ok) throw new Error(`failed to release JWKS cooldown: ${response.status}`);
+}
+
 async function expireCatalogJwk(kid: string): Promise<void> {
     if (!mf) throw new Error("miniflare not initialized");
     const response = await mf.dispatchFetch("http://example.com/expire-jwk", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ kid }),
+        body: JSON.stringify({ kid, jwksUrl: JWKS_URL }),
     });
     if (!response.ok) throw new Error(`failed to expire Catalog JWK: ${response.status} ${await response.text()}`);
 }
@@ -432,7 +467,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
 
         expect(await jwksStats()).toEqual({
             fetchCount: 1,
-            lastUrl: "https://unreachable.invalid/jwks",
+            lastUrl: JWKS_URL,
             kids: [KID],
         });
     });
@@ -1108,6 +1143,44 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         retry.socket.close();
     });
 
+    test("fails closed on outbound JWKS errors and suppresses retries during durable cooldown", async () => {
+        for (const mode of ["throw", "status", "invalid-json", "malformed", "empty"] as const) {
+            await setJwksMode(mode);
+            await releaseJwksCooldown();
+            const before = await jwksStats();
+
+            const failed = await openSocket(await signedUnknown(), { clientId: `a-${mode}-jwks-failure` });
+            await expect(failed.first).resolves.toMatchObject({
+                t: "error",
+                code: "CDB_CATALOG_UNAVAILABLE",
+                retryable: true,
+            });
+            await failed.closed;
+            expect((await jwksStats()).fetchCount).toBe(before.fetchCount + 1);
+
+            const cooledDown = await openSocket(await signedUnknown(), { clientId: `b-${mode}-jwks-failure` });
+            await expect(cooledDown.first).resolves.toMatchObject({
+                t: "error",
+                code: "CDB_CATALOG_UNAVAILABLE",
+                retryable: true,
+            });
+            await cooledDown.closed;
+            expect((await jwksStats()).fetchCount).toBe(before.fetchCount + 1);
+        }
+
+        await setJwksMode("ok");
+        await releaseJwksCooldown();
+        const beforeRecovery = await jwksStats();
+        const recovered = await openSocket(await signedUnknown(), { clientId: "jwks-failure-recovered" });
+        await expect(recovered.first).resolves.toMatchObject({
+            t: "error",
+            code: "CDB_FORBIDDEN",
+            retryable: false,
+        });
+        await recovered.closed;
+        expect((await jwksStats()).fetchCount).toBe(beforeRecovery.fetchCount + 1);
+    });
+
     test("refreshes an expired key, accepts the rotated kid, and rejects retired or unknown keys", async () => {
         if (!mutationRef) throw new Error("mutation ref was not seeded");
         const beforePrime = await jwksStats();
@@ -1128,7 +1201,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         await retired.closed;
         expect(await jwksStats()).toEqual({
             fetchCount: fetchBaseline + 1,
-            lastUrl: "https://unreachable.invalid/jwks",
+            lastUrl: JWKS_URL,
             kids: [ROTATED_KID],
         });
 
@@ -1167,6 +1240,6 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         const unknown = await openSocket(await signedUnknown(), { clientId: "jwks-unknown-key" });
         await expect(unknown.first).resolves.toMatchObject({ t: "error", code: "CDB_FORBIDDEN", retryable: false });
         await unknown.closed;
-        expect(await jwksStats()).toMatchObject({ fetchCount: fetchBaseline + 2, kids: [ROTATED_KID] });
+        expect(await jwksStats()).toMatchObject({ fetchCount: fetchBaseline + 1, kids: [ROTATED_KID] });
     });
 });

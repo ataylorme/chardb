@@ -18,6 +18,18 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { renderSqliteTableDdl } from "../../auth/ddl.ts";
+import {
+    type CatalogJwkResolution,
+    type CatalogJwkResolutionRequest,
+    JWKS_CACHE_TTL_MS,
+    JWKS_FAILURE_BACKOFF_INITIAL_MS,
+    JWKS_FAILURE_BACKOFF_MAX_MS,
+    JWKS_MAX_KID_BYTES,
+    JWKS_REFRESH_LEASE_MS,
+    JWKS_SUCCESS_COOLDOWN_MS,
+    fetchValidatedJwks,
+    parseCachedJwk,
+} from "../../auth/jwks_cache.ts";
 import { getAuthRuntime, placementFor, tableFor } from "../../auth/runtime.ts";
 import { authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
 import { CdbError } from "../../errors.ts";
@@ -49,6 +61,21 @@ CREATE TABLE IF NOT EXISTS catalog_jwks (
   fetched_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS catalog_jwks_v2 (
+  jwks_url TEXT NOT NULL,
+  kid TEXT NOT NULL,
+  jwk_json TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY (jwks_url, kid)
+);
+CREATE TABLE IF NOT EXISTS catalog_jwks_refresh (
+  jwks_url TEXT PRIMARY KEY,
+  next_fetch_at INTEGER NOT NULL,
+  refreshing_until INTEGER NOT NULL,
+  failure_count INTEGER NOT NULL,
+  last_success_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS catalog_barrier (
   barrier_id TEXT PRIMARY KEY,
   ts INTEGER NOT NULL,
@@ -67,6 +94,59 @@ export type CatalogEnv = Record<string, never>;
 
 type AuthEpochScope = "global" | "tenant" | "principal";
 type CatalogSql = ReturnType<typeof adaptSqlStorage>;
+
+const JWKS_URL_MAX_BYTES = 2_048;
+
+const JWKS_V2_COLUMNS = [
+    ["jwks_url", "TEXT", 1, 1],
+    ["kid", "TEXT", 1, 2],
+    ["jwk_json", "TEXT", 1, 0],
+    ["fetched_at", "INTEGER", 1, 0],
+    ["expires_at", "INTEGER", 1, 0],
+] as const;
+
+const JWKS_REFRESH_COLUMNS = [
+    ["jwks_url", "TEXT", 0, 1],
+    ["next_fetch_at", "INTEGER", 1, 0],
+    ["refreshing_until", "INTEGER", 1, 0],
+    ["failure_count", "INTEGER", 1, 0],
+    ["last_success_at", "INTEGER", 0, 0],
+] as const;
+
+type JwksRefreshOutcome =
+    | { readonly ok: true }
+    | { readonly ok: false; readonly message: string; readonly retryAfterMs: number };
+
+function assertInternalTable(
+    sql: CatalogSql,
+    table: "catalog_jwks_v2" | "catalog_jwks_refresh",
+    expected: readonly (readonly [name: string, type: string, notnull: number, pk: number])[]
+): void {
+    const actual = sql
+        .all<{ name: string; type: string; notnull: number; pk: number }>(`PRAGMA table_info('${table}')`)
+        .map(row => [row.name, row.type.toUpperCase(), row.notnull, row.pk] as const);
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+        throw new CdbError({
+            code: "CDB_INVARIANT",
+            message: `Catalog internal schema mismatch for ${table}`,
+        });
+    }
+}
+
+function normalizeJwksUrl(rawUrl: string): string | null {
+    if (new TextEncoder().encode(rawUrl).byteLength > JWKS_URL_MAX_BYTES) return null;
+    try {
+        const url = new URL(rawUrl);
+        if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) return null;
+        return url.toString();
+    } catch {
+        return null;
+    }
+}
+
+function jwksResolutionUnavailable(message: string, retryAfterMs: number): CatalogJwkResolution {
+    return { ok: false, message, retryAfterMs: Math.max(1, Math.ceil(retryAfterMs)) };
+}
 
 function addEpochScope(
     scopes: Map<string, { scope: AuthEpochScope; scopeId: string }>,
@@ -138,6 +218,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
     private bootstrapped = false;
     private authTablesBootstrapped = false;
     private cachedMap: VshardMap | null = null;
+    private readonly jwksRefreshes = new Map<string, Promise<JwksRefreshOutcome>>();
 
     constructor(state: DurableObjectState, env: CatalogEnv) {
         super(state, env);
@@ -153,6 +234,8 @@ export class Catalog extends DurableObject<CatalogEnv> {
             .filter(Boolean)) {
             sql.exec(stmt);
         }
+        assertInternalTable(sql, "catalog_jwks_v2", JWKS_V2_COLUMNS);
+        assertInternalTable(sql, "catalog_jwks_refresh", JWKS_REFRESH_COLUMNS);
         sql.exec(
             "INSERT OR IGNORE INTO catalog_ranges (lo, hi, shard_id) VALUES (?, ?, ?)",
             0,
@@ -473,6 +556,176 @@ export class Catalog extends DurableObject<CatalogEnv> {
             tenant: args.tenantId ? this.readEpoch("auth_tenant", args.tenantId) : 0,
             principal: args.principalId ? this.readEpoch("auth_principal", args.principalId) : 0,
         };
+    }
+
+    async resolveJwk(request: CatalogJwkResolutionRequest): Promise<CatalogJwkResolution> {
+        const jwksUrl = normalizeJwksUrl(request.jwksUrl);
+        if (jwksUrl === null) {
+            return jwksResolutionUnavailable("Catalog JWKS URL is invalid", JWKS_FAILURE_BACKOFF_MAX_MS);
+        }
+        if (request.kid.length === 0 || new TextEncoder().encode(request.kid).byteLength > JWKS_MAX_KID_BYTES) {
+            return { ok: true, jwkJson: null };
+        }
+
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        const scoped = this.readScopedJwk(sql, jwksUrl, request.kid);
+        if (scoped && scoped.expiresAt > Date.now()) {
+            try {
+                parseCachedJwk(scoped.jwkJson);
+                return { ok: true, jwkJson: scoped.jwkJson };
+            } catch {
+                // A corrupt cache row is never trusted. Treat it like an
+                // expired row and require a successful remote replacement.
+            }
+        }
+
+        const refreshState = sql.one<{
+            next_fetch_at: number;
+            refreshing_until: number;
+            failure_count: number;
+        }>(
+            `SELECT next_fetch_at, refreshing_until, failure_count
+             FROM catalog_jwks_refresh WHERE jwks_url = ?`,
+            jwksUrl
+        );
+
+        const existing = this.jwksRefreshes.get(jwksUrl);
+        if (existing) return this.finishJwkResolution(existing, jwksUrl, request.kid);
+
+        const now = Date.now();
+        if (refreshState && refreshState.refreshing_until > now) {
+            return jwksResolutionUnavailable(
+                "Catalog JWKS refresh is already in progress",
+                refreshState.refreshing_until - now
+            );
+        }
+        if (refreshState && refreshState.next_fetch_at > now) {
+            if (refreshState.failure_count > 0) {
+                return jwksResolutionUnavailable(
+                    "Catalog JWKS refresh is cooling down after a failure",
+                    refreshState.next_fetch_at - now
+                );
+            }
+            if (!scoped) return { ok: true, jwkJson: null };
+        }
+
+        this.markJwksRefreshLease(sql, jwksUrl, now + JWKS_REFRESH_LEASE_MS);
+        const refresh = this.refreshJwks(jwksUrl);
+        this.jwksRefreshes.set(jwksUrl, refresh);
+        try {
+            return await this.finishJwkResolution(refresh, jwksUrl, request.kid);
+        } finally {
+            if (this.jwksRefreshes.get(jwksUrl) === refresh) this.jwksRefreshes.delete(jwksUrl);
+        }
+    }
+
+    private async finishJwkResolution(
+        refresh: Promise<JwksRefreshOutcome>,
+        jwksUrl: string,
+        kid: string
+    ): Promise<CatalogJwkResolution> {
+        const outcome = await refresh;
+        if (!outcome.ok) return outcome;
+        const row = this.readScopedJwk(adaptSqlStorage(this.ctx.storage.sql), jwksUrl, kid);
+        if (!row || row.expiresAt <= Date.now()) return { ok: true, jwkJson: null };
+        try {
+            parseCachedJwk(row.jwkJson);
+            return { ok: true, jwkJson: row.jwkJson };
+        } catch {
+            return jwksResolutionUnavailable("Catalog stored an invalid JWK", JWKS_FAILURE_BACKOFF_INITIAL_MS);
+        }
+    }
+
+    private async refreshJwks(jwksUrl: string): Promise<JwksRefreshOutcome> {
+        try {
+            const fresh = await fetchValidatedJwks((url, init) => globalThis.fetch(url, init), jwksUrl);
+            const now = Date.now();
+            this.ctx.storage.transactionSync(() => {
+                const sql = adaptSqlStorage(this.ctx.storage.sql);
+                sql.exec("DELETE FROM catalog_jwks_v2 WHERE jwks_url = ?", jwksUrl);
+                for (const key of fresh.keys) {
+                    sql.exec(
+                        `INSERT INTO catalog_jwks_v2
+                         (jwks_url, kid, jwk_json, fetched_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
+                        jwksUrl,
+                        key.kid as string,
+                        JSON.stringify(key),
+                        now,
+                        now + JWKS_CACHE_TTL_MS
+                    );
+                }
+                sql.exec(
+                    `INSERT INTO catalog_jwks_refresh
+                     (jwks_url, next_fetch_at, refreshing_until, failure_count, last_success_at)
+                     VALUES (?, ?, 0, 0, ?)
+                     ON CONFLICT(jwks_url) DO UPDATE SET
+                       next_fetch_at = excluded.next_fetch_at,
+                       refreshing_until = 0,
+                       failure_count = 0,
+                       last_success_at = excluded.last_success_at`,
+                    jwksUrl,
+                    now + JWKS_SUCCESS_COOLDOWN_MS,
+                    now
+                );
+            });
+            return { ok: true };
+        } catch (cause) {
+            const now = Date.now();
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const previous = sql.one<{ failure_count: number }>(
+                "SELECT failure_count FROM catalog_jwks_refresh WHERE jwks_url = ?",
+                jwksUrl
+            );
+            const failureCount = Math.min((previous?.failure_count ?? 0) + 1, 31);
+            const retryAfterMs = Math.min(
+                JWKS_FAILURE_BACKOFF_MAX_MS,
+                JWKS_FAILURE_BACKOFF_INITIAL_MS * 2 ** Math.min(failureCount - 1, 16)
+            );
+            try {
+                sql.exec(
+                    `INSERT INTO catalog_jwks_refresh
+                     (jwks_url, next_fetch_at, refreshing_until, failure_count, last_success_at)
+                     VALUES (?, ?, 0, ?, NULL)
+                     ON CONFLICT(jwks_url) DO UPDATE SET
+                       next_fetch_at = excluded.next_fetch_at,
+                       refreshing_until = 0,
+                       failure_count = excluded.failure_count`,
+                    jwksUrl,
+                    now + retryAfterMs,
+                    failureCount
+                );
+            } catch {
+                // The caller still receives a typed fail-closed result. A
+                // broken Catalog store cannot promise durable cooldown state.
+            }
+            const message = cause instanceof Error ? cause.message : "Catalog JWKS refresh failed";
+            return jwksResolutionUnavailable(message, retryAfterMs);
+        }
+    }
+
+    private readScopedJwk(
+        sql: CatalogSql,
+        jwksUrl: string,
+        kid: string
+    ): { readonly jwkJson: string; readonly expiresAt: number } | null {
+        const row = sql.one<{ jwk_json: string; expires_at: number }>(
+            `SELECT jwk_json, expires_at FROM catalog_jwks_v2
+             WHERE jwks_url = ? AND kid = ?`,
+            jwksUrl,
+            kid
+        );
+        return row ? { jwkJson: row.jwk_json, expiresAt: row.expires_at } : null;
+    }
+
+    private markJwksRefreshLease(sql: CatalogSql, jwksUrl: string, refreshingUntil: number): void {
+        sql.exec(
+            `INSERT INTO catalog_jwks_refresh
+             (jwks_url, next_fetch_at, refreshing_until, failure_count, last_success_at)
+             VALUES (?, 0, ?, 0, NULL)
+             ON CONFLICT(jwks_url) DO UPDATE SET refreshing_until = excluded.refreshing_until`,
+            jwksUrl,
+            refreshingUntil
+        );
     }
 
     async putJwk(kid: string, jwkJson: string, ttlMs: number): Promise<void> {

@@ -1,99 +1,239 @@
-/**
- * JWKS resolver backed by the Catalog DO's `catalog_jwks` SWR cache.
- *
- * Better-auth's `jwt()` plugin exposes the JWKS at `/api/auth/jwks`.
- * The Gateway DO can't make outbound HTTP requests to its own Worker
- * cheaply on every connection — so we cache the resolved JWK set in
- * the Catalog DO and refresh it lazily when:
- *
- *   - the requested `kid` is missing from the cache (cold-start path),
- *   - the cached entry is past its `expires_at` (TTL refresh).
- *
- * The cache is shared across every Gateway instance because all of
- * them route through the singleton Catalog DO. Concurrent fetches for
- * the same `kid` are serialized at the Catalog DO's input gate, so
- * we never fan out N parallel JWKS pulls during a thundering-herd
- * boot of N websockets.
- */
+/** Catalog-backed JWKS lookup and strict remote-document validation. */
 
 import type { JWK } from "jose";
 import { CdbError } from "../errors.ts";
 import type { JwksResolver } from "./jwt.ts";
 
-/** Default freshness — better-auth's `jwt` plugin rotates keys every ~30d. */
-const DEFAULT_TTL_MS = 60 * 60 * 1000;
+export const JWKS_CACHE_TTL_MS = 60 * 60 * 1000;
+export const JWKS_FETCH_TIMEOUT_MS = 5_000;
+export const JWKS_REFRESH_LEASE_MS = 10_000;
+export const JWKS_MAX_DOCUMENT_BYTES = 256 * 1024;
+export const JWKS_MAX_KEYS = 32;
+export const JWKS_MAX_KID_BYTES = 256;
+export const JWKS_SUCCESS_COOLDOWN_MS = 5_000;
+export const JWKS_FAILURE_BACKOFF_INITIAL_MS = 1_000;
+export const JWKS_FAILURE_BACKOFF_MAX_MS = 60_000;
 
 interface CatalogJwksRpc {
     getJwk(kid: string): Promise<{ jwkJson: string; expiresAt: number } | null>;
     putJwk(kid: string, jwkJson: string, ttlMs: number): Promise<void>;
 }
 
-interface JwksDocument {
-    readonly keys: readonly JWK[];
+export type JwksFetcher = (url: string, init?: RequestInit) => Promise<Response>;
+
+export interface CatalogJwkResolutionRequest {
+    readonly kid: string;
+    readonly jwksUrl: string;
+}
+
+export type CatalogJwkResolution =
+    | { readonly ok: true; readonly jwkJson: string | null }
+    | { readonly ok: false; readonly message: string; readonly retryAfterMs: number };
+
+export interface CatalogOwnedJwksRpc {
+    resolveJwk(request: CatalogJwkResolutionRequest): Promise<CatalogJwkResolution>;
 }
 
 export interface CatalogJwksResolverOptions {
-    /**
-     * Catalog DO RPC stub. Caller resolves the singleton id
-     * (`env.CDB_CATALOG.idFromName("global")`) and hands the stub in.
-     */
     readonly catalog: CatalogJwksRpc;
-    /**
-     * Absolute URL the better-auth `jwt()` plugin serves the JWKS at —
-     * normally `${baseURL}/api/auth/jwks`. The resolver fetches this
-     * URL on cache miss; the entrypoint Worker can route the request
-     * back to itself via the same fetch handler since `/api/auth/*`
-     * is mounted by `mountChardb`.
-     */
     readonly jwksUrl: string;
-    /** Cache entry TTL in milliseconds. Defaults to 1h. */
     readonly ttlMs?: number;
-    /**
-     * Custom fetcher — useful in tests (no network) or to inject
-     * a service-binding-routed fetch when the Worker has its own
-     * RPC stub for the Worker that hosts better-auth.
-     */
-    readonly fetch?: (url: string) => Promise<Response>;
+    readonly fetch?: JwksFetcher;
 }
 
+export interface FetchJwksOptions {
+    readonly timeoutMs?: number;
+    readonly maxDocumentBytes?: number;
+    readonly maxKeys?: number;
+    readonly maxKidBytes?: number;
+}
+
+export interface ValidatedJwksDocument {
+    readonly keys: readonly JWK[];
+}
+
+/**
+ * Compatibility resolver for direct callers and unit tests. Production
+ * Gateway verification uses the Catalog-owned resolver below so refresh
+ * coordination and cooldown state are shared across Gateway objects.
+ */
 export function createCatalogJwksResolver(opts: CatalogJwksResolverOptions): JwksResolver {
-    const ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
+    const ttlMs = opts.ttlMs ?? JWKS_CACHE_TTL_MS;
     const fetcher = opts.fetch ?? globalThis.fetch.bind(globalThis);
 
     return async (kid: string): Promise<JWK | null> => {
         const cached = await opts.catalog.getJwk(kid);
-        if (cached && cached.expiresAt > Date.now()) {
-            return JSON.parse(cached.jwkJson) as JWK;
-        }
-        // Cache miss or stale — fetch + cache. We refresh the entire
-        // JWKS in one round-trip (better-auth never lists more than a
-        // handful of keys at a time) so a wave of unknown-kid requests
-        // converges to a single fetch.
-        const fresh = await fetchJwks(fetcher, opts.jwksUrl);
+        if (cached && cached.expiresAt > Date.now()) return parseCachedJwk(cached.jwkJson);
+
+        const fresh = await fetchValidatedJwks(fetcher, opts.jwksUrl);
         let found: JWK | null = null;
         for (const key of fresh.keys) {
-            if (typeof key.kid !== "string") continue;
-            await opts.catalog.putJwk(key.kid, JSON.stringify(key), ttlMs);
+            await opts.catalog.putJwk(key.kid as string, JSON.stringify(key), ttlMs);
             if (key.kid === kid) found = key;
         }
         return found;
     };
 }
 
-async function fetchJwks(fetcher: (url: string) => Promise<Response>, url: string): Promise<JwksDocument> {
-    const res = await fetcher(url);
-    if (!res.ok) {
-        throw new CdbError({
-            code: "CDB_FORBIDDEN",
-            message: `jwks_cache: ${url} returned ${res.status}`,
-        });
+/** Resolve through the singleton Catalog without exposing cache state to Gateway. */
+export function createCatalogOwnedJwksResolver(catalog: CatalogOwnedJwksRpc, jwksUrl: string): JwksResolver {
+    return async (kid: string): Promise<JWK | null> => {
+        const result = await catalog.resolveJwk({ kid, jwksUrl });
+        if (!result.ok) {
+            throw new CdbError({
+                code: "CDB_CATALOG_UNAVAILABLE",
+                message: result.message,
+                retryAfterMs: result.retryAfterMs,
+            });
+        }
+        return result.jwkJson === null ? null : parseCachedJwk(result.jwkJson);
+    };
+}
+
+export function parseCachedJwk(jwkJson: string): JWK {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(jwkJson);
+    } catch (cause) {
+        throw jwksUnavailable("jwks_cache: cached JWK is invalid JSON", cause);
     }
-    const doc = (await res.json()) as JwksDocument;
-    if (!doc || !Array.isArray(doc.keys)) {
-        throw new CdbError({
-            code: "CDB_FORBIDDEN",
-            message: "jwks_cache: malformed JWKS document",
-        });
+    return validateJwk(parsed, JWKS_MAX_KID_BYTES, new Set<string>());
+}
+
+export async function fetchValidatedJwks(
+    fetcher: JwksFetcher,
+    url: string,
+    options: FetchJwksOptions = {}
+): Promise<ValidatedJwksDocument> {
+    const timeoutMs = options.timeoutMs ?? JWKS_FETCH_TIMEOUT_MS;
+    const maxDocumentBytes = options.maxDocumentBytes ?? JWKS_MAX_DOCUMENT_BYTES;
+    const maxKeys = options.maxKeys ?? JWKS_MAX_KEYS;
+    const maxKidBytes = options.maxKidBytes ?? JWKS_MAX_KID_BYTES;
+
+    const abort = new AbortController();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+            abort.abort("JWKS fetch timed out");
+            reject(jwksUnavailable(`jwks_cache: ${url} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+    });
+    try {
+        const response = await Promise.race([fetcher(url, { signal: abort.signal }), timedOut]);
+        if (!response.ok) throw jwksUnavailable(`jwks_cache: ${url} returned ${response.status}`);
+        const text = await Promise.race([readBoundedBody(response, maxDocumentBytes), timedOut]);
+        let document: unknown;
+        try {
+            document = JSON.parse(text);
+        } catch (cause) {
+            throw jwksUnavailable("jwks_cache: invalid JWKS JSON", cause);
+        }
+        if (document === null || typeof document !== "object" || Array.isArray(document)) {
+            throw jwksUnavailable("jwks_cache: JWKS root must be an object");
+        }
+        const keys = (document as { readonly keys?: unknown }).keys;
+        if (!Array.isArray(keys) || keys.length === 0) {
+            throw jwksUnavailable("jwks_cache: JWKS keys must be a nonempty array");
+        }
+        if (keys.length > maxKeys) {
+            throw jwksUnavailable(`jwks_cache: JWKS exceeds the ${maxKeys}-key limit`);
+        }
+
+        const kids = new Set<string>();
+        return { keys: keys.map(key => validateJwk(key, maxKidBytes, kids)) };
+    } catch (cause) {
+        if (cause instanceof CdbError) throw cause;
+        throw jwksUnavailable(`jwks_cache: ${url} fetch failed`, cause);
+    } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
     }
-    return doc;
+}
+
+function validateJwk(value: unknown, maxKidBytes: number, kids: Set<string>): JWK {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw jwksUnavailable("jwks_cache: each JWK must be an object");
+    }
+    const key = value as Record<string, unknown>;
+    if (typeof key.kid !== "string" || key.kid.length === 0) {
+        throw jwksUnavailable("jwks_cache: each JWK must have a nonempty kid");
+    }
+    if (new TextEncoder().encode(key.kid).byteLength > maxKidBytes) {
+        throw jwksUnavailable(`jwks_cache: JWK kid exceeds ${maxKidBytes} bytes`);
+    }
+    if (kids.has(key.kid)) throw jwksUnavailable(`jwks_cache: duplicate JWK kid ${key.kid}`);
+    kids.add(key.kid);
+    if (typeof key.kty !== "string" || key.kty.length === 0) {
+        throw jwksUnavailable(`jwks_cache: JWK ${key.kid} is missing kty`);
+    }
+    if (key.alg !== undefined && (typeof key.alg !== "string" || key.alg.length === 0)) {
+        throw jwksUnavailable(`jwks_cache: JWK ${key.kid} has an invalid alg`);
+    }
+    if (key.use !== undefined && typeof key.use !== "string") {
+        throw jwksUnavailable(`jwks_cache: JWK ${key.kid} has an invalid use`);
+    }
+    if (key.key_ops !== undefined && !isStringArray(key.key_ops)) {
+        throw jwksUnavailable(`jwks_cache: JWK ${key.kid} has invalid key_ops`);
+    }
+    validateKeyMaterial(key);
+    return key as JWK;
+}
+
+function validateKeyMaterial(key: Record<string, unknown>): void {
+    const required =
+        key.kty === "EC"
+            ? ["crv", "x", "y"]
+            : key.kty === "OKP"
+              ? ["crv", "x"]
+              : key.kty === "RSA"
+                ? ["n", "e"]
+                : key.kty === "oct"
+                  ? ["k"]
+                  : null;
+    if (required === null) throw jwksUnavailable(`jwks_cache: JWK ${String(key.kid)} has unsupported kty`);
+    for (const field of required) {
+        if (typeof key[field] !== "string" || key[field].length === 0) {
+            throw jwksUnavailable(`jwks_cache: JWK ${String(key.kid)} is missing ${field}`);
+        }
+    }
+}
+
+function isStringArray(value: unknown): value is readonly string[] {
+    return Array.isArray(value) && value.every(item => typeof item === "string");
+}
+
+async function readBoundedBody(response: Response, maxBytes: number): Promise<string> {
+    if (!response.body) return "";
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > maxBytes) {
+                await reader.cancel();
+                throw jwksUnavailable(`jwks_cache: JWKS exceeds ${maxBytes} bytes`);
+            }
+            chunks.push(value);
+        }
+    } catch (cause) {
+        if (cause instanceof CdbError) throw cause;
+        throw jwksUnavailable("jwks_cache: failed to read JWKS response", cause);
+    }
+    const body = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        body.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(body);
+}
+
+function jwksUnavailable(message: string, cause?: unknown): CdbError {
+    return new CdbError({
+        code: "CDB_CATALOG_UNAVAILABLE",
+        message,
+        ...(cause === undefined ? {} : { cause }),
+    });
 }

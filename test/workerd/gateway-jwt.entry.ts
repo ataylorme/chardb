@@ -7,6 +7,7 @@ import { vshardOf } from "../../src/vshard.ts";
 
 const ISSUER = "https://issuer.example";
 const AUDIENCE = "chardb-workerd";
+const JWKS_URL = "https://unreachable.invalid/jwks";
 const USER_ID = "workerd-user";
 const ORGANIZATION_ID = "workerd-org";
 const OTHER_ORGANIZATION_ID = "workerd-org-b";
@@ -23,7 +24,7 @@ const auth = defineAuth({
         jwt({
             jwt: { issuer: ISSUER, audience: AUDIENCE },
             jwks: {
-                remoteUrl: "https://unreachable.invalid/jwks",
+                remoteUrl: JWKS_URL,
                 keyPairConfig: { alg: "ES256" },
             },
         }),
@@ -164,6 +165,50 @@ export class Catalog extends app.Catalog {
     private authorityEntered: Promise<void> = Promise.resolve();
     private markAuthorityEntered: (() => void) | undefined;
 
+    seedJwkForTest(jwksUrl: string, kid: string, jwkJson: string, ttlMs: number): void {
+        const now = Date.now();
+        const cursor = this.ctx.storage.sql.exec(
+            `INSERT INTO catalog_jwks_v2
+             (jwks_url, kid, jwk_json, fetched_at, expires_at) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(jwks_url, kid) DO UPDATE SET
+               jwk_json = excluded.jwk_json,
+               fetched_at = excluded.fetched_at,
+               expires_at = excluded.expires_at`,
+            jwksUrl,
+            kid,
+            jwkJson,
+            now,
+            now + ttlMs
+        );
+        for (const _ of cursor.raw()) {
+            // Drain the write cursor.
+        }
+    }
+
+    expireJwkForTest(jwksUrl: string, kid: string): boolean {
+        const cursor = this.ctx.storage.sql.exec(
+            "UPDATE catalog_jwks_v2 SET expires_at = 0 WHERE jwks_url = ? AND kid = ?",
+            jwksUrl,
+            kid
+        );
+        for (const _ of cursor.raw()) {
+            // Drain the write cursor before reading changes().
+        }
+        const changes = this.ctx.storage.sql.exec("SELECT changes() AS changes");
+        for (const row of changes.raw()) return Number(row[0]) === 1;
+        return false;
+    }
+
+    releaseJwksCooldownForTest(jwksUrl: string): void {
+        const cursor = this.ctx.storage.sql.exec(
+            "UPDATE catalog_jwks_refresh SET next_fetch_at = 0, refreshing_until = 0 WHERE jwks_url = ?",
+            jwksUrl
+        );
+        for (const _ of cursor.raw()) {
+            // Drain the write cursor.
+        }
+    }
+
     setAuthorityFault(fault: AuthorityFault): void {
         this.authorityFault = fault;
         if (fault === "hold" || fault === "hold-throw") {
@@ -225,7 +270,7 @@ export default {
                 : {};
             const id = env.CDB_CATALOG.idFromName("global");
             const catalog = env.CDB_CATALOG.get(id) as unknown as {
-                putJwk(kid: string, jwkJson: string, ttlMs: number): Promise<void>;
+                seedJwkForTest(jwksUrl: string, kid: string, jwkJson: string, ttlMs: number): Promise<void>;
                 mutateAuth(args: {
                     readonly model: string;
                     readonly op: "create";
@@ -234,7 +279,7 @@ export default {
                 route(vshard: number): Promise<{ readonly shardId: string }>;
             };
             if (body.kid !== undefined && body.jwk !== undefined) {
-                await catalog.putJwk(body.kid, JSON.stringify(body.jwk), 60_000);
+                await catalog.seedJwkForTest(JWKS_URL, body.kid, JSON.stringify(body.jwk), 60_000);
             }
             const now = Date.parse("2026-08-23T00:00:00Z");
             await catalog.mutateAuth({
@@ -335,15 +380,23 @@ export default {
             });
         }
         if (url.pathname === "/expire-jwk") {
-            const body = (await request.json()) as { readonly kid: string };
+            const body = (await request.json()) as { readonly kid: string; readonly jwksUrl: string };
             const id = env.CDB_CATALOG.idFromName("global");
             const catalog = env.CDB_CATALOG.get(id) as unknown as {
-                getJwk(kid: string): Promise<{ readonly jwkJson: string } | null>;
-                putJwk(kid: string, jwkJson: string, ttlMs: number): Promise<void>;
+                expireJwkForTest(jwksUrl: string, kid: string): Promise<boolean>;
             };
-            const cached = await catalog.getJwk(body.kid);
-            if (!cached) return new Response("JWK is not cached", { status: 404 });
-            await catalog.putJwk(body.kid, cached.jwkJson, -1);
+            if (!(await catalog.expireJwkForTest(body.jwksUrl, body.kid))) {
+                return new Response("JWK is not cached", { status: 404 });
+            }
+            return Response.json({ ok: true });
+        }
+        if (url.pathname === "/release-jwks-cooldown") {
+            const body = (await request.json()) as { readonly jwksUrl: string };
+            const id = env.CDB_CATALOG.idFromName("global");
+            const catalog = env.CDB_CATALOG.get(id) as unknown as {
+                releaseJwksCooldownForTest(jwksUrl: string): Promise<void>;
+            };
+            await catalog.releaseJwksCooldownForTest(body.jwksUrl);
             return Response.json({ ok: true });
         }
         if (url.pathname === "/authority-fault") {
