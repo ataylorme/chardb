@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { Miniflare } from "miniflare";
 import { type ChardbRef, ClientId, MutId, SubId } from "../../src/types.ts";
-import { type Down, PROTOCOL_V, decodeWire, encodeWire } from "../../src/wire.ts";
+import { type Down, PROTOCOL_V, type Up, decodeWire, encodeWire } from "../../src/wire.ts";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ENTRY = path.join(HERE, "gateway-live.entry.ts");
@@ -64,6 +64,7 @@ let mf: Miniflare | undefined;
 let workerdUrl: URL | undefined;
 let mutationRef: ChardbRef | undefined;
 let queryRef: ChardbRef | undefined;
+let publicQueryRef: ChardbRef | undefined;
 let shardId = "";
 let signToken: ((subject: string) => Promise<string>) | undefined;
 
@@ -104,7 +105,7 @@ async function buildWorker(): Promise<string> {
     }
 }
 
-async function openSocket(clientId: string, jwt: string): Promise<OpenedSocket> {
+async function openSocket(clientId: string, jwt: string, immediate?: Up): Promise<OpenedSocket> {
     if (!workerdUrl) throw new Error("Miniflare is not initialized");
     const url = new URL("/ws", workerdUrl);
     url.searchParams.set("clientId", clientId);
@@ -139,6 +140,7 @@ async function openSocket(clientId: string, jwt: string): Promise<OpenedSocket> 
             jwt,
         })
     );
+    if (immediate) socket.send(encodeWire(immediate));
     return { socket, welcome: await welcome, closed };
 }
 
@@ -305,13 +307,16 @@ beforeAll(async () => {
     const seed = (await seeded.json()) as {
         readonly mutationRef: ChardbRef;
         readonly queryRef: ChardbRef;
+        readonly publicQueryRef: ChardbRef;
         readonly shardA: string;
         readonly shardB: string;
     };
     mutationRef = seed.mutationRef;
     queryRef = seed.queryRef;
+    publicQueryRef = seed.publicQueryRef;
     shardId = seed.shardA;
     expect(seed.shardA).toBe(seed.shardB);
+    await fixtureFetch("/live-public-seed", { shardId });
 });
 
 afterAll(async () => {
@@ -319,6 +324,73 @@ afterAll(async () => {
 });
 
 describe("public durable live queries in real workerd", () => {
+    test("publicRead remains JWT-authenticated, membership-bound, and tenant-scoped", async () => {
+        if (!publicQueryRef) throw new Error("public query ref was not seeded");
+        const clientId = "public-reader-08";
+        const opened = await openSocket(clientId, await signed("workerd-user"));
+        expect(opened.welcome.t).toBe("welcome");
+
+        const snapshotMessage = nextDown(opened.socket);
+        opened.socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(20),
+                ref: publicQueryRef,
+                args: { organizationId: ORGANIZATION_A },
+            })
+        );
+        await currentRegistration(clientId, 20);
+        await drainGateway(clientId);
+        const snapshot = await snapshotMessage;
+        expect(snapshot).toEqual({
+            t: "snapshot",
+            subId: SubId(20),
+            cookie: expect.any(String),
+            rows: [{ id: "public-org-a", organizationId: ORGANIZATION_A, label: "Organization A" }],
+        });
+        if (snapshot.t !== "snapshot") throw new Error("expected publicRead snapshot");
+        acknowledge(opened.socket, snapshot);
+
+        const forbidden = nextDown(opened.socket);
+        opened.socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(21),
+                ref: publicQueryRef,
+                args: { organizationId: ORGANIZATION_B },
+            })
+        );
+        await expect(forbidden).resolves.toMatchObject({
+            t: "error",
+            subId: 21,
+            code: "CDB_FORBIDDEN",
+            retryable: false,
+        });
+        expect((await gatewayState(clientId)).registrations.some(row => row.subId === 21 && row.currentHead)).toBe(
+            false
+        );
+
+        opened.socket.close();
+        await opened.closed;
+        await drainGateway(clientId);
+
+        for (const [rejectedClientId, jwt] of [
+            ["missing-jwt-09", ""],
+            ["invalid-jwt-10", "not-a-jwt"],
+        ] as const) {
+            const rejected = await openSocket(rejectedClientId, jwt, {
+                t: "sub",
+                subId: SubId(1),
+                ref: publicQueryRef,
+                args: { organizationId: ORGANIZATION_A },
+            });
+            expect(rejected.welcome).toMatchObject({ t: "error", code: "CDB_FORBIDDEN", retryable: false });
+            expect(rejected.welcome.t).not.toBe("welcome");
+            await rejected.closed;
+            expect((await gatewayState(rejectedClientId)).registrations.some(row => row.currentHead)).toBe(false);
+        }
+    });
+
     test("two clients receive a committed replacement while another organization stays isolated", async () => {
         if (!mutationRef) throw new Error("mutation ref was not seeded");
         const clientA1 = "live-a-one-001";

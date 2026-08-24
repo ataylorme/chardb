@@ -1,5 +1,64 @@
+import { text } from "drizzle-orm/sqlite-core";
+import { z } from "zod";
+import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
+import { type ChardbManifest, api, forOrg, manifestFromExports } from "../../src/server/index.ts";
 import baseWorker, { Catalog, Cdb as ProductionCdb, Gateway as ProductionGateway } from "./gateway-jwt.entry.ts";
+
+const PUBLIC_QUERY_REF = "test/workerd/gateway-live.entry.ts#listPublicOrganizationRows";
+
+const { cdbTable } = forOrg();
+const publicOrganizationRows = cdbTable(
+    "gateway_public_rows",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id").notNull(),
+        label: text("label").notNull(),
+    },
+    {
+        tenantBy: "organizationId",
+        partitionBy: "organizationId",
+        publicRead: true,
+    }
+);
+
+const listPublicOrganizationRows = api.query({
+    ref: PUBLIC_QUERY_REF,
+    args: z.object({ organizationId: z.string() }),
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: args => ({
+        kind: "select",
+        tables: ["gateway_public_rows"],
+        partitionKey: {
+            table: "gateway_public_rows",
+            column: "organization_id",
+            values: [args.organizationId],
+        },
+        joinShape: "colocated",
+        intervals: [
+            {
+                table: "gateway_public_rows",
+                indexName: "organization_id",
+                intervals: [{ kind: "full" }],
+            },
+        ],
+    }),
+    // Deliberately omit a caller predicate. The authenticated organization
+    // floor must remain in force even though publicRead supplies the grant.
+    handler: async ctx => ctx.db.select().from(publicOrganizationRows).orderBy(publicOrganizationRows.id).all(),
+});
+
+const publicManifest = manifestFromExports({ listPublicOrganizationRows });
+
+function withPublicQuery(base: ChardbManifest): ChardbManifest {
+    return {
+        mutations: base.mutations,
+        queries: new Map([...base.queries, ...publicManifest.queries]),
+        crons: base.crons,
+        ledgers: base.ledgers,
+    };
+}
 
 interface Env {
     readonly CDB_CATALOG: DurableObjectNamespace;
@@ -50,6 +109,17 @@ export { Catalog };
 export class Gateway extends ProductionGateway {
     private readonly fixtureInstanceId = crypto.randomUUID();
     private fixtureNowSequence: number[] = [];
+
+    protected override runtimeManifest(): ChardbManifest {
+        return withPublicQuery(super.runtimeManifest());
+    }
+
+    protected override runtimePolicyDigest(tableNames: readonly string[]): string | null {
+        if (tableNames.every(table => table === "gateway_public_rows")) {
+            return cdbPolicyDigest({ publicOrganizationRows }, tableNames);
+        }
+        return super.runtimePolicyDigest(tableNames);
+    }
 
     // Tests call fixtureDrain after they inspect each durable transition. Keep
     // workerd's alarm delivery from racing those assertions.
@@ -128,6 +198,30 @@ export class Gateway extends ProductionGateway {
 export class Cdb extends ProductionCdb {
     private readonly fixtureInstanceId = crypto.randomUUID();
 
+    protected override mutationSchema(): Record<string, unknown> {
+        return { ...super.mutationSchema(), publicOrganizationRows };
+    }
+
+    protected override mutationManifest(): ChardbManifest {
+        return withPublicQuery(super.mutationManifest());
+    }
+
+    fixtureSeedPublicRows(): void {
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        sql.exec(
+            "INSERT INTO gateway_public_rows (id, organization_id, label) VALUES (?, ?, ?)",
+            "public-org-a",
+            "workerd-org",
+            "Organization A"
+        );
+        sql.exec(
+            "INSERT INTO gateway_public_rows (id, organization_id, label) VALUES (?, ?, ?)",
+            "public-org-b",
+            "workerd-org-b",
+            "Organization B"
+        );
+    }
+
     fixtureMatchOrganization(): CdbLiveState["subscriptions"] {
         const matched = this.matchSubsForRow("gateway_writes", [
             { indexName: "organization_id", key: ["workerd-org"] },
@@ -186,6 +280,7 @@ interface GatewayFixtureRpc {
 interface CdbFixtureRpc {
     fixtureMatchOrganization(): Promise<CdbLiveState["subscriptions"]>;
     fixtureLiveState(): Promise<CdbLiveState>;
+    fixtureSeedPublicRows(): Promise<void>;
 }
 
 type MembershipMutation =
@@ -209,6 +304,22 @@ interface CatalogFixtureRpc {
 export default {
     async fetch(request: Request, env: Env): Promise<Response> {
         const url = new URL(request.url);
+        if (url.pathname === "/seed") {
+            const response = await baseWorker.fetch(request, env);
+            if (!response.ok) return response;
+            return Response.json({
+                ...((await response.json()) as Record<string, unknown>),
+                publicQueryRef: listPublicOrganizationRows.__chardbRef,
+            });
+        }
+        if (url.pathname === "/live-public-seed") {
+            const shardId = url.searchParams.get("shardId");
+            if (!shardId) return new Response("missing shardId", { status: 400 });
+            const id = env.CDB_SHARD.idFromName(shardId);
+            const cdb = env.CDB_SHARD.get(id) as unknown as CdbFixtureRpc;
+            await cdb.fixtureSeedPublicRows();
+            return Response.json({ ok: true });
+        }
         if (url.pathname === "/live-membership") {
             const mutation = (await request.json()) as MembershipMutation;
             const id = env.CDB_CATALOG.idFromName("global");
