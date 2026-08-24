@@ -3715,7 +3715,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         }
     }
 
-    override async webSocketClose(ws: WebSocket): Promise<void> {
+    private async cleanupGatewaySocket(ws: WebSocket): Promise<void> {
         const attachment = ws.deserializeAttachment() as GwAttachment | null;
         if (attachment) {
             if (attachment.kind !== "rejected") {
@@ -3745,6 +3745,14 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 throw error;
             }
         }
+    }
+
+    override async webSocketClose(ws: WebSocket): Promise<void> {
+        await this.cleanupGatewaySocket(ws);
+    }
+
+    override async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
+        await this.cleanupGatewaySocket(ws);
     }
 
     private async onHello(ws: WebSocket, msg: Extract<Up, { t: "hello" }>): Promise<void> {

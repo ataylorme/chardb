@@ -501,6 +501,29 @@ describe("Gateway public durable registration", () => {
         expect(currentAlarm).toBe(101);
     });
 
+    test("socket error retires an active subscription and completes durable cleanup", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        const subscription = subscribeCalls[0]?.subscription;
+        if (!subscription) throw new Error("subscribe call was not recorded");
+        currentAlarm = null;
+        socketConnected = false;
+
+        await gateway.webSocketError(socket as unknown as WebSocket, new Error("socket failed"));
+
+        expect(socket.attachment as unknown).toMatchObject({ kind: "rejected", connectionId: "connection-1" });
+        expect(head()).toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "retiring", retry_at: 100 });
+        expect(currentAlarm as number | null).toBe(101);
+        expect(unsubscribeCalls).toEqual([]);
+
+        clock = 101;
+        currentAlarm = null;
+        await gateway.alarm();
+        expect(unsubscribeCalls).toEqual([subscription]);
+        expect(generation()).toBeNull();
+    });
+
     test("unsubscribe retires the head in the transaction that owns its cleanup alarm", async () => {
         await subscribe();
         await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
@@ -614,6 +637,32 @@ describe("Gateway public durable registration", () => {
             "transaction commit unavailable"
         );
 
+        expect(head()).not.toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "active", cdb_state: "active", retry_at: null });
+        expect(currentAlarm as number | null).toBe(101);
+        expect(unsubscribeCalls).toEqual([]);
+
+        clock = 101;
+        currentAlarm = null;
+        await gateway.alarm();
+        expect(unsubscribeCalls).toEqual([subscription]);
+        expect(generation()).toBeNull();
+    });
+
+    test("socket error commit failure falls back to an alarm that reconciles the abandoned head", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        const subscription = subscribeCalls[0]?.subscription;
+        if (!subscription) throw new Error("subscribe call was not recorded");
+        currentAlarm = null;
+        transactionCommitFailures = 1;
+        socketConnected = false;
+
+        await expect(
+            gateway.webSocketError(socket as unknown as WebSocket, new Error("socket failed"))
+        ).rejects.toThrow("transaction commit unavailable");
+
+        expect(socket.attachment as unknown).toMatchObject({ kind: "rejected", connectionId: "connection-1" });
         expect(head()).not.toBeNull();
         expect(generation()).toMatchObject({ lifecycle: "active", cdb_state: "active", retry_at: null });
         expect(currentAlarm as number | null).toBe(101);
