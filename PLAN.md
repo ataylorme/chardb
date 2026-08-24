@@ -214,7 +214,9 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Preserve the last delivered nonempty cookie on mutation failures and across auth refresh.
 - [x] Return typed errors for malformed messages instead of accepting any object with a known `t` field.
 - [x] Validate every wire message field.
-- [ ] Bound pending mutations, subscriptions, staged snapshots, and presence state.
+- [x] Cap unsettled Gateway mutations at 32 per connection and 256 per Gateway object. Reject excess work before dispatch with retryable `CDB_RATE_LIMITED` and release capacity on every settlement path.
+- [x] Accept inbound WebSocket text frames only through the exact 1 MiB UTF-8 boundary. Measure before wire decoding and close oversized frames with code 1009.
+- [ ] Bound subscriptions, staged snapshots, presence state, and other remaining queues.
 - [x] Define and test snapshot acknowledgement, durable retry until exact acknowledgement, and client same-cookie deduplication with re-acknowledgement.
 - [ ] Apply backpressure or disconnect slow consumers.
 - [ ] Make disconnect and shutdown reject or retain pending mutations according to a documented rule.
