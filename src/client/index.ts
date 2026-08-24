@@ -26,8 +26,10 @@ import {
 } from "../wire.ts";
 
 export const RECONNECT_RYW_WINDOW_MS = 30_000;
+const DEFAULT_MUTATION_TIMEOUT_MS = 60_000;
 const RECONNECT_INITIAL_BACKOFF_MS = 250;
 const RECONNECT_MAX_BACKOFF_MS = 10_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export interface ChardbClientOptions {
     readonly endpoint: string;
@@ -36,6 +38,8 @@ export interface ChardbClientOptions {
     readonly logicalDb?: string;
     readonly crossTab?: boolean;
     readonly persistMutations?: "memory" | "indexeddb";
+    /** Maximum time to wait for a mutation result, including reconnects. Defaults to 60 seconds. */
+    readonly mutationTimeoutMs?: number;
 }
 
 type SubState = "pending" | "live" | "refetching" | "error" | "closed";
@@ -67,6 +71,7 @@ interface PendingMutation {
     reject: (err: CdbError) => void;
     /** Set after first send so reconnect doesn't double-resolve. */
     inFlight: boolean;
+    timeout: ReturnType<typeof setTimeout> | null;
 }
 
 export interface ChardbClient {
@@ -84,6 +89,10 @@ export interface ChardbClient {
 }
 
 export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
+    const mutationTimeoutMs = opts.mutationTimeoutMs ?? DEFAULT_MUTATION_TIMEOUT_MS;
+    if (!Number.isSafeInteger(mutationTimeoutMs) || mutationTimeoutMs <= 0 || mutationTimeoutMs > MAX_TIMER_DELAY_MS) {
+        throw new RangeError(`mutationTimeoutMs must be an integer between 1 and ${MAX_TIMER_DELAY_MS}`);
+    }
     const clientId = ClientId(opts.clientId ?? crypto.randomUUID());
     const subs = new Map<number, SubRecord>();
     const pending = new Map<string, PendingMutation>();
@@ -223,7 +232,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 applyPatches(msg.patches, false);
                 if (msg.mutResults) {
                     for (const r of msg.mutResults) {
-                        const m = pending.get(r.mutId);
+                        const m = takePendingMutation(r.mutId);
                         if (!m) continue;
                         if (r.ok) {
                             m.resolve(r.result);
@@ -235,7 +244,6 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                                 })
                             );
                         }
-                        pending.delete(r.mutId);
                     }
                 }
                 return;
@@ -323,6 +331,20 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         void code;
     }
 
+    function clearMutationTimeout(mutation: PendingMutation): void {
+        if (mutation.timeout === null) return;
+        clearTimeout(mutation.timeout);
+        mutation.timeout = null;
+    }
+
+    function takePendingMutation(mutId: MutId): PendingMutation | undefined {
+        const mutation = pending.get(mutId);
+        if (!mutation) return undefined;
+        pending.delete(mutId);
+        clearMutationTimeout(mutation);
+        return mutation;
+    }
+
     function failSession(code: CdbErrorCode, message: string, subState: TerminalSubState = "error"): void {
         if (terminated) return;
         terminated = true;
@@ -338,7 +360,10 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         const mutations = [...pending.values()];
         pending.clear();
         const error = new CdbError({ code, message });
-        for (const mutation of mutations) mutation.reject(error);
+        for (const mutation of mutations) {
+            clearMutationTimeout(mutation);
+            mutation.reject(error);
+        }
         ws?.close();
         bc?.close();
     }
@@ -381,6 +406,14 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     }
 
     function mutate<TResult = RawJson>(ref: string, args: RawJson): Promise<TResult> {
+        if (terminated) {
+            return Promise.reject(
+                new CdbError({
+                    code: "CDB_STREAM_ABORTED",
+                    message: "cannot issue a mutation after the Chardb client has closed",
+                })
+            );
+        }
         const mutId = MutId(uuidv7());
         return new Promise<TResult>((resolve, reject) => {
             const rec: PendingMutation = {
@@ -390,12 +423,35 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 resolve: resolve as (r: RawJson) => void,
                 reject,
                 inFlight: false,
+                timeout: null,
             };
             pending.set(mutId, rec);
+            rec.timeout = setTimeout(() => {
+                if (pending.get(mutId) !== rec) return;
+                pending.delete(mutId);
+                rec.timeout = null;
+                rec.reject(
+                    new CdbError({
+                        code: "CDB_MUTATION_OUTCOME_UNKNOWN",
+                        message: `mutation ${mutId} timed out after ${mutationTimeoutMs}ms`,
+                    })
+                );
+            }, mutationTimeoutMs);
             if (ws && state === "open") {
                 const up: Up = { t: "mut", mutId, ref: rec.ref, args };
-                ws.send(encodeWire(up));
-                rec.inFlight = true;
+                try {
+                    ws.send(encodeWire(up));
+                    rec.inFlight = true;
+                } catch (cause) {
+                    const failed = takePendingMutation(mutId);
+                    failed?.reject(
+                        new CdbError({
+                            code: "CDB_STREAM_ABORTED",
+                            message: `failed to send mutation ${mutId}`,
+                            cause,
+                        })
+                    );
+                }
             }
         });
     }

@@ -12,7 +12,7 @@
  * synchronous control of ordering.
  */
 import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
-import { createChardbClient } from "../src/client/index.ts";
+import { type ChardbClientOptions, createChardbClient } from "../src/client/index.ts";
 import { CdbError } from "../src/errors.ts";
 import { ChardbRef, ClientId, Cookie, SubId } from "../src/types.ts";
 import { type Down, PROTOCOL_V, type Up, encodeWire } from "../src/wire.ts";
@@ -65,12 +65,13 @@ afterEach(() => {
     if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
 });
 
-function client() {
+function client(overrides: Partial<ChardbClientOptions> = {}) {
     return createChardbClient({
         endpoint: "wss://example.com/ws",
         getJwt: async () => "jwt-stub",
         clientId: "c-test",
         crossTab: false,
+        ...overrides,
     });
 }
 
@@ -90,7 +91,65 @@ async function welcome(ws: FakeWS, cookie = "c-test:0"): Promise<void> {
     await flush();
 }
 
+function spyOnClearTimeout(): { readonly calls: unknown[]; restore: () => void } {
+    const original = globalThis.clearTimeout;
+    const calls: unknown[] = [];
+    globalThis.clearTimeout = ((handle: Parameters<typeof clearTimeout>[0]) => {
+        calls.push(handle);
+        original(handle);
+    }) as typeof clearTimeout;
+    return {
+        calls,
+        restore() {
+            globalThis.clearTimeout = original;
+        },
+    };
+}
+
+function installManualTimers(): {
+    runDelay: (delayMs: number) => void;
+    scheduledDelays: () => number[];
+    restore: () => void;
+} {
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    let nextId = 1;
+    const scheduled = new Map<number, { readonly delayMs: number; readonly run: () => void }>();
+    globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delayMs = 0, ...args: unknown[]) => {
+        const id = nextId++;
+        scheduled.set(id, { delayMs, run: () => callback(...args) });
+        return id as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = ((handle: Parameters<typeof clearTimeout>[0]) => {
+        scheduled.delete(handle as unknown as number);
+    }) as typeof clearTimeout;
+    return {
+        runDelay(delayMs) {
+            const entry = [...scheduled].find(([, timer]) => timer.delayMs === delayMs);
+            if (!entry) throw new Error(`expected a scheduled ${delayMs}ms timer`);
+            scheduled.delete(entry[0]);
+            entry[1].run();
+        },
+        scheduledDelays() {
+            return [...scheduled.values()].map(timer => timer.delayMs);
+        },
+        restore() {
+            globalThis.setTimeout = originalSetTimeout;
+            globalThis.clearTimeout = originalClearTimeout;
+        },
+    };
+}
+
 describe("createChardbClient — wire round-trip", () => {
+    test("rejects mutation timeout values that cannot produce a bounded timer", () => {
+        for (const mutationTimeoutMs of [0, -1, 1.5, Number.POSITIVE_INFINITY, 2_147_483_648]) {
+            expect(() => client({ mutationTimeoutMs })).toThrow(
+                "mutationTimeoutMs must be an integer between 1 and 2147483647"
+            );
+        }
+        expect(FakeWS.instances).toHaveLength(0);
+    });
+
     test("hello is sent on open with clientId and jwt", async () => {
         client();
         await flush();
@@ -586,6 +645,31 @@ describe("createChardbClient — wire round-trip", () => {
         expect(result).toEqual({ id: "row-1" });
     });
 
+    test("a successful mutation clears its deadline timer", async () => {
+        const c = client({ mutationTimeoutMs: 1_000 });
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const timeoutSpy = spyOnClearTimeout();
+        try {
+            const mutation = c.mutate("src/api.ts#post", {});
+            await flush();
+            const sent = ws.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "mut");
+            if (!sent || sent.t !== "mut") throw new Error("expected Up.mut");
+            ws.emit({
+                t: "poke",
+                cookie: Cookie("c-1:2"),
+                patches: [],
+                mutResults: [{ mutId: sent.mutId, ok: true, result: null, cookie: Cookie("c-1:2") }],
+            });
+            await mutation;
+            expect(timeoutSpy.calls).toHaveLength(1);
+        } finally {
+            timeoutSpy.restore();
+            c.close();
+        }
+    });
+
     test("mutate → mutResults ok=false rejects with a CdbError carrying the wire code", async () => {
         const c = client();
         await flush();
@@ -619,6 +703,133 @@ describe("createChardbClient — wire round-trip", () => {
         }
         expect(captured).toBeInstanceOf(CdbError);
         expect(captured?.code).toBe("CDB_CROSS_PARTITION");
+    });
+
+    test("a terminal server mutation failure clears its deadline timer", async () => {
+        const c = client({ mutationTimeoutMs: 1_000 });
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const timeoutSpy = spyOnClearTimeout();
+        try {
+            const mutation = c.mutate("src/api.ts#post", {});
+            await flush();
+            const sent = ws.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "mut");
+            if (!sent || sent.t !== "mut") throw new Error("expected Up.mut");
+            ws.emit({
+                t: "poke",
+                cookie: Cookie("c-1:3"),
+                patches: [],
+                mutResults: [
+                    {
+                        mutId: sent.mutId,
+                        ok: false,
+                        error: {
+                            code: "CDB_CROSS_PARTITION",
+                            retryable: false,
+                            docs: "https://chardb.dev/errors/cdb_cross_partition",
+                        },
+                    },
+                ],
+            });
+            await expect(mutation).rejects.toMatchObject({ code: "CDB_CROSS_PARTITION", retryable: false });
+            expect(timeoutSpy.calls).toHaveLength(1);
+        } finally {
+            timeoutSpy.restore();
+            c.close();
+        }
+    });
+
+    test("a synchronous mutation send failure settles once and cannot resend after reconnect", async () => {
+        const c = client({ mutationTimeoutMs: 1_000 });
+        await flush();
+        const first = fakeWebSocket();
+        await welcome(first);
+        const timeoutSpy = spyOnClearTimeout();
+        try {
+            first.failNextSend = true;
+            const mutation = c.mutate("src/api.ts#post", {});
+            await expect(mutation).rejects.toMatchObject({ code: "CDB_STREAM_ABORTED", retryable: true });
+            expect(timeoutSpy.calls).toHaveLength(1);
+
+            first.close();
+            await new Promise(resolve => setTimeout(resolve, 350));
+            const reconnected = fakeWebSocket(1);
+            await welcome(reconnected);
+            expect(reconnected.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+        } finally {
+            timeoutSpy.restore();
+            c.close();
+        }
+    });
+
+    test("a mutation timeout rejects once as outcome-unknown and ignores a late result", async () => {
+        const c = client({ mutationTimeoutMs: 20 });
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        let rejectionCount = 0;
+        const mutationError = c.mutate("src/api.ts#post", {}).catch(error => {
+            rejectionCount++;
+            return error;
+        });
+        await flush();
+        const sent = ws.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "mut");
+        if (!sent || sent.t !== "mut") throw new Error("expected Up.mut");
+
+        await new Promise(resolve => setTimeout(resolve, 40));
+        await expect(mutationError).resolves.toMatchObject({
+            code: "CDB_MUTATION_OUTCOME_UNKNOWN",
+            retryable: false,
+            message: `mutation ${sent.mutId} timed out after 20ms`,
+        });
+
+        ws.emit({
+            t: "poke",
+            cookie: Cookie("c-1:4"),
+            patches: [],
+            mutResults: [{ mutId: sent.mutId, ok: true, result: { late: true }, cookie: Cookie("c-1:4") }],
+        });
+        await flush();
+        expect(rejectionCount).toBe(1);
+        expect(c.state).toBe("open");
+        c.close();
+    });
+
+    test("reconnect resends the same mutId without resetting the original deadline", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 500 });
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+            const mutation = c.mutate("src/api.ts#post", { body: "once" });
+            await flush();
+            const firstSend = first.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "mut");
+            if (!firstSend || firstSend.t !== "mut") throw new Error("expected first Up.mut");
+
+            first.close();
+            await flush();
+            expect(timers.scheduledDelays().sort((a, b) => a - b)).toEqual([250, 500]);
+            timers.runDelay(250);
+            await flush();
+            const reconnected = fakeWebSocket(1);
+            await welcome(reconnected, "c-1:4");
+            const retry = reconnected.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "mut");
+            if (!retry || retry.t !== "mut") throw new Error("expected retried Up.mut");
+            expect(retry).toEqual(firstSend);
+            expect(timers.scheduledDelays()).toEqual([500]);
+
+            timers.runDelay(500);
+            await expect(mutation).rejects.toMatchObject({
+                code: "CDB_MUTATION_OUTCOME_UNKNOWN",
+                retryable: false,
+                message: `mutation ${retry.mutId} timed out after 500ms`,
+            });
+        } finally {
+            timers.restore();
+            c.close();
+        }
     });
 
     test("mustRefetch resets sub state and re-sends an Up.sub envelope", async () => {
@@ -762,5 +973,39 @@ describe("createChardbClient — wire round-trip", () => {
         });
         await new Promise(resolve => setTimeout(resolve, 300));
         expect(FakeWS.instances).toHaveLength(1);
+    });
+
+    test("close clears every pending mutation deadline", async () => {
+        const c = client({ mutationTimeoutMs: 1_000 });
+        await flush();
+        const timeoutSpy = spyOnClearTimeout();
+        try {
+            const mutations = [c.mutate("src/api.ts#one", {}), c.mutate("src/api.ts#two", {})];
+            c.close();
+            await Promise.all(
+                mutations.map(mutation => expect(mutation).rejects.toMatchObject({ code: "CDB_STREAM_ABORTED" }))
+            );
+            expect(timeoutSpy.calls).toHaveLength(2);
+        } finally {
+            timeoutSpy.restore();
+            c.close();
+        }
+    });
+
+    test("mutate after close rejects immediately without creating a deadline", async () => {
+        const c = client({ mutationTimeoutMs: 1_000 });
+        await flush();
+        c.close();
+        await flush();
+        const timeoutSpy = spyOnClearTimeout();
+        try {
+            await expect(c.mutate("src/api.ts#after-close", {})).rejects.toMatchObject({
+                code: "CDB_STREAM_ABORTED",
+                retryable: true,
+            });
+            expect(timeoutSpy.calls).toHaveLength(0);
+        } finally {
+            timeoutSpy.restore();
+        }
     });
 });

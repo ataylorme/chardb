@@ -126,6 +126,7 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
             ...(props.logicalDb !== undefined ? { logicalDb: props.logicalDb } : {}),
             ...(props.crossTab !== undefined ? { crossTab: props.crossTab } : {}),
             ...(props.persistMutations !== undefined ? { persistMutations: props.persistMutations } : {}),
+            ...(props.mutationTimeoutMs !== undefined ? { mutationTimeoutMs: props.mutationTimeoutMs } : {}),
         });
     }, [
         props.client,
@@ -136,6 +137,7 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
         props.logicalDb,
         props.crossTab,
         props.persistMutations,
+        props.mutationTimeoutMs,
     ]);
 
     useEffect(() => () => client.close(), [client]);

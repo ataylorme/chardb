@@ -59,6 +59,18 @@ describe("chardb/react — hook lifecycle", () => {
         }
     });
 
+    test("ChardbProvider forwards mutationTimeoutMs to its client", () => {
+        expect(() =>
+            TestRenderer.create(
+                React.createElement(ChardbProvider, {
+                    endpoint: "wss://example.com/ws",
+                    getJwt: async () => "jwt-stub",
+                    mutationTimeoutMs: 0,
+                })
+            )
+        ).toThrow("mutationTimeoutMs must be an integer between 1 and 2147483647");
+    });
+
     test("useQuery subscribes on mount, receives patches, unsubscribes on unmount", () => {
         const { client, subs } = stubClient();
         const query = Object.assign(async (_ctx: never, _args: { organizationId: string }) => [{ id: "unused" }], {
