@@ -19,8 +19,8 @@ export function Auth() {
                     "declared organization writes use current membership, roles, auth epochs, row predicates, and column rules",
                     "declared exact-partition queries return policy-filtered initial and replacement snapshots",
                     "durable delivery retries until an exact client acknowledgement",
-                    "packed anonymous sign-in through live readback passes in a clean-tarball smoke",
-                    "resume replay, packed tenant denial, restart, JWKS rotation, and migrations remain unfinished",
+                    "packed replay and cross-organization denial pass for two anonymous principals",
+                    "resume replay, packed restart, JWKS rotation, and migrations remain unfinished",
                 ]}
             />
 

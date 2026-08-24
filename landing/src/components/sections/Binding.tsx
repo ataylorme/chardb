@@ -18,8 +18,9 @@ export function Binding() {
                     "tested: organization authority, tenant routing, write policy, and idempotent shard-local commit",
                     "tested: durable registration, invalidation, query rerun, replacement snapshots, and acknowledgements",
                     "tested: two org-A clients update while an org-B query remains empty under policy",
-                    "tested: clean-tarball chat sign-in, empty snapshot, mutation, live replacement, and readback",
-                    "unfinished: packed tenant denial, replay, restart, JWKS rotation, and versioned migrations",
+                    "tested: clean-tarball replay and cross-organization denial for two signed-in principals",
+                    "tested: staged live delivery after Gateway and Cdb reconstruct with a hibernated socket",
+                    "unfinished: packed restart, resume replay, JWKS rotation, and versioned migrations",
                 ]}
             />
 
