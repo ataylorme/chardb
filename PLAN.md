@@ -217,7 +217,9 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Cap unsettled Gateway mutations at 32 per connection and 256 per Gateway object. Reject excess work before dispatch with retryable `CDB_RATE_LIMITED` and release capacity on every settlement path.
 - [x] Accept inbound WebSocket text frames only through the exact 1 MiB UTF-8 boundary. Measure before wire decoding and close oversized frames with code 1009.
 - [x] Cap active client subscription records at 64. Reject excess work synchronously with retryable `CDB_RATE_LIMITED` before allocating an id, changing state, or sending. Preserve the same records across reconnect, release capacity on unsubscribe, clear all records on terminal session failure, roll back a failed subscribe send, and close the session when unsubscribe send fails.
-- [ ] Bound server-wide subscriptions, staged snapshot counts, snapshot bytes and rows, optimistic rows and patches, presence state, and other remaining queues.
+- [x] Cap each Gateway at 256 aggregate current and pending logical registrations. Count durable heads after restart, allow same-key replacement without extra capacity, deny duplicate pending races, and return retryable `CDB_RATE_LIMITED` before routing, Catalog, Cdb, or installation work.
+- [x] Cap direct and registered Cdb query results at 4,096 top-level rows and exactly 512 KiB of serialized JSON. Apply the registered limit only after the generation fence and return `CDB_INVARIANT` with limit or pagination guidance.
+- [ ] Bound client inbound rows and patches, durable total bytes, presence state, other queues, and retention watermarks.
 - [x] Define and test snapshot acknowledgement, durable retry until exact acknowledgement, and client same-cookie deduplication with re-acknowledgement.
 - [ ] Apply backpressure or disconnect slow consumers.
 - [ ] Make disconnect and shutdown reject or retain pending mutations according to a documented rule.
