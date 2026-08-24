@@ -25,7 +25,7 @@ class FakeWS {
     readonly sent: string[] = [];
     onopen: (() => void) | null = null;
     onclose: (() => void) | null = null;
-    onmessage: ((ev: { data: string }) => void) | null = null;
+    onmessage: ((ev: { data: unknown }) => void) | null = null;
     onerror: (() => void) | null = null;
     readyState: number = FakeWS.OPEN;
     failNextSend = false;
@@ -47,6 +47,9 @@ class FakeWS {
     }
     emit(msg: Down): void {
         this.onmessage?.({ data: encodeWire(msg) });
+    }
+    emitRaw(data: unknown): void {
+        this.onmessage?.({ data });
     }
 }
 
@@ -144,6 +147,25 @@ function protoRowsAtBytes(bytes: number): RawJson[] {
         configurable: true,
     });
     return [row];
+}
+
+function streamChunkRawAtBytes(bytes: number, multibyte = false): string {
+    const envelope: { t: "streamChunk"; streamReqId: number; chunk: string } = {
+        t: "streamChunk",
+        streamReqId: 1,
+        chunk: "",
+    };
+    const overhead = new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+    if (bytes < overhead) throw new RangeError("stream chunk envelope is larger than the requested byte length");
+    const remaining = bytes - overhead;
+    envelope.chunk = multibyte
+        ? `${"é".repeat(Math.floor(remaining / 2))}${remaining % 2 === 0 ? "" : "x"}`
+        : "x".repeat(remaining);
+    const raw = JSON.stringify(envelope);
+    if (new TextEncoder().encode(raw).byteLength !== bytes) {
+        throw new Error("stream chunk helper produced the wrong UTF-8 byte length");
+    }
+    return raw;
 }
 
 function spyOnClearTimeout(): { readonly calls: unknown[]; restore: () => void } {
@@ -351,6 +373,109 @@ describe("createChardbClient — wire round-trip", () => {
             code: "CDB_INVARIANT",
             message: "server sent an invalid Chardb session message",
         });
+    });
+
+    test("accepts an ignored inbound text envelope at the exact 1 MiB transport limit", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+
+        ws.emitRaw(streamChunkRawAtBytes(1_024 * 1_024));
+        await flush();
+
+        expect(c.state).toBe("open");
+        expect(ws.readyState).toBe(FakeWS.OPEN);
+        c.close();
+    });
+
+    test("rejects ASCII, multibyte, and binary inbound messages outside the text transport limit", async () => {
+        const cases: readonly unknown[] = [
+            streamChunkRawAtBytes(1_024 * 1_024 + 1),
+            streamChunkRawAtBytes(1_024 * 1_024 + 1, true),
+            new ArrayBuffer(8),
+        ];
+
+        for (const data of cases) {
+            const c = client();
+            await flush();
+            const ws = FakeWS.instances.at(-1);
+            if (!ws) throw new Error("expected a fake WebSocket instance");
+            await welcome(ws);
+            const mutationError = c.mutate("mutations.ts#pending", {}).catch(error => error);
+
+            ws.emitRaw(data);
+            await flush();
+
+            expect(c.state).toBe("closed");
+            expect(ws.readyState).toBe(FakeWS.CLOSED);
+            await expect(mutationError).resolves.toMatchObject({
+                code: "CDB_INVARIANT",
+                message: "server sent an invalid Chardb session message",
+            });
+        }
+    });
+
+    test("an oversized inbound frame performs terminal cleanup once and never reconnects", async () => {
+        class ClosingBroadcastChannel {
+            static instance: ClosingBroadcastChannel | undefined;
+            onmessage: ((event: { data: unknown }) => void) | null = null;
+            closeCalls = 0;
+
+            constructor(_name: string) {
+                ClosingBroadcastChannel.instance = this;
+            }
+
+            postMessage(): void {}
+            close(): void {
+                this.closeCalls += 1;
+            }
+        }
+
+        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = ClosingBroadcastChannel;
+        const timers = installManualTimers();
+        try {
+            const c = createChardbClient({
+                endpoint: "wss://example.com/ws",
+                getJwt: async () => "jwt-stub",
+                clientId: "c-inbound-cleanup",
+                logicalDb: "inbound-cleanup",
+            });
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            let subscriptionNotifications = 0;
+            c.subscribe("queries.ts#pending", {}, () => subscriptionNotifications++);
+            const mutationError = c.mutate("mutations.ts#pending", {}).catch(error => error);
+            expect(timers.scheduledDelays()).toEqual([60_000]);
+
+            ws.emitRaw(streamChunkRawAtBytes(1_024 * 1_024 + 1));
+            await flush();
+
+            expect(c.state).toBe("closed");
+            expect(subscriptionNotifications).toBe(1);
+            await expect(mutationError).resolves.toMatchObject({
+                code: "CDB_INVARIANT",
+                message: "server sent an invalid Chardb session message",
+            });
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(ws.readyState).toBe(FakeWS.CLOSED);
+            expect(ClosingBroadcastChannel.instance?.closeCalls).toBe(1);
+            expect(FakeWS.instances).toHaveLength(1);
+
+            ws.emitRaw(new ArrayBuffer(1));
+            ws.onclose?.();
+            await flush();
+
+            expect(subscriptionNotifications).toBe(1);
+            expect(ClosingBroadcastChannel.instance?.closeCalls).toBe(1);
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(FakeWS.instances).toHaveLength(1);
+        } finally {
+            timers.restore();
+            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
+            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
+        }
     });
 
     test("a terminal auth error before welcome closes without entering a reconnect loop", async () => {

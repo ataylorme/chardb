@@ -30,6 +30,7 @@ const DEFAULT_MUTATION_TIMEOUT_MS = 60_000;
 const RECONNECT_INITIAL_BACKOFF_MS = 250;
 const RECONNECT_MAX_BACKOFF_MS = 10_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const MAX_INBOUND_WEBSOCKET_BYTES = 1_024 * 1_024;
 const MAX_ACTIVE_SUBSCRIPTIONS = 64;
 const MAX_SUBSCRIPTION_ROWS = 4_096;
 const MAX_SUBSCRIPTION_BYTES = 512 * 1_024;
@@ -42,6 +43,7 @@ const MAX_MUTATION_ARGUMENT_BYTES = 512 * 1_024;
 const MAX_MUTATION_ARGUMENT_DEPTH = 99;
 const MAX_PENDING_MUTATIONS = 32;
 const MAX_RETAINED_QUERY_STATE_BYTES = 8 * 1_024 * 1_024;
+const INBOUND_TEXT_ENCODER = new TextEncoder();
 
 export interface ChardbClientOptions {
     readonly endpoint: string;
@@ -170,7 +172,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             };
             ws?.send(encodeWire(hello));
         };
-        ws.onmessage = ev => receiveWire(ev.data as string);
+        ws.onmessage = ev => receiveWire(ev.data);
         ws.onclose = () => onClose();
         ws.onerror = () => ws?.close();
     }
@@ -232,8 +234,18 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         }
     }
 
-    function receiveWire(raw: string): void {
+    function receiveWire(raw: unknown): void {
         try {
+            if (typeof raw !== "string") throw new TypeError("server sent a non-text WebSocket message");
+            // UTF-8 is never shorter than the JavaScript code-unit count. Reject
+            // obvious excess before allocating the encoded copy, then measure
+            // multibyte text exactly before JSON parsing.
+            if (
+                raw.length > MAX_INBOUND_WEBSOCKET_BYTES ||
+                INBOUND_TEXT_ENCODER.encode(raw).byteLength > MAX_INBOUND_WEBSOCKET_BYTES
+            ) {
+                throw new TypeError("server WebSocket message exceeds the client transport limit");
+            }
             onWire(raw);
         } catch {
             const message =
