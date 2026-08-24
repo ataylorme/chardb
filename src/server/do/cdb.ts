@@ -203,6 +203,21 @@ function subscriptionInvariant(message: string): CdbError {
     return new CdbError({ code: "CDB_INVARIANT", message });
 }
 
+function assertQueryIntentCoversReads(
+    ref: ChardbRef,
+    declaredTables: readonly string[],
+    readTables: ReadonlySet<string>
+): void {
+    const declared = new Set(declaredTables);
+    const omitted = [...readTables].filter(tableName => !declared.has(tableName)).sort();
+    if (omitted.length === 0) return;
+    throw new CdbError({
+        code: "CDB_INVARIANT",
+        message: `query ${ref} read undeclared cdbTable${omitted.length === 1 ? "" : "s"}: ${omitted.join(", ")}`,
+        hint: "add every table read by the handler to intent.tables",
+    });
+}
+
 function ensureInvalidationOutboxColumns(sql: SyncSql): void {
     const columns = new Set(
         sql.all<{ name: string }>("PRAGMA table_info(_chardb_invalidation_outbox)").map(column => column.name)
@@ -936,12 +951,19 @@ export class Cdb extends DurableObject<CdbEnv> {
     async query(request: CdbQueryRequest): Promise<CdbQueryResponse> {
         try {
             const descriptor = resolveQuery(this.mutationManifest(), request.ref);
-            const database = wrapQueryDb(drizzle(this.ctx.storage, { schema: this.mutationSchema() }), request.auth);
-            const result = await descriptor.invokeValidated(
-                { db: readOnlyQueryDb(database), auth: request.auth },
-                request.args
+            const declaredTables = descriptor.extractIntent ? descriptor.extractIntent(request.args).tables : undefined;
+            const readTables = new Set<string>();
+            const database = wrapQueryDb(
+                drizzle(this.ctx.storage, { schema: this.mutationSchema() }),
+                request.auth,
+                tableName => readTables.add(tableName)
             );
-            return { ok: true, result: rawJsonResult(result, "query result") };
+            const result = rawJsonResult(
+                await descriptor.invokeValidated({ db: readOnlyQueryDb(database), auth: request.auth }, request.args),
+                "query result"
+            );
+            if (declaredTables) assertQueryIntentCoversReads(request.ref, declaredTables, readTables);
+            return { ok: true, result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
         }
@@ -990,7 +1012,12 @@ export class Cdb extends DurableObject<CdbEnv> {
             }
 
             const descriptor = resolveQuery(this.mutationManifest(), subscription.ref);
-            const database = wrapQueryDb(drizzle(this.ctx.storage, { schema: this.mutationSchema() }), request.auth);
+            const readTables = new Set<string>();
+            const database = wrapQueryDb(
+                drizzle(this.ctx.storage, { schema: this.mutationSchema() }),
+                request.auth,
+                tableName => readTables.add(tableName)
+            );
             const result = rawJsonResult(
                 await descriptor.invokeValidated(
                     { db: readOnlyQueryDb(database), auth: request.auth },
@@ -1001,6 +1028,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             if (!Array.isArray(result)) {
                 throw subscriptionInvariant("registered query result must be an array");
             }
+            assertQueryIntentCoversReads(subscription.ref, routed.intent.tables, readTables);
 
             const current = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,

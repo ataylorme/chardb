@@ -33,7 +33,18 @@
  * grant and the caller may supply only columns granted by that role/self row.
  */
 
-import { getTableColumns } from "drizzle-orm";
+import {
+    Column,
+    Name,
+    Param,
+    Placeholder,
+    SQL,
+    StringChunk,
+    Table,
+    getTableColumns,
+    is,
+    isSQLWrapper,
+} from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../errors.ts";
 import { applyColumnMask, assertColumnsWritable } from "./cdb-cls.ts";
@@ -86,12 +97,19 @@ interface AutoFillPlan {
     }>;
 }
 
-type PolicyPlan = Pick<AutoFillPlan, "table" | "auth" | "policies">;
+interface SelectPlan {
+    readonly table: SQLiteTable;
+    readonly auth: AuthCtx;
+    readonly policies: ReturnType<typeof compileCdbPolicies>;
+    readonly onRead: ((tableName: string) => void) | undefined;
+    readonly queryBoundary: boolean;
+}
 
 interface SelectRootPlan {
     readonly auth: AuthCtx;
     readonly fullRow: boolean;
     readonly queryBoundary: boolean;
+    readonly onRead: ((tableName: string) => void) | undefined;
 }
 
 const UNSUPPORTED_SELECT_METHODS = new Set<PropertyKey>([
@@ -123,6 +141,9 @@ const SAFE_SELECT_CHAIN_METHODS = new Set<PropertyKey>(["orderBy", "limit", "off
 const SAFE_DB_METHODS = new Set<PropertyKey>(["select", "selectDistinct", "insert", "update", "delete", "transaction"]);
 
 const SAFE_WRITE_EXECUTION_METHODS = new Set<PropertyKey>(["run", "toSQL", "getSQL"]);
+const TRACKED_SELECT_BUILDERS = new WeakSet<object>();
+const SAFE_SQL_SYNTAX = /\b(?:and|or|not|exists|between|in|is|null|like|ilike|true|false|escape|asc|desc)\b/gi;
+const SAFE_SQL_PUNCTUATION = /^[\d\s(),=<>!+*/%|&.~-]*$/;
 
 function buildPlan(
     table: SQLiteTable,
@@ -334,17 +355,27 @@ function wrapSelectFromBuilder(builder: unknown, root: SelectRootPlan): unknown 
                     throw unsupportedSelect("cdbTable projections are unavailable until projected masks are compiled");
                 }
                 const selected = (value as (table: SQLiteTable) => unknown).call(target, table);
+                // Observe at FROM construction, not execution. Drizzle can embed a
+                // builder through exists(inner), in which case the inner proxy only
+                // contributes SQL and never runs. This conservative point also means
+                // an unused builder counts as a read.
+                root.onRead?.(meta.name);
+                const queryBoundary =
+                    root.queryBoundary ||
+                    (typeof selected === "object" && selected !== null && TRACKED_SELECT_BUILDERS.has(selected));
                 return scopeSelectBuilder(selected, {
                     table,
                     auth: root.auth,
                     policies: compileCdbPolicies(table),
+                    onRead: root.onRead,
+                    queryBoundary,
                 });
             };
         },
     });
 }
 
-function scopeSelectBuilder(builder: unknown, plan: PolicyPlan): unknown {
+function scopeSelectBuilder(builder: unknown, plan: SelectPlan): unknown {
     const where = Reflect.get(builder as object, "where");
     if (typeof where !== "function") throw unsupportedSelect("select builder does not expose a WHERE stage");
     const scoped = where.call(
@@ -359,12 +390,13 @@ function scopeSelectBuilder(builder: unknown, plan: PolicyPlan): unknown {
     return wrapScopedSelectBuilder(scoped, plan);
 }
 
-function wrapScopedSelectBuilder(builder: unknown, plan: PolicyPlan): unknown {
+function wrapScopedSelectBuilder(builder: unknown, plan: SelectPlan): unknown {
     const proxy = new Proxy(builder as object, {
         get(target, prop, receiver) {
             const value = Reflect.get(target, prop, receiver);
             if (prop === "where" && typeof value === "function") {
                 return (userWhere: import("drizzle-orm").SQL) => {
+                    if (plan.queryBoundary) assertTrackedSql(userWhere, plan.onRead);
                     const combined = applyPoliciesToWhere({
                         op: "select",
                         auth: plan.auth,
@@ -381,11 +413,20 @@ function wrapScopedSelectBuilder(builder: unknown, plan: PolicyPlan): unknown {
                 };
             }
             if (SAFE_SELECT_CHAIN_METHODS.has(prop) && typeof value === "function") {
-                return (...args: readonly unknown[]) =>
-                    wrapScopedSelectBuilder(
+                return (...args: readonly unknown[]) => {
+                    if (plan.queryBoundary && prop === "orderBy") {
+                        for (const arg of args) {
+                            if (typeof arg === "function") {
+                                throw unsupportedSelect("live query orderBy callbacks are unavailable");
+                            }
+                            assertTrackedSql(arg, plan.onRead);
+                        }
+                    }
+                    return wrapScopedSelectBuilder(
                         (value as (...args: readonly unknown[]) => unknown).call(target, ...args),
                         plan
                     );
+                };
             }
             if ((prop === "all" || prop === "execute") && typeof value === "function") {
                 return (...args: readonly unknown[]) =>
@@ -428,6 +469,7 @@ function wrapScopedSelectBuilder(builder: unknown, plan: PolicyPlan): unknown {
             throw unsupportedSelect(`select property "${String(prop)}" is unavailable on a masked query`);
         },
     });
+    TRACKED_SELECT_BUILDERS.add(proxy);
     return proxy;
 }
 
@@ -438,17 +480,69 @@ function mapMaybePromise<T>(value: unknown, map: (value: unknown) => T): T | Pro
     return map(value);
 }
 
-function maskSelectRows(plan: PolicyPlan, value: unknown): readonly Record<string, unknown>[] {
+function assertTrackedSql(value: unknown, onRead: ((tableName: string) => void) | undefined): void {
+    const seen = new WeakSet<object>();
+
+    const scan = (chunk: unknown): boolean => {
+        if (chunk === undefined || chunk === null || typeof chunk !== "object") return false;
+        if (TRACKED_SELECT_BUILDERS.has(chunk)) {
+            throw unsupportedSelect("live query subqueries are unavailable through the policy wrapper");
+        }
+        if (seen.has(chunk)) return false;
+        seen.add(chunk);
+        if (Array.isArray(chunk)) {
+            let tracked = false;
+            for (const item of chunk) tracked = scan(item) || tracked;
+            return tracked;
+        }
+        if (is(chunk, StringChunk)) {
+            const syntax = chunk.value.join("").replace(SAFE_SQL_SYNTAX, "");
+            if (!SAFE_SQL_PUNCTUATION.test(syntax)) {
+                throw unsupportedSelect("live query predicates cannot contain raw SQL identifiers or keywords");
+            }
+            return false;
+        }
+        if (is(chunk, Column)) {
+            const meta = getCdbMeta(chunk.table as SQLiteTable);
+            if (!meta) throw unsupportedSelect("live query predicates may reference only cdbTable columns");
+            onRead?.(meta.name);
+            return true;
+        }
+        if (is(chunk, Table)) {
+            const meta = getCdbMeta(chunk as SQLiteTable);
+            if (!meta) throw unsupportedSelect("live query predicates may reference only cdbTable values");
+            onRead?.(meta.name);
+            return true;
+        }
+        if (is(chunk, SQL)) {
+            let tracked = false;
+            for (const item of chunk.queryChunks) tracked = scan(item) || tracked;
+            return tracked;
+        }
+        if (is(chunk, Name)) {
+            throw unsupportedSelect("live query predicates cannot use untracked SQL identifiers");
+        }
+        if (is(chunk, Param) || is(chunk, Placeholder)) return false;
+        if (isSQLWrapper(chunk)) {
+            throw unsupportedSelect("live query predicates cannot use untracked SQL expressions");
+        }
+        throw unsupportedSelect("live query predicates contain an untracked object");
+    };
+
+    scan(value);
+}
+
+function maskSelectRows(plan: SelectPlan, value: unknown): readonly Record<string, unknown>[] {
     if (!Array.isArray(value)) throw unsupportedSelect("full-row select did not return an array");
     return value.map(row => maskSelectRow(plan, row));
 }
 
-function maskSelectGet(plan: PolicyPlan, value: unknown): Record<string, unknown> | undefined {
+function maskSelectGet(plan: SelectPlan, value: unknown): Record<string, unknown> | undefined {
     if (value === undefined) return undefined;
     return maskSelectRow(plan, value);
 }
 
-function maskSelectRow(plan: PolicyPlan, value: unknown): Record<string, unknown> {
+function maskSelectRow(plan: SelectPlan, value: unknown): Record<string, unknown> {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
         throw unsupportedSelect("full-row select returned a non-object row");
     }
@@ -594,23 +688,24 @@ function conflictingAuthority(authority: "tenant" | "self", column: string): Cdb
  * fail closed. Transactions receive the same wrapper recursively.
  */
 export function wrapDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
-    return wrapDbInternal(db, auth, false, undefined);
+    return wrapDbInternal(db, auth, false, undefined, undefined);
 }
 
-export function wrapQueryDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
-    return wrapDbInternal(db, auth, true, undefined);
+export function wrapQueryDb<TDb extends object>(db: TDb, auth: AuthCtx, onRead?: (tableName: string) => void): TDb {
+    return wrapDbInternal(db, auth, true, undefined, onRead);
 }
 
 /** Internal mutation wrapper used by the atomic executor to collect committed table names. */
 export function wrapMutationDb<TDb extends object>(db: TDb, auth: AuthCtx, onWrite?: (tableName: string) => void): TDb {
-    return wrapDbInternal(db, auth, false, onWrite);
+    return wrapDbInternal(db, auth, false, onWrite, undefined);
 }
 
 function wrapDbInternal<TDb extends object>(
     db: TDb,
     auth: AuthCtx,
     queryBoundary: boolean,
-    onWrite: ((tableName: string) => void) | undefined
+    onWrite: ((tableName: string) => void) | undefined,
+    onRead: ((tableName: string) => void) | undefined
 ): TDb {
     return new Proxy(db, {
         get(target, prop, receiver) {
@@ -635,6 +730,7 @@ function wrapDbInternal<TDb extends object>(
                         auth,
                         fullRow: prop === "select" && args.length === 0,
                         queryBoundary,
+                        onRead,
                     });
                 };
             }
@@ -667,7 +763,7 @@ function wrapDbInternal<TDb extends object>(
             }
             if (prop === "transaction") {
                 return (callback: (tx: TDb) => Promise<unknown>, ...rest: readonly unknown[]) => {
-                    const wrapped = (tx: TDb) => callback(wrapDbInternal(tx, auth, queryBoundary, onWrite));
+                    const wrapped = (tx: TDb) => callback(wrapDbInternal(tx, auth, queryBoundary, onWrite, onRead));
                     return (v as (cb: (tx: TDb) => Promise<unknown>, ...r: readonly unknown[]) => unknown).call(
                         target,
                         wrapped,

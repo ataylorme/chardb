@@ -18,11 +18,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { type SQL, eq } from "drizzle-orm";
+import { type SQL, asc, desc, eq, sql } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import type { BaseSQLiteDatabase, SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../../src/errors.ts";
-import { wrapMutationDb } from "../../src/server/cdb-db-proxy.ts";
+import { wrapMutationDb, wrapQueryDb } from "../../src/server/cdb-db-proxy.ts";
 import type { RoleValue } from "../../src/server/cdb-table-types.ts";
 import type { AuthCtx } from "../../src/server/define.ts";
 import { forOrg, forUser, wrapDb } from "../../src/server/index.ts";
@@ -940,6 +940,110 @@ describe("wrapMutationDb / write observation", () => {
         });
 
         expect(touched).toEqual(["observed_records"]);
+    });
+});
+
+describe("wrapQueryDb / read observation", () => {
+    const { cdbTable } = forOrg();
+    const records = cdbTable(
+        "observed_reads",
+        {
+            id: text("id").primaryKey(),
+            organizationId: text("organization_id")
+                .notNull()
+                .references(() => orgTable.id),
+        },
+        { roles: { member: { read: "*" } } }
+    );
+
+    function selectDb(all: () => unknown = () => [{ id: "record-1", organizationId: "org-acme" }]) {
+        const builder = {
+            where() {
+                return builder;
+            },
+            all,
+            orderBy(..._expressions: readonly unknown[]) {
+                return builder;
+            },
+            toSQL() {
+                return { sql: "select", params: [] };
+            },
+        };
+        return { select: () => ({ from: (_table: SQLiteTable) => builder }) };
+    }
+
+    test("conservatively observes FROM construction before inspection or execution", () => {
+        const readTables: string[] = [];
+        const query = wrapQueryDb(selectDb(), baseAuth, tableName => readTables.push(tableName))
+            .select()
+            .from(records);
+
+        expect(readTables).toEqual(["observed_reads"]);
+        query.toSQL();
+        expect(query.all()).toEqual([{ id: "record-1", organizationId: "org-acme" }]);
+        expect(readTables).toEqual(["observed_reads"]);
+    });
+
+    test("counts an unused builder as a conservative read", () => {
+        const readTables: string[] = [];
+        wrapQueryDb(selectDb(), baseAuth, tableName => readTables.push(tableName))
+            .select()
+            .from(records);
+        expect(readTables).toEqual(["observed_reads"]);
+    });
+
+    test("keeps the conservative observation when execution throws", () => {
+        const readTables: string[] = [];
+        const wrapped = wrapQueryDb(
+            selectDb(() => {
+                throw new Error("read failed");
+            }),
+            baseAuth,
+            tableName => readTables.push(tableName)
+        );
+
+        expect(() => wrapped.select().from(records).all()).toThrow("read failed");
+        expect(readTables).toEqual(["observed_reads"]);
+    });
+
+    test("shares the observer with transaction callback wrappers", () => {
+        const nested = selectDb();
+        const raw = {
+            transaction(callback: (tx: typeof nested) => unknown) {
+                return callback(nested);
+            },
+        };
+        const readTables: string[] = [];
+
+        wrapQueryDb(raw, baseAuth, tableName => readTables.push(tableName)).transaction(tx => {
+            tx.select().from(records).all();
+        });
+
+        expect(readTables).toEqual(["observed_reads"]);
+    });
+
+    test("accepts typed ascending and descending column order", () => {
+        const readTables = new Set<string>();
+        const query = wrapQueryDb(selectDb(), baseAuth, tableName => readTables.add(tableName))
+            .select()
+            .from(records)
+            .orderBy(asc(records.id), desc(records.organizationId));
+
+        expect(query.all()).toEqual([{ id: "record-1", organizationId: "org-acme" }]);
+        expect(readTables).toEqual(new Set(["observed_reads"]));
+    });
+
+    test("rejects order callbacks before they can return hidden raw SQL", () => {
+        let invoked = false;
+        const wrapped = wrapQueryDb(selectDb(), baseAuth);
+        const callback = () => {
+            invoked = true;
+            return sql.raw('(SELECT id FROM "hidden_order_rows")');
+        };
+
+        const error = forbiddenFeature(() => wrapped.select().from(records).orderBy(callback));
+        expect(error.message).toContain("orderBy callbacks are unavailable");
+        expect(invoked).toBe(false);
     });
 });
 

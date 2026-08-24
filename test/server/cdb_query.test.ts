@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, exists, sql } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
@@ -176,6 +176,84 @@ const registeredNonJsonResult = api.query({
         return new Date("2026-08-23T00:00:00Z");
     },
 });
+type IntentCoverageMode = "complete" | "duplicate" | "empty" | "omitted" | "failure";
+function intentCoverage(mode: IntentCoverageMode, organizationId = "org-a") {
+    const tables =
+        mode === "duplicate"
+            ? ["query_records", "query_records"]
+            : mode === "complete" || mode === "empty"
+              ? ["query_records"]
+              : [];
+    return {
+        kind: "select" as const,
+        tables,
+        partitionKey: {
+            table: "query_records",
+            column: "organization_id",
+            values: [organizationId],
+        },
+    };
+}
+const registeredIntentCoverage = api.query({
+    ref: "queries.ts#registeredIntentCoverage",
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: (args: { organizationId: string; mode: IntentCoverageMode }) =>
+        intentCoverage(args.mode, args.organizationId),
+    handler: async function registeredIntentCoverageHandler(
+        ctx,
+        args: { organizationId: string; mode: IntentCoverageMode }
+    ) {
+        const rows = ctx.db
+            .select()
+            .from(records)
+            .where(
+                and(
+                    args.mode === "empty" ? eq(records.groupId, "missing") : eq(records.groupId, "group-a"),
+                    eq(records.organizationId, args.organizationId)
+                )
+            )
+            .orderBy(records.id)
+            .all();
+        if (args.mode === "failure") throw new Error("intent coverage handler failed");
+        return rows;
+    },
+});
+const subqueryAttempt = api.query({
+    ref: "queries.ts#subqueryAttempt",
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: (args: { organizationId: string; declareInner: boolean }) => ({
+        kind: "select" as const,
+        tables: args.declareInner ? ["query_records", "query_public_records"] : ["query_records"],
+        partitionKey: {
+            table: "query_records",
+            column: "organization_id",
+            values: [args.organizationId],
+        },
+    }),
+    handler: async function subqueryAttemptHandler(ctx) {
+        const inner = ctx.db.select().from(publicRecords).where(eq(publicRecords.id, "public-a"));
+        return ctx.db.select().from(records).where(exists(inner)).all();
+    },
+});
+const rawPredicateAttempt = api.query({
+    ref: "queries.ts#rawPredicateAttempt",
+    authority: "organization",
+    partitionKey: "organizationId",
+    intent: (args: { organizationId: string }) => ({
+        kind: "select" as const,
+        tables: ["query_records", "query_public_records"],
+        partitionKey: {
+            table: "query_records",
+            column: "organization_id",
+            values: [args.organizationId],
+        },
+    }),
+    handler: async function rawPredicateAttemptHandler(ctx) {
+        return ctx.db.select().from(records).where(sql.raw('EXISTS (SELECT 1 FROM "query_public_records")')).all();
+    },
+});
 const listPrivateRecords = api.query(async function listPrivateRecordsHandler(ctx) {
     return ctx.db.select().from(privateRecords).all();
 });
@@ -240,6 +318,9 @@ const manifest = manifestFromExports({
     registeredListRecords,
     registeredGetRecord,
     registeredNonJsonResult,
+    registeredIntentCoverage,
+    subqueryAttempt,
+    rawPredicateAttempt,
     listPrivateRecords,
     listPublicRecords,
     projectionAttempt,
@@ -311,6 +392,25 @@ function registeredQuery(
     return { subscription, auth };
 }
 
+function intentCoverageLiveRequest(subscription: LiveSubscriptionId, mode: IntentCoverageMode): CdbSubscriptionRequest {
+    const args = { organizationId: "org-a", mode };
+    const intent = intentCoverage(mode);
+    return {
+        subscription,
+        principalId: PrincipalId("user-1"),
+        organizationId: TenantId("org-a"),
+        ref: registeredIntentCoverage.__chardbRef,
+        args,
+        queryHash: stableJson({ ref: registeredIntentCoverage.__chardbRef, args, intent }),
+        tables: intent.tables,
+        intervals: [...new Set(intent.tables)].map(table => ({
+            table,
+            indexName: "by_id",
+            intervals: [{ kind: "full" as const }],
+        })),
+    };
+}
+
 describe("Cdb registered query execution", () => {
     const databases: Database[] = [];
 
@@ -371,6 +471,112 @@ describe("Cdb registered query execution", () => {
             ],
         });
         expect(registeredProbeRuns).toBe(1);
+    });
+
+    test("checks registered query reads against complete, duplicate, and omitted intent tables", async () => {
+        const { cdb } = await setup();
+
+        for (const mode of ["complete", "duplicate", "empty"] as const) {
+            const subscription = liveIdentity({ registrationId: `registration-intent-${mode}` });
+            await cdb.subscribe(intentCoverageLiveRequest(subscription, mode));
+            await expect(cdb.queryRegistered(registeredQuery(subscription))).resolves.toMatchObject(
+                mode === "empty"
+                    ? { ok: true, result: [] }
+                    : { ok: true, result: [{ id: "record-1" }, { id: "record-2" }] }
+            );
+        }
+
+        const omitted = liveIdentity({ registrationId: "registration-intent-omitted" });
+        await cdb.subscribe(intentCoverageLiveRequest(omitted, "omitted"));
+        const response = await cdb.queryRegistered(registeredQuery(omitted));
+        expect(response).toMatchObject({
+            ok: false,
+            error: {
+                code: "CDB_INVARIANT",
+                message: expect.stringContaining("read undeclared cdbTable: query_records"),
+            },
+        });
+        expect(response).not.toHaveProperty("result");
+    });
+
+    test("checks direct queries with intent and preserves handler failures", async () => {
+        const { cdb } = await setup();
+
+        for (const mode of ["complete", "duplicate", "empty"] as const) {
+            await expect(
+                cdb.query({
+                    ref: registeredIntentCoverage.__chardbRef,
+                    args: { organizationId: "org-a", mode },
+                    auth: AUTH,
+                })
+            ).resolves.toMatchObject(
+                mode === "empty"
+                    ? { ok: true, result: [] }
+                    : { ok: true, result: [{ id: "record-1" }, { id: "record-2" }] }
+            );
+        }
+
+        await expect(
+            cdb.query({
+                ref: registeredIntentCoverage.__chardbRef,
+                args: { organizationId: "org-a", mode: "omitted" },
+                auth: AUTH,
+            })
+        ).resolves.toMatchObject({
+            ok: false,
+            error: {
+                code: "CDB_INVARIANT",
+                message: expect.stringContaining("read undeclared cdbTable: query_records"),
+            },
+        });
+        await expect(
+            cdb.query({
+                ref: registeredIntentCoverage.__chardbRef,
+                args: { organizationId: "org-a", mode: "failure" },
+                auth: AUTH,
+            })
+        ).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT", message: "intent coverage handler failed" },
+        });
+    });
+
+    test("blocks embedded select builders even when intent declares the inner table", async () => {
+        const { cdb } = await setup();
+
+        for (const declareInner of [false, true]) {
+            const response = await cdb.query({
+                ref: subqueryAttempt.__chardbRef,
+                args: { organizationId: "org-a", declareInner },
+                auth: AUTH,
+            });
+            expect(response).toMatchObject({
+                ok: false,
+                error: {
+                    code: "CDB_UNSUPPORTED_FEATURE",
+                    message: expect.stringContaining("subqueries are unavailable"),
+                },
+            });
+            expect(response).not.toHaveProperty("result");
+        }
+    });
+
+    test("blocks raw predicates that hide a table reference", async () => {
+        const { cdb } = await setup();
+        const response = await cdb.query({
+            ref: rawPredicateAttempt.__chardbRef,
+            args: { organizationId: "org-a" },
+            auth: AUTH,
+        });
+
+        expect(response).toMatchObject({
+            ok: false,
+            error: {
+                code: "CDB_UNSUPPORTED_FEATURE",
+                message: expect.stringContaining("raw SQL identifiers or keywords"),
+            },
+        });
+        expect(response).not.toHaveProperty("result");
     });
 
     test("does not return a result when the generation retires during the handler await", async () => {
