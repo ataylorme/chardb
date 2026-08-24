@@ -2852,6 +2852,27 @@ export class Gateway extends DurableObject<GatewayEnv> {
         await this.scheduleGatewayAlarm(Math.max(nowMs + 1, Math.min(...due)));
     }
 
+    /**
+     * Pre-arm cleanup, then retire the logical head. If pre-arming fails, the
+     * durable retirement still removes query ownership and the immediate alarm
+     * write gets one independent attempt. A later bootstrap can recover the
+     * headless cleanup row if both alarm writes fail.
+     */
+    private async retireGatewayStateWithCleanupAlarm(nowMs: number, retire: () => void): Promise<void> {
+        let prearmed = false;
+        try {
+            await this.scheduleGatewayAlarm(nowMs + GATEWAY_SUBSCRIBE_RECOVERY_MS);
+            prearmed = true;
+        } catch {}
+
+        retire();
+        try {
+            await this.scheduleGatewayWork(nowMs);
+        } catch (error) {
+            if (!prearmed) throw error;
+        }
+    }
+
     private async drainGatewayWork(): Promise<void> {
         const nowMs = this.gatewayNowMs();
         for (const recovery of this.dueGatewayInstallRecoveries(nowMs)) {
@@ -3092,15 +3113,15 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 if (pending.connectionId === attachment.connectionId) pending.cancelled = true;
             }
             const nowMs = this.gatewayNowMs();
-            await this.scheduleGatewayAlarm(nowMs + GATEWAY_SUBSCRIBE_RECOVERY_MS);
-            this.ctx.storage.transactionSync(() => {
-                retireCurrentGatewayRegistrationsForConnection(
-                    adaptSqlStorage(this.ctx.storage.sql),
-                    attachment.connectionId,
-                    nowMs
-                );
+            await this.retireGatewayStateWithCleanupAlarm(nowMs, () => {
+                this.ctx.storage.transactionSync(() => {
+                    retireCurrentGatewayRegistrationsForConnection(
+                        adaptSqlStorage(this.ctx.storage.sql),
+                        attachment.connectionId,
+                        nowMs
+                    );
+                });
             });
-            await this.scheduleGatewayWork(nowMs).catch(() => {});
         }
     }
 
@@ -3604,23 +3625,23 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const pending = this.pendingSubscriptions.get(`${att.connectionId}:${msg.subId}`);
         if (pending) pending.cancelled = true;
         const nowMs = this.gatewayNowMs();
-        await this.scheduleGatewayAlarm(nowMs + GATEWAY_SUBSCRIBE_RECOVERY_MS);
-        this.ctx.storage.transactionSync(() => {
-            retireCurrentGatewayRegistration(adaptSqlStorage(this.ctx.storage.sql), {
-                principalId: att.principalId,
-                clientId: att.clientId,
-                subId: msg.subId,
-                connectionId: att.connectionId,
-                nowMs,
+        await this.retireGatewayStateWithCleanupAlarm(nowMs, () => {
+            this.ctx.storage.transactionSync(() => {
+                retireCurrentGatewayRegistration(adaptSqlStorage(this.ctx.storage.sql), {
+                    principalId: att.principalId,
+                    clientId: att.clientId,
+                    subId: msg.subId,
+                    connectionId: att.connectionId,
+                    nowMs,
+                });
             });
+            if (att.snapshotSubIds?.includes(msg.subId)) {
+                ws.serializeAttachment({
+                    ...att,
+                    snapshotSubIds: att.snapshotSubIds.filter(subId => subId !== msg.subId),
+                } satisfies VerifiedGwAttachment);
+            }
         });
-        await this.scheduleGatewayWork(nowMs).catch(() => {});
-        if (att.snapshotSubIds?.includes(msg.subId)) {
-            ws.serializeAttachment({
-                ...att,
-                snapshotSubIds: att.snapshotSubIds.filter(subId => subId !== msg.subId),
-            } satisfies VerifiedGwAttachment);
-        }
     }
 
     private onAck(ws: WebSocket, msg: Extract<Up, { t: "ack" }>): void {
