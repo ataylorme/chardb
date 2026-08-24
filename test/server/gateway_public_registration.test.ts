@@ -72,6 +72,7 @@ describe("Gateway public durable registration", () => {
     let currentAlarm: number | null;
     let alarmFailures: number;
     let transactionCommitFailures: number;
+    let beforeTransactionCommit: (() => Promise<void>) | undefined;
     let socketConnected: boolean;
     let subscribeCalls: CdbSubscriptionRequest[];
     let unsubscribeCalls: LiveSubscriptionId[];
@@ -101,6 +102,7 @@ describe("Gateway public durable registration", () => {
         currentAlarm = null;
         alarmFailures = 0;
         transactionCommitFailures = 0;
+        beforeTransactionCommit = undefined;
         socketConnected = true;
         subscribeCalls = [];
         unsubscribeCalls = [];
@@ -187,6 +189,9 @@ describe("Gateway public durable registration", () => {
                                 stagedAlarm = value instanceof Date ? value.getTime() : value;
                             },
                         } as DurableObjectTransaction);
+                        const beforeCommit = beforeTransactionCommit;
+                        beforeTransactionCommit = undefined;
+                        if (beforeCommit) await beforeCommit();
                         if (transactionCommitFailures > 0) {
                             transactionCommitFailures -= 1;
                             throw new Error("transaction commit unavailable");
@@ -261,6 +266,22 @@ describe("Gateway public durable registration", () => {
                 args,
             })
         );
+    }
+
+    function holdNextTransactionCommit(): { readonly entered: Promise<void>; readonly release: () => void } {
+        let markEntered: () => void = () => {};
+        const entered = new Promise<void>(resolve => {
+            markEntered = resolve;
+        });
+        let release: () => void = () => {};
+        const held = new Promise<void>(resolve => {
+            release = resolve;
+        });
+        beforeTransactionCommit = () => {
+            markEntered();
+            return held;
+        };
+        return { entered, release };
     }
 
     test("rejects hostile query arguments before routing, capacity, RPC, or durable work and then recovers", async () => {
@@ -509,6 +530,59 @@ describe("Gateway public durable registration", () => {
         await gateway.alarm();
         expect(unsubscribeCalls).toEqual([subscription]);
         expect(generation()).toBeNull();
+    });
+
+    test("a close rejection wins over held unsubscribe attachment settlement", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        const held = holdNextTransactionCommit();
+
+        const unsubscribeTask = gateway.webSocketMessage(
+            socket as unknown as WebSocket,
+            JSON.stringify({ t: "unsub", subId: 1 })
+        );
+        await held.entered;
+        socketConnected = false;
+        const closeTask = gateway.webSocketClose(socket as unknown as WebSocket);
+        const rejectedAttachment = socket.attachment as unknown;
+        expect(rejectedAttachment).toMatchObject({ kind: "rejected", connectionId: "connection-1" });
+
+        held.release();
+        await Promise.all([unsubscribeTask, closeTask]);
+
+        expect(socket.attachment as unknown).toBe(rejectedAttachment);
+        expect(head()).toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "retiring", retry_at: 100 });
+        expect(currentAlarm).toBe(101);
+    });
+
+    test("held unsubscribe preserves a newer attachment for the same identity", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        const held = holdNextTransactionCommit();
+
+        const unsubscribeTask = gateway.webSocketMessage(
+            socket as unknown as WebSocket,
+            JSON.stringify({ t: "unsub", subId: 1 })
+        );
+        await held.entered;
+        const newerAttachment = {
+            ...socket.attachment,
+            jwtExp: socket.attachment.jwtExp + 1_000,
+            jwtNbf: 50,
+            lastCookie: Cookie("cookie-newer"),
+            presenceKeys: ["presence-newer"],
+            snapshotSubIds: [SubId(1), SubId(2)],
+        } satisfies VerifiedGwAttachment;
+        socket.attachment = newerAttachment;
+
+        held.release();
+        await unsubscribeTask;
+
+        expect(socket.attachment).toEqual({ ...newerAttachment, snapshotSubIds: [SubId(2)] });
+        expect(head()).toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "retiring", retry_at: 100 });
+        expect(currentAlarm).toBe(101);
     });
 
     test("unsubscribe rolls back its alarm when the retirement transaction cannot commit", async () => {

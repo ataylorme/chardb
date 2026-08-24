@@ -4414,10 +4414,17 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 nowMs,
             });
         });
-        if (att.snapshotSubIds?.includes(msg.subId)) {
+        const current = ws.deserializeAttachment() as GwAttachment | null;
+        if (
+            isVerifiedAttachment(current) &&
+            current.connectionId === att.connectionId &&
+            current.clientId === att.clientId &&
+            current.principalId === att.principalId &&
+            current.snapshotSubIds?.includes(msg.subId)
+        ) {
             ws.serializeAttachment({
-                ...att,
-                snapshotSubIds: att.snapshotSubIds.filter(subId => subId !== msg.subId),
+                ...current,
+                snapshotSubIds: current.snapshotSubIds.filter(subId => subId !== msg.subId),
             } satisfies VerifiedGwAttachment);
         }
     }
