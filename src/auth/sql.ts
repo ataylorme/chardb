@@ -26,10 +26,15 @@
 
 import { type Column, getTableColumns, getTableName } from "drizzle-orm";
 import type { AnySQLiteTable } from "drizzle-orm/sqlite-core";
+import { CdbError } from "../errors.ts";
 import type { SqlValue, SyncSql } from "../oplog/wrapper.ts";
 import type { RawJson } from "../types.ts";
 
 const ALLOWED_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+export const AUTH_BULK_PRELOAD_MAX_ROWS = 4_096;
+export const AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES = 512 * 1_024;
+export const AUTH_BULK_REPLACEMENT_MAX_BYTES = 512 * 1_024;
+const AUTH_BULK_PRELOAD_RETRY_MS = 1_000;
 
 function quoteIdent(raw: string): string {
     if (!ALLOWED_IDENT.test(raw)) {
@@ -114,6 +119,160 @@ function bindWhere(info: TableInfo, where: { readonly [k: string]: RawJson }): {
     return { sql: parts.join(" AND "), params };
 }
 
+function checkedAggregate(value: unknown, subject: string): number {
+    const numeric = typeof value === "bigint" ? Number(value) : value;
+    if (typeof numeric !== "number" || !Number.isSafeInteger(numeric) || numeric < 0) {
+        throw new CdbError({
+            code: "CDB_INVARIANT",
+            message: `auth/sql: bulk preload ${subject} aggregate is missing or invalid`,
+        });
+    }
+    return numeric;
+}
+
+function bulkPreloadCapacityExceeded(subject: string, limit: number): CdbError {
+    return new CdbError({
+        code: "CDB_RATE_LIMITED",
+        message: `Catalog auth bulk mutation exceeds the ${limit}-${subject} preload limit`,
+        retryAfterMs: AUTH_BULK_PRELOAD_RETRY_MS,
+        hint: "narrow the auth mutation predicate and retry in smaller batches",
+    });
+}
+
+function utf8ByteLength(value: string, stopAfter: number): number {
+    let bytes = 0;
+    for (let index = 0; index < value.length; index++) {
+        const code = value.charCodeAt(index);
+        if (code <= 0x7f) bytes += 1;
+        else if (code <= 0x7ff) bytes += 2;
+        else if (code >= 0xd800 && code <= 0xdbff) {
+            const next = value.charCodeAt(index + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) {
+                bytes += 4;
+                index++;
+            } else {
+                bytes += 3;
+            }
+        } else bytes += 3;
+        if (bytes > stopAfter) return bytes;
+    }
+    return bytes;
+}
+
+function sqlValueByteLength(value: SqlValue): bigint {
+    if (value === null) return 0n;
+    if (typeof value === "string") return BigInt(utf8ByteLength(value, AUTH_BULK_REPLACEMENT_MAX_BYTES));
+    if (value instanceof Uint8Array) return BigInt(value.byteLength);
+    return 8n;
+}
+
+function expandedReplacementBytes(
+    info: TableInfo,
+    payload: { readonly [k: string]: RawJson },
+    matchedRows: number
+): bigint {
+    if (matchedRows === 0) return 0n;
+    let bytesPerRow = 0n;
+    for (const key of Object.keys(payload)) {
+        if (!info.columns.has(key)) continue;
+        bytesPerRow += sqlValueByteLength(toSqlValue(payload[key] as RawJson));
+        if (bytesPerRow > BigInt(AUTH_BULK_REPLACEMENT_MAX_BYTES)) return bytesPerRow;
+    }
+    return bytesPerRow * BigInt(matchedRows);
+}
+
+export function authPreloadScopeRows(
+    sql: SyncSql,
+    table: AnySQLiteTable,
+    where: { readonly [k: string]: RawJson },
+    projectionKeys: readonly string[],
+    additionalScopeValues: readonly unknown[] = [],
+    replacementPayload?: { readonly [k: string]: RawJson }
+): {
+    readonly matchedRows: number;
+    readonly scopeBytes: number;
+    readonly rows: readonly Record<string, RawJson>[];
+} {
+    const info = infoOf(table);
+    const w = bindWhere(info, where);
+    const projected = [...new Set(projectionKeys)].map(modelKey => {
+        const sqlName = info.columns.get(modelKey);
+        if (!sqlName) {
+            throw new CdbError({
+                code: "CDB_INVARIANT",
+                message: `auth/sql: scope projection key "${modelKey}" is not a column on table ${info.name}`,
+            });
+        }
+        return { modelKey, sqlName, quoted: quoteIdent(sqlName) };
+    });
+    const storedByteExpression =
+        projected.length === 0
+            ? "0"
+            : projected
+                  .map(
+                      column =>
+                          `CASE WHEN typeof(${column.quoted}) = 'text' THEN length(CAST(${column.quoted} AS BLOB)) ELSE 0 END`
+                  )
+                  .join(" + ");
+    const aggregate = sql.one<{ matched_rows: number | bigint; scope_bytes: number | bigint }>(
+        `SELECT COUNT(*) AS matched_rows,
+                COALESCE(SUM(${storedByteExpression}), 0) AS scope_bytes
+         FROM ${quoteIdent(info.name)}
+         WHERE ${w.sql}`,
+        ...w.params
+    );
+    if (!aggregate) {
+        throw new CdbError({ code: "CDB_INVARIANT", message: "auth/sql: bulk preload aggregate returned no row" });
+    }
+    const matchedRows = checkedAggregate(aggregate.matched_rows, "row count");
+    if (matchedRows > AUTH_BULK_PRELOAD_MAX_ROWS) {
+        throw bulkPreloadCapacityExceeded("row", AUTH_BULK_PRELOAD_MAX_ROWS);
+    }
+    const replacementBytes = replacementPayload ? expandedReplacementBytes(info, replacementPayload, matchedRows) : 0n;
+    if (replacementBytes > BigInt(AUTH_BULK_REPLACEMENT_MAX_BYTES)) {
+        throw bulkPreloadCapacityExceeded("expanded-replacement-byte", AUTH_BULK_REPLACEMENT_MAX_BYTES);
+    }
+    let scopeBytes = checkedAggregate(aggregate.scope_bytes, "scope byte count");
+    if (matchedRows > 0) {
+        for (const value of additionalScopeValues) {
+            if (typeof value !== "string") continue;
+            scopeBytes += utf8ByteLength(value, AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES - scopeBytes);
+            if (!Number.isSafeInteger(scopeBytes)) {
+                throw new CdbError({
+                    code: "CDB_INVARIANT",
+                    message: "auth/sql: bulk preload scope byte total is invalid",
+                });
+            }
+        }
+    }
+    if (scopeBytes > AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES) {
+        throw bulkPreloadCapacityExceeded("scope-byte", AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES);
+    }
+    if (matchedRows === 0 || projected.length === 0) return { matchedRows, scopeBytes, rows: [] };
+
+    const selected = projected
+        .map(
+            column =>
+                `CASE WHEN typeof(${column.quoted}) = 'text' THEN ${column.quoted} ELSE NULL END AS ${column.quoted}`
+        )
+        .join(", ");
+    const rawRows = sql.all<Record<string, unknown>>(
+        `SELECT ${selected}
+         FROM ${quoteIdent(info.name)}
+         WHERE ${w.sql}
+         LIMIT ?`,
+        ...w.params,
+        AUTH_BULK_PRELOAD_MAX_ROWS + 1
+    );
+    if (rawRows.length !== matchedRows) {
+        throw new CdbError({
+            code: "CDB_INVARIANT",
+            message: "auth/sql: bulk preload row count changed inside one transaction",
+        });
+    }
+    return { matchedRows, scopeBytes, rows: rawRows.map(raw => projectRow(info, raw)) };
+}
+
 export function authCreate(
     sql: SyncSql,
     table: AnySQLiteTable,
@@ -152,7 +311,8 @@ export function authUpdate(
     sql: SyncSql,
     table: AnySQLiteTable,
     where: { readonly [k: string]: RawJson },
-    set: { readonly [k: string]: RawJson }
+    set: { readonly [k: string]: RawJson },
+    returnRow = true
 ): { affected: number; row: Record<string, RawJson> | null } {
     const info = infoOf(table);
     const setCols: string[] = [];
@@ -164,12 +324,12 @@ export function authUpdate(
         params.push(toSqlValue(set[key] as RawJson));
     }
     if (setCols.length === 0) {
-        return { affected: 0, row: authFindOne(sql, table, where) };
+        return { affected: 0, row: returnRow ? authFindOne(sql, table, where) : null };
     }
     const w = bindWhere(info, where);
     sql.exec(`UPDATE ${quoteIdent(info.name)} SET ${setCols.join(", ")} WHERE ${w.sql}`, ...params, ...w.params);
     const affected = sql.changes();
-    const row = authFindOne(sql, table, where);
+    const row = returnRow ? authFindOne(sql, table, where) : null;
     return { affected, row };
 }
 

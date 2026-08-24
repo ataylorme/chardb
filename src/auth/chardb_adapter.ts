@@ -41,6 +41,7 @@ interface CatalogRpc {
         op: "create" | "update" | "delete";
         where?: { [k: string]: RawJson };
         payload?: { [k: string]: RawJson };
+        returnRow?: boolean;
     }): Promise<{ ok: true; row?: Record<string, RawJson> | null; affected?: number }>;
     queryAuth(args: {
         model: string;
@@ -108,6 +109,7 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                     op: "update",
                     where: flat,
                     payload: update as { [k: string]: RawJson },
+                    returnRow: true,
                 });
                 return (r.row ?? null) as never;
             },
@@ -119,6 +121,7 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                     op: "update",
                     where: flat,
                     payload: update as { [k: string]: RawJson },
+                    returnRow: false,
                 });
                 return r.affected ?? 0;
             },

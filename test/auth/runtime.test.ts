@@ -8,7 +8,7 @@
 import { Database as BunSqlite } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { organization } from "better-auth/plugins/organization";
-import { sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { blob, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import {
     type AuthPartitionRule,
     bindAuthRuntime,
@@ -17,27 +17,35 @@ import {
     tableFor,
 } from "../../src/auth/runtime.ts";
 import {
+    AUTH_BULK_PRELOAD_MAX_ROWS,
+    AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES,
+    AUTH_BULK_REPLACEMENT_MAX_BYTES,
     authCount,
     authCreate,
     authDelete,
     authFindMany,
     authFindOne,
+    authPreloadScopeRows,
     authTableColumns,
     authTableName,
     authUpdate,
 } from "../../src/auth/sql.ts";
 import { defineAuth } from "../../src/auth/synthesize.ts";
 import type { SyncSql } from "../../src/oplog/wrapper.ts";
+import type { RawJson } from "../../src/types.ts";
 
-function bunSyncSql(db: BunSqlite): SyncSql {
+function bunSyncSql(db: BunSqlite, statements: string[] = []): SyncSql {
     return {
         exec(sql, ...params) {
+            statements.push(sql);
             db.query(sql).run(...(params as never[]));
         },
         one<T>(sql: string, ...params: never[]): T | null {
+            statements.push(sql);
             return db.query(sql).get(...params) as T | null;
         },
         all<T>(sql: string, ...params: never[]): T[] {
+            statements.push(sql);
             return db.query(sql).all(...params) as T[];
         },
         changes() {
@@ -185,6 +193,164 @@ describe("auth/sql — render path against bun:sqlite", () => {
         expect(() => authFindMany(sql, t, {}, 1, 0, { field: "name", direction: "sideways" } as never)).toThrow(
             /invalid sort direction/
         );
+    });
+
+    test("bulk scope preload accepts exactly 4096 rows and rejects the next row", () => {
+        const { db } = bootstrap();
+        const statements: string[] = [];
+        const sql = bunSyncSql(db, statements);
+        const scoped = sqliteTable("bulk_scope_rows", { id: text("scope_id") });
+        sql.exec('CREATE TABLE "bulk_scope_rows" ("scope_id" TEXT PRIMARY KEY)');
+        const insert = db.prepare('INSERT INTO "bulk_scope_rows" ("scope_id") VALUES (?)');
+        db.transaction(() => {
+            for (let index = 0; index < AUTH_BULK_PRELOAD_MAX_ROWS; index++) insert.run(`scope-${index}`);
+        })();
+
+        const exact = authPreloadScopeRows(sql, scoped, {}, ["id"]);
+        expect(exact.matchedRows).toBe(AUTH_BULK_PRELOAD_MAX_ROWS);
+        expect(exact.rows).toHaveLength(AUTH_BULK_PRELOAD_MAX_ROWS);
+
+        insert.run("scope-over");
+        expect(() => authPreloadScopeRows(sql, scoped, {}, ["id"])).toThrow(
+            new RegExp(`${AUTH_BULK_PRELOAD_MAX_ROWS}-row preload limit`)
+        );
+    });
+
+    test("bulk scope preload maps renamed columns, ignores wide fields, and enforces exact stored bytes", () => {
+        const { db } = bootstrap();
+        const statements: string[] = [];
+        const sql = bunSyncSql(db, statements);
+        const scoped = sqliteTable("bulk_scope_bytes", {
+            id: text("db_id"),
+            organizationId: text("org_id"),
+            wide: text("wide_payload"),
+        });
+        sql.exec('CREATE TABLE "bulk_scope_bytes" ("db_id" TEXT PRIMARY KEY, "org_id" TEXT, "wide_payload" TEXT)');
+        const insert = db.prepare(
+            'INSERT INTO "bulk_scope_bytes" ("db_id", "org_id", "wide_payload") VALUES (?, ?, ?)'
+        );
+        insert.run("a", "o".repeat(AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES - 1), "w".repeat(1_024 * 1_024));
+        statements.length = 0;
+
+        const exact = authPreloadScopeRows(sql, scoped, {}, ["id", "organizationId"]);
+        expect(exact.scopeBytes).toBe(AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES);
+        expect(exact.rows).toEqual([{ id: "a", organizationId: "o".repeat(AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES - 1) }]);
+        expect(statements.every(statement => !statement.includes("wide_payload"))).toBe(true);
+        expect(statements.some(statement => statement.includes('typeof("db_id")'))).toBe(true);
+        expect(statements.some(statement => statement.includes('typeof("org_id")'))).toBe(true);
+
+        db.exec('DELETE FROM "bulk_scope_bytes"');
+        insert.run("x".repeat(AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES + 1), null, "wide");
+        expect(() => authPreloadScopeRows(sql, scoped, {}, ["id"])).toThrow(
+            new RegExp(`${AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES}-scope-byte preload limit`)
+        );
+
+        db.exec('DELETE FROM "bulk_scope_bytes"');
+        insert.run("a", null, "wide");
+        expect(() =>
+            authPreloadScopeRows(sql, scoped, {}, ["id"], ["n".repeat(AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES)])
+        ).toThrow(new RegExp(`${AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES}-scope-byte preload limit`));
+    });
+
+    test("bulk preload caps expanded text, JSON, binary, and scalar replacements", () => {
+        const { db } = bootstrap();
+        const sql = bunSyncSql(db);
+        const replacements = sqliteTable("bulk_replacements", {
+            id: text("id"),
+            textValue: text("text_value"),
+            jsonValue: text("json_value", { mode: "json" }),
+            binaryValue: blob("binary_value"),
+            numberValue: integer("number_value"),
+            nullableValue: text("nullable_value"),
+        });
+        sql.exec(
+            'CREATE TABLE "bulk_replacements" ("id" TEXT PRIMARY KEY, "text_value" TEXT, "json_value" TEXT, "binary_value" BLOB, "number_value" INTEGER, "nullable_value" TEXT)'
+        );
+        sql.exec('INSERT INTO "bulk_replacements" ("id") VALUES (?)', "one");
+
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, {}, ["id"], [], {
+                textValue: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES),
+            })
+        ).not.toThrow();
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, {}, ["id"], [], {
+                textValue: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES + 1),
+            })
+        ).toThrow(new RegExp(`${AUTH_BULK_REPLACEMENT_MAX_BYTES}-expanded-replacement-byte preload limit`));
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, {}, ["id"], [], {
+                textValue: "é".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES / 2),
+            })
+        ).not.toThrow();
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, {}, ["id"], [], {
+                textValue: "é".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES / 2 + 1),
+            })
+        ).toThrow(new RegExp(`${AUTH_BULK_REPLACEMENT_MAX_BYTES}-expanded-replacement-byte preload limit`));
+
+        const emptyJsonBytes = JSON.stringify({ value: "" }).length;
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, {}, ["id"], [], {
+                jsonValue: { value: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES - emptyJsonBytes) },
+            })
+        ).not.toThrow();
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, {}, ["id"], [], {
+                jsonValue: { value: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES - emptyJsonBytes + 1) },
+            })
+        ).toThrow(new RegExp(`${AUTH_BULK_REPLACEMENT_MAX_BYTES}-expanded-replacement-byte preload limit`));
+        const emptyArrayBytes = JSON.stringify([""]).length;
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, {}, ["id"], [], {
+                jsonValue: ["x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES - emptyArrayBytes)],
+            })
+        ).not.toThrow();
+
+        const exactMixed = {
+            binaryValue: new Uint8Array(AUTH_BULK_REPLACEMENT_MAX_BYTES - 8),
+            numberValue: 42,
+            nullableValue: null,
+        } as unknown as Record<string, RawJson>;
+        expect(() => authPreloadScopeRows(sql, replacements, {}, ["id"], [], exactMixed)).not.toThrow();
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, {}, ["id"], [], {
+                ...exactMixed,
+                binaryValue: new Uint8Array(AUTH_BULK_REPLACEMENT_MAX_BYTES - 7),
+            } as unknown as Record<string, RawJson>)
+        ).toThrow(new RegExp(`${AUTH_BULK_REPLACEMENT_MAX_BYTES}-expanded-replacement-byte preload limit`));
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, {}, ["id"], [], {
+                unknown: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES + 1),
+            })
+        ).not.toThrow();
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, { id: "missing" }, ["id"], [], {
+                textValue: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES + 1),
+            })
+        ).not.toThrow();
+    });
+
+    test("bulk replacement budget multiplies each bound value by matched rows", () => {
+        const { db } = bootstrap();
+        const sql = bunSyncSql(db);
+        const replacements = sqliteTable("bulk_replacement_rows", {
+            id: text("id"),
+            value: text("value"),
+        });
+        sql.exec('CREATE TABLE "bulk_replacement_rows" ("id" TEXT PRIMARY KEY, "value" TEXT)');
+        sql.exec('INSERT INTO "bulk_replacement_rows" ("id") VALUES (?), (?)', "one", "two");
+
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, {}, ["id"], [], {
+                value: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES / 2),
+            })
+        ).not.toThrow();
+        expect(() =>
+            authPreloadScopeRows(sql, replacements, {}, ["id"], [], {
+                value: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES / 2 + 1),
+            })
+        ).toThrow(new RegExp(`${AUTH_BULK_REPLACEMENT_MAX_BYTES}-expanded-replacement-byte preload limit`));
     });
 
     test("rejects where keys that are not columns", () => {

@@ -31,7 +31,16 @@ import {
     parseCachedJwk,
 } from "../../auth/jwks_cache.ts";
 import { getAuthRuntime, placementFor, tableFor } from "../../auth/runtime.ts";
-import { authCount, authCreate, authDelete, authFindMany, authFindOne, authUpdate } from "../../auth/sql.ts";
+import {
+    authCount,
+    authCreate,
+    authDelete,
+    authFindMany,
+    authFindOne,
+    authPreloadScopeRows,
+    authTableColumns,
+    authUpdate,
+} from "../../auth/sql.ts";
 import { CdbError } from "../../errors.ts";
 import type { RawJson } from "../../types.ts";
 import { type PrincipalId, ShardId, type TenantId, type Vshard } from "../../types.ts";
@@ -174,6 +183,13 @@ function addRowEpochScopes(
     // Auth fields add the other scope when the row carries one.
     if (typeof row.organizationId === "string") addEpochScope(scopes, "tenant", row.organizationId);
     if (typeof row.userId === "string") addEpochScope(scopes, "principal", row.userId);
+}
+
+function authEpochScopeColumns(model: string, table: Parameters<typeof authTableColumns>[0]): readonly string[] {
+    const schemaColumns = authTableColumns(table);
+    const placement = placementFor(model);
+    const candidates = [...(placement.kind === "replicated" ? [] : [placement.column]), "organizationId", "userId"];
+    return [...new Set(candidates.filter(column => schemaColumns.has(column)))];
 }
 
 function bumpAuthEpochInSql(sql: CatalogSql, scope: AuthEpochScope, scopeId: string): number {
@@ -323,6 +339,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
         readonly op: "create" | "update" | "delete";
         readonly where?: { readonly [k: string]: RawJson };
         readonly payload?: { readonly [k: string]: RawJson };
+        readonly returnRow?: boolean;
     }): Promise<{
         readonly ok: true;
         readonly row?: Record<string, RawJson> | null;
@@ -331,6 +348,8 @@ export class Catalog extends DurableObject<CatalogEnv> {
         await this.bootstrap();
         this.ensureAuthTables();
         const table = tableFor(args.model);
+        const scopeColumns = authEpochScopeColumns(args.model, table);
+        const placement = placementFor(args.model);
         let row: Record<string, RawJson> | null | undefined;
         let affected = 0;
         this.ctx.storage.transactionSync(() => {
@@ -348,14 +367,29 @@ export class Catalog extends DurableObject<CatalogEnv> {
                     if (!args.where || !args.payload) {
                         throw new Error("auth: update requires where and payload");
                     }
-                    const before = authFindMany(sql, table, args.where);
-                    const r = authUpdate(sql, table, args.where, args.payload);
+                    const before = authPreloadScopeRows(
+                        sql,
+                        table,
+                        args.where,
+                        scopeColumns,
+                        scopeColumns.map(column => args.payload?.[column]),
+                        args.payload
+                    );
+                    const returnRow = args.returnRow !== false;
+                    const fullBefore = returnRow && before.matchedRows > 0 ? authFindOne(sql, table, args.where) : null;
+                    const r = authUpdate(sql, table, args.where, args.payload, returnRow);
                     affected = r.affected;
                     if (affected > 0) {
-                        const after = before.map(previous => ({ ...previous, ...args.payload }));
-                        row = r.row ?? after[0] ?? null;
-                        for (const previous of before) addRowEpochScopes(scopes, args.model, previous);
-                        for (const next of after) addRowEpochScopes(scopes, args.model, next);
+                        if (placement.kind === "replicated") addEpochScope(scopes, "global", "global");
+                        row = returnRow ? (r.row ?? (fullBefore ? { ...fullBefore, ...args.payload } : null)) : null;
+                        for (const previous of before.rows) {
+                            addRowEpochScopes(scopes, args.model, previous);
+                            const next: Record<string, RawJson> = { ...previous };
+                            for (const column of scopeColumns) {
+                                if (Object.hasOwn(args.payload, column)) next[column] = args.payload[column] as RawJson;
+                            }
+                            addRowEpochScopes(scopes, args.model, next);
+                        }
                     } else {
                         row = r.row;
                     }
@@ -363,10 +397,11 @@ export class Catalog extends DurableObject<CatalogEnv> {
                 }
                 case "delete": {
                     if (!args.where) throw new Error("auth: delete requires where");
-                    const before = authFindMany(sql, table, args.where);
+                    const before = authPreloadScopeRows(sql, table, args.where, scopeColumns);
                     affected = authDelete(sql, table, args.where).affected;
                     if (affected > 0) {
-                        for (const previous of before) addRowEpochScopes(scopes, args.model, previous);
+                        if (placement.kind === "replicated") addEpochScope(scopes, "global", "global");
+                        for (const previous of before.rows) addRowEpochScopes(scopes, args.model, previous);
                     }
                     break;
                 }

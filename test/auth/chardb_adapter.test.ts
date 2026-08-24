@@ -2,6 +2,11 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chardbAuthAdapter } from "../../src/auth/chardb_adapter.ts";
 import { bindAuthRuntime, resetAuthRuntime } from "../../src/auth/runtime.ts";
+import {
+    AUTH_BULK_PRELOAD_MAX_ROWS,
+    AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES,
+    AUTH_BULK_REPLACEMENT_MAX_BYTES,
+} from "../../src/auth/sql.ts";
 import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import { chardb } from "../../src/server/chardb.ts";
 import { Catalog } from "../../src/server/do/catalog.ts";
@@ -441,6 +446,152 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(await adapter.findMany({ model: "user", where: eq("name", "After") })).toHaveLength(2);
         expect(harness.catalog.authEpoch({ principalId: "batch-user-1" as never }).principal).toBe(2);
         expect(harness.catalog.authEpoch({ principalId: "batch-user-2" as never }).principal).toBe(2);
+    });
+
+    test("rejects a 4097-row auth update before the row or epoch write", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const insert = harness.db.prepare(
+            'INSERT INTO "user" ("id", "name", "email", "emailVerified", "createdAt", "updatedAt") VALUES (?, ?, ?, ?, ?, ?)'
+        );
+        harness.db.transaction(() => {
+            for (let index = 0; index <= AUTH_BULK_PRELOAD_MAX_ROWS; index++) {
+                insert.run(
+                    `bulk-over-${index}`,
+                    "Bulk row cap",
+                    `bulk-over-${index}@example.com`,
+                    1,
+                    1_777_000_000_000,
+                    1_777_000_000_000
+                );
+            }
+        })();
+        harness.sqlStatements.length = 0;
+
+        await expect(
+            adapter.updateMany({ model: "user", where: eq("name", "Bulk row cap"), update: { name: "Changed" } })
+        ).rejects.toMatchObject({ code: "CDB_RATE_LIMITED", retryable: true });
+        expect(harness.db.query('SELECT COUNT(*) AS count FROM "user" WHERE "name" = ?').get("Changed")).toEqual({
+            count: 0,
+        });
+        expect(harness.sqlStatements.some(statement => statement.startsWith('UPDATE "user"'))).toBe(false);
+        expect(harness.sqlStatements.some(statement => statement.startsWith("UPDATE catalog_epoch"))).toBe(false);
+        expect(harness.catalog.authEpoch({ principalId: "bulk-over-0" as never }).principal).toBe(0);
+    });
+
+    test("rejects excess stored and replacement scope bytes before auth writes", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const oversizedId = "s".repeat(AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES + 1);
+        harness.db
+            .prepare(
+                'INSERT INTO "user" ("id", "name", "email", "emailVerified", "createdAt", "updatedAt") VALUES (?, ?, ?, ?, ?, ?)'
+            )
+            .run(oversizedId, "Bulk byte cap", "bulk-byte-cap@example.com", 1, 1_777_000_000_000, 1_777_000_000_000);
+        await adapter.create({
+            model: "user",
+            forceAllowId: true,
+            data: {
+                id: "replacement-byte-user",
+                name: "Before",
+                email: "replacement-byte-user@example.com",
+                emailVerified: true,
+                createdAt: new Date("2026-08-23T00:00:00Z"),
+                updatedAt: new Date("2026-08-23T00:00:00Z"),
+            },
+        });
+        harness.sqlStatements.length = 0;
+
+        await expect(
+            adapter.updateMany({ model: "user", where: eq("name", "Bulk byte cap"), update: { name: "Changed" } })
+        ).rejects.toMatchObject({ code: "CDB_RATE_LIMITED", retryable: true });
+        await expect(adapter.deleteMany({ model: "user", where: eq("name", "Bulk byte cap") })).rejects.toMatchObject({
+            code: "CDB_RATE_LIMITED",
+            retryable: true,
+        });
+        await expect(
+            harness.catalog.mutateAuth({
+                model: "user",
+                op: "update",
+                where: { id: "replacement-byte-user" },
+                payload: { id: "n".repeat(AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES) },
+                returnRow: false,
+            })
+        ).rejects.toMatchObject({ code: "CDB_RATE_LIMITED", retryable: true });
+        expect(harness.db.query('SELECT "name" FROM "user" WHERE "id" = ?').get(oversizedId)).toEqual({
+            name: "Bulk byte cap",
+        });
+        expect(harness.db.query('SELECT "name" FROM "user" WHERE "id" = ?').get("replacement-byte-user")).toEqual({
+            name: "Before",
+        });
+        expect(harness.sqlStatements.some(statement => statement.startsWith('UPDATE "user"'))).toBe(false);
+        expect(harness.sqlStatements.some(statement => statement.startsWith('DELETE FROM "user"'))).toBe(false);
+        expect(harness.sqlStatements.some(statement => statement.startsWith("UPDATE catalog_epoch"))).toBe(false);
+        expect(harness.catalog.authEpoch({ principalId: oversizedId as never }).principal).toBe(0);
+    });
+
+    test("updateMany preloads only narrow scope columns and skips a full-row reread", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        await adapter.create({
+            model: "user",
+            forceAllowId: true,
+            data: {
+                id: "wide-bulk-user",
+                name: "Before",
+                email: "wide-bulk-user@example.com",
+                emailVerified: true,
+                image: "w".repeat(1_024 * 1_024),
+                createdAt: new Date("2026-08-23T00:00:00Z"),
+                updatedAt: new Date("2026-08-23T00:00:00Z"),
+            },
+        });
+        harness.sqlStatements.length = 0;
+
+        await expect(
+            adapter.updateMany({
+                model: "user",
+                where: eq("email", "wide-bulk-user@example.com"),
+                update: { name: "After" },
+            })
+        ).resolves.toBe(1);
+        const userSelects = harness.sqlStatements.filter(
+            statement => statement.startsWith("SELECT") && statement.includes('FROM "user"')
+        );
+        expect(userSelects).toHaveLength(2);
+        expect(userSelects.every(statement => !statement.includes('"image"'))).toBe(true);
+        expect(userSelects.every(statement => !statement.includes("SELECT *"))).toBe(true);
+        expect(harness.catalog.authEpoch({ principalId: "wide-bulk-user" as never }).principal).toBe(2);
+    });
+
+    test("rejects expanded non-scope replacements before base or epoch writes", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        await adapter.create({
+            model: "user",
+            forceAllowId: true,
+            data: {
+                id: "replacement-expansion-user",
+                name: "Before",
+                email: "replacement-expansion-user@example.com",
+                emailVerified: true,
+                image: "before",
+                createdAt: new Date("2026-08-23T00:00:00Z"),
+                updatedAt: new Date("2026-08-23T00:00:00Z"),
+            },
+        });
+        const epochBefore = harness.catalog.authEpoch({ principalId: "replacement-expansion-user" as never });
+        harness.sqlStatements.length = 0;
+
+        await expect(
+            adapter.updateMany({
+                model: "user",
+                where: eq("id", "replacement-expansion-user"),
+                update: { image: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES + 1) },
+            })
+        ).rejects.toMatchObject({ code: "CDB_RATE_LIMITED", retryable: true });
+        expect(harness.db.query('SELECT "image" FROM "user" WHERE "id" = ?').get("replacement-expansion-user")).toEqual(
+            { image: "before" }
+        );
+        expect(harness.sqlStatements.some(statement => statement.startsWith('UPDATE "user"'))).toBe(false);
+        expect(harness.sqlStatements.some(statement => statement.startsWith("UPDATE catalog_epoch"))).toBe(false);
+        expect(harness.catalog.authEpoch({ principalId: "replacement-expansion-user" as never })).toEqual(epochBefore);
     });
 
     test("updateMany bumps every tenant and principal touched by membership rows", async () => {
