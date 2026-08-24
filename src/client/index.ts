@@ -37,6 +37,9 @@ const MAX_OPTIMISTIC_PATCHES = 4_096;
 const MAX_OPTIMISTIC_PATCH_BYTES = 512 * 1_024;
 const MAX_PATCHES_PER_BATCH = 4_096;
 const MAX_PATCH_BATCH_BYTES = 512 * 1_024;
+const MAX_MUTATION_ARGUMENT_MEMBERS = 4_096;
+const MAX_MUTATION_ARGUMENT_BYTES = 512 * 1_024;
+const MAX_MUTATION_ARGUMENT_DEPTH = 99;
 const MAX_PENDING_MUTATIONS = 32;
 
 export interface ChardbClientOptions {
@@ -372,14 +375,47 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         assertSerializedSize(value, MAX_PATCH_BATCH_BYTES, "patch batch");
     }
 
-    function assertSerializedSize(value: unknown, limit: number, subject: string): void {
+    function assertSerializedSize(
+        value: unknown,
+        limit: number,
+        subject: string,
+        limits: {
+            readonly memberLimit?: number;
+            readonly maxDepth?: number;
+            readonly errorCode?: CdbErrorCode;
+        } = {}
+    ): void {
+        const errorCode = limits.errorCode ?? "CDB_INVARIANT";
         let bytes = 0;
+        let members = 0;
         const ancestors = new WeakSet<object>();
+        const invalidJson = (reason: string): never => {
+            throw new CdbError({ code: errorCode, message: `${subject} is not JSON-compatible: ${reason}` });
+        };
         const add = (amount: number): void => {
             bytes += amount;
             if (bytes > limit) {
-                throw new CdbError({ code: "CDB_INVARIANT", message: `${subject} exceeds the client byte limit` });
+                throw new CdbError({ code: errorCode, message: `${subject} exceeds the ${limit}-byte client limit` });
             }
+        };
+        const addMember = (): void => {
+            members++;
+            if (limits.memberLimit !== undefined && members > limits.memberLimit) {
+                throw new CdbError({
+                    code: errorCode,
+                    message: `${subject} exceeds the ${limits.memberLimit}-member client limit`,
+                });
+            }
+        };
+        const visitChild = (child: unknown, depth: number): void => {
+            addMember();
+            if (limits.maxDepth !== undefined && depth >= limits.maxDepth) {
+                throw new CdbError({
+                    code: errorCode,
+                    message: `${subject} exceeds the ${limits.maxDepth}-level client depth limit`,
+                });
+            }
+            visit(child, depth + 1);
         };
         const addString = (text: string): void => {
             add(2);
@@ -416,46 +452,77 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 }
             }
         };
-        const visit = (item: unknown): void => {
+        const visit = (item: unknown, depth: number): void => {
             if (item === null) {
                 add(4);
             } else if (typeof item === "string") {
                 addString(item);
             } else if (typeof item === "number") {
-                if (!Number.isFinite(item)) throw new TypeError(`${subject} is not JSON-compatible`);
+                if (!Number.isFinite(item) || Object.is(item, -0)) {
+                    invalidJson("numbers must be finite and must not be negative zero");
+                }
                 add(JSON.stringify(item).length);
             } else if (typeof item === "boolean") {
                 add(item ? 4 : 5);
             } else if (typeof item === "object") {
-                if (ancestors.has(item)) throw new TypeError(`${subject} is cyclic`);
+                if (ancestors.has(item)) invalidJson("cyclic references are unsupported");
                 ancestors.add(item);
                 if (Array.isArray(item)) {
+                    const ownKeys = Reflect.ownKeys(item);
+                    if (ownKeys.some(key => typeof key === "symbol")) {
+                        invalidJson("symbol properties are unsupported");
+                    }
+                    if (ownKeys.length !== item.length + 1) {
+                        invalidJson("arrays cannot be sparse or have extra properties");
+                    }
                     add(2);
                     for (let index = 0; index < item.length; index++) {
+                        const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
+                        if (!descriptor) invalidJson("array entries must be own properties");
+                        const dataDescriptor = descriptor as PropertyDescriptor;
+                        if (!dataDescriptor.enumerable || !("value" in dataDescriptor)) {
+                            invalidJson("array entries must be enumerable data properties");
+                        }
                         if (index > 0) add(1);
-                        visit(item[index]);
+                        visitChild(dataDescriptor.value, depth);
                     }
                 } else {
                     const prototype = Object.getPrototypeOf(item);
                     if (prototype !== Object.prototype && prototype !== null) {
-                        throw new TypeError(`${subject} is not a plain JSON object`);
+                        invalidJson("objects must be plain objects");
                     }
                     add(2);
                     let first = true;
-                    for (const [key, child] of Object.entries(item)) {
+                    for (const key of Reflect.ownKeys(item)) {
+                        if (typeof key !== "string") invalidJson("symbol properties are unsupported");
+                        const stringKey = key as string;
+                        const descriptor = Object.getOwnPropertyDescriptor(item, stringKey);
+                        if (!descriptor) invalidJson("object properties must be own properties");
+                        const dataDescriptor = descriptor as PropertyDescriptor;
+                        if (!dataDescriptor.enumerable || !("value" in dataDescriptor)) {
+                            invalidJson("object properties must be enumerable data properties");
+                        }
                         if (!first) add(1);
                         first = false;
-                        addString(key);
+                        addString(stringKey);
                         add(1);
-                        visit(child);
+                        visitChild(dataDescriptor.value, depth);
                     }
                 }
                 ancestors.delete(item);
             } else {
-                throw new TypeError(`${subject} is not JSON-compatible`);
+                invalidJson(`${typeof item} values are unsupported`);
             }
         };
-        visit(value);
+        visit(value, 0);
+    }
+
+    function assertMutationArguments(args: RawJson): void {
+        assertSerializedSize(args, MAX_MUTATION_ARGUMENT_BYTES, "mutation arguments", {
+            memberLimit: MAX_MUTATION_ARGUMENT_MEMBERS,
+            maxDepth: MAX_MUTATION_ARGUMENT_DEPTH,
+            errorCode: "CDB_INVALID_ARGS",
+        });
     }
 
     function assertSubscriptionRows(rows: readonly RawJson[], subject: string): void {
@@ -622,6 +689,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         let mutationRef: ChardbRef;
         try {
             mutationRef = ChardbRef(ref);
+            assertMutationArguments(args);
         } catch (error) {
             return Promise.reject(error);
         }

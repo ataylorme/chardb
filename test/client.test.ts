@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bu
 import { type ChardbClientOptions, createChardbClient } from "../src/client/index.ts";
 import { CdbError } from "../src/errors.ts";
 import { ChardbRef, ClientId, Cookie, type RawJson, SubId } from "../src/types.ts";
-import { type Down, PROTOCOL_V, type Up, encodeWire } from "../src/wire.ts";
+import { type Down, PROTOCOL_V, type Up, decodeWire, encodeWire } from "../src/wire.ts";
 
 class FakeWS {
     static OPEN = 1 as const;
@@ -106,6 +106,12 @@ function sentMutations(ws: FakeWS): Extract<Up, { t: "mut" }>[] {
     return ws.sent
         .map(raw => JSON.parse(raw) as Up)
         .filter((message): message is Extract<Up, { t: "mut" }> => message.t === "mut");
+}
+
+function nestedJson(depth: number): RawJson {
+    let value: RawJson = null;
+    for (let level = 0; level < depth; level++) value = { value };
+    return value;
 }
 
 function spyOnClearTimeout(): { readonly calls: unknown[]; restore: () => void } {
@@ -1126,6 +1132,170 @@ describe("createChardbClient — wire round-trip", () => {
             expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
             c.close();
             await expect(admitted).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
+        } finally {
+            timers.restore();
+            c.close();
+        }
+    });
+
+    test("rejects non-JSON mutation arguments without invoking accessors or allocating work", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 1_000 });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+
+            const sparse = Array<RawJson>(1);
+            const extraArray: RawJson[] = [null];
+            Object.defineProperty(extraArray, "extra", { value: true, enumerable: true });
+            const symbolArray: RawJson[] = [null];
+            Object.defineProperty(symbolArray, Symbol("hidden"), { value: true, enumerable: true });
+            const symbolObject: Record<string, RawJson> = {};
+            Object.defineProperty(symbolObject, Symbol("hidden"), { value: true, enumerable: true });
+            const nonEnumerableObject: Record<string, RawJson> = {};
+            Object.defineProperty(nonEnumerableObject, "hidden", { value: true, enumerable: false });
+            let getterRuns = 0;
+            const accessorObject: Record<string, RawJson> = {};
+            Object.defineProperty(accessorObject, "value", {
+                enumerable: true,
+                get() {
+                    getterRuns++;
+                    return null;
+                },
+            });
+            const accessorArray: RawJson[] = [null];
+            Object.defineProperty(accessorArray, "0", {
+                enumerable: true,
+                get() {
+                    getterRuns++;
+                    return null;
+                },
+            });
+
+            await expect(c.mutate("invalid-ref", accessorObject)).rejects.toBeInstanceOf(TypeError);
+            for (const args of [
+                -0,
+                Number.POSITIVE_INFINITY,
+                sparse,
+                extraArray,
+                symbolArray,
+                symbolObject,
+                nonEnumerableObject,
+                accessorObject,
+                accessorArray,
+            ] as unknown as RawJson[]) {
+                await expect(c.mutate("mutations.ts#invalid-json", args)).rejects.toMatchObject({
+                    code: "CDB_INVALID_ARGS",
+                    retryable: false,
+                });
+            }
+            expect(getterRuns).toBe(0);
+            expect(timers.scheduledDelays()).toHaveLength(0);
+            expect(sentMutations(ws)).toHaveLength(0);
+
+            const nullPrototypeArgs = Object.create(null) as Record<string, RawJson>;
+            nullPrototypeArgs.value = "accepted";
+            const admitted = c.mutate("mutations.ts#after-invalid-json", nullPrototypeArgs).catch(error => error);
+            expect(timers.scheduledDelays()).toHaveLength(1);
+            expect(sentMutations(ws)).toEqual([
+                expect.objectContaining({
+                    ref: ChardbRef("mutations.ts#after-invalid-json"),
+                    args: { value: "accepted" },
+                }),
+            ]);
+            c.close();
+            await expect(admitted).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
+        } finally {
+            timers.restore();
+            c.close();
+        }
+    });
+
+    test("caps mutation argument members, depth, and bytes before allocation or send", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 1_000 });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            const exactCount = c
+                .mutate(
+                    "mutations.ts#exact-argument-count",
+                    Array.from({ length: 2_048 }, () => [null])
+                )
+                .catch(error => error);
+            const exactDepth = c.mutate("mutations.ts#exact-argument-depth", nestedJson(99)).catch(error => error);
+            const exactBytes = c
+                .mutate("mutations.ts#exact-argument-bytes", { value: "é".repeat(262_138) })
+                .catch(error => error);
+            expect(timers.scheduledDelays()).toHaveLength(3);
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+
+            await expect(
+                c.mutate(
+                    "mutations.ts#too-many-arguments",
+                    Array.from({ length: 2_048 }, (_, index) => (index === 0 ? [null, null] : [null]))
+                )
+            ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
+            await expect(c.mutate("mutations.ts#too-deep-arguments", nestedJson(100))).rejects.toMatchObject({
+                code: "CDB_INVALID_ARGS",
+                retryable: false,
+            });
+            await expect(
+                c.mutate("mutations.ts#too-many-argument-bytes", { value: "é".repeat(262_139) })
+            ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
+            expect(timers.scheduledDelays()).toHaveLength(3);
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+
+            await welcome(ws);
+            expect(sentMutations(ws).map(message => message.ref)).toEqual([
+                ChardbRef("mutations.ts#exact-argument-count"),
+                ChardbRef("mutations.ts#exact-argument-depth"),
+                ChardbRef("mutations.ts#exact-argument-bytes"),
+            ]);
+            const exactDepthRaw = ws.sent.find(raw => raw.includes('"ref":"mutations.ts#exact-argument-depth"'));
+            if (!exactDepthRaw) throw new Error("expected exact-depth mutation send");
+            expect(decodeWire(exactDepthRaw)).toMatchObject({
+                t: "mut",
+                ref: ChardbRef("mutations.ts#exact-argument-depth"),
+            });
+
+            c.close();
+            await Promise.all([exactCount, exactDepth, exactBytes]);
+        } finally {
+            timers.restore();
+            c.close();
+        }
+    });
+
+    test("keeps invalid ref and argument-limit polarity ahead of a full pending queue", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 1_000 });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            const pending = Array.from({ length: 32 }, (_, index) =>
+                c.mutate("mutations.ts#held-for-argument-order", { index }).catch(error => error)
+            );
+            expect(timers.scheduledDelays()).toHaveLength(32);
+
+            await expect(c.mutate("invalid-ref", { value: "é".repeat(262_139) })).rejects.toBeInstanceOf(TypeError);
+            await expect(
+                c.mutate("mutations.ts#oversized-at-cap", { value: "é".repeat(262_139) })
+            ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
+            await expect(c.mutate("mutations.ts#too-deep-at-cap", nestedJson(100))).rejects.toMatchObject({
+                code: "CDB_INVALID_ARGS",
+                retryable: false,
+            });
+            await expect(c.mutate("mutations.ts#valid-at-cap", {})).rejects.toMatchObject({
+                code: "CDB_RATE_LIMITED",
+                retryable: true,
+            });
+            expect(timers.scheduledDelays()).toHaveLength(32);
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+
+            c.close();
+            await Promise.all(pending);
         } finally {
             timers.restore();
             c.close();
