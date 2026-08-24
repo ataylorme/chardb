@@ -3761,8 +3761,13 @@ export class Gateway extends DurableObject<GatewayEnv> {
         try {
             const mismatch = checkProtocolV(msg.protocolV);
             if (mismatch) {
-                this.send(ws, mismatch);
-                ws.close(1002, `unsupported chardb protocol ${msg.protocolV}`);
+                this.markConnectionRejected(ws, pending.connectionId);
+                this.sendThenClose(
+                    ws,
+                    () => this.send(ws, mismatch),
+                    1002,
+                    `unsupported chardb protocol ${msg.protocolV}`
+                );
                 return;
             }
             const attachment = await this.verifyAttachment(
@@ -3798,7 +3803,12 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 region: "WNAM",
                 ...(msg.resumeFromCookie ? { resumedFromCookie: msg.resumeFromCookie } : {}),
             };
-            this.send(ws, welcome);
+            try {
+                this.send(ws, welcome);
+            } catch (error) {
+                this.markConnectionRejected(ws, pending.connectionId);
+                this.closePreservingFailure(ws, 1011, "welcome delivery failed", { value: error });
+            }
         } finally {
             this.releaseAuthOperation(pending.connectionId, claim);
         }
@@ -3969,27 +3979,42 @@ export class Gateway extends DurableObject<GatewayEnv> {
     ): void {
         const current = ws.deserializeAttachment() as GwAttachment | null;
         if (current?.kind === "rejected") return;
-        if (current) {
-            ws.serializeAttachment({
-                kind: "rejected",
-                connectionId: current.connectionId,
-                authOrigin: current.authOrigin,
-            } satisfies RejectedGwAttachment);
-        }
-        let sendFailed = false;
-        let sendFailure: unknown;
+        if (current) this.markConnectionRejected(ws, current.connectionId);
+        this.sendThenClose(ws, () => this.sendError(ws, code), closeCode, reason);
+    }
+
+    private markConnectionRejected(ws: WebSocket, expectedConnectionId: string): void {
+        const current = ws.deserializeAttachment() as GwAttachment | null;
+        if (!current || current.kind === "rejected" || current.connectionId !== expectedConnectionId) return;
+        ws.serializeAttachment({
+            kind: "rejected",
+            connectionId: current.connectionId,
+            authOrigin: current.authOrigin,
+        } satisfies RejectedGwAttachment);
+    }
+
+    private sendThenClose(ws: WebSocket, send: () => void, closeCode: number, reason: string): void {
+        let sendFailure: { readonly value: unknown } | null = null;
         try {
-            this.sendError(ws, code);
+            send();
         } catch (error) {
-            sendFailed = true;
-            sendFailure = error;
+            sendFailure = { value: error };
         }
+        this.closePreservingFailure(ws, closeCode, reason, sendFailure);
+    }
+
+    private closePreservingFailure(
+        ws: WebSocket,
+        closeCode: number,
+        reason: string,
+        priorFailure: { readonly value: unknown } | null
+    ): void {
         try {
             ws.close(closeCode, reason);
         } catch (error) {
-            if (!sendFailed) throw error;
+            if (priorFailure === null) throw error;
         }
-        if (sendFailed) throw sendFailure;
+        if (priorFailure !== null) throw priorFailure.value;
     }
 
     private async onSub(ws: WebSocket, msg: Extract<Up, { t: "sub" }>): Promise<void> {

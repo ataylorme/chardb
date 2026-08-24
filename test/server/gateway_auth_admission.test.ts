@@ -104,6 +104,13 @@ function hello(gateway: Gateway, socket: FakeSocket, jwt: string): Promise<void>
     );
 }
 
+function helloWithProtocol(gateway: Gateway, socket: FakeSocket, protocolV: number): Promise<void> {
+    return gateway.webSocketMessage(
+        socket as unknown as WebSocket,
+        JSON.stringify({ t: "hello", protocolV, clientId: "client-1", jwt: "token" })
+    );
+}
+
 function updateAuth(gateway: Gateway, socket: FakeSocket, jwt: string): Promise<void> {
     return gateway.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({ t: "updateAuth", jwt }));
 }
@@ -208,6 +215,69 @@ describe("Gateway authentication single-flight admission", () => {
         internals.verifyAttachment = async () => verifiedAttachment();
         await hello(gateway, socket, "replacement-token");
         expect(socket.attachment).toMatchObject({ kind: "verified", principalId: "principal-1" });
+    });
+
+    test("rejects and closes a verified hello when welcome delivery fails", async () => {
+        const socket = new FakeSocket(pendingAttachment());
+        socket.failSend = true;
+        socket.failClose = true;
+        const internals = gateway as unknown as GatewayInternals;
+        internals.verifyAttachment = async () => verifiedAttachment();
+
+        await expect(hello(gateway, socket, "welcome-failure-token")).rejects.toThrow("socket send failed");
+
+        expect(socket.attachment).toEqual({
+            kind: "rejected",
+            connectionId: "connection-1",
+            authOrigin: "https://app.example",
+        });
+        expect(socket.sendCalls).toBe(1);
+        expect(socket.serializeCalls).toBe(2);
+        expect(socket.closed).toEqual([{ code: 1011, reason: "welcome delivery failed" }]);
+        expect(internals.authOperationClaims.size).toBe(0);
+    });
+
+    test("closes an unsupported protocol even when the mismatch send fails", async () => {
+        const socket = new FakeSocket(pendingAttachment());
+        socket.failSend = true;
+        const internals = gateway as unknown as GatewayInternals;
+        let verifyCalls = 0;
+        internals.verifyAttachment = async () => {
+            verifyCalls += 1;
+            return verifiedAttachment();
+        };
+
+        await expect(helloWithProtocol(gateway, socket, PROTOCOL_V + 1)).rejects.toThrow("socket send failed");
+
+        expect(socket.attachment).toEqual({
+            kind: "rejected",
+            connectionId: "connection-1",
+            authOrigin: "https://app.example",
+        });
+        expect(socket.sendCalls).toBe(1);
+        expect(socket.serializeCalls).toBe(1);
+        expect(socket.closed).toEqual([{ code: 1002, reason: `unsupported chardb protocol ${PROTOCOL_V + 1}` }]);
+        expect(verifyCalls).toBe(0);
+        expect(internals.authOperationClaims.size).toBe(0);
+    });
+
+    test("propagates an unsupported-protocol close failure after sending the mismatch", async () => {
+        const socket = new FakeSocket(pendingAttachment());
+        socket.failClose = true;
+
+        await expect(helloWithProtocol(gateway, socket, PROTOCOL_V + 1)).rejects.toThrow("socket close failed");
+
+        expect(socket.sent.map(message => JSON.parse(message))).toEqual([
+            { t: "mustRefetch", subIds: [], reason: "protocolMismatch" },
+        ]);
+        expect(socket.attachment).toEqual({
+            kind: "rejected",
+            connectionId: "connection-1",
+            authOrigin: "https://app.example",
+        });
+        expect(socket.sendCalls).toBe(1);
+        expect(socket.serializeCalls).toBe(1);
+        expect(socket.closed).toEqual([{ code: 1002, reason: `unsupported chardb protocol ${PROTOCOL_V + 1}` }]);
     });
 
     test("closes a rejected connection even when its auth error send fails", async () => {
