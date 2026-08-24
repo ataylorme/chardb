@@ -112,7 +112,8 @@ The configured Gateway verifies JWT signatures and registered claims during `hel
 - [x] Move URL-scoped JWKS refresh ownership into Catalog. Enforce a 5-second deadline, 256 KiB document limit, 32-key limit, 256-byte `kid` limit, and 2,048-byte URL limit. Coordinate refresh with a durable 10-second lease, cache missing keys for 5 seconds after success, and persist exponential failure cooldown from 1 to 60 seconds.
 - [x] Fail closed without stale keys or the unscoped legacy cache, replace each URL's key set atomically so absent keys retire, and prove failure cooldown plus rotation through the configured workerd Gateway.
 - [x] Reject missing, malformed, tampered, expired, not-yet-valid, wrong-issuer, wrong-audience, and disallowed-algorithm tokens.
-- [x] Serialize `updateAuth` per server connection id, drain admitted work, retire current durable registrations before replacing the subject, report affected subscription ids through `mustRefetch`, and store a terminal rejected attachment on failure.
+- [x] Admit only one `hello` or `updateAuth` operation per server connection id. Reject duplicates with retryable `CDB_RATE_LIMITED` before verification, Catalog access, attachment mutation, or refresh chaining. Release only the exact owning claim on every outcome. Keep an admitted `updateAuth` barrier visible to mutations and subscriptions while it drains admitted work, retires current durable registrations, and reports affected subscription ids through `mustRefetch`.
+- [x] On socket close, store a rejected attachment and fence authentication after every awaited verification, drain, alarm schedule, and invalidation, and before retirement or send, so queued work cannot dispatch after close.
 - [x] Recheck token time bounds before every mutation, subscription, and presence operation.
 - [x] Stop deriving a principal from `clientId` for protected requests.
 - [x] Derive organization membership, role, roles, and auth epochs from Catalog for each declared organization mutation and exact-partition organization query. Treat the caller's validated organization only as the requested partition.
@@ -225,7 +226,7 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Cap each nonduplicate client snapshot at 4,096 rows and the exact 512 KiB serialized JSON boundary. Re-acknowledge and ignore a same-cookie duplicate before sizing it.
 - [x] Preflight canonical and cross-tab optimistic patch batches at 4,096 items and exactly 512 KiB before subscription lookup or cross-tab stringify. Enforce the same row and byte caps on every planned cache, plus 4,096 items and 512 KiB on optimistic history. Commit every valid planned state before listeners run, and fail the session without partial application on malformed or oversized input.
 - [ ] Bound mutation arguments and domain write volume independently of the public frame and result caps.
-- [ ] Bound durable total bytes, presence state, other queues, and retention watermarks.
+- [ ] Bound the same-subscription duplicate replacement chain, durable total bytes, presence state, other queues, and retention watermarks.
 - [x] Define and test snapshot acknowledgement, durable retry until exact acknowledgement, and client same-cookie deduplication with re-acknowledgement.
 - [ ] Apply backpressure or disconnect slow consumers.
 - [ ] Make disconnect and shutdown reject or retain pending mutations according to a documented rule.
