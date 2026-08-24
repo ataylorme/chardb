@@ -12,7 +12,11 @@
  * synchronous control of ordering.
  */
 import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
-import { type ChardbClientOptions, createChardbClient } from "../src/client/index.ts";
+import {
+    type ChardbClientOptions,
+    createChardbClient,
+    createDeferredChardbClientController,
+} from "../src/client/index.ts";
 import { CdbError } from "../src/errors.ts";
 import { ChardbRef, ClientId, Cookie, type RawJson, SubId } from "../src/types.ts";
 import { type Down, PROTOCOL_V, type Up, decodeWire, encodeWire } from "../src/wire.ts";
@@ -218,6 +222,77 @@ function installManualTimers(): {
 }
 
 describe("createChardbClient — wire round-trip", () => {
+    test("deferred clients start once after valid subscription or mutation admission", async () => {
+        let subscriptionJwtCalls = 0;
+        const subscriptionController = createDeferredChardbClientController({
+            endpoint: "wss://example.com/ws",
+            getJwt: async () => {
+                subscriptionJwtCalls += 1;
+                return "jwt-stub";
+            },
+            clientId: "c-deferred-subscription",
+            crossTab: false,
+        });
+
+        expect(subscriptionJwtCalls).toBe(0);
+        expect(FakeWS.instances).toHaveLength(0);
+        expect(() => subscriptionController.client.subscribe("invalid-ref", {}, () => {})).toThrow("invalid ChardbRef");
+        await expect(subscriptionController.client.mutate("invalid-ref", {})).rejects.toThrow("invalid ChardbRef");
+        expect(subscriptionJwtCalls).toBe(0);
+        expect(FakeWS.instances).toHaveLength(0);
+
+        subscriptionController.client.subscribe("queries.ts#deferred", {}, () => {});
+        subscriptionController.start();
+        subscriptionController.start();
+        expect(subscriptionJwtCalls).toBe(1);
+        await flush();
+        expect(FakeWS.instances).toHaveLength(1);
+        subscriptionController.client.close();
+
+        let mutationJwtCalls = 0;
+        const mutationController = createDeferredChardbClientController({
+            endpoint: "wss://example.com/ws",
+            getJwt: async () => {
+                mutationJwtCalls += 1;
+                return "jwt-stub";
+            },
+            clientId: "c-deferred-mutation",
+            crossTab: false,
+        });
+        const mutationError = mutationController.client.mutate("mutations.ts#deferred", {}).catch(error => error);
+        mutationController.start();
+        expect(mutationJwtCalls).toBe(1);
+        await flush();
+        expect(FakeWS.instances).toHaveLength(2);
+        mutationController.client.close();
+        await expect(mutationError).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
+    });
+
+    test("closing a deferred client before start prevents all connection work", async () => {
+        let getJwtCalls = 0;
+        const controller = createDeferredChardbClientController({
+            endpoint: "wss://example.com/ws",
+            getJwt: async () => {
+                getJwtCalls += 1;
+                return "jwt-stub";
+            },
+            clientId: "c-deferred-closed",
+            crossTab: false,
+        });
+
+        controller.client.close();
+        controller.start();
+        expect(() => controller.client.subscribe("queries.ts#closed", {}, () => {})).toThrow(
+            "cannot open a subscription after the Chardb client has closed"
+        );
+        await expect(controller.client.mutate("mutations.ts#closed", {})).rejects.toMatchObject({
+            code: "CDB_STREAM_ABORTED",
+        });
+        await flush();
+        expect(getJwtCalls).toBe(0);
+        expect(FakeWS.instances).toHaveLength(0);
+    });
+
     test("rejects mutation timeout values that cannot produce a bounded timer", () => {
         for (const mutationTimeoutMs of [0, -1, 1.5, Number.POSITIVE_INFINITY, 2_147_483_648]) {
             expect(() => client({ mutationTimeoutMs })).toThrow(

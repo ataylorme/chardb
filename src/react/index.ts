@@ -12,11 +12,12 @@ import {
     useContext,
     useEffect,
     useMemo,
+    useRef,
     useState,
     useSyncExternalStore,
 } from "react";
 import type { ChardbClient, ChardbClientOptions } from "../client/index.ts";
-import { createChardbClient } from "../client/index.ts";
+import { createDeferredChardbClientController } from "../client/index.ts";
 import { stableJson } from "../util/canonical.ts";
 import type { RawJson } from "../wire.ts";
 
@@ -87,6 +88,14 @@ interface ChardbContextValue {
     readonly auth: AuthClientLike | null;
 }
 
+type ProviderClientResource =
+    | { readonly client: ChardbClient; readonly owned: false }
+    | { readonly client: ChardbClient; readonly owned: true; readonly start: () => void };
+
+interface PendingClientClose {
+    cancelled: boolean;
+}
+
 const ChardbCtx = createContext<ChardbContextValue | null>(null);
 
 export interface ChardbProviderProps extends Partial<ChardbClientOptions> {
@@ -102,8 +111,8 @@ export interface ChardbProviderProps extends Partial<ChardbClientOptions> {
 }
 
 export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): ReactElement {
-    const client = useMemo<ChardbClient>(() => {
-        if (props.client) return props.client;
+    const resource = useMemo<ProviderClientResource>(() => {
+        if (props.client !== undefined) return { client: props.client, owned: false };
         const auth = props.auth;
         const getJwt =
             props.getJwt ??
@@ -119,7 +128,7 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
         if (!props.endpoint || !getJwt) {
             throw new Error("ChardbProvider requires {endpoint} plus either {getJwt} or {auth: createAuthClient(...)}");
         }
-        return createChardbClient({
+        const controller = createDeferredChardbClientController({
             endpoint: props.endpoint,
             getJwt,
             ...(props.clientId !== undefined ? { clientId: props.clientId } : {}),
@@ -128,6 +137,7 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
             ...(props.persistMutations !== undefined ? { persistMutations: props.persistMutations } : {}),
             ...(props.mutationTimeoutMs !== undefined ? { mutationTimeoutMs: props.mutationTimeoutMs } : {}),
         });
+        return { client: controller.client, owned: true, start: controller.start };
     }, [
         props.client,
         props.endpoint,
@@ -139,10 +149,36 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
         props.persistMutations,
         props.mutationTimeoutMs,
     ]);
+    const pendingCloses = useRef(new WeakMap<ChardbClient, Set<PendingClientClose>>());
 
-    useEffect(() => () => client.close(), [client]);
+    useEffect(() => {
+        const pendingForClient = pendingCloses.current.get(resource.client);
+        if (pendingForClient) {
+            for (const pending of pendingForClient) pending.cancelled = true;
+            pendingCloses.current.delete(resource.client);
+        }
+        if (resource.owned) resource.start();
+        return () => {
+            if (!resource.owned) return;
+            const pending: PendingClientClose = { cancelled: false };
+            let clientClosures = pendingCloses.current.get(resource.client);
+            if (!clientClosures) {
+                clientClosures = new Set();
+                pendingCloses.current.set(resource.client, clientClosures);
+            }
+            clientClosures.add(pending);
+            queueMicrotask(() => {
+                clientClosures?.delete(pending);
+                if (clientClosures?.size === 0) pendingCloses.current.delete(resource.client);
+                if (!pending.cancelled) resource.client.close();
+            });
+        };
+    }, [resource]);
 
-    const value = useMemo<ChardbContextValue>(() => ({ client, auth: props.auth ?? null }), [client, props.auth]);
+    const value = useMemo<ChardbContextValue>(
+        () => ({ client: resource.client, auth: props.auth ?? null }),
+        [resource.client, props.auth]
+    );
 
     return createElement(ChardbCtx.Provider, { value }, props.children);
 }
@@ -190,13 +226,26 @@ export function useQuery<F extends (...args: never[]) => Promise<unknown>>(
 ): UseQueryResult<RowOf<F>> {
     const client = useChardb();
     if (!isHandle(handle)) throw new TypeError("useQuery requires a defineQuery handle and raw JSON args");
-    const [data, setData] = useState<RowOf<F>[] | undefined>(undefined);
+    const ref = handle.__chardbRef.toString();
     const argsIdentity = stableJson(args as RawJson);
     const stableArgs = useMemo(() => JSON.parse(argsIdentity) as RawJson, [argsIdentity]);
+    const identity = useMemo(() => ({ client, ref, argsIdentity }), [client, ref, argsIdentity]);
+    const [snapshot, setSnapshot] = useState<{
+        readonly identity: typeof identity;
+        readonly data: RowOf<F>[];
+    }>();
     useEffect(() => {
-        const sub = client.subscribe<RowOf<F>>(handle.__chardbRef.toString(), stableArgs, rows => setData(rows));
-        return sub.unsubscribe;
-    }, [client, handle, stableArgs]);
+        let active = true;
+        setSnapshot(current => (current?.identity === identity ? current : undefined));
+        const sub = client.subscribe<RowOf<F>>(ref, stableArgs, rows => {
+            if (active) setSnapshot({ identity, data: rows });
+        });
+        return () => {
+            active = false;
+            sub.unsubscribe();
+        };
+    }, [client, identity, ref, stableArgs]);
+    const data = snapshot?.identity === identity ? snapshot.data : undefined;
     return { data, state: data === undefined ? "pending" : "live" };
 }
 

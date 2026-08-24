@@ -108,6 +108,16 @@ export interface ChardbClient {
 }
 
 export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
+    const controller = createDeferredChardbClientController(opts);
+    controller.start();
+    return controller.client;
+}
+
+/** @internal Used by the React provider to keep connection startup out of render. */
+export function createDeferredChardbClientController(opts: ChardbClientOptions): {
+    readonly client: ChardbClient;
+    readonly start: () => void;
+} {
     const mutationTimeoutMs = opts.mutationTimeoutMs ?? DEFAULT_MUTATION_TIMEOUT_MS;
     if (!Number.isSafeInteger(mutationTimeoutMs) || mutationTimeoutMs <= 0 || mutationTimeoutMs > MAX_TIMER_DELAY_MS) {
         throw new RangeError(`mutationTimeoutMs must be an integer between 1 and ${MAX_TIMER_DELAY_MS}`);
@@ -123,6 +133,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectBackoff = RECONNECT_INITIAL_BACKOFF_MS;
     let lastDisconnectAt = 0;
+    let started = false;
 
     // BroadcastChannel
     // (https://developer.mozilla.org/en-US/docs/Web/API/BroadcastChannel)
@@ -130,11 +141,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     // tabs that share an origin so a single mutation in one tab settles every
     // other tab's `useQuery` cache without an extra round-trip.
     const enableCrossTab = opts.crossTab !== false && typeof BroadcastChannel !== "undefined";
-    const bc =
-        enableCrossTab && opts.logicalDb ? new BroadcastChannel(`chardb:${opts.logicalDb}:${"todo-principal"}`) : null;
-    if (bc) {
-        bc.onmessage = ev => onCrossTab(ev.data);
-    }
+    let bc: BroadcastChannel | null = null;
 
     function onCrossTab(value: unknown): void {
         try {
@@ -181,6 +188,16 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         void connect().catch(() => {
             failSession("CDB_INVARIANT", "failed to establish Chardb client session");
         });
+    }
+
+    function start(): void {
+        if (started || terminated) return;
+        started = true;
+        if (enableCrossTab && opts.logicalDb) {
+            bc = new BroadcastChannel(`chardb:${opts.logicalDb}:${"todo-principal"}`);
+            bc.onmessage = ev => onCrossTab(ev.data);
+        }
+        startConnect();
     }
 
     function sendSessionState(): void {
@@ -794,6 +811,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             optimisticPatches: [],
         };
         subs.set(subId, rec);
+        start();
         if (ws && state === "open") {
             const up: Up = { t: "sub", subId, ref: queryRef, args: rec.args };
             try {
@@ -878,6 +896,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                     })
                 );
             }, mutationTimeoutMs);
+            start();
             if (ws && state === "open") {
                 const up: Up = { t: "mut", mutId, ref: rec.ref, args: rec.args };
                 try {
@@ -901,10 +920,9 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         failSession("CDB_STREAM_ABORTED", "Chardb client closed before pending work settled", "closed");
     }
 
-    startConnect();
     void isCdbError;
 
-    return {
+    const client: ChardbClient = {
         subscribe,
         mutate,
         close,
@@ -912,4 +930,5 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             return state;
         },
     };
+    return { client, start };
 }
