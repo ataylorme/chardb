@@ -9,6 +9,7 @@ import {
     Gateway,
     type GatewayEnv,
     type GatewayRegistrationInstall,
+    type VerifiedGwAttachment,
     installGatewayRegistration,
     retireGatewayRegistration,
 } from "../../src/server/do/gateway.ts";
@@ -96,6 +97,7 @@ describe("Gateway retired-generation cleanup", () => {
     let nameLookups: string[];
     let unsubscribeCalls: LiveSubscriptionId[];
     let unsubscribeBehavior: (subscription: LiveSubscriptionId) => unknown | Promise<unknown>;
+    let sockets: { deserializeAttachment: () => VerifiedGwAttachment }[];
     let state: DurableObjectState;
     let env: GatewayEnv;
 
@@ -120,6 +122,7 @@ describe("Gateway retired-generation cleanup", () => {
         nameLookups = [];
         unsubscribeCalls = [];
         unsubscribeBehavior = () => undefined;
+        sockets = [];
         const cdb = {
             async unsubscribe(subscription: LiveSubscriptionId): Promise<unknown> {
                 unsubscribeCalls.push(subscription);
@@ -151,6 +154,7 @@ describe("Gateway retired-generation cleanup", () => {
                     alarms.push(currentAlarm);
                 },
             },
+            getWebSockets: () => sockets as unknown as WebSocket[],
             blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
                 ready = callback();
             },
@@ -162,6 +166,28 @@ describe("Gateway retired-generation cleanup", () => {
 
     function install(input: GatewayRegistrationInstall): void {
         db.transaction(() => installGatewayRegistration(sql, input))();
+    }
+
+    function activate(input: GatewayRegistrationInstall, changeSeq = 0): void {
+        const result = db
+            .query(
+                `UPDATE _gw_registration_generations
+                 SET lifecycle = 'active', cdb_state = 'active', dirty_version = MAX(dirty_version, ?),
+                     initial_snapshot_pending = 1, retry_count = 0, retry_at = NULL,
+                     retry_error = NULL, updated_at = ?
+                 WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+                   AND connection_id = ? AND lifecycle = 'installing' AND cdb_state = 'pending'`
+            )
+            .run(
+                changeSeq,
+                input.nowMs,
+                input.registrationId,
+                input.principalId,
+                input.clientId,
+                input.subId,
+                input.connectionId
+            );
+        expect(result.changes).toBe(1);
     }
 
     function retire(input: GatewayRegistrationInstall, nowMs = clock): void {
@@ -207,6 +233,7 @@ describe("Gateway retired-generation cleanup", () => {
             sourceCdbId: "physical-object-success",
         });
         install(current);
+        activate(current);
         retire(current);
 
         await fireCleanupAlarm();
@@ -229,6 +256,7 @@ describe("Gateway retired-generation cleanup", () => {
     test("retains failures and malformed outcomes with capped exponential retry state", async () => {
         const current = registration("registration-retry");
         install(current);
+        activate(current);
         retire(current);
         unsubscribeBehavior = () => {
             throw new Error("Cdb unavailable");
@@ -275,6 +303,7 @@ describe("Gateway retired-generation cleanup", () => {
         const old = registration("registration-old", { connectionId: "connection-old" });
         const replacement = registration("registration-new", { connectionId: "connection-new", nowMs: clock });
         install(old);
+        activate(old);
         install(replacement);
 
         await fireCleanupAlarm();
@@ -302,6 +331,7 @@ describe("Gateway retired-generation cleanup", () => {
         resetWithLegacyNullableSourceSchema();
         const legacy = registration("registration-legacy-retired");
         install(legacy);
+        activate(legacy);
         db.query("UPDATE _gw_registration_generations SET source_cdb_id = NULL WHERE registration_id = ?").run(
             legacy.registrationId
         );
@@ -320,6 +350,7 @@ describe("Gateway retired-generation cleanup", () => {
         resetWithLegacyNullableSourceSchema();
         const legacy = registration("registration-legacy-old", { connectionId: "connection-legacy-old" });
         install(legacy);
+        activate(legacy);
         db.query("UPDATE _gw_registration_generations SET source_cdb_id = NULL WHERE registration_id = ?").run(
             legacy.registrationId
         );
@@ -352,6 +383,7 @@ describe("Gateway retired-generation cleanup", () => {
                 connectionId: `connection-batch-${index}`,
             });
             install(current);
+            activate(current);
             retire(current);
         }
 
@@ -367,6 +399,7 @@ describe("Gateway retired-generation cleanup", () => {
     test("restarts by scheduling active dirty work ahead of later retired cleanup", async () => {
         const retired = registration("registration-restart", { subId: SubId(1) });
         install(retired);
+        activate(retired);
         retire(retired, 500);
         db.query("UPDATE _gw_registration_generations SET retry_at = NULL WHERE registration_id = ?").run(
             retired.registrationId
@@ -388,6 +421,7 @@ describe("Gateway retired-generation cleanup", () => {
     test("retains and retries a generation changed while Cdb unsubscribe is paused", async () => {
         const current = registration("registration-raced-cleanup");
         install(current);
+        activate(current);
         retire(current);
         let finishUnsubscribe: (outcome: unknown) => void = () => {};
         unsubscribeBehavior = () =>
@@ -422,6 +456,7 @@ describe("Gateway retired-generation cleanup", () => {
     test("preserves an earlier dirty alarm while retired cleanup is in flight", async () => {
         const retired = registration("registration-cleanup-alarm", { subId: SubId(1) });
         install(retired);
+        activate(retired);
         retire(retired);
         const active = registration("registration-dirty-alarm", {
             clientId: ClientId("client-dirty"),
@@ -429,6 +464,18 @@ describe("Gateway retired-generation cleanup", () => {
             connectionId: "connection-dirty",
         });
         install(active);
+        activate(active);
+        sockets.push({
+            deserializeAttachment: () => ({
+                kind: "verified",
+                connectionId: active.connectionId,
+                authOrigin: "https://app.example",
+                clientId: active.clientId,
+                principalId: active.principalId,
+                jwtExp: 1_000,
+                snapshotSubIds: [active.subId],
+            }),
+        });
         let failUnsubscribe: (error: Error) => void = () => {};
         unsubscribeBehavior = () =>
             new Promise((_resolve, reject) => {

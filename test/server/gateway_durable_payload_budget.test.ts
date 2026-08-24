@@ -112,6 +112,19 @@ function expectRateLimited(run: () => unknown): void {
     }
 }
 
+function activateRegistration(db: Database, input: GatewayRegistrationInstall): void {
+    const result = db
+        .query(
+            `UPDATE _gw_registration_generations
+             SET lifecycle = 'active', cdb_state = 'active', initial_snapshot_pending = 1,
+                 retry_count = 0, retry_at = NULL, retry_error = NULL, updated_at = ?
+             WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+               AND connection_id = ? AND lifecycle = 'installing' AND cdb_state = 'pending'`
+        )
+        .run(input.nowMs, input.registrationId, input.principalId, input.clientId, input.subId, input.connectionId);
+    expect(result.changes).toBe(1);
+}
+
 describe("Gateway durable payload budget", () => {
     let db: Database;
     let sql: SyncSql;
@@ -444,6 +457,7 @@ describe("Gateway durable payload budget", () => {
     test("cleanup releases bytes retained by exact unsubscribe identity", () => {
         const retired = registration("registration-retired");
         db.transaction(() => installGatewayRegistration(sql, retired))();
+        activateRegistration(db, retired);
         expect(db.transaction(() => retireGatewayRegistration(sql, retired, retired.registrationId, 200))()).toBe(true);
         fillRegistrationUsage(db, sql, retired.registrationId, GATEWAY_MAX_REGISTRATION_PAYLOAD_BYTES);
 
