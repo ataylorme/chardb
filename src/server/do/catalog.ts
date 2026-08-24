@@ -498,6 +498,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }): Promise<{ applied: boolean; newEpoch: number }> {
         let applied = false;
         let newEpoch = 0;
+        let committedMap: VshardMap | null = null;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             const guard = sql.one<{ v: string }>("SELECT v FROM catalog_meta WHERE k = ?", `cutover:${args.migId}`);
@@ -512,13 +513,14 @@ export class Catalog extends DurableObject<CatalogEnv> {
             }
             sql.exec("UPDATE catalog_epoch SET epoch = epoch + 1 WHERE scope = 'schema' AND scope_id = 'global'");
             sql.exec("INSERT INTO catalog_meta (k, v) VALUES (?, ?)", `cutover:${args.migId}`, args.fromShard);
-            this.cachedMap = next;
             applied = true;
             const row = sql.one<{ epoch: number }>(
                 "SELECT epoch FROM catalog_epoch WHERE scope = 'schema' AND scope_id = 'global'"
             );
             newEpoch = row?.epoch ?? 0;
+            committedMap = next;
         });
+        if (committedMap) this.cachedMap = committedMap;
         return { applied, newEpoch };
     }
 
