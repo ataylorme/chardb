@@ -30,6 +30,8 @@ The public mutation path is open only for definitions with an explicit stable re
 - [x] Validate that mutation results are JSON before committing them.
 - [x] Accept mutation results through the exact 512 KiB serialized JSON boundary and reject larger results with `CDB_INVARIANT` inside the atomic transaction before op-log finalization or the write-set hook.
 - [x] Prove a fresh oversized result rolls back domain SQL and its provisional op-log row. Reject an oversized legacy replay without running the handler or hook or changing the stored row, while accepted replays remain unchanged.
+- [x] Enforce the mutation argument contract in the client, Gateway, trusted dispatcher, and Cdb: strict JSON data properties without invoking getters, exactly 512 KiB of serialized UTF-8, 4,096 aggregate members, and 99 argument levels because the wire envelope consumes one level. Return `CDB_INVALID_ARGS` from mutation-specific validation before UUID, timer, admission, auth-refresh waiting, Catalog authorization, routing, alarm, handler, op-log, or domain work as applicable.
+- [x] Cap each newly executed atomic mutation at 256 successful typed write statements and 4,096 total direct, trigger, and foreign-key affected rows measured through `total_changes()` deltas. Treat a caught violation as a terminal poisoned `CDB_INVARIANT`, roll back domain SQL and the provisional op-log row, suppress the write-set hook, and let replay bypass the handler and write accounting.
 - [x] Store the exact result in the op-log replay envelope.
 - [x] Return that stored result when the client repeats the same `mutId`.
 - [x] Keep collision detection for a repeated `mutId` with different arguments.
@@ -226,7 +228,6 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Cap direct and registered Cdb query results at 4,096 top-level rows and exactly 512 KiB of serialized JSON. Apply the registered limit only after the generation fence and return `CDB_INVARIANT` with limit or pagination guidance.
 - [x] Cap each nonduplicate client snapshot at 4,096 rows and the exact 512 KiB serialized JSON boundary. Re-acknowledge and ignore a same-cookie duplicate before sizing it.
 - [x] Preflight canonical and cross-tab optimistic patch batches at 4,096 items and exactly 512 KiB before subscription lookup or cross-tab stringify. Enforce the same row and byte caps on every planned cache, plus 4,096 items and 512 KiB on optimistic history. Commit every valid planned state before listeners run, and fail the session without partial application on malformed or oversized input.
-- [ ] Bound mutation arguments and domain write volume independently of the public frame and result caps.
 - [ ] Bound durable total bytes, presence state, other queues, and retention watermarks.
 - [x] Define and test snapshot acknowledgement, durable retry until exact acknowledgement, and client same-cookie deduplication with re-acknowledgement.
 - [ ] Apply backpressure or disconnect slow consumers.

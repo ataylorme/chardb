@@ -24,7 +24,7 @@ Implemented and tested in isolation:
 - Gateway JWT signature and registered-claim verification
 - Public organization-authorized mutations with explicit stable refs
 - Catalog-derived membership, roles, and auth epochs for each declared organization mutation
-- Single-pass mutation argument validation and transformation before partition routing
+- Single-pass mutation schema transformation before partition routing, with bounded argument checks at every trust boundary
 - Client mutation settlement bounded by a configurable timeout across reconnects
 - Schema-first insert, update, delete, and full-row select authorization, including writable-column checks and readable-column masks
 - A fail-closed database wrapper that rejects raw, session, client, plain-table, insert-select, conflict, returning, and unsupported builder paths
@@ -67,7 +67,13 @@ The client option `mutationTimeoutMs` defaults to 60 seconds and covers the full
 
 The same pending-mutation map caps queued, in-flight, and reconnecting client work at 32 records. Mutation refs validate before admission. A valid 33rd request rejects immediately with retryable `CDB_RATE_LIMITED` before UUID allocation, timer creation, map insertion, or send. Reconnect preserves admitted ids and deadlines. Success, typed failure, timeout, synchronous send failure, client close, and session failure remove records and release capacity.
 
+Mutation arguments must be strict JSON primitives, dense arrays, or plain or null-prototype objects with enumerable data properties. Validation rejects accessors without invoking getters, plus cycles, sparse or decorated arrays, unsupported prototypes, symbols, nonfinite numbers, negative zero, and other non-JSON values. Arguments accept the exact 512 KiB serialized UTF-8 boundary, at most 4,096 aggregate array elements and object properties, and 99 nested argument levels because the mutation envelope consumes one level of the wire decoder's 100-level budget. Mutation-specific violations return nonretryable `CDB_INVALID_ARGS`; the public wire decoder rejects a deeper envelope before Gateway mutation admission.
+
+The client checks this contract before UUID allocation, timers, pending admission, or send. Gateway checks it before mutation admission or auth-refresh waiting. Trusted dispatch checks raw arguments before local routing or Catalog authorization and checks transformed arguments again before Catalog routing or Cdb selection. Cdb checks once more before descriptor lookup, recovery-alarm scheduling, handler execution, provisional op-log insertion, or domain SQL.
+
 Mutation results accept the exact 512 KiB serialized JSON boundary. A fresh oversized result returns `CDB_INVARIANT` inside the atomic transaction before op-log finalization or the write-set hook. Its domain SQL and provisional op-log row roll back. Replay applies the same limit to the stored result. An oversized legacy row is rejected without running the handler or hook and without changing the stored row. Accepted results replay unchanged. The error guidance directs larger reads to a paginated query.
+
+A newly executed atomic mutation accepts at most 256 successful typed write statements and 4,096 affected rows. The executor uses each statement's `total_changes()` delta so direct writes, trigger fanout, and foreign-key actions share the row cap. Either overflow is terminal `CDB_INVARIANT`: even if the handler catches it, later writes stay blocked and the stored violation aborts commit. Domain SQL and the provisional op-log row roll back, and the write-set hook does not run. An accepted replay bypasses the handler and these write counters.
 
 Gateway admits at most 32 unsettled mutations per connection and 256 per Gateway object. Excess mutations receive retryable `CDB_RATE_LIMITED` before dispatch. Inbound WebSocket text frames are measured as UTF-8 before wire decoding. Gateway accepts the exact 1 MiB boundary and closes larger frames with code 1009.
 
@@ -77,7 +83,7 @@ Nonduplicate snapshots accept up to 4,096 rows and the exact 512 KiB serialized 
 
 For each Gateway connection and subscription id, one subscription attempt can be active and one replacement can wait behind it. Further duplicates receive retryable `CDB_RATE_LIMITED` before capacity SQL, query routing, Catalog reads, Cdb calls, or installation. Later duplicates cannot replace the accepted replacement payload. Route rejection and final scheduler errors are sent only while the attempt still owns the pending slot and its exact verified socket remains current, so replacement, unsubscribe, and close fence stale errors.
 
-Each Gateway admits at most 256 aggregate current and pending logical registrations. It counts durable heads after restart, permits a same-key replacement without consuming another slot, and rejects a duplicate pending race. Excess work receives retryable `CDB_RATE_LIMITED` before query routing, Catalog reads, Cdb calls, or registration installation. Independent mutation-argument and write-volume bounds, durable total bytes, presence state, other queues, slow-consumer backpressure, and retention watermarks remain incomplete.
+Each Gateway admits at most 256 aggregate current and pending logical registrations. It counts durable heads after restart, permits a same-key replacement without consuming another slot, and rejects a duplicate pending race. Excess work receives retryable `CDB_RATE_LIMITED` before query routing, Catalog reads, Cdb calls, or registration installation. Durable total bytes, presence state, other queues, slow-consumer backpressure, and retention watermarks remain incomplete.
 
 Each auth mutation commits with every directly derivable old and new global, tenant, or principal epoch bump. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. Bulk updates and deletes preload matched rows to derive epoch scopes. Indirect plugin relationships without placement metadata or conventional `organizationId` or `userId` fields may lack a secondary scope. These cases have Bun fake-Durable-Object coverage, not workerd coverage.
 
