@@ -40,6 +40,7 @@ The public mutation path is open only for definitions with an explicit stable re
 - [x] Return that stored result when the client repeats the same `mutId`.
 - [x] Keep collision detection for a repeated `mutId` with different arguments.
 - [x] Settle admitted public mutations once across local routing, Catalog authority and routing, Cdb RPC, malformed response, and policy failures.
+- [x] After routed mutation work settles, require the exact current verified `connectionId`, `clientId`, and `principalId` before updating its cookie or sending its result. Suppress stale close or attachment-replacement delivery without changing commit or op-log replay semantics.
 
 ## 2. Make runtime registration and routing coherent
 
