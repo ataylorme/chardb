@@ -35,7 +35,6 @@ import {
     type Down,
     type MustRefetchReason,
     PROTOCOL_V,
-    type RowPatch,
     type Up,
     type WireMessage,
     checkProtocolV,
@@ -168,8 +167,6 @@ CREATE TABLE IF NOT EXISTS _gw_presence_subs (
 ${GATEWAY_REGISTRATION_DDL}
 ` as const;
 
-export const COALESCE_WINDOW_MS = 50 as const;
-export const MAX_POKE_INTERVAL_MS = 250 as const;
 export const PRESENCE_FANOUT_CAP = 1024 as const;
 
 export const PRESENCE_TTL_DEFAULT_MS = 30_000 as const;
@@ -2220,8 +2217,6 @@ export async function shardsForIntent(catalog: CatalogRoutingRpc, intent: CdbInt
 export class Gateway extends DurableObject<GatewayEnv> {
     private bootstrapped = false;
     private alarmScheduler: Promise<void> = Promise.resolve();
-    private coalesceTimer: ReturnType<typeof setTimeout> | null = null;
-    private readonly pendingPatches = new Map<ClientId, RowPatch[]>();
     private readonly authRefreshBarriers = new Map<string, Promise<boolean>>();
     private readonly activeOperations = new Map<string, Set<Promise<void>>>();
     private readonly pendingSubscriptions = new Map<string, PendingSubscription>();
@@ -3215,7 +3210,6 @@ export class Gateway extends DurableObject<GatewayEnv> {
             ...(latest.presenceKeys !== undefined ? { presenceKeys: latest.presenceKeys } : {}),
             ...(latest.snapshotSubIds !== undefined ? { snapshotSubIds: latest.snapshotSubIds } : {}),
         } satisfies VerifiedGwAttachment);
-        this.pendingPatches.delete(latest.clientId);
         try {
             const retirementAt = this.gatewayNowMs();
             await this.scheduleGatewayAlarm(retirementAt + GATEWAY_SUBSCRIBE_RECOVERY_MS);
@@ -3925,37 +3919,6 @@ export class Gateway extends DurableObject<GatewayEnv> {
     private cdb(shardId: string): CdbRpc {
         const id = this.env.CDB_SHARD.idFromName(shardId);
         return this.env.CDB_SHARD.get(id) as unknown as CdbRpc;
-    }
-
-    /**
-     * Coalesce row patches per client; flush every COALESCE_WINDOW_MS.
-     * The MAX_POKE_INTERVAL_MS hard ceiling is enforced by the alarm timer so
-     * stalled producers cannot starve a subscription of progress.
-     */
-    enqueuePatch(clientId: ClientId, patch: RowPatch): void {
-        let arr = this.pendingPatches.get(clientId);
-        if (!arr) {
-            arr = [];
-            this.pendingPatches.set(clientId, arr);
-        }
-        arr.push(patch);
-        if (this.coalesceTimer === null) {
-            this.coalesceTimer = setTimeout(() => this.flushCoalesce(), COALESCE_WINDOW_MS);
-        }
-    }
-
-    private flushCoalesce(): void {
-        this.coalesceTimer = null;
-        for (const ws of this.ctx.getWebSockets()) {
-            const att = ws.deserializeAttachment() as GwAttachment | null;
-            if (!isVerifiedAttachment(att) || !isCurrentVerifiedAttachment(att)) continue;
-            const patches = this.pendingPatches.get(att.clientId);
-            if (!patches || patches.length === 0) continue;
-            const cookie = Cookie(`${att.clientId}:${Date.now()}`);
-            ws.serializeAttachment({ ...att, lastCookie: cookie } satisfies VerifiedGwAttachment);
-            this.send(ws, { t: "poke", cookie, patches });
-            patches.length = 0;
-        }
     }
 
     emitMustRefetch(subIds: readonly SubId[], reason: MustRefetchReason): void {

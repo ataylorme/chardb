@@ -313,16 +313,6 @@ async function authorityControl(pathname: "/authority-waiting" | "/authority-rel
     if (!response.ok) throw new Error(`authority control failed: ${pathname} ${response.status}`);
 }
 
-async function enqueuePatch(clientId: string, rowKey: string): Promise<void> {
-    if (!mf) throw new Error("miniflare not initialized");
-    const response = await mf.dispatchFetch("http://example.com/patch-poke", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ clientId, rowKey }),
-    });
-    if (!response.ok) throw new Error(`failed to enqueue patch: ${response.status}`);
-}
-
 describe("configured Gateway JWT handshake in real workerd", () => {
     test("rejects a hello client id that differs from the Worker-routed client id", async () => {
         const { first, closed } = await openSocket(await signed(), {
@@ -819,34 +809,6 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         expect(failure).toMatchObject({
             t: "poke",
             cookie: last.cookie,
-            mutResults: [{ ok: false, error: { code: "CDB_AUTH_NOT_BOUND" } }],
-        });
-        socket.close();
-    });
-
-    test("a patch poke advances the cookie used by a later mutation failure", async () => {
-        if (!closedMutationRef) throw new Error("closed mutation ref was not seeded");
-        const clientId = "workerd-patch-client";
-        const { socket, first } = await openSocket(await signed(), { clientId });
-        await first;
-        const patchResponse = nextDowns(socket, 1);
-        await enqueuePatch(clientId, "patch-row");
-        const [patch] = await patchResponse;
-        expect(patch).toMatchObject({
-            t: "poke",
-            patches: [{ op: "put", subId: 1, rowKey: "patch-row" }],
-        });
-        if (!patch || patch.t !== "poke") throw new Error("expected patch poke");
-
-        const failure = await sendAndReceive(socket, {
-            t: "mut",
-            mutId: MutId("after-patch"),
-            ref: closedMutationRef,
-            args: { organizationId: "workerd-org" },
-        });
-        expect(failure).toMatchObject({
-            t: "poke",
-            cookie: patch.cookie,
             mutResults: [{ ok: false, error: { code: "CDB_AUTH_NOT_BOUND" } }],
         });
         socket.close();

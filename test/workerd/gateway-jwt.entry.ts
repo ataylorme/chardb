@@ -3,9 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { api, chardb, defineAuth, forOrg } from "../../src/server/index.ts";
-import { ClientId, SubId } from "../../src/types.ts";
 import { vshardOf } from "../../src/vshard.ts";
-import type { RowPatch } from "../../src/wire.ts";
 
 const ISSUER = "https://issuer.example";
 const AUDIENCE = "chardb-workerd";
@@ -351,20 +349,6 @@ export default {
             const id = env.CDB_CATALOG.idFromName("global");
             const catalog = env.CDB_CATALOG.get(id) as unknown as { releaseHeldAuthority(): Promise<void> };
             await catalog.releaseHeldAuthority();
-            return Response.json({ ok: true });
-        }
-        if (url.pathname === "/patch-poke") {
-            const body = (await request.json()) as { readonly clientId: string; readonly rowKey: string };
-            const id = env.CDB_GATEWAY.idFromName(body.clientId.slice(0, 12));
-            const gateway = env.CDB_GATEWAY.get(id) as unknown as {
-                enqueuePatch(clientId: ReturnType<typeof ClientId>, patch: RowPatch): Promise<void>;
-            };
-            await gateway.enqueuePatch(ClientId(body.clientId), {
-                op: "put",
-                subId: SubId(1),
-                rowKey: body.rowKey,
-                row: { id: body.rowKey },
-            });
             return Response.json({ ok: true });
         }
         if (url.pathname === "/ws") {
