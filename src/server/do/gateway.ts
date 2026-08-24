@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS _gw_registration_generations (
   cdb_state TEXT NOT NULL CHECK (cdb_state IN ('pending', 'active', 'retiring', 'error')),
   dirty_version INTEGER NOT NULL CHECK (dirty_version >= 0),
   delivered_version INTEGER NOT NULL CHECK (delivered_version >= 0 AND delivered_version <= dirty_version),
+  initial_snapshot_pending INTEGER NOT NULL DEFAULT 0 CHECK (initial_snapshot_pending IN (0, 1)),
   run_token TEXT,
   run_target_version INTEGER CHECK (run_target_version IS NULL OR (run_target_version >= 0 AND run_target_version <= dirty_version)),
   run_lease_expires_at INTEGER CHECK (run_lease_expires_at IS NULL OR run_lease_expires_at >= 0),
@@ -183,6 +184,7 @@ export const GATEWAY_QUERY_BATCH_SIZE = 16 as const;
 export const GATEWAY_SEND_BATCH_SIZE = 32 as const;
 export const GATEWAY_QUERY_LEASE_MS = 30_000 as const;
 export const GATEWAY_SEND_LEASE_MS = 10_000 as const;
+export const GATEWAY_SUBSCRIBE_RECOVERY_MS = 30_000 as const;
 
 interface PendingGwAttachment {
     readonly kind: "pending";
@@ -202,6 +204,13 @@ interface PendingSubscription {
     readonly subId: SubId;
     cancelled: boolean;
     task: Promise<void>;
+}
+
+interface StoredGatewayInstallRecovery {
+    readonly principal_id: string;
+    readonly client_id: string;
+    readonly sub_id: number;
+    readonly registration_id: string;
 }
 
 export interface VerifiedGwAttachment {
@@ -507,6 +516,36 @@ export function cdbSubscriptionRequest(input: {
     };
 }
 
+function cdbSubscriptionChangeSeq(value: unknown, expected: LiveSubscriptionId): number {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new TypeError("Cdb returned a malformed subscribe response");
+    }
+    const response = value as Record<string, unknown>;
+    const subscription = response.subscription;
+    if (
+        !hasExactKeys(response, ["subscription", "changeSeq"]) ||
+        typeof subscription !== "object" ||
+        subscription === null ||
+        Array.isArray(subscription)
+    ) {
+        throw new TypeError("Cdb returned a malformed subscribe response");
+    }
+    const identity = subscription as Record<string, unknown>;
+    if (
+        !hasExactKeys(identity, ["gatewayId", "registrationId", "connectionId", "clientId", "subId"]) ||
+        identity.gatewayId !== expected.gatewayId ||
+        identity.registrationId !== expected.registrationId ||
+        identity.connectionId !== expected.connectionId ||
+        identity.clientId !== expected.clientId ||
+        identity.subId !== expected.subId ||
+        !Number.isSafeInteger(response.changeSeq) ||
+        (response.changeSeq as number) < 0
+    ) {
+        throw new TypeError("Cdb returned a mismatched subscribe response");
+    }
+    return response.changeSeq as number;
+}
+
 interface StoredCdbRegistration {
     readonly registrationId: string;
     readonly connectionId: string;
@@ -570,6 +609,13 @@ export interface GatewayRegistrationAdvance extends GatewayRegistrationKey {
     readonly retryCount: number;
     readonly retryAt: number | null;
     readonly retryError: string | null;
+    readonly nowMs: number;
+}
+
+interface GatewaySubscriptionActivation extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly changeSeq: number;
     readonly nowMs: number;
 }
 
@@ -817,6 +863,71 @@ export function installGatewayRegistration(
     return { supersededRegistrationId: previous?.registration_id ?? null };
 }
 
+function armGatewaySubscriptionRecovery(
+    sql: SyncSql,
+    input: GatewayRegistrationKey & {
+        readonly registrationId: string;
+        readonly connectionId: string;
+        readonly recoveryAt: number;
+        readonly nowMs: number;
+    }
+): boolean {
+    assertGatewayRegistrationIdentity(input);
+    assertNonnegativeSafeInteger(input.recoveryAt, "recoveryAt");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    if (input.recoveryAt <= input.nowMs) throw new TypeError("recoveryAt must be later than nowMs");
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET retry_at = ?, retry_error = 'subscription install recovery', updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND lifecycle = 'installing' AND cdb_state = 'pending'
+           AND EXISTS (
+             SELECT 1 FROM _gw_registration_heads h
+             WHERE h.registration_id = _gw_registration_generations.registration_id
+               AND h.principal_id = _gw_registration_generations.principal_id
+               AND h.client_id = _gw_registration_generations.client_id
+               AND h.sub_id = _gw_registration_generations.sub_id
+           )`,
+        input.recoveryAt,
+        input.nowMs,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    return sql.changes() === 1;
+}
+
+function activateGatewaySubscription(sql: SyncSql, input: GatewaySubscriptionActivation): boolean {
+    assertGatewayRegistrationIdentity(input);
+    assertNonnegativeSafeInteger(input.changeSeq, "changeSeq");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET lifecycle = 'active', cdb_state = 'active', dirty_version = MAX(dirty_version, ?),
+             initial_snapshot_pending = 1,
+             retry_count = 0, retry_at = NULL, retry_error = NULL, updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND lifecycle = 'installing' AND cdb_state = 'pending'
+           AND EXISTS (
+             SELECT 1 FROM _gw_registration_heads h
+             WHERE h.registration_id = _gw_registration_generations.registration_id
+               AND h.principal_id = _gw_registration_generations.principal_id
+               AND h.client_id = _gw_registration_generations.client_id
+               AND h.sub_id = _gw_registration_generations.sub_id
+           )`,
+        input.changeSeq,
+        input.nowMs,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    return sql.changes() === 1;
+}
+
 /** Advance state only when this registration still owns its logical head and run version. */
 export function advanceGatewayRegistration(sql: SyncSql, input: GatewayRegistrationAdvance): boolean {
     assertNonnegativeSafeInteger(input.expectedRunVersion, "expectedRunVersion");
@@ -1008,7 +1119,7 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
          WHERE g.registration_id = ? AND g.principal_id = ? AND g.client_id = ? AND g.sub_id = ?
            AND g.connection_id = ? AND g.lifecycle = 'active' AND g.cdb_state = 'active'
            AND g.source_cdb_id IS NOT NULL AND g.source_cdb_id <> ''
-           AND g.dirty_version > g.delivered_version
+           AND (g.initial_snapshot_pending = 1 OR g.dirty_version > g.delivered_version)
            AND (g.retry_at IS NULL OR g.retry_at <= ?)
            AND NOT EXISTS (
              SELECT 1 FROM _gw_snapshot_outbox o WHERE o.registration_id = g.registration_id
@@ -1475,7 +1586,8 @@ export function acknowledgeGatewaySnapshot(sql: SyncSql, input: GatewaySnapshotA
     }
     sql.exec(
         `UPDATE _gw_registration_generations
-         SET delivered_version = MAX(delivered_version, ?), last_cookie = ?, last_snapshot_cookie = ?, updated_at = ?
+         SET delivered_version = MAX(delivered_version, ?), initial_snapshot_pending = 0,
+             last_cookie = ?, last_snapshot_cookie = ?, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
            AND connection_id = ? AND lifecycle = 'active' AND cdb_state = 'active'
            AND delivered_version <= ? AND dirty_version >= ?
@@ -1845,6 +1957,13 @@ function ensureGatewayRegistrationColumns(sql: SyncSql): void {
     if (!columns.has("last_snapshot_cookie")) {
         sql.exec("ALTER TABLE _gw_registration_generations ADD COLUMN last_snapshot_cookie TEXT");
     }
+    if (!columns.has("initial_snapshot_pending")) {
+        sql.exec(
+            `ALTER TABLE _gw_registration_generations
+             ADD COLUMN initial_snapshot_pending INTEGER NOT NULL DEFAULT 0
+             CHECK (initial_snapshot_pending IN (0, 1))`
+        );
+    }
     // Run this after every restart. A crash after ALTER but before repair must
     // not leave a partial run triple that no claimant can recover.
     sql.exec(
@@ -2158,7 +2277,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
               AND h.sub_id = g.sub_id
              WHERE g.lifecycle = 'active' AND g.cdb_state = 'active'
                AND g.source_cdb_id IS NOT NULL AND g.source_cdb_id <> ''
-               AND g.dirty_version > g.delivered_version
+           AND (g.initial_snapshot_pending = 1 OR g.dirty_version > g.delivered_version)
                AND (g.retry_at IS NULL OR g.retry_at <= ?)
                AND NOT EXISTS (
                  SELECT 1 FROM _gw_snapshot_outbox o WHERE o.registration_id = g.registration_id
@@ -2172,6 +2291,24 @@ export class Gateway extends DurableObject<GatewayEnv> {
              ORDER BY COALESCE(g.retry_at, 0), g.registration_id
              LIMIT ?`,
             nowMs,
+            nowMs,
+            GATEWAY_QUERY_BATCH_SIZE
+        );
+    }
+
+    private dueGatewayInstallRecoveries(nowMs: number): readonly StoredGatewayInstallRecovery[] {
+        return adaptSqlStorage(this.ctx.storage.sql).all<StoredGatewayInstallRecovery>(
+            `SELECT g.principal_id, g.client_id, g.sub_id, g.registration_id
+             FROM _gw_registration_generations g
+             INNER JOIN _gw_registration_heads h
+               ON h.registration_id = g.registration_id
+              AND h.principal_id = g.principal_id
+              AND h.client_id = g.client_id
+              AND h.sub_id = g.sub_id
+             WHERE g.lifecycle = 'installing' AND g.cdb_state = 'pending'
+               AND g.retry_at IS NOT NULL AND g.retry_at <= ?
+             ORDER BY g.retry_at, g.registration_id
+             LIMIT ?`,
             nowMs,
             GATEWAY_QUERY_BATCH_SIZE
         );
@@ -2594,6 +2731,22 @@ export class Gateway extends DurableObject<GatewayEnv> {
         );
     }
 
+    private earliestGatewayInstallRecoveryAt(): number | null {
+        return (
+            adaptSqlStorage(this.ctx.storage.sql).one<{ retry_at: number | null }>(
+                `SELECT MIN(g.retry_at) AS retry_at
+                 FROM _gw_registration_generations g
+                 INNER JOIN _gw_registration_heads h
+                   ON h.registration_id = g.registration_id
+                  AND h.principal_id = g.principal_id
+                  AND h.client_id = g.client_id
+                  AND h.sub_id = g.sub_id
+                 WHERE g.lifecycle = 'installing' AND g.cdb_state = 'pending'
+                   AND g.retry_at IS NOT NULL`
+            )?.retry_at ?? null
+        );
+    }
+
     private earliestGatewayQueryAt(): number | null {
         return (
             adaptSqlStorage(this.ctx.storage.sql).one<{ due_at: number | null }>(
@@ -2611,7 +2764,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                   AND h.sub_id = g.sub_id
                  WHERE g.lifecycle = 'active' AND g.cdb_state = 'active'
                    AND g.source_cdb_id IS NOT NULL AND g.source_cdb_id <> ''
-                   AND g.dirty_version > g.delivered_version
+                   AND (g.initial_snapshot_pending = 1 OR g.dirty_version > g.delivered_version)
                    AND NOT EXISTS (
                      SELECT 1 FROM _gw_snapshot_outbox o WHERE o.registration_id = g.registration_id
                    )
@@ -2649,6 +2802,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
     private async scheduleGatewayWork(nowMs: number): Promise<void> {
         const due = [
             this.earliestGatewayCleanupAt(),
+            this.earliestGatewayInstallRecoveryAt(),
             this.earliestGatewayQueryAt(),
             this.earliestGatewaySnapshotSendAt(),
         ].filter((value): value is number => value !== null);
@@ -2658,6 +2812,20 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     private async drainGatewayWork(): Promise<void> {
         const nowMs = this.gatewayNowMs();
+        for (const recovery of this.dueGatewayInstallRecoveries(nowMs)) {
+            this.ctx.storage.transactionSync(() => {
+                retireGatewayRegistration(
+                    adaptSqlStorage(this.ctx.storage.sql),
+                    {
+                        principalId: PrincipalId(recovery.principal_id),
+                        clientId: ClientId(recovery.client_id),
+                        subId: SubId(recovery.sub_id),
+                    },
+                    recovery.registration_id,
+                    nowMs
+                );
+            });
+        }
         const cleanupRows = this.dueGatewayCleanupRows(nowMs);
         await Promise.allSettled(cleanupRows.map(row => this.cleanupGatewayGeneration(row, nowMs)));
 
@@ -2831,7 +2999,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
-    override webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer): void {
+    override async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer): Promise<void> {
         if (typeof raw !== "string") return;
         let msg: WireMessage;
         try {
@@ -2842,19 +3010,19 @@ export class Gateway extends DurableObject<GatewayEnv> {
         }
         switch ((msg as Up).t) {
             case "hello":
-                void this.onHello(ws, msg as Extract<Up, { t: "hello" }>);
+                await this.onHello(ws, msg as Extract<Up, { t: "hello" }>);
                 break;
             case "updateAuth":
-                this.onUpdateAuth(ws, msg as Extract<Up, { t: "updateAuth" }>);
+                await this.onUpdateAuth(ws, msg as Extract<Up, { t: "updateAuth" }>);
                 break;
             case "sub":
-                void this.onSub(ws, msg as Extract<Up, { t: "sub" }>);
+                await this.onSub(ws, msg as Extract<Up, { t: "sub" }>);
                 break;
             case "unsub":
-                this.onUnsub(ws, msg as Extract<Up, { t: "unsub" }>);
+                await this.onUnsub(ws, msg as Extract<Up, { t: "unsub" }>);
                 break;
             case "mut":
-                this.onMut(ws, msg as Extract<Up, { t: "mut" }>);
+                await this.onMut(ws, msg as Extract<Up, { t: "mut" }>);
                 break;
             case "ack":
                 this.onAck(ws, msg as Extract<Up, { t: "ack" }>);
@@ -2873,7 +3041,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         }
     }
 
-    override webSocketClose(ws: WebSocket): void {
+    override async webSocketClose(ws: WebSocket): Promise<void> {
         const attachment = ws.deserializeAttachment() as GwAttachment | null;
         if (attachment) {
             this.authRefreshBarriers.delete(attachment.connectionId);
@@ -2881,9 +3049,17 @@ export class Gateway extends DurableObject<GatewayEnv> {
             for (const pending of this.pendingSubscriptions.values()) {
                 if (pending.connectionId === attachment.connectionId) pending.cancelled = true;
             }
+            const nowMs = this.gatewayNowMs();
+            await this.scheduleGatewayAlarm(nowMs + GATEWAY_SUBSCRIBE_RECOVERY_MS);
+            this.ctx.storage.transactionSync(() => {
+                retireCurrentGatewayRegistrationsForConnection(
+                    adaptSqlStorage(this.ctx.storage.sql),
+                    attachment.connectionId,
+                    nowMs
+                );
+            });
+            await this.scheduleGatewayWork(nowMs).catch(() => {});
         }
-        // Public initial-query attempts are in memory only. The isolated
-        // registration helpers retain their own `_gw_subs` state.
     }
 
     private async onHello(ws: WebSocket, msg: Extract<Up, { t: "hello" }>): Promise<void> {
@@ -2921,7 +3097,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         this.send(ws, welcome);
     }
 
-    private onUpdateAuth(ws: WebSocket, msg: Extract<Up, { t: "updateAuth" }>): void {
+    private async onUpdateAuth(ws: WebSocket, msg: Extract<Up, { t: "updateAuth" }>): Promise<void> {
         const current = ws.deserializeAttachment() as GwAttachment | null;
         if (!isVerifiedAttachment(current)) {
             this.rejectAuth(ws, "CDB_FORBIDDEN");
@@ -2936,11 +3112,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 return false;
             });
         this.authRefreshBarriers.set(connectionId, barrier);
-        void barrier.then(succeeded => {
-            if (succeeded && this.authRefreshBarriers.get(connectionId) === barrier) {
-                this.authRefreshBarriers.delete(connectionId);
-            }
-        });
+        const succeeded = await barrier;
+        if (succeeded && this.authRefreshBarriers.get(connectionId) === barrier) {
+            this.authRefreshBarriers.delete(connectionId);
+        }
     }
 
     private async performUpdateAuth(
@@ -2983,8 +3158,18 @@ export class Gateway extends DurableObject<GatewayEnv> {
         } satisfies VerifiedGwAttachment);
         this.pendingPatches.delete(latest.clientId);
         try {
-            const { subIds: persistedSubIds, rpcFailed } = await this.invalidateClientSubscriptions(latest.clientId);
-            if (rpcFailed) {
+            const retirementAt = this.gatewayNowMs();
+            await this.scheduleGatewayAlarm(retirementAt + GATEWAY_SUBSCRIBE_RECOVERY_MS);
+            const retired = this.ctx.storage.transactionSync(() =>
+                retireCurrentGatewayRegistrationsForConnection(
+                    adaptSqlStorage(this.ctx.storage.sql),
+                    connectionId,
+                    retirementAt
+                )
+            );
+            await this.scheduleGatewayWork(retirementAt).catch(() => {});
+            const legacy = await this.invalidateClientSubscriptions(latest.clientId);
+            if (legacy.rpcFailed) {
                 this.rejectConnection(ws, "CDB_SHARD_UNAVAILABLE", 1011, "subscription invalidation failed");
                 return false;
             }
@@ -2993,7 +3178,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 this.rejectAuth(ws, "CDB_FORBIDDEN");
                 return false;
             }
-            const subIds = [...new Set([...(refreshed.snapshotSubIds ?? []), ...persistedSubIds])]
+            const subIds = [
+                ...new Set([...(refreshed.snapshotSubIds ?? []), ...retired.map(item => item.subId), ...legacy.subIds]),
+            ]
                 .sort((left, right) => left - right)
                 .map(SubId);
             ws.serializeAttachment({ ...refreshed, snapshotSubIds: [] } satisfies VerifiedGwAttachment);
@@ -3048,7 +3235,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         ws.close(closeCode, reason);
     }
 
-    private onSub(ws: WebSocket, msg: Extract<Up, { t: "sub" }>): void {
+    private async onSub(ws: WebSocket, msg: Extract<Up, { t: "sub" }>): Promise<void> {
         const attachment = ws.deserializeAttachment() as GwAttachment | null;
         if (!isVerifiedAttachment(attachment) || !isCurrentVerifiedAttachment(attachment)) {
             this.sendError(ws, "CDB_FORBIDDEN", msg.subId);
@@ -3081,28 +3268,33 @@ export class Gateway extends DurableObject<GatewayEnv> {
             task: Promise.resolve(),
         };
         this.pendingSubscriptions.set(operationKey, pending);
-        const barrier = this.authRefreshBarriers.get(attachment.connectionId);
-        if (barrier || previous) {
-            void (previous?.task.catch(() => {}) ?? Promise.resolve())
-                .then(() => barrier ?? true)
-                .then(succeeded => {
-                    if (succeeded && !pending.cancelled) {
-                        this.admitSubscription(ws, msg, pending, operationKey);
-                    } else if (this.pendingSubscriptions.get(operationKey) === pending) {
-                        this.pendingSubscriptions.delete(operationKey);
-                    }
-                });
+        if (this.authRefreshBarriers.has(attachment.connectionId) || previous) {
+            await (previous?.task.catch(() => {}) ?? Promise.resolve());
+            let succeeded = true;
+            while (true) {
+                const barrier = this.authRefreshBarriers.get(attachment.connectionId);
+                if (!barrier) break;
+                if (!(await barrier)) {
+                    succeeded = false;
+                    break;
+                }
+            }
+            if (succeeded && !pending.cancelled) {
+                await this.admitSubscription(ws, msg, pending, operationKey);
+            } else if (this.pendingSubscriptions.get(operationKey) === pending) {
+                this.pendingSubscriptions.delete(operationKey);
+            }
             return;
         }
-        this.admitSubscription(ws, msg, pending, operationKey);
+        await this.admitSubscription(ws, msg, pending, operationKey);
     }
 
-    private admitSubscription(
+    private async admitSubscription(
         ws: WebSocket,
         msg: Extract<Up, { t: "sub" }>,
         pending: PendingSubscription,
         operationKey: string
-    ): void {
+    ): Promise<void> {
         const att = ws.deserializeAttachment() as GwAttachment | null;
         if (!isVerifiedAttachment(att) || !isCurrentVerifiedAttachment(att)) {
             if (!pending.cancelled) this.sendError(ws, "CDB_FORBIDDEN", msg.subId);
@@ -3119,15 +3311,17 @@ export class Gateway extends DurableObject<GatewayEnv> {
             this.activeOperations.set(att.connectionId, active);
         }
         active.add(task);
-        void task
-            .catch(() => this.sendError(ws, "CDB_INVARIANT", msg.subId))
-            .finally(() => {
-                if (this.pendingSubscriptions.get(operationKey) === pending) {
-                    this.pendingSubscriptions.delete(operationKey);
-                }
-                active?.delete(task);
-                if (active?.size === 0) this.activeOperations.delete(att.connectionId);
-            });
+        try {
+            await task;
+        } catch {
+            this.sendError(ws, "CDB_INVARIANT", msg.subId);
+        } finally {
+            if (this.pendingSubscriptions.get(operationKey) === pending) {
+                this.pendingSubscriptions.delete(operationKey);
+            }
+            active.delete(task);
+            if (active.size === 0) this.activeOperations.delete(att.connectionId);
+        }
     }
 
     private async settleSubscription(
@@ -3191,57 +3385,194 @@ export class Gateway extends DurableObject<GatewayEnv> {
             this.sendError(ws, projected.code, msg.subId);
             return;
         }
+        const authEpochs = projected.auth.authEpochs;
+        if (!authEpochs) {
+            this.sendError(ws, "CDB_CATALOG_UNAVAILABLE", msg.subId);
+            return;
+        }
 
         let shardId: string;
+        let schemaEpoch: number;
         try {
             const route = await catalog.route(vshard);
-            if (typeof route?.shardId !== "string" || route.shardId.length === 0) {
+            if (
+                typeof route?.shardId !== "string" ||
+                route.shardId.length === 0 ||
+                !Number.isSafeInteger(route.schemaEpoch) ||
+                route.schemaEpoch < 0
+            ) {
                 throw new TypeError("Catalog returned a malformed shard route");
             }
             shardId = route.shardId;
+            schemaEpoch = route.schemaEpoch;
         } catch {
             if (pending.cancelled) return;
             this.sendError(ws, "CDB_CATALOG_UNAVAILABLE", msg.subId);
             return;
         }
         if (pending.cancelled) return;
-        const cdb = this.cdb(shardId);
-        let response: CdbQueryRowsResponse;
-        try {
-            response = projectCdbQueryRows(await cdb.query({ ref: msg.ref, args: routed.args, auth: projected.auth }));
-        } catch {
-            if (pending.cancelled) return;
-            this.sendError(ws, "CDB_SHARD_UNAVAILABLE", msg.subId);
-            return;
-        }
-        if (pending.cancelled) return;
-        if (!response.ok) {
-            this.sendError(ws, response.error.code, msg.subId);
-            return;
-        }
-
-        const current = ws.deserializeAttachment() as GwAttachment | null;
+        const currentBeforeInstall = ws.deserializeAttachment() as GwAttachment | null;
+        const operationKey = `${att.connectionId}:${msg.subId}`;
         if (
-            pending.cancelled ||
-            !isVerifiedAttachment(current) ||
-            current.connectionId !== att.connectionId ||
-            current.principalId !== att.principalId
+            this.pendingSubscriptions.get(operationKey) !== pending ||
+            !isVerifiedAttachment(currentBeforeInstall) ||
+            !isCurrentVerifiedAttachment(currentBeforeInstall) ||
+            currentBeforeInstall.connectionId !== att.connectionId ||
+            currentBeforeInstall.clientId !== att.clientId ||
+            currentBeforeInstall.principalId !== att.principalId
         ) {
             return;
         }
-        const cookie = Cookie(`${att.clientId}:${Date.now()}:${crypto.randomUUID()}`);
+
+        const cdbId = this.env.CDB_SHARD.idFromName(shardId);
+        const sourceCdbId = cdbId.toString();
+        if (sourceCdbId.length === 0) {
+            this.sendError(ws, "CDB_SHARD_UNAVAILABLE", msg.subId);
+            return;
+        }
+        const registrationId = crypto.randomUUID();
+        const installedAt = this.gatewayNowMs();
+        const identity = {
+            principalId: att.principalId,
+            clientId: att.clientId,
+            subId: msg.subId,
+            registrationId,
+            connectionId: att.connectionId,
+        } as const;
+        const recoveryAt = installedAt + GATEWAY_SUBSCRIBE_RECOVERY_MS;
+        try {
+            await this.scheduleGatewayAlarm(recoveryAt);
+        } catch {
+            if (!pending.cancelled) this.sendError(ws, "CDB_SHARD_UNAVAILABLE", msg.subId);
+            return;
+        }
+        const currentBeforeCommit = ws.deserializeAttachment() as GwAttachment | null;
+        if (
+            pending.cancelled ||
+            this.pendingSubscriptions.get(operationKey) !== pending ||
+            !isVerifiedAttachment(currentBeforeCommit) ||
+            !isCurrentVerifiedAttachment(currentBeforeCommit) ||
+            currentBeforeCommit.connectionId !== att.connectionId ||
+            currentBeforeCommit.clientId !== att.clientId ||
+            currentBeforeCommit.principalId !== att.principalId
+        ) {
+            return;
+        }
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            installGatewayRegistration(sql, {
+                ...identity,
+                organizationId: TenantId(organizationId),
+                ref: msg.ref,
+                args: routed.args,
+                intent: routed.intent,
+                queryHash: routed.queryHash,
+                shardId,
+                sourceCdbId,
+                schemaEpoch,
+                authEpochs,
+                ...(att.lastCookie === undefined ? {} : { lastCookie: att.lastCookie }),
+                nowMs: installedAt,
+            });
+            if (!armGatewaySubscriptionRecovery(sql, { ...identity, recoveryAt, nowMs: installedAt })) {
+                throw gatewayInvalidationInvariant("Gateway subscription install could not arm recovery");
+            }
+        });
+        const retireInstalled = async (): Promise<void> => {
+            this.ctx.storage.transactionSync(() => {
+                retireGatewayRegistration(
+                    adaptSqlStorage(this.ctx.storage.sql),
+                    identity,
+                    registrationId,
+                    this.gatewayNowMs()
+                );
+            });
+            await this.scheduleGatewayWork(this.gatewayNowMs());
+        };
+        const isCancelledOrStale = (): boolean => {
+            const current = ws.deserializeAttachment() as GwAttachment | null;
+            return (
+                pending.cancelled ||
+                this.pendingSubscriptions.get(operationKey) !== pending ||
+                !isVerifiedAttachment(current) ||
+                !isCurrentVerifiedAttachment(current) ||
+                current.connectionId !== att.connectionId ||
+                current.clientId !== att.clientId ||
+                current.principalId !== att.principalId
+            );
+        };
+
+        // The prearmed recovery deadline remains durable if this earlier
+        // scheduling attempt fails.
+        await this.scheduleGatewayWork(installedAt).catch(() => {});
+        if (isCancelledOrStale()) {
+            await retireInstalled();
+            return;
+        }
+
+        const request = cdbSubscriptionRequest({
+            gatewayId: this.ctx.id.toString(),
+            ...identity,
+            organizationId: TenantId(organizationId),
+            ref: msg.ref,
+            args: routed.args,
+            queryHash: routed.queryHash,
+            intent: routed.intent,
+        });
+        let changeSeq: number;
+        try {
+            const cdb = this.env.CDB_SHARD.get(cdbId) as unknown as CdbSubscriptionRpc;
+            changeSeq = cdbSubscriptionChangeSeq(await cdb.subscribe(request), request.subscription);
+        } catch {
+            await retireInstalled();
+            if (!pending.cancelled) this.sendError(ws, "CDB_SHARD_UNAVAILABLE", msg.subId);
+            return;
+        }
+        if (isCancelledOrStale()) {
+            await retireInstalled();
+            return;
+        }
+        const activatedAt = this.gatewayNowMs();
+        const activated = this.ctx.storage.transactionSync(() =>
+            activateGatewaySubscription(adaptSqlStorage(this.ctx.storage.sql), {
+                ...identity,
+                changeSeq,
+                nowMs: activatedAt,
+            })
+        );
+        if (!activated || isCancelledOrStale()) {
+            await retireInstalled();
+            return;
+        }
+        const current = ws.deserializeAttachment() as VerifiedGwAttachment;
         const snapshotSubIds = [...new Set([...(current.snapshotSubIds ?? []), msg.subId])]
             .sort((left, right) => left - right)
             .map(SubId);
-        ws.serializeAttachment({ ...current, lastCookie: cookie, snapshotSubIds } satisfies VerifiedGwAttachment);
-        this.send(ws, { t: "snapshot", subId: msg.subId, cookie, rows: response.result });
+        ws.serializeAttachment({ ...current, snapshotSubIds } satisfies VerifiedGwAttachment);
+        try {
+            await this.scheduleGatewayWork(activatedAt);
+        } catch {
+            this.sendError(ws, "CDB_SHARD_UNAVAILABLE", msg.subId);
+        }
     }
 
-    private onUnsub(ws: WebSocket, msg: Extract<Up, { t: "unsub" }>): void {
+    private async onUnsub(ws: WebSocket, msg: Extract<Up, { t: "unsub" }>): Promise<void> {
         const att = ws.deserializeAttachment() as GwAttachment | null;
-        if (!isVerifiedAttachment(att)) return;
+        if (!isVerifiedAttachment(att) || !isCurrentVerifiedAttachment(att)) return;
         const pending = this.pendingSubscriptions.get(`${att.connectionId}:${msg.subId}`);
         if (pending) pending.cancelled = true;
+        const nowMs = this.gatewayNowMs();
+        await this.scheduleGatewayAlarm(nowMs + GATEWAY_SUBSCRIBE_RECOVERY_MS);
+        this.ctx.storage.transactionSync(() => {
+            retireCurrentGatewayRegistration(adaptSqlStorage(this.ctx.storage.sql), {
+                principalId: att.principalId,
+                clientId: att.clientId,
+                subId: msg.subId,
+                connectionId: att.connectionId,
+                nowMs,
+            });
+        });
+        await this.scheduleGatewayWork(nowMs).catch(() => {});
         if (att.snapshotSubIds?.includes(msg.subId)) {
             ws.serializeAttachment({
                 ...att,
@@ -3289,19 +3620,17 @@ export class Gateway extends DurableObject<GatewayEnv> {
         void this.scheduleGatewayWork(nowMs);
     }
 
-    private onMut(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): void {
+    private async onMut(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): Promise<void> {
         const attachment = ws.deserializeAttachment() as GwAttachment | null;
         const barrier = attachment ? this.authRefreshBarriers.get(attachment.connectionId) : undefined;
         if (barrier) {
-            void barrier.then(succeeded => {
-                if (succeeded) this.admitMutation(ws, msg);
-            });
+            if (await barrier) await this.admitMutation(ws, msg);
             return;
         }
-        this.admitMutation(ws, msg);
+        await this.admitMutation(ws, msg);
     }
 
-    private admitMutation(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): void {
+    private async admitMutation(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): Promise<void> {
         const att = ws.deserializeAttachment() as GwAttachment | null;
         if (!isVerifiedAttachment(att)) {
             this.sendMutFailure(
@@ -3328,15 +3657,15 @@ export class Gateway extends DurableObject<GatewayEnv> {
             this.activeOperations.set(att.connectionId, active);
         }
         active.add(task);
-        void task
-            .catch(() => {
-                // The only uncaught failure here is the final WebSocket send.
-                // A second send would violate exactly-once settlement.
-            })
-            .finally(() => {
-                active?.delete(task);
-                if (active?.size === 0) this.activeOperations.delete(att.connectionId);
-            });
+        try {
+            await task;
+        } catch {
+            // The only uncaught failure here is the final WebSocket send. A
+            // second send would violate exactly-once settlement.
+        } finally {
+            active.delete(task);
+            if (active.size === 0) this.activeOperations.delete(att.connectionId);
+        }
     }
 
     /**

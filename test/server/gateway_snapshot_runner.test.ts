@@ -275,11 +275,11 @@ describe("Gateway active snapshot runner", () => {
             last_cookie: snapshot.cookie,
             last_snapshot_cookie: snapshot.cookie,
         });
-        expect(socket.attachment.lastCookie).toBe("cookie-mutation");
+        expect(socket.attachment.lastCookie).toBe(Cookie("cookie-mutation"));
         expect(db.query("SELECT * FROM _gw_snapshot_outbox").get()).toBeNull();
 
         gateway.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({ t: "ack", cookie: snapshot.cookie }));
-        expect(socket.attachment.lastCookie).toBe("cookie-mutation");
+        expect(socket.attachment.lastCookie).toBe(Cookie("cookie-mutation"));
         await new Promise(resolve => setTimeout(resolve, 0));
         expect(currentAlarm).toBe(10_101);
     });

@@ -603,7 +603,11 @@ describe("Gateway snapshot delivery state", () => {
                 "  run_lease_expires_at INTEGER CHECK (run_lease_expires_at IS NULL OR run_lease_expires_at >= 0),\n",
                 ""
             )
-            .replace("  last_snapshot_cookie TEXT,\n", "");
+            .replace("  last_snapshot_cookie TEXT,\n", "")
+            .replace(
+                "  initial_snapshot_pending INTEGER NOT NULL DEFAULT 0 CHECK (initial_snapshot_pending IN (0, 1)),\n",
+                ""
+            );
         db.exec(legacyDdl);
         db.query(
             `INSERT INTO _gw_registration_generations
@@ -635,6 +639,11 @@ describe("Gateway snapshot delivery state", () => {
             )
         ).toContain("last_snapshot_cookie");
         expect(
+            (db.query("PRAGMA table_info('_gw_registration_generations')").all() as { name: string }[]).map(
+                column => column.name
+            )
+        ).toContain("initial_snapshot_pending");
+        expect(
             db
                 .query(
                     `SELECT run_token, run_target_version, run_lease_expires_at, run_version
@@ -642,6 +651,14 @@ describe("Gateway snapshot delivery state", () => {
                 )
                 .get()
         ).toEqual({ run_token: null, run_target_version: null, run_lease_expires_at: null, run_version: 5 });
+        expect(
+            db
+                .query(
+                    `SELECT initial_snapshot_pending
+                 FROM _gw_registration_generations WHERE registration_id = 'registration-legacy'`
+                )
+                .get()
+        ).toEqual({ initial_snapshot_pending: 0 });
         expect(
             db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_gw_snapshot_outbox'").get()
         ).toEqual({ name: "_gw_snapshot_outbox" });
