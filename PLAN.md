@@ -192,9 +192,9 @@ Do not start with incremental row patches. Re-run the affected query after a com
 - [x] Send replacement snapshots with a new cookie.
 - [x] Add the replacement-query runner that owns run tokens, consumes coalesced dirtiness, and stages an immutable snapshot before delivery settlement.
 - [x] Remove the dead Gateway patch queue after replacement snapshots superseded it.
-- [ ] Remove the production `matchSubsForRow` method once its remaining test-only callers are replaced.
+- [x] Remove the dead production `matchSubsForRow` method and replace its test-only callers with durable-state and interval-reconstruction assertions.
 - [x] Add a workerd test in which two org-A clients receive and acknowledge a replacement snapshot after a public mutation while an org-B rerun stays empty under policy.
-- [x] Prove focused Gateway and Cdb reconstruction preserves registration, outbox, retry, acknowledgement, and cleanup state.
+- [x] Prove focused Gateway and Cdb reconstruction preserves normalized subscription and table state, rebuilt intervals, outbox state, retries, acknowledgements, and cleanup state.
 - [x] Evict and reconstruct both Gateway and Cdb with a hibernated socket and a staged replacement, then deliver and acknowledge the same snapshot cookie.
 
 ## 9. Define reconnect, retry, and failure behavior
