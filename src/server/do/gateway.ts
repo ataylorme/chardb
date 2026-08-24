@@ -3968,6 +3968,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         reason: string
     ): void {
         const current = ws.deserializeAttachment() as GwAttachment | null;
+        if (current?.kind === "rejected") return;
         if (current) {
             ws.serializeAttachment({
                 kind: "rejected",
@@ -3975,8 +3976,20 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 authOrigin: current.authOrigin,
             } satisfies RejectedGwAttachment);
         }
-        this.sendError(ws, code);
-        ws.close(closeCode, reason);
+        let sendFailed = false;
+        let sendFailure: unknown;
+        try {
+            this.sendError(ws, code);
+        } catch (error) {
+            sendFailed = true;
+            sendFailure = error;
+        }
+        try {
+            ws.close(closeCode, reason);
+        } catch (error) {
+            if (!sendFailed) throw error;
+        }
+        if (sendFailed) throw sendFailure;
     }
 
     private async onSub(ws: WebSocket, msg: Extract<Up, { t: "sub" }>): Promise<void> {

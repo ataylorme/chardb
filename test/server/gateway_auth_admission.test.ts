@@ -39,6 +39,10 @@ type TestAttachment = PendingAttachment | VerifiedGwAttachment | Record<string, 
 class FakeSocket {
     readonly sent: string[] = [];
     readonly closed: Array<{ code: number; reason: string }> = [];
+    sendCalls = 0;
+    serializeCalls = 0;
+    failSend = false;
+    failClose = false;
 
     constructor(public attachment: TestAttachment) {}
 
@@ -47,15 +51,19 @@ class FakeSocket {
     }
 
     serializeAttachment(attachment: TestAttachment): void {
+        this.serializeCalls += 1;
         this.attachment = attachment;
     }
 
     send(message: string): void {
+        this.sendCalls += 1;
+        if (this.failSend) throw new Error("socket send failed");
         this.sent.push(message);
     }
 
     close(code: number, reason: string): void {
         this.closed.push({ code, reason });
+        if (this.failClose) throw new Error("socket close failed");
     }
 }
 
@@ -64,6 +72,7 @@ interface GatewayInternals {
     authRefreshBarriers: Map<string, Promise<boolean>>;
     verifyAttachment: () => Promise<VerifiedGwAttachment | null>;
     performUpdateAuth: () => Promise<boolean>;
+    rejectAuth: (ws: WebSocket, code: "CDB_FORBIDDEN") => void;
 }
 
 function pendingAttachment(): PendingAttachment {
@@ -201,6 +210,53 @@ describe("Gateway authentication single-flight admission", () => {
         expect(socket.attachment).toMatchObject({ kind: "verified", principalId: "principal-1" });
     });
 
+    test("closes a rejected connection even when its auth error send fails", async () => {
+        const socket = new FakeSocket({ ...pendingAttachment(), routedClientId: ClientId("client-other") });
+        socket.failSend = true;
+
+        await expect(hello(gateway, socket, "mismatched-client-token")).rejects.toThrow("socket send failed");
+
+        expect(socket.attachment).toEqual({
+            kind: "rejected",
+            connectionId: "connection-1",
+            authOrigin: "https://app.example",
+        });
+        expect(socket.sendCalls).toBe(1);
+        expect(socket.serializeCalls).toBe(1);
+        expect(socket.closed).toEqual([{ code: 1008, reason: "CDB_FORBIDDEN" }]);
+    });
+
+    test("preserves the auth error send failure when closing also fails", async () => {
+        const socket = new FakeSocket({ ...pendingAttachment(), routedClientId: ClientId("client-other") });
+        socket.failSend = true;
+        socket.failClose = true;
+
+        await expect(hello(gateway, socket, "mismatched-client-token")).rejects.toThrow("socket send failed");
+
+        expect(socket.attachment).toEqual({
+            kind: "rejected",
+            connectionId: "connection-1",
+            authOrigin: "https://app.example",
+        });
+        expect(socket.sendCalls).toBe(1);
+        expect(socket.serializeCalls).toBe(1);
+        expect(socket.closed).toEqual([{ code: 1008, reason: "CDB_FORBIDDEN" }]);
+    });
+
+    test("propagates a close failure when the auth error send succeeds", async () => {
+        const socket = new FakeSocket({ ...pendingAttachment(), routedClientId: ClientId("client-other") });
+        socket.failClose = true;
+
+        await expect(hello(gateway, socket, "mismatched-client-token")).rejects.toThrow("socket close failed");
+
+        expect(socket.sent.map(message => JSON.parse(message))).toEqual([
+            expect.objectContaining({ t: "error", code: "CDB_FORBIDDEN" }),
+        ]);
+        expect(socket.sendCalls).toBe(1);
+        expect(socket.serializeCalls).toBe(1);
+        expect(socket.closed).toEqual([{ code: 1008, reason: "CDB_FORBIDDEN" }]);
+    });
+
     test("a close event fences a held hello before attachment mutation or welcome", async () => {
         const socket = new FakeSocket(pendingAttachment());
         const internals = gateway as unknown as GatewayInternals;
@@ -264,6 +320,34 @@ describe("Gateway authentication single-flight admission", () => {
         await updateAuth(gateway, socket, "crashing-token");
         expect(socket.attachment).toMatchObject({ kind: "rejected", connectionId: "connection-1" });
         expect(socket.closed).toEqual([{ code: 1008, reason: "CDB_CATALOG_UNAVAILABLE" }]);
+        expect(internals.authOperationClaims.size).toBe(0);
+        expect(internals.authRefreshBarriers.size).toBe(0);
+    });
+
+    test("repeated updateAuth rejection remains an exactly-once terminal transition", async () => {
+        const socket = new FakeSocket(verifiedAttachment());
+        const internals = gateway as unknown as GatewayInternals;
+        internals.verifyAttachment = async () => {
+            internals.rejectAuth(socket as unknown as WebSocket, "CDB_FORBIDDEN");
+            throw new Error("verification failed after rejection");
+        };
+
+        await updateAuth(gateway, socket, "rejecting-token");
+        const rejectedAttachment = socket.attachment;
+        await updateAuth(gateway, socket, "repeated-token");
+
+        expect(socket.attachment).toBe(rejectedAttachment);
+        expect(socket.attachment).toEqual({
+            kind: "rejected",
+            connectionId: "connection-1",
+            authOrigin: "https://app.example",
+        });
+        expect(socket.sent.map(message => JSON.parse(message))).toEqual([
+            expect.objectContaining({ t: "error", code: "CDB_FORBIDDEN" }),
+        ]);
+        expect(socket.sendCalls).toBe(1);
+        expect(socket.serializeCalls).toBe(1);
+        expect(socket.closed).toEqual([{ code: 1008, reason: "CDB_FORBIDDEN" }]);
         expect(internals.authOperationClaims.size).toBe(0);
         expect(internals.authRefreshBarriers.size).toBe(0);
     });
