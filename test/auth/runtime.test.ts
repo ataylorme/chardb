@@ -23,6 +23,7 @@ import {
     authCount,
     authCreate,
     authDelete,
+    authFindFirstId,
     authFindMany,
     authFindOne,
     authPreloadScopeRows,
@@ -173,6 +174,33 @@ describe("auth/sql — render path against bun:sqlite", () => {
                 row => row.displayName
             )
         ).toEqual(["Charlie", "Bravo"]);
+    });
+
+    test("selects one deterministic schema-mapped auth id without materializing full rows", () => {
+        const { db } = bootstrap();
+        const statements: string[] = [];
+        const sql = bunSyncSql(db, statements);
+        const renamed = sqliteTable("single_auth_target", {
+            id: text("db_id"),
+            group: text("group_name"),
+            wide: text("wide_payload"),
+        });
+        sql.exec(
+            'CREATE TABLE "single_auth_target" ("db_id" TEXT PRIMARY KEY, "group_name" TEXT, "wide_payload" TEXT)'
+        );
+        const insert = db.prepare(
+            'INSERT INTO "single_auth_target" ("db_id", "group_name", "wide_payload") VALUES (?, ?, ?)'
+        );
+        for (const id of ["target-c", "target-a", "target-b"]) insert.run(id, "shared", "w".repeat(1_024 * 1_024));
+        statements.length = 0;
+
+        expect(authFindFirstId(sql, renamed, { group: "shared" })).toBe("target-a");
+        expect(statements).toHaveLength(1);
+        expect(statements[0]).toContain('SELECT "db_id" AS auth_target_id');
+        expect(statements[0]).toContain('ORDER BY "db_id" ASC');
+        expect(statements[0]).toContain("LIMIT 1");
+        expect(statements[0]).not.toContain("wide_payload");
+        expect(statements[0]).not.toContain("SELECT *");
     });
 
     test("findMany rejects invalid paging and sorting", () => {

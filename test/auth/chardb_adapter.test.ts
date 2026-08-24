@@ -395,6 +395,111 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(harness.catalog.authEpoch({ principalId: "user-2" as never }).principal).toBe(4);
     });
 
+    test("keeps empty single-row mutations as no-ops while bulk mutations remain explicit", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const now = new Date("2026-08-23T00:00:00Z");
+        for (const id of ["empty-single-a", "empty-single-b"] as const) {
+            await adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id,
+                    name: "Before",
+                    email: `${id}@example.com`,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+        }
+        harness.sqlStatements.length = 0;
+
+        await expect(adapter.update({ model: "user", where: [], update: { name: "Single" } })).resolves.toBeNull();
+        await expect(adapter.delete({ model: "user", where: [] })).resolves.toBeUndefined();
+        const singleStatements = [...harness.sqlStatements];
+        expect(singleStatements.some(statement => statement.startsWith('UPDATE "user"'))).toBe(false);
+        expect(singleStatements.some(statement => statement.startsWith('DELETE FROM "user"'))).toBe(false);
+        expect(singleStatements.some(statement => statement.startsWith("UPDATE catalog_epoch"))).toBe(false);
+        expect(await adapter.findMany({ model: "user", where: eq("name", "Before") })).toHaveLength(2);
+
+        expect(await adapter.updateMany({ model: "user", where: [], update: { name: "Bulk" } })).toBe(2);
+        expect(await adapter.deleteMany({ model: "user", where: [] })).toBe(2);
+        expect(await adapter.findMany({ model: "user", where: [] })).toEqual([]);
+    });
+
+    test("keeps legacy direct Catalog mutations bulk by default", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const now = new Date("2026-08-23T00:00:00Z");
+        for (const id of ["legacy-bulk-a", "legacy-bulk-b"] as const) {
+            await adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id,
+                    name: "Legacy",
+                    email: `${id}@example.com`,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+        }
+
+        await expect(
+            harness.catalog.mutateAuth({
+                model: "user",
+                op: "update",
+                where: { name: "Legacy" },
+                payload: { name: "Legacy changed" },
+                returnRow: false,
+            })
+        ).resolves.toMatchObject({ affected: 2 });
+        await expect(
+            harness.catalog.mutateAuth({ model: "user", op: "delete", where: { name: "Legacy changed" } })
+        ).resolves.toMatchObject({ affected: 2 });
+    });
+
+    test("single-row update and delete choose the lowest matching id without touching siblings", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const now = new Date("2026-08-23T00:00:00Z");
+        for (const id of ["single-c", "single-a", "single-b"] as const) {
+            await adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id,
+                    name: "Shared",
+                    email: `${id}@example.com`,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+        }
+        const epochBeforeA = harness.catalog.authEpoch({ principalId: "single-a" as never }).principal;
+        const epochBeforeB = harness.catalog.authEpoch({ principalId: "single-b" as never }).principal;
+        const epochBeforeC = harness.catalog.authEpoch({ principalId: "single-c" as never }).principal;
+
+        await expect(
+            adapter.update({ model: "user", where: eq("name", "Shared"), update: { image: "selected" } })
+        ).resolves.toMatchObject({ id: "single-a", image: "selected" });
+        const shared = await adapter.findMany<Record<string, unknown>>({ model: "user", where: eq("name", "Shared") });
+        expect(Object.fromEntries(shared.map(row => [row.id, row.image ?? null]))).toEqual({
+            "single-a": "selected",
+            "single-b": null,
+            "single-c": null,
+        });
+        expect(harness.catalog.authEpoch({ principalId: "single-a" as never }).principal).toBe(epochBeforeA + 1);
+        expect(harness.catalog.authEpoch({ principalId: "single-b" as never }).principal).toBe(epochBeforeB);
+        expect(harness.catalog.authEpoch({ principalId: "single-c" as never }).principal).toBe(epochBeforeC);
+
+        await adapter.delete({ model: "user", where: eq("name", "Shared") });
+        expect(await adapter.findOne({ model: "user", where: eq("id", "single-a") })).toBeNull();
+        expect(await adapter.findOne({ model: "user", where: eq("id", "single-b") })).not.toBeNull();
+        expect(await adapter.findOne({ model: "user", where: eq("id", "single-c") })).not.toBeNull();
+        expect(await adapter.deleteMany({ model: "user", where: eq("name", "Shared") })).toBe(2);
+    });
+
     test("rolls back an auth row when its atomic epoch bump fails", async () => {
         const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
         harness.db.run(`CREATE TRIGGER fail_auth_epoch
@@ -476,6 +581,25 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(harness.sqlStatements.some(statement => statement.startsWith('UPDATE "user"'))).toBe(false);
         expect(harness.sqlStatements.some(statement => statement.startsWith("UPDATE catalog_epoch"))).toBe(false);
         expect(harness.catalog.authEpoch({ principalId: "bulk-over-0" as never }).principal).toBe(0);
+
+        await expect(
+            adapter.update({
+                model: "user",
+                where: eq("name", "Bulk row cap"),
+                update: { name: "Single changed" },
+            })
+        ).resolves.toMatchObject({ id: "bulk-over-0", name: "Single changed" });
+        expect(harness.db.query('SELECT COUNT(*) AS count FROM "user" WHERE "name" = ?').get("Single changed")).toEqual(
+            {
+                count: 1,
+            }
+        );
+
+        await adapter.delete({ model: "user", where: eq("name", "Bulk row cap") });
+        expect(harness.db.query('SELECT COUNT(*) AS count FROM "user" WHERE "name" = ?').get("Bulk row cap")).toEqual({
+            count: AUTH_BULK_PRELOAD_MAX_ROWS - 1,
+        });
+        expect(harness.db.query('SELECT 1 FROM "user" WHERE "id" = ?').get("bulk-over-1")).toBeNull();
     });
 
     test("rejects excess stored and replacement scope bytes before auth writes", async () => {

@@ -42,6 +42,7 @@ interface CatalogRpc {
         where?: { [k: string]: RawJson };
         payload?: { [k: string]: RawJson };
         returnRow?: boolean;
+        limitOne?: boolean;
     }): Promise<{ ok: true; row?: Record<string, RawJson> | null; affected?: number }>;
     queryAuth(args: {
         model: string;
@@ -110,6 +111,7 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                     where: flat,
                     payload: update as { [k: string]: RawJson },
                     returnRow: true,
+                    limitOne: true,
                 });
                 return (r.row ?? null) as never;
             },
@@ -122,18 +124,19 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                     where: flat,
                     payload: update as { [k: string]: RawJson },
                     returnRow: false,
+                    limitOne: false,
                 });
                 return r.affected ?? 0;
             },
 
             async delete({ model, where }) {
                 const flat = whereToFlat(where);
-                await catalog().mutateAuth({ model, op: "delete", where: flat });
+                await catalog().mutateAuth({ model, op: "delete", where: flat, limitOne: true });
             },
 
             async deleteMany({ model, where }) {
                 const flat = whereToFlat(where);
-                const r = await catalog().mutateAuth({ model, op: "delete", where: flat });
+                const r = await catalog().mutateAuth({ model, op: "delete", where: flat, limitOne: false });
                 return r.affected ?? 0;
             },
         }),

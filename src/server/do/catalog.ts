@@ -35,6 +35,7 @@ import {
     authCount,
     authCreate,
     authDelete,
+    authFindFirstId,
     authFindMany,
     authFindOne,
     authPreloadScopeRows,
@@ -340,6 +341,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
         readonly where?: { readonly [k: string]: RawJson };
         readonly payload?: { readonly [k: string]: RawJson };
         readonly returnRow?: boolean;
+        readonly limitOne?: boolean;
     }): Promise<{
         readonly ok: true;
         readonly row?: Record<string, RawJson> | null;
@@ -367,17 +369,26 @@ export class Catalog extends DurableObject<CatalogEnv> {
                     if (!args.where || !args.payload) {
                         throw new Error("auth: update requires where and payload");
                     }
+                    if (args.limitOne && Object.keys(args.where).length === 0) break;
+                    const mutationWhere = args.limitOne
+                        ? (() => {
+                              const id = authFindFirstId(sql, table, args.where);
+                              return id === null ? null : { id };
+                          })()
+                        : args.where;
+                    if (!mutationWhere) break;
                     const before = authPreloadScopeRows(
                         sql,
                         table,
-                        args.where,
+                        mutationWhere,
                         scopeColumns,
                         scopeColumns.map(column => args.payload?.[column]),
                         args.payload
                     );
                     const returnRow = args.returnRow !== false;
-                    const fullBefore = returnRow && before.matchedRows > 0 ? authFindOne(sql, table, args.where) : null;
-                    const r = authUpdate(sql, table, args.where, args.payload, returnRow);
+                    const fullBefore =
+                        returnRow && before.matchedRows > 0 ? authFindOne(sql, table, mutationWhere) : null;
+                    const r = authUpdate(sql, table, mutationWhere, args.payload, returnRow);
                     affected = r.affected;
                     if (affected > 0) {
                         if (placement.kind === "replicated") addEpochScope(scopes, "global", "global");
@@ -397,8 +408,16 @@ export class Catalog extends DurableObject<CatalogEnv> {
                 }
                 case "delete": {
                     if (!args.where) throw new Error("auth: delete requires where");
-                    const before = authPreloadScopeRows(sql, table, args.where, scopeColumns);
-                    affected = authDelete(sql, table, args.where).affected;
+                    if (args.limitOne && Object.keys(args.where).length === 0) break;
+                    const mutationWhere = args.limitOne
+                        ? (() => {
+                              const id = authFindFirstId(sql, table, args.where);
+                              return id === null ? null : { id };
+                          })()
+                        : args.where;
+                    if (!mutationWhere) break;
+                    const before = authPreloadScopeRows(sql, table, mutationWhere, scopeColumns);
+                    affected = authDelete(sql, table, mutationWhere).affected;
                     if (affected > 0) {
                         if (placement.kind === "replicated") addEpochScope(scopes, "global", "global");
                         for (const previous of before.rows) addRowEpochScopes(scopes, args.model, previous);

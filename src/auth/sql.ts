@@ -358,6 +358,36 @@ export function authFindOne(
     return row ? projectRow(info, row) : null;
 }
 
+export function authFindFirstId(
+    sql: SyncSql,
+    table: AnySQLiteTable,
+    where: { readonly [k: string]: RawJson }
+): string | null {
+    const info = infoOf(table);
+    const idSqlName = info.columns.get("id");
+    if (!idSqlName) {
+        throw new CdbError({ code: "CDB_INVARIANT", message: `auth/sql: table ${info.name} has no id column` });
+    }
+    const quotedId = quoteIdent(idSqlName);
+    const w = bindWhere(info, where);
+    const row = sql.one<{ auth_target_id: unknown }>(
+        `SELECT ${quotedId} AS auth_target_id
+         FROM ${quoteIdent(info.name)}
+         WHERE ${w.sql}
+         ORDER BY ${quotedId} ASC
+         LIMIT 1`,
+        ...w.params
+    );
+    if (!row) return null;
+    if (typeof row.auth_target_id !== "string") {
+        throw new CdbError({
+            code: "CDB_INVARIANT",
+            message: `auth/sql: selected id on table ${info.name} is not a string`,
+        });
+    }
+    return row.auth_target_id;
+}
+
 export function authFindMany(
     sql: SyncSql,
     table: AnySQLiteTable,
