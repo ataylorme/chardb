@@ -587,6 +587,63 @@ describe("createChardbClient — wire round-trip", () => {
         await expect(mutation).rejects.toMatchObject({ code: "CDB_UNSUPPORTED_FEATURE" });
     });
 
+    test("backs off repeated pre-welcome closes through the 10 second cap", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            let socket = fakeWebSocket();
+            expect(socket.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+
+            for (const delay of [250, 500, 1_000, 2_000, 4_000, 8_000, 10_000, 10_000]) {
+                socket.close();
+                await flush();
+                expect(timers.scheduledDelays()).toEqual([delay]);
+
+                timers.runDelay(delay);
+                await flush();
+                socket = fakeWebSocket(FakeWS.instances.length - 1);
+                expect(socket.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+                expect(c.state).toBe("connecting");
+            }
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("a valid welcome resets a backed-off connection to the initial reconnect delay", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            let socket = fakeWebSocket();
+            socket.close();
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([250]);
+
+            timers.runDelay(250);
+            await flush();
+            socket = fakeWebSocket(1);
+            socket.close();
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([500]);
+
+            timers.runDelay(500);
+            await flush();
+            socket = fakeWebSocket(2);
+            expect(socket.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+            await welcome(socket, "c-test:backoff-reset");
+            socket.close();
+            await flush();
+
+            expect(timers.scheduledDelays()).toEqual([250]);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
     test("subscribe → server poke delivers rows to the listener", async () => {
         const c = client();
         await flush();

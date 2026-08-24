@@ -169,7 +169,6 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         url.searchParams.set("clientId", clientId);
         ws = new WebSocket(url.toString());
         ws.onopen = () => {
-            reconnectBackoff = RECONNECT_INITIAL_BACKOFF_MS;
             const hello: Up = {
                 t: "hello",
                 protocolV: PROTOCOL_V,
@@ -283,6 +282,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                 }
                 lastCookie = msg.baseCookie;
                 state = "open";
+                reconnectBackoff = RECONNECT_INITIAL_BACKOFF_MS;
                 sendSessionState();
                 return;
             case "poke":
