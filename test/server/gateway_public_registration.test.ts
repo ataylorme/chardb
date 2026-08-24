@@ -15,6 +15,10 @@ interface Cursor<T> extends Iterable<T> {
     raw(): IterableIterator<unknown[]>;
 }
 
+interface GatewaySchedulerInternals {
+    scheduleGatewayWork: (nowMs: number) => Promise<void>;
+}
+
 function sqlStorage(db: Database) {
     return {
         exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): Cursor<T> {
@@ -699,6 +703,50 @@ describe("Gateway public durable registration", () => {
         expect(rows).toHaveLength(2);
         expect(rows.map(row => row.lifecycle).sort()).toEqual(["active", "retiring"]);
         expect(head()).toEqual({ registration_id: replacementId });
+    });
+
+    test("a displaced subscription does not report a late final scheduler rejection", async () => {
+        let schedulerCalls = 0;
+        let rejectHeldSchedule: (error: Error) => void = () => {};
+        (gateway as unknown as GatewaySchedulerInternals).scheduleGatewayWork = async () => {
+            schedulerCalls += 1;
+            if (schedulerCalls !== 2) return;
+            await new Promise<void>((_, reject) => {
+                rejectHeldSchedule = reject;
+            });
+        };
+
+        const first = subscribe();
+        await waitFor(() => schedulerCalls === 2, "held final scheduler call");
+        const replacement = subscribe();
+        rejectHeldSchedule(new Error("scheduler unavailable"));
+        await Promise.all([first, replacement]);
+
+        expect(subscribeCalls).toHaveLength(2);
+        expect(socket.sent.map(message => JSON.parse(message))).not.toContainEqual(
+            expect.objectContaining({ t: "error", code: "CDB_SHARD_UNAVAILABLE" })
+        );
+    });
+
+    test("a closed subscription does not report a late final scheduler rejection", async () => {
+        let schedulerCalls = 0;
+        let rejectHeldSchedule: (error: Error) => void = () => {};
+        (gateway as unknown as GatewaySchedulerInternals).scheduleGatewayWork = async () => {
+            schedulerCalls += 1;
+            if (schedulerCalls !== 2) return;
+            await new Promise<void>((_, reject) => {
+                rejectHeldSchedule = reject;
+            });
+        };
+
+        const pending = subscribe();
+        await waitFor(() => schedulerCalls === 2, "held final scheduler call");
+        await gateway.webSocketClose(socket as unknown as WebSocket);
+        rejectHeldSchedule(new Error("scheduler unavailable"));
+        await pending;
+
+        expect(socket.sent).toEqual([]);
+        expect(socket.attachment).toMatchObject({ kind: "rejected", connectionId: "connection-1" });
     });
 
     test("subscribe response loss leaves an exact cleanup tombstone", async () => {

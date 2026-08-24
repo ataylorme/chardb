@@ -222,6 +222,7 @@ interface PendingSubscription {
     readonly subId: SubId;
     readonly capacityKey: string;
     cancelled: boolean;
+    queued: boolean;
     task: Promise<void>;
 }
 
@@ -3591,8 +3592,12 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return;
         }
         const operationKey = `${attachment.connectionId}:${msg.subId}`;
-        const capacityKey = stableJson([attachment.principalId, attachment.clientId, msg.subId]);
         const previous = this.pendingSubscriptions.get(operationKey);
+        if (previous?.queued) {
+            this.sendError(ws, "CDB_RATE_LIMITED", msg.subId);
+            return;
+        }
+        const capacityKey = stableJson([attachment.principalId, attachment.clientId, msg.subId]);
         const duplicatePending = [...this.pendingSubscriptions.values()].some(
             pending => !pending.cancelled && pending !== previous && pending.capacityKey === capacityKey
         );
@@ -3621,16 +3626,18 @@ export class Gateway extends DurableObject<GatewayEnv> {
             this.sendError(ws, "CDB_RATE_LIMITED", msg.subId);
             return;
         }
+        const queued = this.authRefreshBarriers.has(attachment.connectionId) || previous !== undefined;
         if (previous) previous.cancelled = true;
         const pending: PendingSubscription = {
             connectionId: attachment.connectionId,
             subId: msg.subId,
             capacityKey,
             cancelled: false,
+            queued,
             task: Promise.resolve(),
         };
         this.pendingSubscriptions.set(operationKey, pending);
-        if (this.authRefreshBarriers.has(attachment.connectionId) || previous) {
+        if (queued) {
             await (previous?.task.catch(() => {}) ?? Promise.resolve());
             let succeeded = true;
             while (true) {
@@ -3642,6 +3649,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 }
             }
             if (succeeded && !pending.cancelled) {
+                pending.queued = false;
                 await this.admitSubscription(ws, msg, pending, operationKey);
             } else if (this.pendingSubscriptions.get(operationKey) === pending) {
                 this.pendingSubscriptions.delete(operationKey);
@@ -3712,7 +3720,18 @@ export class Gateway extends DurableObject<GatewayEnv> {
         try {
             await task;
         } catch {
-            this.sendError(ws, "CDB_INVARIANT", msg.subId);
+            const current = ws.deserializeAttachment() as GwAttachment | null;
+            if (
+                !pending.cancelled &&
+                this.pendingSubscriptions.get(operationKey) === pending &&
+                isVerifiedAttachment(current) &&
+                isCurrentVerifiedAttachment(current) &&
+                current.connectionId === att.connectionId &&
+                current.clientId === att.clientId &&
+                current.principalId === att.principalId
+            ) {
+                this.sendError(ws, "CDB_INVARIANT", msg.subId);
+            }
         } finally {
             if (this.pendingSubscriptions.get(operationKey) === pending) {
                 this.pendingSubscriptions.delete(operationKey);
@@ -3951,7 +3970,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         try {
             await this.scheduleGatewayWork(activatedAt);
         } catch {
-            this.sendError(ws, "CDB_SHARD_UNAVAILABLE", msg.subId);
+            if (!isCancelledOrStale()) this.sendError(ws, "CDB_SHARD_UNAVAILABLE", msg.subId);
         }
     }
 
