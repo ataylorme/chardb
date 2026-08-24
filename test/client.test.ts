@@ -91,6 +91,17 @@ async function welcome(ws: FakeWS, cookie = "c-test:0"): Promise<void> {
     await flush();
 }
 
+function captureCdbError(run: () => unknown): CdbError {
+    let caught: unknown;
+    try {
+        run();
+    } catch (error) {
+        caught = error;
+    }
+    expect(caught).toBeInstanceOf(CdbError);
+    return caught as CdbError;
+}
+
 function spyOnClearTimeout(): { readonly calls: unknown[]; restore: () => void } {
     const original = globalThis.clearTimeout;
     const calls: unknown[] = [];
@@ -357,6 +368,184 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
         expect(seen.length).toBe(1);
         expect(seen[0]).toEqual([{ id: "r-1", __key: "row-1" }]);
+    });
+
+    test("caps active subscriptions at 64 without sending or consuming an id for rejected work", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        expect(() => c.subscribe("invalid-ref", {}, () => {})).toThrow("invalid ChardbRef");
+        const subscriptions = Array.from({ length: 64 }, (_, index) =>
+            c.subscribe("queries.ts#bounded", { index }, () => {})
+        );
+        const admitted = ws.sent.map(raw => JSON.parse(raw) as Up).filter(message => message.t === "sub");
+        expect(admitted).toHaveLength(64);
+        expect(admitted.at(0)).toMatchObject({ t: "sub", subId: 1 });
+        expect(admitted.at(-1)).toMatchObject({ t: "sub", subId: 64 });
+
+        ws.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-test:1"), rows: [] });
+        await flush();
+        const sentBeforeRejection = ws.sent.length;
+        expect(() => c.subscribe("still-invalid-at-cap", {}, () => {})).toThrow("invalid ChardbRef");
+        expect(ws.sent).toHaveLength(sentBeforeRejection);
+        const limited = captureCdbError(() => c.subscribe("queries.ts#over-limit", {}, () => {}));
+        expect(limited).toMatchObject({ code: "CDB_RATE_LIMITED", retryable: true });
+        expect(ws.sent).toHaveLength(sentBeforeRejection);
+
+        subscriptions[0]?.unsubscribe();
+        const replacement = c.subscribe("queries.ts#replacement", {}, () => {});
+        expect(
+            ws.sent
+                .map(raw => JSON.parse(raw) as Up)
+                .filter(message => message.t === "sub")
+                .at(-1)
+        ).toMatchObject({
+            t: "sub",
+            subId: 65,
+        });
+        replacement.unsubscribe();
+        c.close();
+        expect(captureCdbError(() => c.subscribe("queries.ts#after-close", {}, () => {}))).toMatchObject({
+            code: "CDB_STREAM_ABORTED",
+        });
+    });
+
+    test("rolls back a subscription whose synchronous send fails and never reconnects it", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+            first.failNextSend = true;
+            expect(captureCdbError(() => c.subscribe("queries.ts#send-failure", {}, () => {}))).toMatchObject({
+                code: "CDB_STREAM_ABORTED",
+            });
+
+            first.close();
+            await flush();
+            timers.runDelay(250);
+            await flush();
+            const reconnected = fakeWebSocket(1);
+            await welcome(reconnected);
+            expect(reconnected.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+
+            c.subscribe("queries.ts#replacement-after-send-failure", {}, () => {});
+            expect(
+                reconnected.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "sub")
+            ).toMatchObject({ t: "sub", subId: 2 });
+        } finally {
+            timers.restore();
+            c.close();
+        }
+    });
+
+    test("closes the session when unsubscribe cannot reach the server", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const first = c.subscribe("queries.ts#first", {}, () => {});
+        let remainingNotifications = 0;
+        c.subscribe("queries.ts#remaining", {}, () => remainingNotifications++);
+        ws.failNextSend = true;
+
+        expect(captureCdbError(() => first.unsubscribe())).toMatchObject({ code: "CDB_STREAM_ABORTED" });
+        expect(c.state).toBe("closed");
+        expect(ws.readyState).toBe(FakeWS.CLOSED);
+        expect(remainingNotifications).toBe(1);
+        expect(captureCdbError(() => c.subscribe("queries.ts#after-unsub-failure", {}, () => {}))).toMatchObject({
+            code: "CDB_STREAM_ABORTED",
+        });
+    });
+
+    test("finishes terminal cleanup when a subscription listener throws", async () => {
+        class ClosingBroadcastChannel {
+            static instance: ClosingBroadcastChannel | undefined;
+            onmessage: ((event: { data: unknown }) => void) | null = null;
+            closeCalls = 0;
+
+            constructor(_name: string) {
+                ClosingBroadcastChannel.instance = this;
+            }
+
+            close(): void {
+                this.closeCalls += 1;
+            }
+        }
+
+        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = ClosingBroadcastChannel;
+        const timeoutSpy = spyOnClearTimeout();
+        try {
+            const c = createChardbClient({
+                endpoint: "wss://example.com/ws",
+                getJwt: async () => "jwt-stub",
+                clientId: "c-listener-cleanup",
+                logicalDb: "listener-cleanup",
+            });
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            c.subscribe("queries.ts#throwing", {}, () => {
+                throw new Error("listener failed");
+            });
+            let remainingNotifications = 0;
+            c.subscribe("queries.ts#remaining", {}, () => remainingNotifications++);
+            const mutationError = c.mutate("mutations.ts#pending", {}).catch(error => error);
+
+            expect(() => c.close()).not.toThrow();
+            await expect(mutationError).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
+            expect(remainingNotifications).toBe(1);
+            expect(timeoutSpy.calls).toHaveLength(1);
+            expect(ws.readyState).toBe(FakeWS.CLOSED);
+            expect(ClosingBroadcastChannel.instance?.closeCalls).toBe(1);
+        } finally {
+            timeoutSpy.restore();
+            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
+            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
+        }
+    });
+
+    test("reconnect resends the same 64 subscriptions without consuming more capacity", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+            const subscriptions = Array.from({ length: 64 }, (_, index) =>
+                c.subscribe("queries.ts#bounded-reconnect", { index }, () => {})
+            );
+
+            first.close();
+            await flush();
+            timers.runDelay(250);
+            await flush();
+            const reconnected = fakeWebSocket(1);
+            await welcome(reconnected);
+            expect(
+                reconnected.sent.map(raw => JSON.parse(raw) as Up).filter(message => message.t === "sub")
+            ).toHaveLength(64);
+
+            const sentBeforeRejection = reconnected.sent.length;
+            expect(captureCdbError(() => c.subscribe("queries.ts#reconnect-over-limit", {}, () => {}))).toMatchObject({
+                code: "CDB_RATE_LIMITED",
+            });
+            expect(reconnected.sent).toHaveLength(sentBeforeRejection);
+
+            subscriptions[0]?.unsubscribe();
+            c.subscribe("queries.ts#reconnect-replacement", {}, () => {});
+            expect(
+                reconnected.sent
+                    .map(raw => JSON.parse(raw) as Up)
+                    .filter(message => message.t === "sub")
+                    .at(-1)
+            ).toMatchObject({ t: "sub", subId: 65 });
+        } finally {
+            timers.restore();
+            c.close();
+        }
     });
 
     test("snapshot replaces existing rows exactly", async () => {

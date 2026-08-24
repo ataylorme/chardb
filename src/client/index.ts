@@ -30,6 +30,7 @@ const DEFAULT_MUTATION_TIMEOUT_MS = 60_000;
 const RECONNECT_INITIAL_BACKOFF_MS = 250;
 const RECONNECT_MAX_BACKOFF_MS = 10_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const MAX_ACTIVE_SUBSCRIPTIONS = 64;
 
 export interface ChardbClientOptions {
     readonly endpoint: string;
@@ -353,9 +354,17 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
         }
-        for (const sub of subs.values()) {
+        const subscriptions = [...subs.values()];
+        subs.clear();
+        for (const sub of subscriptions) {
             sub.state = subState;
-            notify(sub);
+            for (const listener of sub.listeners) {
+                try {
+                    listener(sub.rows);
+                } catch {
+                    // User listeners cannot interrupt terminal resource cleanup.
+                }
+            }
         }
         const mutations = [...pending.values()];
         pending.clear();
@@ -364,8 +373,11 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             clearMutationTimeout(mutation);
             mutation.reject(error);
         }
-        ws?.close();
-        bc?.close();
+        try {
+            ws?.close();
+        } finally {
+            bc?.close();
+        }
     }
 
     function notify(sub: SubRecord): void {
@@ -377,8 +389,20 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         args: RawJson,
         onChange: (rows: TRow[]) => void
     ): { unsubscribe: () => void } {
-        const subId = SubId(nextSubId++);
+        if (terminated) {
+            throw new CdbError({
+                code: "CDB_STREAM_ABORTED",
+                message: "cannot open a subscription after the Chardb client has closed",
+            });
+        }
         const queryRef = ChardbRef(ref);
+        if (subs.size >= MAX_ACTIVE_SUBSCRIPTIONS) {
+            throw new CdbError({
+                code: "CDB_RATE_LIMITED",
+                message: `cannot open more than ${MAX_ACTIVE_SUBSCRIPTIONS} active subscriptions`,
+            });
+        }
+        const subId = SubId(nextSubId++);
         const widenedListener: (rows: RawJson[]) => void = rows => onChange(rows as readonly RawJson[] as TRow[]);
         const rec: SubRecord = {
             subId,
@@ -392,14 +416,35 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
         subs.set(subId, rec);
         if (ws && state === "open") {
             const up: Up = { t: "sub", subId, ref: queryRef, args };
-            ws.send(encodeWire(up));
+            try {
+                ws.send(encodeWire(up));
+            } catch (cause) {
+                subs.delete(subId);
+                throw new CdbError({
+                    code: "CDB_STREAM_ABORTED",
+                    message: `failed to send subscription ${subId}`,
+                    cause,
+                });
+            }
         }
         return {
             unsubscribe() {
-                subs.delete(subId);
+                if (!subs.delete(subId)) return;
                 if (ws && state === "open") {
                     const up: Up = { t: "unsub", subId };
-                    ws.send(encodeWire(up));
+                    try {
+                        ws.send(encodeWire(up));
+                    } catch (cause) {
+                        failSession(
+                            "CDB_STREAM_ABORTED",
+                            `failed to send unsubscription ${subId}; client session closed`
+                        );
+                        throw new CdbError({
+                            code: "CDB_STREAM_ABORTED",
+                            message: `failed to send unsubscription ${subId}`,
+                            cause,
+                        });
+                    }
                 }
             },
         };
