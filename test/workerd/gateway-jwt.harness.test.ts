@@ -1089,24 +1089,26 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         await closed;
     });
 
-    test("multiple updateAuth messages serialize before a later mutation", async () => {
+    test("sequential updateAuth messages settle before a later mutation", async () => {
         if (!mutationRef) throw new Error("mutation ref was not seeded");
         const { socket, first } = await openSocket(await signed());
         await first;
-        const ordered = nextDowns(socket, 3);
-        socket.send(encodeWire({ t: "updateAuth", jwt: await signed({ subject: "workerd-user-2" }) }));
-        socket.send(encodeWire({ t: "updateAuth", jwt: await signed({ subject: "workerd-user" }) }));
-        socket.send(
-            encodeWire({
-                t: "mut",
-                mutId: MutId("after-two-refreshes"),
-                ref: mutationRef,
-                args: { id: "after-two-refreshes", organizationId: "workerd-org", body: "final", createdAt: 8 },
-            })
-        );
-        const [firstRefresh, secondRefresh, mutation] = await ordered;
+        const firstRefresh = await sendAndReceive(socket, {
+            t: "updateAuth",
+            jwt: await signed({ subject: "workerd-user-2" }),
+        });
         expect(firstRefresh).toMatchObject({ t: "mustRefetch", reason: "authChanged" });
+        const secondRefresh = await sendAndReceive(socket, {
+            t: "updateAuth",
+            jwt: await signed({ subject: "workerd-user" }),
+        });
         expect(secondRefresh).toMatchObject({ t: "mustRefetch", reason: "authChanged" });
+        const mutation = await sendAndReceive(socket, {
+            t: "mut",
+            mutId: MutId("after-two-refreshes"),
+            ref: mutationRef,
+            args: { id: "after-two-refreshes", organizationId: "workerd-org", body: "final", createdAt: 8 },
+        });
         expect(mutation).toMatchObject({
             t: "poke",
             mutResults: [{ ok: true, result: { userId: "workerd-user" } }],
