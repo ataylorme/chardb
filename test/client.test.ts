@@ -114,6 +114,32 @@ function nestedJson(depth: number): RawJson {
     return value;
 }
 
+function stringRowsAtBytes(bytes: number): RawJson[] {
+    if (bytes < 4) throw new RangeError("serialized row array must include brackets and string quotes");
+    return ["x".repeat(bytes - 4)];
+}
+
+function keyedRowsAtBytes(bytes: number, rowKey: string): RawJson[] {
+    const empty = [{ __key: rowKey, value: "" }];
+    const overhead = JSON.stringify(empty).length;
+    if (bytes < overhead) throw new RangeError("serialized keyed row array is too small");
+    return [{ __key: rowKey, value: "x".repeat(bytes - overhead) }];
+}
+
+function protoRowsAtBytes(bytes: number): RawJson[] {
+    const row: Record<string, RawJson> = {};
+    Object.defineProperty(row, "__proto__", { value: "", enumerable: true, writable: true, configurable: true });
+    const overhead = JSON.stringify([row]).length;
+    if (bytes < overhead) throw new RangeError("serialized __proto__ row array is too small");
+    Object.defineProperty(row, "__proto__", {
+        value: "x".repeat(bytes - overhead),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+    });
+    return [row];
+}
+
 function spyOnClearTimeout(): { readonly calls: unknown[]; restore: () => void } {
     const original = globalThis.clearTimeout;
     const calls: unknown[] = [];
@@ -608,6 +634,216 @@ describe("createChardbClient — wire round-trip", () => {
         c.close();
     });
 
+    test("listener mutation and cycles cannot alter private retained query state", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: RawJson[][] = [];
+        c.subscribe("queries.ts#isolated-listener-state", {}, rows => {
+            seen.push(rows);
+            if (seen.length !== 1) return;
+            const first = rows[0] as Record<string, RawJson>;
+            first.value = "listener-mutated";
+            first.cycle = first as RawJson;
+            rows.push({ value: "listener-added" });
+        });
+
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-test:isolated-listener-snapshot"),
+            rows: [{ value: "canonical" }],
+        });
+        ws.emit({
+            t: "poke",
+            cookie: Cookie("c-test:isolated-listener-poke"),
+            patches: [{ op: "del", subId: SubId(1), rowKey: "missing" }],
+        });
+        await flush();
+
+        expect(c.state).toBe("open");
+        expect(seen).toHaveLength(2);
+        expect(seen[1]).toEqual([{ value: "canonical" }]);
+        c.close();
+    });
+
+    test("preserves an own __proto__ data property without prototype mutation", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: RawJson[][] = [];
+        c.subscribe("queries.ts#proto-data", {}, rows => seen.push(rows));
+        const row = JSON.parse('{"__proto__":{"source":"canonical"},"value":"safe"}') as RawJson;
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-test:proto-data"),
+            rows: [row],
+        });
+        await flush();
+
+        const delivered = seen[0]?.[0] as Record<string, RawJson>;
+        expect(Object.getPrototypeOf(delivered)).toBe(Object.prototype);
+        expect(Object.hasOwn(delivered, "__proto__")).toBeTrue();
+        expect(delivered.__proto__).toEqual({ source: "canonical" });
+        expect((delivered as { polluted?: unknown }).polluted).toBeUndefined();
+        delivered.__proto__ = { listener: "mutated" };
+        expect(Object.getPrototypeOf(delivered)).toBe(Object.prototype);
+
+        ws.emit({
+            t: "poke",
+            cookie: Cookie("c-test:proto-data-poke"),
+            patches: [{ op: "del", subId: SubId(1), rowKey: "missing" }],
+        });
+        await flush();
+        const redelivered = seen.at(-1)?.[0] as Record<string, RawJson>;
+        expect(Object.hasOwn(redelivered, "__proto__")).toBeTrue();
+        expect(redelivered.__proto__).toEqual({ source: "canonical" });
+        expect(Object.getPrototypeOf(redelivered)).toBe(Object.prototype);
+        c.close();
+    });
+
+    test("caps aggregate retained query state at exactly 8 MiB and releases it on unsubscribe", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const subscriptions = Array.from({ length: 16 }, (_, index) =>
+            c.subscribe(`queries.ts#aggregate-${index}`, {}, () => {})
+        );
+        const fullRows = stringRowsAtBytes(512 * 1_024);
+        for (let subId = 1; subId <= 15; subId++) {
+            ws.emit({
+                t: "snapshot",
+                subId: SubId(subId),
+                cookie: Cookie(`c-test:aggregate-full-${subId}`),
+                rows: fullRows,
+            });
+        }
+        const finalRows = protoRowsAtBytes(524_256);
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(16),
+            cookie: Cookie("c-test:aggregate-final"),
+            rows: finalRows,
+        });
+        await flush();
+        expect(c.state).toBe("open");
+
+        const oneOverFinalRows = protoRowsAtBytes(524_257);
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(16),
+            cookie: Cookie("c-test:aggregate-final"),
+            rows: oneOverFinalRows,
+        });
+        await flush();
+        expect(c.state).toBe("open");
+        expect(
+            ws.sent
+                .map(raw => JSON.parse(raw) as Up)
+                .filter(message => message.t === "ack" && message.cookie === Cookie("c-test:aggregate-final"))
+        ).toHaveLength(2);
+
+        subscriptions[0]?.unsubscribe();
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(16),
+            cookie: Cookie("c-test:aggregate-replacement"),
+            rows: oneOverFinalRows,
+        });
+        const released = c.subscribe("queries.ts#aggregate-released", {}, () => {});
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(17),
+            cookie: Cookie("c-test:aggregate-refilled"),
+            rows: stringRowsAtBytes(524_287),
+        });
+        await flush();
+        expect(c.state).toBe("open");
+
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(17),
+            cookie: Cookie("c-test:aggregate-over"),
+            rows: stringRowsAtBytes(524_288),
+        });
+        await flush();
+        expect(c.state).toBe("closed");
+        expect(ws.sent.map(raw => JSON.parse(raw) as Up)).not.toContainEqual({
+            t: "ack",
+            cookie: Cookie("c-test:aggregate-over"),
+        });
+        released.unsubscribe();
+    });
+
+    test("rejects an aggregate-overflowing multi-sub patch before either subscription commits", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen = new Map<number, RawJson[][]>();
+        for (let index = 0; index < 18; index++) {
+            const subId = index + 1;
+            seen.set(subId, []);
+            c.subscribe(`queries.ts#aggregate-atomic-${index}`, {}, rows => seen.get(subId)?.push(rows));
+        }
+        const fullRows = stringRowsAtBytes(512 * 1_024);
+        for (let subId = 1; subId <= 15; subId++) {
+            ws.emit({
+                t: "snapshot",
+                subId: SubId(subId),
+                cookie: Cookie(`c-test:aggregate-atomic-full-${subId}`),
+                rows: fullRows,
+            });
+        }
+        const targetRowsBytes = 180_000;
+        for (let subId = 16; subId <= 17; subId++) {
+            ws.emit({
+                t: "snapshot",
+                subId: SubId(subId),
+                cookie: Cookie(`c-test:aggregate-atomic-target-${subId}`),
+                rows: keyedRowsAtBytes(targetRowsBytes, `target-${subId}`),
+            });
+        }
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(18),
+            cookie: Cookie("c-test:aggregate-atomic-filler"),
+            rows: stringRowsAtBytes(164_252),
+        });
+        await flush();
+        expect(c.state).toBe("open");
+
+        const before16 = seen.get(16)?.at(-1);
+        const before17 = seen.get(17)?.at(-1);
+        ws.emit({
+            t: "poke",
+            cookie: Cookie("c-test:aggregate-atomic-over"),
+            patches: [
+                {
+                    op: "put",
+                    subId: SubId(16),
+                    rowKey: "target-16",
+                    row: { value: `${(before16?.[0] as { value: string }).value}x` },
+                },
+                {
+                    op: "put",
+                    subId: SubId(17),
+                    rowKey: "target-17",
+                    row: { value: `${(before17?.[0] as { value: string }).value}x` },
+                },
+            ],
+        });
+        await flush();
+
+        expect(c.state).toBe("closed");
+        expect(seen.get(16)?.at(-1)).toEqual(before16);
+        expect(seen.get(17)?.at(-1)).toEqual(before17);
+    });
+
     test("accepts 4096 snapshot rows and terminates before storing one over", async () => {
         const c = client();
         await flush();
@@ -907,6 +1143,58 @@ describe("createChardbClient — wire round-trip", () => {
                     .filter((message): message is Extract<Up, { t: "ack" }> => message.t === "ack")
                     .map(message => message.cookie)
             ).toEqual([Cookie("c-1:1"), Cookie("c-1:1"), Cookie("c-1:1"), Cookie("c-1:2")]);
+            c.close();
+        } finally {
+            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
+            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
+        }
+    });
+
+    test("caller mutation of an optimistic patch cannot alter retained rows or history", async () => {
+        class IsolatedBroadcastChannel {
+            static instance: IsolatedBroadcastChannel | undefined;
+            onmessage: ((event: { data: unknown }) => void) | null = null;
+
+            constructor(_name: string) {
+                IsolatedBroadcastChannel.instance = this;
+            }
+
+            postMessage(): void {}
+            close(): void {}
+            emit(data: unknown): void {
+                this.onmessage?.({ data });
+            }
+        }
+
+        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = IsolatedBroadcastChannel;
+        try {
+            const c = createChardbClient({
+                endpoint: "wss://example.com/ws",
+                getJwt: async () => "jwt-stub",
+                clientId: "c-optimistic-isolation",
+                logicalDb: "optimistic-isolation",
+            });
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const seen: RawJson[][] = [];
+            c.subscribe("queries.ts#optimistic-isolation", {}, rows => seen.push(rows));
+            const row: Record<string, RawJson> = { nested: { value: "original" } };
+            const patch = { op: "put" as const, subId: SubId(1), rowKey: "optimistic", row };
+            IsolatedBroadcastChannel.instance?.emit({ kind: "optimistic", patches: [patch] });
+
+            (row.nested as Record<string, RawJson>).value = "caller-mutated";
+            row.cycle = row as RawJson;
+            patch.rowKey = "caller-mutated-key";
+            ws.emit({
+                t: "poke",
+                cookie: Cookie("c-test:optimistic-isolation"),
+                patches: [{ op: "del", subId: SubId(1), rowKey: "missing" }],
+            });
+            await flush();
+
+            expect(c.state).toBe("open");
+            expect(seen.at(-1)).toEqual([{ nested: { value: "original" }, __key: "optimistic" }]);
             c.close();
         } finally {
             if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");

@@ -41,6 +41,7 @@ const MAX_MUTATION_ARGUMENT_MEMBERS = 4_096;
 const MAX_MUTATION_ARGUMENT_BYTES = 512 * 1_024;
 const MAX_MUTATION_ARGUMENT_DEPTH = 99;
 const MAX_PENDING_MUTATIONS = 32;
+const MAX_RETAINED_QUERY_STATE_BYTES = 8 * 1_024 * 1_024;
 
 export interface ChardbClientOptions {
     readonly endpoint: string;
@@ -72,6 +73,11 @@ interface SubRecord {
     listeners: Set<(rows: RawJson[]) => void>;
     optimisticPatches: RowPatch[];
     lastSnapshotCookie?: Cookie;
+}
+
+interface PlannedSubState {
+    rows: RawJson[];
+    optimisticPatches: RowPatch[];
 }
 
 interface PendingMutation {
@@ -278,9 +284,14 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                     return;
                 }
                 assertSubscriptionRows(msg.rows, "snapshot");
+                const next: PlannedSubState = {
+                    rows: cloneRawJson(msg.rows) as RawJson[],
+                    optimisticPatches: [],
+                };
+                assertAggregateQueryState(new Map([[sub, next]]));
                 lastCookie = msg.cookie;
-                sub.rows = [...msg.rows];
-                sub.optimisticPatches = [];
+                sub.rows = next.rows;
+                sub.optimisticPatches = next.optimisticPatches;
                 sub.lastSnapshotCookie = msg.cookie;
                 sub.state = "live";
                 notify(sub);
@@ -325,7 +336,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     function applyPatches(patches: readonly RowPatch[], optimistic: boolean): void {
         assertPatchBatchLimits(patches);
         for (const patch of patches) assertPatchRowShape(patch);
-        const planned = new Map<SubRecord, { rows: RawJson[]; optimisticPatches: RowPatch[] }>();
+        const planned = new Map<SubRecord, PlannedSubState>();
         for (const p of patches) {
             const sub = subs.get(p.subId);
             if (!sub) continue;
@@ -338,17 +349,27 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             if (p.op === "del") {
                 if (idx >= 0) next.rows.splice(idx, 1);
             } else {
-                const row = { ...(p.row as { readonly [key: string]: RawJson }), __key: p.rowKey } as RawJson;
+                const row = {
+                    ...(cloneRawJson(p.row as RawJson) as { readonly [key: string]: RawJson }),
+                    __key: p.rowKey,
+                } as RawJson;
                 if (idx >= 0) next.rows[idx] = row;
                 else next.rows.push(row);
             }
-            if (optimistic) next.optimisticPatches.push(p);
-            else next.optimisticPatches = next.optimisticPatches.filter(op => op.rowKey !== p.rowKey);
+            if (optimistic) {
+                next.optimisticPatches.push({
+                    op: p.op,
+                    subId: p.subId,
+                    rowKey: p.rowKey,
+                    ...(p.row === undefined ? {} : { row: cloneRawJson(p.row) }),
+                });
+            } else next.optimisticPatches = next.optimisticPatches.filter(op => op.rowKey !== p.rowKey);
         }
         for (const next of planned.values()) {
             assertSubscriptionRows(next.rows, optimistic ? "optimistic patch result" : "patch result");
             assertOptimisticPatchHistory(next.optimisticPatches);
         }
+        assertAggregateQueryState(planned);
         for (const [sub, next] of planned) {
             sub.rows = next.rows;
             sub.optimisticPatches = next.optimisticPatches;
@@ -384,7 +405,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             readonly maxDepth?: number;
             readonly errorCode?: CdbErrorCode;
         } = {}
-    ): void {
+    ): number {
         const errorCode = limits.errorCode ?? "CDB_INVARIANT";
         let bytes = 0;
         let members = 0;
@@ -515,6 +536,53 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             }
         };
         visit(value, 0);
+        return bytes;
+    }
+
+    function cloneRawJson(value: RawJson | readonly RawJson[]): RawJson | RawJson[] {
+        if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+            return value;
+        }
+        if (Array.isArray(value)) return value.map(item => cloneRawJson(item) as RawJson);
+        const clone: Record<string, RawJson> = Object.getPrototypeOf(value) === null ? Object.create(null) : {};
+        for (const [key, child] of Object.entries(value)) {
+            Object.defineProperty(clone, key, {
+                value: cloneRawJson(child) as RawJson,
+                enumerable: true,
+                writable: true,
+                configurable: true,
+            });
+        }
+        return clone;
+    }
+
+    function assertAggregateQueryState(
+        planned: ReadonlyMap<SubRecord, PlannedSubState>,
+        additional: PlannedSubState | undefined = undefined,
+        errorCode: CdbErrorCode = "CDB_INVARIANT"
+    ): void {
+        let bytes = 0;
+        const add = (state: PlannedSubState): void => {
+            bytes += assertSerializedSize(state.rows, MAX_RETAINED_QUERY_STATE_BYTES, "retained query state", {
+                errorCode,
+            });
+            bytes += assertSerializedSize(
+                state.optimisticPatches,
+                MAX_RETAINED_QUERY_STATE_BYTES,
+                "retained query state",
+                { errorCode }
+            );
+            if (bytes > MAX_RETAINED_QUERY_STATE_BYTES) {
+                throw new CdbError({
+                    code: errorCode,
+                    message: `retained query state exceeds the ${MAX_RETAINED_QUERY_STATE_BYTES}-byte client limit`,
+                });
+            }
+        };
+        for (const sub of subs.values()) {
+            add(planned.get(sub) ?? sub);
+        }
+        if (additional) add(additional);
     }
 
     function assertMutationArguments(args: RawJson): void {
@@ -587,7 +655,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
             sub.state = subState;
             for (const listener of sub.listeners) {
                 try {
-                    listener(sub.rows);
+                    listener(cloneRawJson(sub.rows) as RawJson[]);
                 } catch {
                     // User listeners cannot interrupt terminal resource cleanup.
                 }
@@ -608,7 +676,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     }
 
     function notify(sub: SubRecord): void {
-        for (const fn of sub.listeners) fn(sub.rows);
+        for (const fn of sub.listeners) fn(cloneRawJson(sub.rows) as RawJson[]);
     }
 
     function subscribe<TRow = RawJson>(
@@ -629,6 +697,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 message: `cannot open more than ${MAX_ACTIVE_SUBSCRIPTIONS} active subscriptions`,
             });
         }
+        assertAggregateQueryState(new Map(), { rows: [], optimisticPatches: [] }, "CDB_RATE_LIMITED");
         const subId = SubId(nextSubId++);
         const widenedListener: (rows: RawJson[]) => void = rows => onChange(rows as readonly RawJson[] as TRow[]);
         const rec: SubRecord = {
