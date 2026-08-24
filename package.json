@@ -30,7 +30,7 @@
         "test:correctness": "bun scripts/test-correctness.mjs",
         "test:watch": "bun scripts/test-correctness.mjs --watch",
         "test:scale": "bun test test/workerd/gateway-live.harness.test.ts --test-name-pattern 'scaled SDK'",
-        "bench:live": "bun run test:scale",
+        "bench:live": "bun scripts/run-scale-benchmark.mjs",
         "typecheck": "tsc --noEmit",
         "lint": "biome check .",
         "format": "biome format --write ."

@@ -47,6 +47,10 @@ function isMissingProcess(error) {
     return error !== null && typeof error === "object" && "code" in error && error.code === "ESRCH";
 }
 
+function isPermissionDenied(error) {
+    return error !== null && typeof error === "object" && "code" in error && error.code === "EPERM";
+}
+
 function signalProcessGroup(child, signal) {
     if (process.platform === "win32") {
         child.kill(signal);
@@ -68,6 +72,7 @@ function processGroupExists(pid) {
         return true;
     } catch (error) {
         if (isMissingProcess(error)) return false;
+        if (isPermissionDenied(error)) return true;
         throw error;
     }
 }

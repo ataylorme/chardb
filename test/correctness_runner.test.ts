@@ -143,4 +143,25 @@ describe("correctness runner process control", () => {
         await expect(completion).resolves.toBeUndefined();
         await expectProcessGone(grandchildPid);
     });
+
+    test("preserves captured stdout and stderr from a failed child", async () => {
+        const directory = await mkdtemp(path.join(tmpdir(), "chardb-correctness-output-"));
+        temporaryDirectories.push(directory);
+        const stdoutPath = path.join(directory, "stdout.log");
+        const stderrPath = path.join(directory, "stderr.log");
+        const failure = await run(
+            "synthetic captured failure",
+            [process.execPath, "-e", 'console.log("sample output"); console.error("sample error"); process.exit(23)'],
+            undefined,
+            {
+                stdin: "ignore",
+                stdout: Bun.file(stdoutPath),
+                stderr: Bun.file(stderrPath),
+            }
+        ).catch((error: unknown) => error);
+
+        expect(failure).toMatchObject({ exitCode: 23, signalCode: null });
+        expect(await readFile(stdoutPath, "utf8")).toBe("sample output\n");
+        expect(await readFile(stderrPath, "utf8")).toBe("sample error\n");
+    });
 });

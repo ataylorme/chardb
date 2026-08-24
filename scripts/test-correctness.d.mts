@@ -2,8 +2,8 @@ export interface CorrectnessRunOptions {
     readonly cwd?: string;
     readonly env?: Record<string, string | undefined>;
     readonly stdin?: "inherit" | "ignore";
-    readonly stdout?: "inherit" | "ignore";
-    readonly stderr?: "inherit" | "ignore";
+    readonly stdout?: "inherit" | "ignore" | Bun.BunFile;
+    readonly stderr?: "inherit" | "ignore" | Bun.BunFile;
     readonly terminationGraceMs?: number;
     readonly signalSource?: {
         on(event: "SIGINT" | "SIGTERM", listener: () => void): unknown;

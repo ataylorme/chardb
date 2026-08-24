@@ -3,25 +3,19 @@ name: Live scale benchmark
 on:
   workflow_dispatch:
     inputs:
-      clients_per_tenant:
-        description: Clients per tenant (1-8)
+      profile:
+        description: Reproducible workload profile
         required: true
-        default: "2"
-        type: string
-      mutations_per_tenant:
-        description: Mutations per tenant (1-1024)
+        default: client-max-accepted
+        type: choice
+        options:
+          - ci-smoke
+          - client-max-accepted
+          - throughput
+      samples:
+        description: Repeated samples (1-20)
         required: true
-        default: "4"
-        type: string
-      subscriptions:
-        description: Subscriptions per client (1-64)
-        required: true
-        default: "4"
-        type: string
-      refresh_rounds:
-        description: Snapshot refresh rounds (1-64)
-        required: true
-        default: "2"
+        default: "3"
         type: string
 
 permissions:
@@ -34,50 +28,10 @@ concurrency:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CHARDB_WORKERD_CLIENTS_PER_TENANT: ${{ inputs.clients_per_tenant }}
-      CHARDB_WORKERD_MUTATIONS_PER_TENANT: ${{ inputs.mutations_per_tenant }}
-      CHARDB_WORKERD_MUTATION_BATCH: "16"
-      CHARDB_WORKERD_SUBSCRIPTIONS: ${{ inputs.subscriptions }}
-      CHARDB_WORKERD_REFRESH_ROUNDS: ${{ inputs.refresh_rounds }}
-      CHARDB_WORKERD_WAIT_MS: "60000"
-      CHARDB_WORKERD_TEST_TIMEOUT_MS: "300000"
+    timeout-minutes: 120
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Validate scale inputs
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          validate_integer() {
-            local name="$1"
-            local value="$2"
-            local maximum="$3"
-
-            if [[ ! "$value" =~ ^[0-9]+$ ]]; then
-              echo "${name} must be an integer from 1 through ${maximum}" >&2
-              exit 2
-            fi
-
-            while [[ ${#value} -gt 1 && ${value:0:1} == "0" ]]; do
-              value="${value:1}"
-            done
-
-            if [[ "$value" == "0" ]] ||
-              [[ ${#value} -gt ${#maximum} ]] ||
-              { [[ ${#value} -eq ${#maximum} ]] && [[ "$value" > "$maximum" ]]; }; then
-              echo "${name} must be an integer from 1 through ${maximum}" >&2
-              exit 2
-            fi
-          }
-
-          validate_integer CHARDB_WORKERD_CLIENTS_PER_TENANT "$CHARDB_WORKERD_CLIENTS_PER_TENANT" 8
-          validate_integer CHARDB_WORKERD_MUTATIONS_PER_TENANT "$CHARDB_WORKERD_MUTATIONS_PER_TENANT" 1024
-          validate_integer CHARDB_WORKERD_SUBSCRIPTIONS "$CHARDB_WORKERD_SUBSCRIPTIONS" 64
-          validate_integer CHARDB_WORKERD_REFRESH_ROUNDS "$CHARDB_WORKERD_REFRESH_ROUNDS" 64
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -87,50 +41,21 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Record run metadata
-        shell: bash
-        run: |
-          printf '%s\n' \
-            "git_sha=${GITHUB_SHA}" \
-            "git_ref=${GITHUB_REF}" \
-            "run_id=${GITHUB_RUN_ID}" \
-            "run_attempt=${GITHUB_RUN_ATTEMPT}" \
-            "runner_name=${RUNNER_NAME}" \
-            "runner_os=${RUNNER_OS}" \
-            "runner_arch=${RUNNER_ARCH}" \
-            "clients_per_tenant=${CHARDB_WORKERD_CLIENTS_PER_TENANT}" \
-            "mutations_per_tenant=${CHARDB_WORKERD_MUTATIONS_PER_TENANT}" \
-            "mutation_batch=${CHARDB_WORKERD_MUTATION_BATCH}" \
-            "subscriptions=${CHARDB_WORKERD_SUBSCRIPTIONS}" \
-            "refresh_rounds=${CHARDB_WORKERD_REFRESH_ROUNDS}" \
-            "wait_ms=${CHARDB_WORKERD_WAIT_MS}" \
-            "test_timeout_ms=${CHARDB_WORKERD_TEST_TIMEOUT_MS}" \
-            > scale-metadata.txt
-
       - name: Run live scale benchmark
-        shell: bash
+        env:
+          SCALE_PROFILE: ${{ inputs.profile }}
+          SCALE_SAMPLES: ${{ inputs.samples }}
         run: |
-          set -o pipefail
-          bun run bench:live | tee scale-stdout.log
-
-      - name: Extract benchmark metrics
-        shell: bash
-        run: |
-          grep -F '"type":"chardb-workerd-benchmark"' scale-stdout.log > scale-results.ndjson || true
-          metric_count="$(wc -l < scale-results.ndjson)"
-          if (( metric_count != 2 )); then
-            echo "Expected 2 benchmark metric records, found ${metric_count}" >&2
-            exit 1
-          fi
+          bun run bench:live \
+            --profile "$SCALE_PROFILE" \
+            --samples "$SCALE_SAMPLES" \
+            --output-dir scale-results
 
       - name: Upload scale results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: live-scale-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            scale-metadata.txt
-            scale-results.ndjson
-            scale-stdout.log
+          name: live-scale-${{ inputs.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: scale-results/
           if-no-files-found: warn
           retention-days: 14
