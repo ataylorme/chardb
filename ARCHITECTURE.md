@@ -100,7 +100,9 @@ Patch application builds and validates every affected subscription state before 
 
 Each Gateway admits at most 256 aggregate current and pending logical registrations. The admission check counts durable current heads from SQLite, so restart does not reset capacity. A replacement with the same principal, client, and subscription key reuses its slot. A second pending request for that key on another connection receives retryable `CDB_RATE_LIMITED` instead of racing the first installation. New work over the aggregate cap is rejected before query routing, Catalog authority or placement reads, Cdb RPCs, or durable installation.
 
-The remaining resource work includes independent mutation-argument and write-volume bounds, the same-subscription duplicate replacement chain, durable total-byte limits, presence state, other queues, slow-consumer backpressure, and retention watermarks.
+For one Gateway connection and subscription id, admission retains at most one active attempt and one queued replacement. Once that replacement slot is occupied, another duplicate receives retryable `CDB_RATE_LIMITED` before capacity SQL, query routing, Catalog or Cdb calls, or installation. Later duplicates do not overwrite the accepted replacement's payload. A route rejection or final scheduler failure reports an error only while its attempt still owns the pending slot and the exact verified socket remains current. Replacement, unsubscribe, or close therefore fences stale errors.
+
+The remaining resource work includes independent mutation-argument and write-volume bounds, durable total-byte limits, presence state, other queues, slow-consumer backpressure, and retention watermarks.
 
 Durable Object SQLite transactions cannot span `await`. The atomic executor rejects native async handlers and thenables. Input validation and any external I/O must finish before entering the transaction.
 
