@@ -5,6 +5,7 @@ import {
     GATEWAY_CLEANUP_MAX_ERROR_LENGTH,
     GATEWAY_CLEANUP_MAX_RETRY_COUNT,
     GATEWAY_CLEANUP_MAX_RETRY_MS,
+    GATEWAY_REGISTRATION_DDL,
     Gateway,
     type GatewayEnv,
     type GatewayRegistrationInstall,
@@ -188,6 +189,17 @@ describe("Gateway retired-generation cleanup", () => {
         throw new Error("Gateway did not start Cdb unsubscribe");
     }
 
+    function resetWithLegacyNullableSourceSchema(): void {
+        db.close();
+        db = new Database(":memory:");
+        db.exec("PRAGMA foreign_keys = ON");
+        db.exec(GATEWAY_REGISTRATION_DDL.replace("  source_cdb_id TEXT NOT NULL,\n", "  source_cdb_id TEXT,\n"));
+        sql = syncSql(db);
+        (state.storage as unknown as { sql: ReturnType<typeof sqlStorage> }).sql = sqlStorage(db);
+        currentAlarm = null;
+        alarms = [];
+    }
+
     test("uses the exact physical Cdb ID and deletes only after unsubscribe succeeds", async () => {
         const current = registration("registration-success", {
             connectionId: "connection-success",
@@ -285,6 +297,53 @@ describe("Gateway retired-generation cleanup", () => {
         ]);
     });
 
+    test("deletes a retired migrated generation with no physical Cdb ID without retrying", async () => {
+        resetWithLegacyNullableSourceSchema();
+        const legacy = registration("registration-legacy-retired");
+        install(legacy);
+        db.query("UPDATE _gw_registration_generations SET source_cdb_id = NULL WHERE registration_id = ?").run(
+            legacy.registrationId
+        );
+        await reconstruct();
+        retire(legacy);
+
+        await fireCleanupAlarm();
+
+        expect(cleanupState(legacy.registrationId)).toBeNull();
+        expect(stringLookups).toEqual([]);
+        expect(unsubscribeCalls).toEqual([]);
+        expect(alarms).toEqual([]);
+    });
+
+    test("deletes a superseded migrated generation without touching its replacement head", async () => {
+        resetWithLegacyNullableSourceSchema();
+        const legacy = registration("registration-legacy-old", { connectionId: "connection-legacy-old" });
+        install(legacy);
+        db.query("UPDATE _gw_registration_generations SET source_cdb_id = NULL WHERE registration_id = ?").run(
+            legacy.registrationId
+        );
+        await reconstruct();
+        const replacement = registration("registration-legacy-new", {
+            connectionId: "connection-legacy-new",
+            nowMs: clock,
+        });
+        install(replacement);
+
+        await fireCleanupAlarm();
+
+        expect(cleanupState(legacy.registrationId)).toBeNull();
+        expect(cleanupState(replacement.registrationId)).toMatchObject({
+            lifecycle: "installing",
+            cdb_state: "pending",
+        });
+        expect(db.query("SELECT registration_id FROM _gw_registration_heads").all()).toEqual([
+            { registration_id: replacement.registrationId },
+        ]);
+        expect(stringLookups).toEqual([]);
+        expect(unsubscribeCalls).toEqual([]);
+        expect(alarms).toEqual([]);
+    });
+
     test("bounds each cleanup pass and schedules immediately when due rows remain", async () => {
         for (let index = 0; index < 33; index++) {
             const current = registration(`registration-batch-${index.toString().padStart(2, "0")}`, {
@@ -304,7 +363,7 @@ describe("Gateway retired-generation cleanup", () => {
         expect(alarms).toEqual([clock + 1]);
     });
 
-    test("restarts by scheduling the earliest retired cleanup and ignores active dirty rows", async () => {
+    test("restarts by scheduling active dirty work ahead of later retired cleanup", async () => {
         const retired = registration("registration-restart", { subId: SubId(1) });
         install(retired);
         retire(retired, 500);
@@ -320,13 +379,9 @@ describe("Gateway retired-generation cleanup", () => {
         ).run(active.registrationId);
 
         await reconstruct();
-        expect(alarms).toEqual([500]);
-
-        clock = 500;
-        await fireCleanupAlarm();
-        expect(cleanupState(retired.registrationId)).toBeNull();
+        expect(alarms).toEqual([101]);
+        expect(cleanupState(retired.registrationId)).toMatchObject({ lifecycle: "retiring", retry_at: 500 });
         expect(cleanupState(active.registrationId)).toMatchObject({ lifecycle: "active", retry_at: 50 });
-        expect(alarms).toEqual([500]);
     });
 
     test("retains and retries a generation changed while Cdb unsubscribe is paused", async () => {
@@ -363,7 +418,7 @@ describe("Gateway retired-generation cleanup", () => {
         expect(alarms).toEqual([1_100]);
     });
 
-    test("preserves an earlier dirty alarm while active dirty execution remains the next package", async () => {
+    test("preserves an earlier dirty alarm while retired cleanup is in flight", async () => {
         const retired = registration("registration-cleanup-alarm", { subId: SubId(1) });
         install(retired);
         retire(retired);

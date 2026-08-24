@@ -7,10 +7,13 @@ import {
     type GatewayDirtyRun,
     type GatewayEnv,
     type GatewayRegistrationInstall,
+    type GatewaySnapshotSendAttempt,
     acknowledgeGatewaySnapshot,
     claimDirtyGatewayRegistration,
     claimDueGatewaySnapshot,
+    failGatewaySnapshotSend,
     installGatewayRegistration,
+    retireClaimedGatewaySnapshot,
     retireGatewayRegistration,
     stageGatewaySnapshot,
 } from "../../src/server/do/gateway.ts";
@@ -258,7 +261,10 @@ describe("Gateway snapshot delivery state", () => {
         expect(stage(current, claim(current) as GatewayDirtyRun)).toBe(true);
 
         expect(db.transaction(() => claimDueGatewaySnapshot(sql, { nowMs: 219, attemptExpiresAt: 300 }))()).toBeNull();
-        expect(db.transaction(() => claimDueGatewaySnapshot(sql, { nowMs: 220, attemptExpiresAt: 300 }))()).toEqual({
+        const firstAttempt = db.transaction(() =>
+            claimDueGatewaySnapshot(sql, { nowMs: 220, attemptExpiresAt: 300 })
+        )();
+        expect(firstAttempt).toMatchObject({
             principalId: current.principalId,
             clientId: current.clientId,
             subId: current.subId,
@@ -270,7 +276,9 @@ describe("Gateway snapshot delivery state", () => {
             byteSize: new TextEncoder().encode('[{"body":"héllo","id":1}]').byteLength,
             sendAttempts: 1,
             nextAttemptAt: 300,
+            claimVersion: 1,
         });
+        expect(firstAttempt?.claimToken).toEqual(expect.any(String));
         expect(db.transaction(() => claimDueGatewaySnapshot(sql, { nowMs: 299, attemptExpiresAt: 400 }))()).toBeNull();
         expect(
             db.transaction(() => claimDueGatewaySnapshot(sql, { nowMs: 300, attemptExpiresAt: 400 }))()
@@ -280,6 +288,83 @@ describe("Gateway snapshot delivery state", () => {
             next_attempt_at: 400,
             last_sent_at: 300,
         });
+    });
+
+    test("fences a stale send claimant after lease recovery and after acknowledgement", () => {
+        const current = registration("registration-send-fence");
+        installActive(current);
+        expect(stage(current, claim(current) as GatewayDirtyRun)).toBe(true);
+        const first = db.transaction(() =>
+            claimDueGatewaySnapshot(sql, { nowMs: 220, attemptExpiresAt: 300 })
+        )() as GatewaySnapshotSendAttempt;
+        const second = db.transaction(() =>
+            claimDueGatewaySnapshot(sql, { nowMs: 300, attemptExpiresAt: 400 })
+        )() as GatewaySnapshotSendAttempt;
+
+        expect(
+            db.transaction(() =>
+                failGatewaySnapshotSend(sql, {
+                    registrationId: first.registrationId,
+                    cookie: first.cookie,
+                    claimToken: first.claimToken,
+                    claimVersion: first.claimVersion,
+                    nowMs: 301,
+                    error: "late first attempt",
+                })
+            )()
+        ).toBe(false);
+        expect(
+            db.transaction(() =>
+                retireClaimedGatewaySnapshot(sql, {
+                    principalId: current.principalId,
+                    clientId: current.clientId,
+                    subId: current.subId,
+                    registrationId: current.registrationId,
+                    connectionId: current.connectionId,
+                    cookie: first.cookie,
+                    claimToken: first.claimToken,
+                    claimVersion: first.claimVersion,
+                    nowMs: 301,
+                })
+            )()
+        ).toBe(false);
+        expect(
+            db
+                .query(
+                    `SELECT claim_token, claim_version, last_error
+                 FROM _gw_snapshot_outbox WHERE registration_id = ?`
+                )
+                .get(current.registrationId)
+        ).toEqual({ claim_token: second.claimToken, claim_version: second.claimVersion, last_error: null });
+        expect(db.query("SELECT registration_id FROM _gw_registration_heads").get()).toEqual({
+            registration_id: current.registrationId,
+        });
+
+        expect(
+            db.transaction(() =>
+                acknowledgeGatewaySnapshot(sql, {
+                    principalId: current.principalId,
+                    clientId: current.clientId,
+                    subId: current.subId,
+                    registrationId: current.registrationId,
+                    connectionId: current.connectionId,
+                    cookie: second.cookie,
+                    nowMs: 302,
+                })
+            )()
+        ).toBe(true);
+        expect(
+            db.transaction(() =>
+                failGatewaySnapshotSend(sql, {
+                    registrationId: second.registrationId,
+                    cookie: second.cookie,
+                    claimToken: second.claimToken,
+                    claimVersion: second.claimVersion,
+                    nowMs: 303,
+                    error: "late second attempt",
+                })
+            )()
+        ).toBe(false);
     });
 
     test("rolls back a send claim when staged rows are corrupt", () => {
@@ -435,6 +520,55 @@ describe("Gateway snapshot delivery state", () => {
             run_target_version: null,
             run_lease_expires_at: null,
         });
+    });
+
+    test("upgrades the 160eb45 outbox shape, claims after restart, and repairs a partial claim", async () => {
+        db.close();
+        db = new Database(":memory:");
+        db.exec("PRAGMA foreign_keys = ON");
+        const legacyDdl = GATEWAY_REGISTRATION_DDL.replace("  claim_token TEXT,\n", "")
+            .replace("  claim_version INTEGER NOT NULL DEFAULT 0 CHECK (claim_version >= 0),\n", "")
+            .replace("  claim_expires_at INTEGER CHECK (claim_expires_at IS NULL OR claim_expires_at >= 0),\n", "")
+            .replace("  attachment_base_cookie TEXT,\n", "");
+        db.exec(legacyDdl);
+        sql = syncSql(db);
+        const current = registration("registration-legacy-outbox");
+        installActive(current);
+        db.query(
+            `INSERT INTO _gw_snapshot_outbox
+             (registration_id, cookie, target_version, rows_json, byte_size, send_attempts,
+              next_attempt_at, last_sent_at, last_error, created_at)
+             VALUES (?, 'cookie-legacy-outbox', 5, '[{"id":1}]', 10, 0, 200, NULL, NULL, 200)`
+        ).run(current.registrationId);
+
+        await bootstrapGateway();
+
+        expect(
+            (db.query("PRAGMA table_info('_gw_snapshot_outbox')").all() as { name: string }[]).map(row => row.name)
+        ).toEqual(
+            expect.arrayContaining(["claim_token", "claim_version", "claim_expires_at", "attachment_base_cookie"])
+        );
+        const claimed = db.transaction(() => claimDueGatewaySnapshot(sql, { nowMs: 200, attemptExpiresAt: 300 }))();
+        expect(claimed).toMatchObject({
+            registrationId: current.registrationId,
+            cookie: "cookie-legacy-outbox",
+            claimVersion: 1,
+        });
+
+        db.query(
+            `UPDATE _gw_snapshot_outbox
+             SET claim_token = 'partial-claim', claim_expires_at = NULL, claim_version = 1
+             WHERE registration_id = ?`
+        ).run(current.registrationId);
+        await bootstrapGateway();
+        expect(
+            db
+                .query(
+                    `SELECT claim_token, claim_expires_at, claim_version
+                 FROM _gw_snapshot_outbox WHERE registration_id = ?`
+                )
+                .get(current.registrationId)
+        ).toEqual({ claim_token: null, claim_expires_at: null, claim_version: 2 });
     });
 
     test("restart repairs a partial run triple after the lease column already exists", async () => {

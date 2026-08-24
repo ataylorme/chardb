@@ -59,6 +59,7 @@ import type {
     CdbMutationRpc,
     CdbQueryResponse,
     CdbQueryRpc,
+    CdbRegisteredQueryRpc,
     CdbSubscriptionRequest,
     CdbSubscriptionRpc,
     GatewayInvalidationAck,
@@ -127,6 +128,10 @@ CREATE TABLE IF NOT EXISTS _gw_snapshot_outbox (
   byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
   send_attempts INTEGER NOT NULL DEFAULT 0 CHECK (send_attempts >= 0),
   next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
+  claim_token TEXT,
+  claim_version INTEGER NOT NULL DEFAULT 0 CHECK (claim_version >= 0),
+  claim_expires_at INTEGER CHECK (claim_expires_at IS NULL OR claim_expires_at >= 0),
+  attachment_base_cookie TEXT,
   last_sent_at INTEGER CHECK (last_sent_at IS NULL OR last_sent_at >= 0),
   last_error TEXT,
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
@@ -174,6 +179,10 @@ export const GATEWAY_CLEANUP_BASE_RETRY_MS = 1_000 as const;
 export const GATEWAY_CLEANUP_MAX_RETRY_MS = 60_000 as const;
 export const GATEWAY_CLEANUP_MAX_RETRY_COUNT = 30 as const;
 export const GATEWAY_CLEANUP_MAX_ERROR_LENGTH = 512 as const;
+export const GATEWAY_QUERY_BATCH_SIZE = 16 as const;
+export const GATEWAY_SEND_BATCH_SIZE = 32 as const;
+export const GATEWAY_QUERY_LEASE_MS = 30_000 as const;
+export const GATEWAY_SEND_LEASE_MS = 10_000 as const;
 
 interface PendingGwAttachment {
     readonly kind: "pending";
@@ -359,6 +368,10 @@ function projectCdbQueryRows(value: unknown): CdbQueryRowsResponse {
         return projected.ok ? mutationFailure("CDB_INVARIANT", "Cdb returned a malformed query failure") : projected;
     }
     return mutationFailure("CDB_INVARIANT", "Cdb returned a malformed query response");
+}
+
+function isTerminalRegisteredQueryFailure(code: string): boolean {
+    return isCdbErrorCode(code) && !isRetryable(code);
 }
 
 type OrganizationAuthProjection =
@@ -594,6 +607,9 @@ export interface GatewayDirtyRun {
     readonly runVersion: number;
     readonly leaseExpiresAt: number;
     readonly reclaimed: boolean;
+    readonly organizationId: TenantId;
+    readonly shardId: string;
+    readonly sourceCdbId: string;
 }
 
 export interface GatewaySnapshotStage extends GatewayRegistrationKey {
@@ -626,6 +642,43 @@ export interface GatewaySnapshotSendAttempt extends GatewayRegistrationKey {
     readonly byteSize: number;
     readonly sendAttempts: number;
     readonly nextAttemptAt: number;
+    readonly claimToken: string;
+    readonly claimVersion: number;
+}
+
+export interface GatewayDirtyRunFailure extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly runToken: string;
+    readonly runVersion: number;
+    readonly nowMs: number;
+    readonly error: unknown;
+}
+
+export interface GatewayClaimedRunRetire extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly runToken: string;
+    readonly runVersion: number;
+    readonly nowMs: number;
+}
+
+export interface GatewayClaimedSnapshotRetire extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly cookie: Cookie;
+    readonly claimToken: string;
+    readonly claimVersion: number;
+    readonly nowMs: number;
+}
+
+export interface GatewaySnapshotSendFailure {
+    readonly registrationId: string;
+    readonly cookie: Cookie;
+    readonly claimToken: string;
+    readonly claimVersion: number;
+    readonly nowMs: number;
+    readonly error: unknown;
 }
 
 export interface GatewaySnapshotAcknowledge extends GatewayRegistrationKey {
@@ -633,6 +686,21 @@ export interface GatewaySnapshotAcknowledge extends GatewayRegistrationKey {
     readonly connectionId: string;
     readonly cookie: Cookie;
     readonly nowMs: number;
+}
+
+export interface GatewaySnapshotAckLookup {
+    readonly principalId: PrincipalId;
+    readonly clientId: ClientId;
+    readonly connectionId: string;
+    readonly cookie: Cookie;
+}
+
+export interface GatewaySnapshotAckIdentity extends GatewayRegistrationKey {
+    readonly registrationId: string;
+    readonly connectionId: string;
+    readonly cookie: Cookie;
+    readonly alreadyAcknowledged: boolean;
+    readonly attachmentBaseCookie: Cookie | null;
 }
 
 export interface GatewayCurrentRegistration extends GatewayRegistrationKey {
@@ -658,6 +726,19 @@ interface StoredGatewayCleanupRow {
     readonly source_cdb_id: string | null;
     readonly retry_count: number;
 }
+
+interface StoredGatewayRunCandidate {
+    readonly principal_id: string;
+    readonly client_id: string;
+    readonly sub_id: number;
+    readonly registration_id: string;
+    readonly connection_id: string;
+}
+
+type ExactGatewaySocket =
+    | { readonly status: "ready"; readonly ws: WebSocket; readonly attachment: VerifiedGwAttachment }
+    | { readonly status: "refreshing" }
+    | { readonly status: "terminal" };
 
 /**
  * Install a new durable generation. The caller must wrap this helper in the
@@ -912,8 +993,12 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         delivered_version: number;
         run_token: string | null;
         run_version: number;
+        organization_id: string;
+        shard_id: string;
+        source_cdb_id: string;
     }>(
-        `SELECT g.dirty_version, g.delivered_version, g.run_token, g.run_version
+        `SELECT g.dirty_version, g.delivered_version, g.run_token, g.run_version,
+                g.organization_id, g.shard_id, g.source_cdb_id
          FROM _gw_registration_generations g
          INNER JOIN _gw_registration_heads h
            ON h.registration_id = g.registration_id
@@ -922,6 +1007,7 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
           AND h.sub_id = g.sub_id
          WHERE g.registration_id = ? AND g.principal_id = ? AND g.client_id = ? AND g.sub_id = ?
            AND g.connection_id = ? AND g.lifecycle = 'active' AND g.cdb_state = 'active'
+           AND g.source_cdb_id IS NOT NULL AND g.source_cdb_id <> ''
            AND g.dirty_version > g.delivered_version
            AND (g.retry_at IS NULL OR g.retry_at <= ?)
            AND NOT EXISTS (
@@ -993,6 +1079,9 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         runVersion,
         leaseExpiresAt: input.leaseExpiresAt,
         reclaimed: current.run_token !== null,
+        organizationId: TenantId(current.organization_id),
+        shardId: current.shard_id,
+        sourceCdbId: current.source_cdb_id,
     };
 }
 
@@ -1054,8 +1143,9 @@ export function stageGatewaySnapshot(sql: SyncSql, input: GatewaySnapshotStage):
     sql.exec(
         `INSERT INTO _gw_snapshot_outbox
          (registration_id, cookie, target_version, rows_json, byte_size,
-          send_attempts, next_attempt_at, last_sent_at, last_error, created_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?)`,
+          send_attempts, next_attempt_at, claim_token, claim_version, claim_expires_at,
+          last_sent_at, last_error, created_at)
+         VALUES (?, ?, ?, ?, ?, 0, ?, NULL, 0, NULL, NULL, NULL, ?)`,
         input.registrationId,
         input.cookie,
         input.targetVersion,
@@ -1089,9 +1179,12 @@ export function claimDueGatewaySnapshot(
         byte_size: number;
         send_attempts: number;
         next_attempt_at: number;
+        claim_token: string | null;
+        claim_version: number;
     }>(
         `SELECT o.registration_id, g.principal_id, g.client_id, g.sub_id, g.connection_id,
-                o.cookie, o.target_version, o.rows_json, o.byte_size, o.send_attempts, o.next_attempt_at
+                o.cookie, o.target_version, o.rows_json, o.byte_size, o.send_attempts, o.next_attempt_at,
+                o.claim_token, o.claim_version
          FROM _gw_snapshot_outbox o
          INNER JOIN _gw_registration_generations g ON g.registration_id = o.registration_id
          INNER JOIN _gw_registration_heads h
@@ -1099,17 +1192,29 @@ export function claimDueGatewaySnapshot(
           AND h.principal_id = g.principal_id
           AND h.client_id = g.client_id
           AND h.sub_id = g.sub_id
-         WHERE o.next_attempt_at <= ? AND g.lifecycle = 'active' AND g.cdb_state = 'active'
+         WHERE o.next_attempt_at <= ?
+           AND (o.claim_token IS NULL OR o.claim_expires_at IS NULL OR o.claim_expires_at <= ?)
+           AND g.lifecycle = 'active' AND g.cdb_state = 'active'
          ORDER BY o.next_attempt_at, o.registration_id
          LIMIT 1`,
+        input.nowMs,
         input.nowMs
     );
     if (!due) return null;
+    const claimToken = crypto.randomUUID();
+    const claimVersion = due.claim_version + 1;
     sql.exec(
         `UPDATE _gw_snapshot_outbox
-         SET send_attempts = send_attempts + 1, next_attempt_at = ?, last_sent_at = ?
+         SET send_attempts = MIN(send_attempts + 1, ?), next_attempt_at = ?,
+             claim_token = ?, claim_version = claim_version + 1, claim_expires_at = ?, last_sent_at = ?
          WHERE registration_id = ? AND cookie = ? AND target_version = ?
-           AND send_attempts = ? AND next_attempt_at = ? AND next_attempt_at <= ?`,
+           AND send_attempts = ? AND next_attempt_at = ? AND claim_version = ?
+           AND ((claim_token IS NULL AND ? IS NULL) OR claim_token = ?)
+           AND next_attempt_at <= ?
+           AND (claim_token IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= ?)`,
+        GATEWAY_CLEANUP_MAX_RETRY_COUNT,
+        input.attemptExpiresAt,
+        claimToken,
         input.attemptExpiresAt,
         input.nowMs,
         due.registration_id,
@@ -1117,6 +1222,10 @@ export function claimDueGatewaySnapshot(
         due.target_version,
         due.send_attempts,
         due.next_attempt_at,
+        due.claim_version,
+        due.claim_token,
+        due.claim_token,
+        input.nowMs,
         input.nowMs
     );
     if (sql.changes() !== 1) return null;
@@ -1138,8 +1247,182 @@ export function claimDueGatewaySnapshot(
         targetVersion: due.target_version,
         rows,
         byteSize: due.byte_size,
-        sendAttempts: due.send_attempts + 1,
+        sendAttempts: Math.min(due.send_attempts + 1, GATEWAY_CLEANUP_MAX_RETRY_COUNT),
         nextAttemptAt: input.attemptExpiresAt,
+        claimToken,
+        claimVersion,
+    };
+}
+
+/** Clear one exact failed query run and retain its dirty target for a bounded retry. */
+export function failGatewayDirtyRun(sql: SyncSql, input: GatewayDirtyRunFailure): boolean {
+    assertGatewayRegistrationIdentity(input);
+    if (input.runToken.length === 0) throw new TypeError("runToken must be nonempty");
+    assertNonnegativeSafeInteger(input.runVersion, "runVersion");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    const current = sql.one<{ retry_count: number }>(
+        `SELECT g.retry_count
+         FROM _gw_registration_generations g
+         INNER JOIN _gw_registration_heads h
+           ON h.registration_id = g.registration_id
+          AND h.principal_id = g.principal_id
+          AND h.client_id = g.client_id
+          AND h.sub_id = g.sub_id
+         WHERE g.registration_id = ? AND g.principal_id = ? AND g.client_id = ? AND g.sub_id = ?
+           AND g.connection_id = ? AND g.lifecycle = 'active' AND g.cdb_state = 'active'
+           AND g.run_token = ? AND g.run_version = ?`,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId,
+        input.runToken,
+        input.runVersion
+    );
+    if (!current) return false;
+    const attempts = Math.min(current.retry_count + 1, GATEWAY_CLEANUP_MAX_RETRY_COUNT);
+    const retryAt = input.nowMs + gatewayRetryDelayMs(attempts);
+    const message = gatewayRetryError(input.error);
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET run_token = NULL, run_target_version = NULL, run_lease_expires_at = NULL,
+             run_version = run_version + 1, retry_count = ?, retry_at = ?, retry_error = ?, updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND lifecycle = 'active' AND cdb_state = 'active'
+           AND run_token = ? AND run_version = ?
+           AND EXISTS (
+             SELECT 1 FROM _gw_registration_heads h
+             WHERE h.registration_id = _gw_registration_generations.registration_id
+               AND h.principal_id = _gw_registration_generations.principal_id
+               AND h.client_id = _gw_registration_generations.client_id
+               AND h.sub_id = _gw_registration_generations.sub_id
+           )`,
+        attempts,
+        retryAt,
+        message,
+        input.nowMs,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId,
+        input.runToken,
+        input.runVersion
+    );
+    return sql.changes() === 1;
+}
+
+/** Release one exact failed send claim without changing its immutable payload or cookie. */
+export function failGatewaySnapshotSend(sql: SyncSql, input: GatewaySnapshotSendFailure): boolean {
+    if (input.registrationId.length === 0) throw new TypeError("registrationId must be nonempty");
+    if (input.cookie.length === 0) throw new TypeError("cookie must be nonempty");
+    if (input.claimToken.length === 0) throw new TypeError("claimToken must be nonempty");
+    assertNonnegativeSafeInteger(input.claimVersion, "claimVersion");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    const current = sql.one<{ send_attempts: number }>(
+        `SELECT send_attempts FROM _gw_snapshot_outbox
+         WHERE registration_id = ? AND cookie = ? AND claim_token = ? AND claim_version = ?`,
+        input.registrationId,
+        input.cookie,
+        input.claimToken,
+        input.claimVersion
+    );
+    if (!current) return false;
+    const retryAt = input.nowMs + gatewayRetryDelayMs(Math.max(1, current.send_attempts));
+    sql.exec(
+        `UPDATE _gw_snapshot_outbox
+         SET claim_token = NULL, claim_expires_at = NULL, next_attempt_at = ?, last_error = ?
+         WHERE registration_id = ? AND cookie = ? AND claim_token = ? AND claim_version = ?`,
+        retryAt,
+        gatewayRetryError(input.error),
+        input.registrationId,
+        input.cookie,
+        input.claimToken,
+        input.claimVersion
+    );
+    return sql.changes() === 1;
+}
+
+/** Bind one exact send claim to the socket cookie observed immediately before send. */
+export function markGatewaySnapshotSendBaseCookie(
+    sql: SyncSql,
+    input: GatewaySnapshotSendAttempt,
+    baseCookie: Cookie | null
+): boolean {
+    sql.exec(
+        `UPDATE _gw_snapshot_outbox
+         SET attachment_base_cookie = COALESCE(attachment_base_cookie, ?)
+         WHERE registration_id = ? AND cookie = ? AND claim_token = ? AND claim_version = ?
+           AND EXISTS (
+             SELECT 1
+             FROM _gw_registration_generations g
+             INNER JOIN _gw_registration_heads h
+               ON h.registration_id = g.registration_id
+              AND h.principal_id = g.principal_id
+              AND h.client_id = g.client_id
+              AND h.sub_id = g.sub_id
+             WHERE g.registration_id = _gw_snapshot_outbox.registration_id
+               AND g.principal_id = ? AND g.client_id = ? AND g.sub_id = ? AND g.connection_id = ?
+               AND g.lifecycle = 'active' AND g.cdb_state = 'active'
+           )`,
+        baseCookie,
+        input.registrationId,
+        input.cookie,
+        input.claimToken,
+        input.claimVersion,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    return sql.changes() === 1;
+}
+
+/** Resolve a staged cookie only within one verified socket identity. */
+export function resolveGatewaySnapshotAck(
+    sql: SyncSql,
+    input: GatewaySnapshotAckLookup
+): GatewaySnapshotAckIdentity | null {
+    if (input.connectionId.length === 0) throw new TypeError("connectionId must be nonempty");
+    if (input.cookie.length === 0) throw new TypeError("cookie must be nonempty");
+    const staged = sql.one<{
+        registration_id: string;
+        sub_id: number;
+        already_acknowledged: number;
+        attachment_base_cookie: string | null;
+    }>(
+        `SELECT g.registration_id, g.sub_id,
+                CASE WHEN o.registration_id IS NULL THEN 1 ELSE 0 END AS already_acknowledged,
+                o.attachment_base_cookie
+         FROM _gw_registration_generations g
+         INNER JOIN _gw_registration_heads h
+           ON h.registration_id = g.registration_id
+          AND h.principal_id = g.principal_id
+          AND h.client_id = g.client_id
+          AND h.sub_id = g.sub_id
+         LEFT JOIN _gw_snapshot_outbox o ON o.registration_id = g.registration_id
+         WHERE g.principal_id = ? AND g.client_id = ? AND g.connection_id = ?
+           AND g.lifecycle = 'active' AND g.cdb_state = 'active'
+           AND (
+             (o.cookie = ? AND o.send_attempts > 0 AND o.last_sent_at IS NOT NULL AND o.claim_token IS NOT NULL)
+             OR (o.registration_id IS NULL AND g.last_snapshot_cookie = ?)
+           )`,
+        input.principalId,
+        input.clientId,
+        input.connectionId,
+        input.cookie,
+        input.cookie
+    );
+    if (!staged) return null;
+    return {
+        principalId: input.principalId,
+        clientId: input.clientId,
+        subId: SubId(staged.sub_id),
+        registrationId: staged.registration_id,
+        connectionId: input.connectionId,
+        cookie: input.cookie,
+        alreadyAcknowledged: staged.already_acknowledged === 1,
+        attachmentBaseCookie: staged.attachment_base_cookie === null ? null : Cookie(staged.attachment_base_cookie),
     };
 }
 
@@ -1158,7 +1441,7 @@ export function acknowledgeGatewaySnapshot(sql: SyncSql, input: GatewaySnapshotA
           AND h.client_id = g.client_id
           AND h.sub_id = g.sub_id
          WHERE o.registration_id = ? AND o.cookie = ?
-           AND o.send_attempts > 0 AND o.last_sent_at IS NOT NULL
+           AND o.send_attempts > 0 AND o.last_sent_at IS NOT NULL AND o.claim_token IS NOT NULL
            AND g.principal_id = ? AND g.client_id = ? AND g.sub_id = ? AND g.connection_id = ?
            AND g.lifecycle = 'active' AND g.cdb_state = 'active'`,
         input.registrationId,
@@ -1396,6 +1679,65 @@ export function retireGatewayRegistration(
     return true;
 }
 
+/** Retire only while one exact leased run still owns this current generation. */
+export function retireClaimedGatewayRegistration(sql: SyncSql, input: GatewayClaimedRunRetire): boolean {
+    assertGatewayRegistrationIdentity(input);
+    if (input.runToken.length === 0) throw new TypeError("runToken must be nonempty");
+    assertNonnegativeSafeInteger(input.runVersion, "runVersion");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    const owned = sql.one<{ registration_id: string }>(
+        `SELECT g.registration_id
+         FROM _gw_registration_generations g
+         INNER JOIN _gw_registration_heads h
+           ON h.registration_id = g.registration_id
+          AND h.principal_id = g.principal_id
+          AND h.client_id = g.client_id
+          AND h.sub_id = g.sub_id
+         WHERE g.registration_id = ? AND g.principal_id = ? AND g.client_id = ? AND g.sub_id = ?
+           AND g.connection_id = ? AND g.lifecycle = 'active' AND g.cdb_state = 'active'
+           AND g.run_token = ? AND g.run_version = ?`,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId,
+        input.runToken,
+        input.runVersion
+    );
+    return owned ? retireGatewayRegistration(sql, input, input.registrationId, input.nowMs) : false;
+}
+
+/** Retire only while one exact staged-send attempt still owns this generation. */
+export function retireClaimedGatewaySnapshot(sql: SyncSql, input: GatewayClaimedSnapshotRetire): boolean {
+    assertGatewayRegistrationIdentity(input);
+    if (input.cookie.length === 0) throw new TypeError("cookie must be nonempty");
+    if (input.claimToken.length === 0) throw new TypeError("claimToken must be nonempty");
+    assertNonnegativeSafeInteger(input.claimVersion, "claimVersion");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    const owned = sql.one<{ registration_id: string }>(
+        `SELECT g.registration_id
+         FROM _gw_snapshot_outbox o
+         INNER JOIN _gw_registration_generations g ON g.registration_id = o.registration_id
+         INNER JOIN _gw_registration_heads h
+           ON h.registration_id = g.registration_id
+          AND h.principal_id = g.principal_id
+          AND h.client_id = g.client_id
+          AND h.sub_id = g.sub_id
+         WHERE o.registration_id = ? AND o.cookie = ? AND o.claim_token = ? AND o.claim_version = ?
+           AND g.principal_id = ? AND g.client_id = ? AND g.sub_id = ? AND g.connection_id = ?
+           AND g.lifecycle = 'active' AND g.cdb_state = 'active'`,
+        input.registrationId,
+        input.cookie,
+        input.claimToken,
+        input.claimVersion,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    return owned ? retireGatewayRegistration(sql, input, input.registrationId, input.nowMs) : false;
+}
+
 /** Delete one retired cleanup row without touching any logical head. */
 export function cleanupGatewayRegistration(sql: SyncSql, key: GatewayRegistrationKey, registrationId: string): boolean {
     sql.exec(
@@ -1468,6 +1810,15 @@ function assertNonnegativeSafeInteger(value: number, name: string): void {
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a nonnegative safe integer`);
 }
 
+function gatewayRetryDelayMs(attempts: number): number {
+    const exponent = Math.max(0, Math.min(attempts - 1, GATEWAY_CLEANUP_MAX_RETRY_COUNT - 1));
+    return Math.min(GATEWAY_CLEANUP_MAX_RETRY_MS, GATEWAY_CLEANUP_BASE_RETRY_MS * 2 ** exponent);
+}
+
+function gatewayRetryError(error: unknown): string {
+    return (error instanceof Error ? error.message : String(error)).slice(0, GATEWAY_CLEANUP_MAX_ERROR_LENGTH);
+}
+
 function ensureGatewayRegistrationColumns(sql: SyncSql): void {
     const columns = new Set(
         sql.all<{ name: string }>("PRAGMA table_info('_gw_registration_generations')").map(column => column.name)
@@ -1505,6 +1856,25 @@ function ensureGatewayRegistrationColumns(sql: SyncSql): void {
            OR
            (run_token IS NOT NULL AND run_target_version IS NOT NULL AND run_lease_expires_at IS NOT NULL)
          )`
+    );
+}
+
+function ensureGatewaySnapshotOutboxColumns(sql: SyncSql): void {
+    const columns = new Set(sql.all<{ name: string }>("PRAGMA table_info('_gw_snapshot_outbox')").map(row => row.name));
+    const additions = [
+        ["claim_token", "claim_token TEXT"],
+        ["claim_version", "claim_version INTEGER NOT NULL DEFAULT 0"],
+        ["claim_expires_at", "claim_expires_at INTEGER"],
+        ["attachment_base_cookie", "attachment_base_cookie TEXT"],
+    ] as const;
+    for (const [name, definition] of additions) {
+        if (!columns.has(name)) sql.exec(`ALTER TABLE _gw_snapshot_outbox ADD COLUMN ${definition}`);
+    }
+    sql.exec(
+        `UPDATE _gw_snapshot_outbox
+         SET claim_token = NULL, claim_expires_at = NULL, claim_version = claim_version + 1
+         WHERE (claim_token IS NULL) <> (claim_expires_at IS NULL)
+            OR (claim_token IS NOT NULL AND claim_version = 0)`
     );
 }
 
@@ -1777,9 +2147,302 @@ export class Gateway extends DurableObject<GatewayEnv> {
         return scheduled;
     }
 
+    private dueGatewayRunCandidates(nowMs: number): readonly StoredGatewayRunCandidate[] {
+        return adaptSqlStorage(this.ctx.storage.sql).all<StoredGatewayRunCandidate>(
+            `SELECT g.principal_id, g.client_id, g.sub_id, g.registration_id, g.connection_id
+             FROM _gw_registration_generations g
+             INNER JOIN _gw_registration_heads h
+               ON h.registration_id = g.registration_id
+              AND h.principal_id = g.principal_id
+              AND h.client_id = g.client_id
+              AND h.sub_id = g.sub_id
+             WHERE g.lifecycle = 'active' AND g.cdb_state = 'active'
+               AND g.source_cdb_id IS NOT NULL AND g.source_cdb_id <> ''
+               AND g.dirty_version > g.delivered_version
+               AND (g.retry_at IS NULL OR g.retry_at <= ?)
+               AND NOT EXISTS (
+                 SELECT 1 FROM _gw_snapshot_outbox o WHERE o.registration_id = g.registration_id
+               )
+               AND (
+                 (g.run_token IS NULL AND g.run_target_version IS NULL AND g.run_lease_expires_at IS NULL)
+                 OR
+                 (g.run_token IS NOT NULL AND g.run_target_version IS NOT NULL
+                  AND g.run_lease_expires_at IS NOT NULL AND g.run_lease_expires_at <= ?)
+               )
+             ORDER BY COALESCE(g.retry_at, 0), g.registration_id
+             LIMIT ?`,
+            nowMs,
+            nowMs,
+            GATEWAY_QUERY_BATCH_SIZE
+        );
+    }
+
+    private exactGatewaySocket(
+        identity: GatewayRegistrationKey & { readonly connectionId: string },
+        nowMs: number
+    ): ExactGatewaySocket {
+        if (this.authRefreshBarriers.has(identity.connectionId)) return { status: "refreshing" };
+        const matching = this.ctx.getWebSockets().filter(ws => {
+            const attachment = ws.deserializeAttachment() as GwAttachment | null;
+            return attachment?.connectionId === identity.connectionId;
+        });
+        if (matching.length !== 1) return { status: "terminal" };
+        const ws = matching[0];
+        if (!ws) return { status: "terminal" };
+        const attachment = ws.deserializeAttachment() as GwAttachment | null;
+        if (
+            !isVerifiedAttachment(attachment) ||
+            !isCurrentVerifiedAttachment(attachment, Math.floor(nowMs / 1_000)) ||
+            attachment.connectionId !== identity.connectionId ||
+            attachment.principalId !== identity.principalId ||
+            attachment.clientId !== identity.clientId ||
+            !attachment.snapshotSubIds?.includes(identity.subId)
+        ) {
+            return { status: "terminal" };
+        }
+        return { status: "ready", ws, attachment };
+    }
+
+    private trackGatewayTask(connectionId: string, task: Promise<void>): Promise<void> {
+        let active = this.activeOperations.get(connectionId);
+        if (!active) {
+            active = new Set();
+            this.activeOperations.set(connectionId, active);
+        }
+        active.add(task);
+        const cleanup = () => {
+            active?.delete(task);
+            if (active?.size === 0) this.activeOperations.delete(connectionId);
+        };
+        void task.then(cleanup, cleanup);
+        return task;
+    }
+
+    private async retireGatewayRunnerRegistration(
+        identity: GatewayRegistrationKey & { readonly registrationId: string; readonly connectionId: string },
+        nowMs: number,
+        run?: GatewayDirtyRun
+    ): Promise<void> {
+        const retired = this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            return run
+                ? retireClaimedGatewayRegistration(sql, {
+                      ...identity,
+                      runToken: run.runToken,
+                      runVersion: run.runVersion,
+                      nowMs,
+                  })
+                : retireGatewayRegistration(sql, identity, identity.registrationId, nowMs);
+        });
+        if (retired) await this.scheduleGatewayWork(nowMs);
+    }
+
+    private async retireGatewaySnapshotAttempt(attempt: GatewaySnapshotSendAttempt, nowMs: number): Promise<void> {
+        const retired = this.ctx.storage.transactionSync(() =>
+            retireClaimedGatewaySnapshot(adaptSqlStorage(this.ctx.storage.sql), {
+                ...attempt,
+                nowMs,
+            })
+        );
+        if (retired) await this.scheduleGatewayWork(nowMs);
+    }
+
+    private async settleGatewayQueryFailure(
+        candidate: StoredGatewayRunCandidate,
+        run: GatewayDirtyRun,
+        nowMs: number,
+        error: unknown
+    ): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            failGatewayDirtyRun(adaptSqlStorage(this.ctx.storage.sql), {
+                principalId: PrincipalId(candidate.principal_id),
+                clientId: ClientId(candidate.client_id),
+                subId: SubId(candidate.sub_id),
+                registrationId: candidate.registration_id,
+                connectionId: candidate.connection_id,
+                runToken: run.runToken,
+                runVersion: run.runVersion,
+                nowMs,
+                error,
+            });
+        });
+        await this.scheduleGatewayWork(nowMs);
+    }
+
+    private async runGatewayQueryCandidate(candidate: StoredGatewayRunCandidate, nowMs: number): Promise<void> {
+        const identity = {
+            principalId: PrincipalId(candidate.principal_id),
+            clientId: ClientId(candidate.client_id),
+            subId: SubId(candidate.sub_id),
+            registrationId: candidate.registration_id,
+            connectionId: candidate.connection_id,
+        };
+        const initialSocket = this.exactGatewaySocket(identity, nowMs);
+        if (initialSocket.status === "refreshing") return;
+        if (initialSocket.status === "terminal") {
+            await this.retireGatewayRunnerRegistration(identity, nowMs);
+            return;
+        }
+        await this.scheduleGatewayAlarm(nowMs + GATEWAY_QUERY_LEASE_MS);
+        const claimNowMs = this.gatewayNowMs();
+        const claimSocket = this.exactGatewaySocket(identity, claimNowMs);
+        if (claimSocket.status === "refreshing") return;
+        if (claimSocket.status === "terminal") {
+            await this.retireGatewayRunnerRegistration(identity, claimNowMs);
+            return;
+        }
+        const run = this.ctx.storage.transactionSync(() =>
+            claimDirtyGatewayRegistration(adaptSqlStorage(this.ctx.storage.sql), {
+                ...identity,
+                nowMs: claimNowMs,
+                leaseExpiresAt: claimNowMs + GATEWAY_QUERY_LEASE_MS,
+            })
+        );
+        if (!run) return;
+
+        try {
+            const catalog = this.catalog() as CatalogRoutingRpc & CatalogOrganizationAuthorityRpc;
+            const authority = await catalog.resolveOrganizationAuthority({
+                principalId: identity.principalId,
+                organizationId: run.organizationId,
+            });
+            const projected = projectOrganizationMutationAuth(authority, {
+                principalId: identity.principalId,
+                organizationId: run.organizationId,
+            });
+            if (!projected.ok) {
+                if (projected.code === "CDB_FORBIDDEN") {
+                    await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                } else {
+                    await this.settleGatewayQueryFailure(candidate, run, this.gatewayNowMs(), projected.message);
+                }
+                return;
+            }
+
+            const route = await catalog.route(Number(vshardOf([run.organizationId])));
+            if (typeof route?.shardId !== "string" || route.shardId.length === 0) {
+                throw new TypeError("Catalog returned a malformed shard route");
+            }
+            const routedPhysicalId = this.env.CDB_SHARD.idFromName(route.shardId).toString();
+            if (routedPhysicalId !== run.sourceCdbId) {
+                await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                return;
+            }
+            const sourceId = this.env.CDB_SHARD.idFromString(run.sourceCdbId);
+            const cdb = this.env.CDB_SHARD.get(sourceId) as unknown as CdbRegisteredQueryRpc;
+            const response = projectCdbQueryRows(
+                await cdb.queryRegistered({
+                    subscription: {
+                        gatewayId: this.ctx.id.toString(),
+                        registrationId: identity.registrationId,
+                        connectionId: identity.connectionId,
+                        clientId: identity.clientId,
+                        subId: identity.subId,
+                    },
+                    auth: projected.auth,
+                })
+            );
+            if (!response.ok) {
+                if (isTerminalRegisteredQueryFailure(response.error.code)) {
+                    await this.retireGatewayRunnerRegistration(identity, this.gatewayNowMs(), run);
+                } else {
+                    await this.settleGatewayQueryFailure(candidate, run, this.gatewayNowMs(), response.error.message);
+                }
+                return;
+            }
+
+            const settledAt = this.gatewayNowMs();
+            const currentSocket = this.exactGatewaySocket(identity, settledAt);
+            if (currentSocket.status === "refreshing") {
+                await this.settleGatewayQueryFailure(candidate, run, settledAt, "authentication refresh is in flight");
+                return;
+            }
+            if (currentSocket.status === "terminal") {
+                await this.retireGatewayRunnerRegistration(identity, settledAt, run);
+                return;
+            }
+            const authEpochs = projected.auth.authEpochs;
+            if (!authEpochs) {
+                await this.settleGatewayQueryFailure(
+                    candidate,
+                    run,
+                    settledAt,
+                    "Catalog authority omitted auth epochs"
+                );
+                return;
+            }
+            const cookie = Cookie(`${identity.clientId}:${run.targetVersion}:${crypto.randomUUID()}`);
+            const staged = this.ctx.storage.transactionSync(() =>
+                stageGatewaySnapshot(adaptSqlStorage(this.ctx.storage.sql), {
+                    ...identity,
+                    runToken: run.runToken,
+                    runVersion: run.runVersion,
+                    targetVersion: run.targetVersion,
+                    cookie,
+                    rows: response.result,
+                    authEpochs,
+                    nowMs: settledAt,
+                })
+            );
+            if (staged) await this.scheduleGatewayAlarm(settledAt + 1);
+        } catch (error) {
+            await this.settleGatewayQueryFailure(candidate, run, this.gatewayNowMs(), error);
+        }
+    }
+
+    private async runGatewaySnapshotSend(attempt: GatewaySnapshotSendAttempt): Promise<void> {
+        const sendNowMs = this.gatewayNowMs();
+        const socket = this.exactGatewaySocket(attempt, sendNowMs);
+        if (socket.status === "refreshing") {
+            this.ctx.storage.transactionSync(() => {
+                failGatewaySnapshotSend(adaptSqlStorage(this.ctx.storage.sql), {
+                    registrationId: attempt.registrationId,
+                    cookie: attempt.cookie,
+                    claimToken: attempt.claimToken,
+                    claimVersion: attempt.claimVersion,
+                    nowMs: sendNowMs,
+                    error: "authentication refresh is in flight",
+                });
+            });
+            await this.scheduleGatewayWork(this.gatewayNowMs());
+            return;
+        }
+        if (socket.status === "terminal") {
+            await this.retireGatewaySnapshotAttempt(attempt, sendNowMs);
+            return;
+        }
+        const marked = this.ctx.storage.transactionSync(() =>
+            markGatewaySnapshotSendBaseCookie(
+                adaptSqlStorage(this.ctx.storage.sql),
+                attempt,
+                socket.attachment.lastCookie ?? null
+            )
+        );
+        if (!marked) return;
+        try {
+            this.send(socket.ws, {
+                t: "snapshot",
+                subId: attempt.subId,
+                cookie: attempt.cookie,
+                rows: attempt.rows,
+            });
+        } catch (error) {
+            this.ctx.storage.transactionSync(() => {
+                failGatewaySnapshotSend(adaptSqlStorage(this.ctx.storage.sql), {
+                    registrationId: attempt.registrationId,
+                    cookie: attempt.cookie,
+                    claimToken: attempt.claimToken,
+                    claimVersion: attempt.claimVersion,
+                    nowMs: this.gatewayNowMs(),
+                    error,
+                });
+            });
+            await this.scheduleGatewayWork(this.gatewayNowMs());
+        }
+    }
+
     private cleanupRetryDelayMs(attempts: number): number {
-        const exponent = Math.max(0, Math.min(attempts - 1, GATEWAY_CLEANUP_MAX_RETRY_COUNT - 1));
-        return Math.min(GATEWAY_CLEANUP_MAX_RETRY_MS, GATEWAY_CLEANUP_BASE_RETRY_MS * 2 ** exponent);
+        return gatewayRetryDelayMs(attempts);
     }
 
     private dueGatewayCleanupRows(nowMs: number): readonly StoredGatewayCleanupRow[] {
@@ -1830,6 +2493,38 @@ export class Gateway extends DurableObject<GatewayEnv> {
         });
     }
 
+    private completeLegacyGatewayCleanup(row: StoredGatewayCleanupRow): void {
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            sql.exec(
+                `DELETE FROM _gw_registration_generations
+                 WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+                   AND connection_id = ? AND (source_cdb_id IS NULL OR source_cdb_id = '')
+                   AND lifecycle = 'retiring' AND cdb_state = 'retiring'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM _gw_registration_heads h
+                     WHERE h.registration_id = _gw_registration_generations.registration_id
+                   )`,
+                row.registration_id,
+                row.principal_id,
+                row.client_id,
+                row.sub_id,
+                row.connection_id
+            );
+            if (sql.changes() === 1) return;
+            if (
+                sql.one<{ registration_id: string }>(
+                    "SELECT registration_id FROM _gw_registration_generations WHERE registration_id = ?",
+                    row.registration_id
+                )
+            ) {
+                throw gatewayInvalidationInvariant(
+                    "legacy retired Gateway generation changed before cleanup could complete"
+                );
+            }
+        });
+    }
+
     private recordGatewayCleanupFailure(row: StoredGatewayCleanupRow, nowMs: number, error: unknown): void {
         const attempts = Math.min(row.retry_count + 1, GATEWAY_CLEANUP_MAX_RETRY_COUNT);
         const message = (error instanceof Error ? error.message : String(error)).slice(
@@ -1863,7 +2558,13 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     private async cleanupGatewayGeneration(row: StoredGatewayCleanupRow, nowMs: number): Promise<void> {
         try {
-            if (!row.source_cdb_id) throw new Error("retired Gateway generation has no physical Cdb object ID");
+            if (!row.source_cdb_id) {
+                // These rows predate physical Cdb registration identity, so no
+                // remote subscription can exist. Delete only the exact
+                // headless legacy generation.
+                this.completeLegacyGatewayCleanup(row);
+                return;
+            }
             const id = this.env.CDB_SHARD.idFromString(row.source_cdb_id);
             const cdb = this.env.CDB_SHARD.get(id) as unknown as CdbSubscriptionRpc;
             const outcome: unknown = await cdb.unsubscribe({
@@ -1893,17 +2594,96 @@ export class Gateway extends DurableObject<GatewayEnv> {
         );
     }
 
-    private async scheduleGatewayCleanup(nowMs: number): Promise<void> {
-        const retryAt = this.earliestGatewayCleanupAt();
-        if (retryAt === null) return;
-        await this.scheduleGatewayAlarm(Math.max(nowMs + 1, retryAt));
+    private earliestGatewayQueryAt(): number | null {
+        return (
+            adaptSqlStorage(this.ctx.storage.sql).one<{ due_at: number | null }>(
+                `SELECT MIN(
+                   CASE
+                     WHEN g.run_token IS NULL THEN COALESCE(g.retry_at, 0)
+                     ELSE g.run_lease_expires_at
+                   END
+                 ) AS due_at
+                 FROM _gw_registration_generations g
+                 INNER JOIN _gw_registration_heads h
+                   ON h.registration_id = g.registration_id
+                  AND h.principal_id = g.principal_id
+                  AND h.client_id = g.client_id
+                  AND h.sub_id = g.sub_id
+                 WHERE g.lifecycle = 'active' AND g.cdb_state = 'active'
+                   AND g.source_cdb_id IS NOT NULL AND g.source_cdb_id <> ''
+                   AND g.dirty_version > g.delivered_version
+                   AND NOT EXISTS (
+                     SELECT 1 FROM _gw_snapshot_outbox o WHERE o.registration_id = g.registration_id
+                   )
+                   AND (
+                     (g.run_token IS NULL AND g.run_target_version IS NULL AND g.run_lease_expires_at IS NULL)
+                     OR
+                     (g.run_token IS NOT NULL AND g.run_target_version IS NOT NULL
+                      AND g.run_lease_expires_at IS NOT NULL)
+                   )`
+            )?.due_at ?? null
+        );
     }
 
-    private async maintainGatewayCleanup(): Promise<void> {
+    private earliestGatewaySnapshotSendAt(): number | null {
+        return (
+            adaptSqlStorage(this.ctx.storage.sql).one<{ due_at: number | null }>(
+                `SELECT MIN(
+                   CASE
+                     WHEN o.claim_token IS NULL THEN o.next_attempt_at
+                     ELSE MAX(o.next_attempt_at, COALESCE(o.claim_expires_at, o.next_attempt_at))
+                   END
+                 ) AS due_at
+                 FROM _gw_snapshot_outbox o
+                 INNER JOIN _gw_registration_generations g ON g.registration_id = o.registration_id
+                 INNER JOIN _gw_registration_heads h
+                   ON h.registration_id = g.registration_id
+                  AND h.principal_id = g.principal_id
+                  AND h.client_id = g.client_id
+                  AND h.sub_id = g.sub_id
+                 WHERE g.lifecycle = 'active' AND g.cdb_state = 'active'`
+            )?.due_at ?? null
+        );
+    }
+
+    private async scheduleGatewayWork(nowMs: number): Promise<void> {
+        const due = [
+            this.earliestGatewayCleanupAt(),
+            this.earliestGatewayQueryAt(),
+            this.earliestGatewaySnapshotSendAt(),
+        ].filter((value): value is number => value !== null);
+        if (due.length === 0) return;
+        await this.scheduleGatewayAlarm(Math.max(nowMs + 1, Math.min(...due)));
+    }
+
+    private async drainGatewayWork(): Promise<void> {
         const nowMs = this.gatewayNowMs();
-        const rows = this.dueGatewayCleanupRows(nowMs);
-        await Promise.all(rows.map(row => this.cleanupGatewayGeneration(row, nowMs)));
-        await this.scheduleGatewayCleanup(nowMs);
+        const cleanupRows = this.dueGatewayCleanupRows(nowMs);
+        await Promise.allSettled(cleanupRows.map(row => this.cleanupGatewayGeneration(row, nowMs)));
+
+        const queryTasks = this.dueGatewayRunCandidates(nowMs).map(candidate =>
+            this.trackGatewayTask(candidate.connection_id, this.runGatewayQueryCandidate(candidate, nowMs))
+        );
+        await Promise.allSettled(queryTasks);
+
+        const sendTasks: Promise<void>[] = [];
+        const sendNowMs = this.gatewayNowMs();
+        const sendDueAt = this.earliestGatewaySnapshotSendAt();
+        if (sendDueAt !== null && sendDueAt <= sendNowMs) {
+            await this.scheduleGatewayAlarm(sendNowMs + GATEWAY_SEND_LEASE_MS);
+        }
+        for (let index = 0; index < GATEWAY_SEND_BATCH_SIZE; index++) {
+            const attempt = this.ctx.storage.transactionSync(() =>
+                claimDueGatewaySnapshot(adaptSqlStorage(this.ctx.storage.sql), {
+                    nowMs: sendNowMs,
+                    attemptExpiresAt: sendNowMs + GATEWAY_SEND_LEASE_MS,
+                })
+            );
+            if (!attempt) break;
+            sendTasks.push(this.trackGatewayTask(attempt.connectionId, this.runGatewaySnapshotSend(attempt)));
+        }
+        await Promise.allSettled(sendTasks);
+        await this.scheduleGatewayWork(this.gatewayNowMs());
     }
 
     private async bootstrap(): Promise<void> {
@@ -1915,22 +2695,23 @@ export class Gateway extends DurableObject<GatewayEnv> {
             .filter(Boolean))
             sql.exec(stmt);
         ensureGatewayRegistrationColumns(sql);
+        ensureGatewaySnapshotOutboxColumns(sql);
         sql.exec(
             `UPDATE _gw_registration_generations
              SET retry_at = updated_at
              WHERE lifecycle = 'retiring' AND cdb_state = 'retiring' AND retry_at IS NULL`
         );
-        await this.scheduleGatewayCleanup(this.gatewayNowMs());
+        await this.scheduleGatewayWork(this.gatewayNowMs());
         this.bootstrapped = true;
     }
 
     override async alarm(): Promise<void> {
-        await this.maintainGatewayCleanup();
+        await this.drainGatewayWork();
     }
 
     /**
      * Accept Cdb invalidations only for the exact generation that still owns
-     * its logical head. Dirty versions remain durable for the later runner.
+     * its logical head. Dirty versions remain durable for the alarm runner.
      */
     async invalidateSubscriptions(request: GatewayInvalidationRequest): Promise<GatewayInvalidationResponse> {
         const gatewayId = this.ctx.id.toString();
@@ -2074,6 +2855,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 break;
             case "mut":
                 this.onMut(ws, msg as Extract<Up, { t: "mut" }>);
+                break;
+            case "ack":
+                this.onAck(ws, msg as Extract<Up, { t: "ack" }>);
                 break;
             case "presencePub":
                 this.onPresencePub(ws, msg as Extract<Up, { t: "presencePub" }>);
@@ -2464,6 +3248,45 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 snapshotSubIds: att.snapshotSubIds.filter(subId => subId !== msg.subId),
             } satisfies VerifiedGwAttachment);
         }
+    }
+
+    private onAck(ws: WebSocket, msg: Extract<Up, { t: "ack" }>): void {
+        const attachment = ws.deserializeAttachment() as GwAttachment | null;
+        const nowMs = this.gatewayNowMs();
+        if (!isVerifiedAttachment(attachment) || !isCurrentVerifiedAttachment(attachment, Math.floor(nowMs / 1_000))) {
+            return;
+        }
+        const settlement = this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = resolveGatewaySnapshotAck(sql, {
+                principalId: attachment.principalId,
+                clientId: attachment.clientId,
+                connectionId: attachment.connectionId,
+                cookie: msg.cookie,
+            });
+            if (!identity) return null;
+            return {
+                identity,
+                acknowledged: acknowledgeGatewaySnapshot(sql, { ...identity, nowMs }),
+            };
+        });
+        if (!settlement?.acknowledged) return;
+        const current = ws.deserializeAttachment() as GwAttachment | null;
+        if (
+            !isVerifiedAttachment(current) ||
+            current.connectionId !== attachment.connectionId ||
+            current.principalId !== attachment.principalId ||
+            current.clientId !== attachment.clientId
+        ) {
+            return;
+        }
+        if (
+            !settlement.identity.alreadyAcknowledged &&
+            (current.lastCookie ?? null) === settlement.identity.attachmentBaseCookie
+        ) {
+            ws.serializeAttachment({ ...current, lastCookie: msg.cookie } satisfies VerifiedGwAttachment);
+        }
+        void this.scheduleGatewayWork(nowMs);
     }
 
     private onMut(ws: WebSocket, msg: Extract<Up, { t: "mut" }>): void {
