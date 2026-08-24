@@ -21,7 +21,7 @@ export function Binding() {
                     "tested: two org-A clients update while an org-B query remains empty under policy",
                     "tested: clean-tarball replay and cross-organization denial for two signed-in principals",
                     "tested: staged live delivery after Gateway and Cdb reconstruct with a hibernated socket",
-                    "unfinished: packed restart, resume replay, JWKS rotation, and versioned migrations",
+                    "unfinished: packed restart, resume replay, JWKS failure backoff, and versioned migrations",
                 ]}
             />
 

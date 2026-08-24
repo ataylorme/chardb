@@ -106,7 +106,8 @@ The configured Gateway verifies JWT signatures and registered claims during `hel
 - [x] Verify the JWT signature before storing `principalId`; do not copy tenant, role, or custom claims into the verified attachment.
 - [x] Pin issuer, audience, and accepted algorithms from the configured Better Auth JWT plugin, with a bounded 30-second default clock tolerance.
 - [x] Resolve JWKS through the Catalog-backed resolver contract.
-- [ ] Prove outbound JWKS fetch, key rotation, and cache refresh through the configured Gateway path.
+- [x] Prove the configured Gateway fetches the exact remote JWKS URL on a cold key lookup, reuses the Catalog cache, refreshes after cache expiry, rejects retired and unknown keys, accepts a rotated key, and derives authority from Catalog instead of forged token claims.
+- [ ] Define and test outbound JWKS failure handling and bounded retry or backoff before production use.
 - [x] Reject missing, malformed, tampered, expired, not-yet-valid, wrong-issuer, wrong-audience, and disallowed-algorithm tokens.
 - [x] Serialize `updateAuth` per server connection id, drain admitted work, retire current durable registrations before replacing the subject, report affected subscription ids through `mustRefetch`, and store a terminal rejected attachment on failure.
 - [x] Recheck token time bounds before every mutation, subscription, and presence operation.
