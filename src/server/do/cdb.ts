@@ -1083,23 +1083,6 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     /**
-     * Project a committed row through every registered index and return the
-     * affected subscription identities. Used by the Gateway to coalesce pokes.
-     */
-    matchSubsForRow(table: string, indexedKeys: { indexName: string; key: IntervalKey }[]): LiveSubscriptionId[] {
-        const hits = new Set<string>();
-        for (const { indexName, key } of indexedKeys) {
-            for (const sub of this.intervalMap.match(table, indexName, key)) hits.add(sub);
-        }
-        const subscriptions: LiveSubscriptionId[] = [];
-        for (const key of hits) {
-            const subscription = this.subscriptions.get(key);
-            if (subscription) subscriptions.push(subscription);
-        }
-        return subscriptions;
-    }
-
-    /**
      * Snapshot the current op-log row id. The Catalog records this as the
      * shard's bookmark for an open barrier, giving every barrier a per-shard
      * coordinate that PITR restore can replay forward to.

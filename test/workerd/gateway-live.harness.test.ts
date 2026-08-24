@@ -201,10 +201,6 @@ async function stageGateway(clientId: string): Promise<void> {
     await fixtureFetch("/live-gateway-stage", { clientId });
 }
 
-async function matchedCdbSubscriptions(): Promise<CdbLiveState["subscriptions"]> {
-    return fixtureFetch("/live-cdb-match", { shardId });
-}
-
 async function currentRegistration(
     clientId: string,
     subId: number
@@ -616,7 +612,11 @@ describe("public durable live queries in real workerd", () => {
         expect(cdbAfterEviction.instanceId).not.toBe(cdbBeforeEviction.instanceId);
         expect(cdbAfterEviction.subscriptions).toEqual(cdbBeforeEviction.subscriptions);
         expect(cdbAfterEviction.invalidations).toEqual(cdbBeforeEviction.invalidations);
-        expect(await matchedCdbSubscriptions()).toContainEqual(cdbRegistration);
+        expect(
+            cdbAfterEviction.subscriptions.find(
+                subscription => subscription.registrationId === cdbRegistration.registrationId
+            )
+        ).toEqual(cdbRegistration);
 
         const replacementMessage = nextDown(opened.socket);
         await drainGateway(clientId);

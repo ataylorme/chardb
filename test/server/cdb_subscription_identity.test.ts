@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { IntervalMap } from "../../src/intervals.ts";
 import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { emptyManifest } from "../../src/server/manifest.ts";
@@ -45,6 +46,42 @@ function sqlStorage(db: Database) {
             };
         },
     };
+}
+
+function durableLiveState(db: Database) {
+    return {
+        registrations: db
+            .prepare(
+                `SELECT gateway_id AS gatewayId, registration_id AS registrationId,
+                        connection_id AS connectionId, client_id AS clientId, sub_id AS subId,
+                        state, organization_id AS organizationId
+                 FROM _chardb_live_subscriptions
+                 ORDER BY gateway_id, registration_id`
+            )
+            .all(),
+        tables: db
+            .prepare(
+                `SELECT gateway_id AS gatewayId, registration_id AS registrationId, table_name AS tableName
+                 FROM _chardb_live_subscription_tables
+                 ORDER BY gateway_id, registration_id, table_name`
+            )
+            .all(),
+        invalidations: db
+            .prepare(
+                `SELECT gateway_id AS gatewayId, registration_id AS registrationId, change_seq AS changeSeq
+                 FROM _chardb_invalidation_outbox
+                 ORDER BY gateway_id, registration_id`
+            )
+            .all(),
+    };
+}
+
+function durableRegistration(identity: LiveSubscriptionId, state: "active" | "retired") {
+    return { ...identity, state, organizationId: state === "active" ? "org-1" : null };
+}
+
+function durableTable(identity: LiveSubscriptionId) {
+    return { gatewayId: identity.gatewayId, registrationId: identity.registrationId, tableName: "messages" };
 }
 
 function subscription(
@@ -135,19 +172,39 @@ describe("Cdb live subscription identity", () => {
             intervals_json: '[{"table":"messages","indexName":"by_org","intervals":[{"kind":"full"}]}]',
         });
 
+        const firstRebuild = spyOn(IntervalMap.prototype, "register");
         await reconstruct();
+        const firstRebuiltIntervals = firstRebuild.mock.calls.map(([key, table, indexName]) => [key, table, indexName]);
+        firstRebuild.mockRestore();
 
-        expect(cdb.matchSubsForRow("messages", [{ indexName: "by_org", key: ["org-1"] }])).toEqual([
-            first,
-            second,
-            third,
+        expect(firstRebuiltIntervals).toEqual([
+            ['["gateway-do-1","registration-client-1"]', "messages", "by_org"],
+            ['["gateway-do-1","registration-client-2"]', "messages", "by_org"],
+            ['["gateway-do-2","registration-client-1"]', "messages", "by_org"],
         ]);
 
-        await cdb.unsubscribe({ ...second });
+        expect(durableLiveState(db)).toEqual({
+            registrations: [
+                durableRegistration(first, "active"),
+                durableRegistration(second, "active"),
+                durableRegistration(third, "active"),
+            ],
+            tables: [durableTable(first), durableTable(second), durableTable(third)],
+            invalidations: [],
+        });
 
+        await cdb.unsubscribe({ ...second });
         await reconstruct();
 
-        expect(cdb.matchSubsForRow("messages", [{ indexName: "by_org", key: ["org-1"] }])).toEqual([first, third]);
+        expect(durableLiveState(db)).toEqual({
+            registrations: [
+                durableRegistration(first, "active"),
+                durableRegistration(second, "retired"),
+                durableRegistration(third, "active"),
+            ],
+            tables: [durableTable(first), durableTable(third)],
+            invalidations: [],
+        });
     });
 
     test("accepts an identical active replay and rejects a changed payload", async () => {
@@ -164,24 +221,6 @@ describe("Cdb live subscription identity", () => {
                 })
             )
         ).resolves.toEqual({ subscription: identity, changeSeq: 0 });
-        expect(
-            db
-                .prepare(
-                    `SELECT COUNT(*) AS count
-                     FROM _chardb_live_subscriptions
-                     WHERE gateway_id = ? AND registration_id = ?`
-                )
-                .get(identity.gatewayId, identity.registrationId)
-        ).toEqual({ count: 1 });
-        expect(
-            db
-                .prepare(
-                    `SELECT table_name
-                     FROM _chardb_live_subscription_tables
-                     WHERE gateway_id = ? AND registration_id = ?`
-                )
-                .all(identity.gatewayId, identity.registrationId)
-        ).toEqual([{ table_name: "messages" }]);
 
         await expect(cdb.subscribe(request(identity, { args: { organizationId: "org-2" } }))).rejects.toMatchObject({
             code: "CDB_INVARIANT",
@@ -192,7 +231,11 @@ describe("Cdb live subscription identity", () => {
         await expect(cdb.subscribe(request(identity, { queryHash: "query-hash-drifted" }))).rejects.toMatchObject({
             code: "CDB_INVARIANT",
         });
-        expect(cdb.matchSubsForRow("messages", [{ indexName: "by_org", key: ["org-1"] }])).toEqual([identity]);
+        expect(durableLiveState(db)).toEqual({
+            registrations: [durableRegistration(identity, "active")],
+            tables: [durableTable(identity)],
+            invalidations: [],
+        });
     });
 
     test("fails closed when an active replay has lost its normalized table mapping", async () => {
@@ -236,7 +279,11 @@ describe("Cdb live subscription identity", () => {
 
         await expect(cdb.subscribe(request(identity))).rejects.toMatchObject({ code: "CDB_INVARIANT" });
         await reconstruct();
-        expect(cdb.matchSubsForRow("messages", [{ indexName: "by_org", key: ["org-1"] }])).toEqual([]);
+        expect(durableLiveState(db)).toEqual({
+            registrations: [durableRegistration(identity, "retired")],
+            tables: [],
+            invalidations: [],
+        });
     });
 
     test("a retired active registration stays absent after reconstruction", async () => {
@@ -248,12 +295,11 @@ describe("Cdb live subscription identity", () => {
 
         await reconstruct();
 
-        expect(cdb.matchSubsForRow("messages", [{ indexName: "by_org", key: ["org-1"] }])).toEqual([active]);
-        expect(
-            db
-                .prepare("SELECT state FROM _chardb_live_subscriptions WHERE registration_id = ?")
-                .get("registration-retired")
-        ).toEqual({ state: "retired" });
+        expect(durableLiveState(db)).toEqual({
+            registrations: [durableRegistration(active, "active"), durableRegistration(retired, "retired")],
+            tables: [durableTable(active)],
+            invalidations: [],
+        });
     });
 
     test("rejects a conflicting unregister identity without retiring the active row", async () => {

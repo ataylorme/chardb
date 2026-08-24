@@ -222,15 +222,6 @@ export class Cdb extends ProductionCdb {
         );
     }
 
-    fixtureMatchOrganization(): CdbLiveState["subscriptions"] {
-        const matched = this.matchSubsForRow("gateway_writes", [
-            { indexName: "organization_id", key: ["workerd-org"] },
-        ]);
-        const state = this.fixtureLiveState();
-        const registrationIds = new Set(matched.map(subscription => subscription.registrationId));
-        return state.subscriptions.filter(subscription => registrationIds.has(subscription.registrationId));
-    }
-
     fixtureLiveState(): CdbLiveState {
         const sql = adaptSqlStorage(this.ctx.storage.sql);
         return {
@@ -278,7 +269,6 @@ interface GatewayFixtureRpc {
 }
 
 interface CdbFixtureRpc {
-    fixtureMatchOrganization(): Promise<CdbLiveState["subscriptions"]>;
     fixtureLiveState(): Promise<CdbLiveState>;
     fixtureSeedPublicRows(): Promise<void>;
 }
@@ -370,14 +360,11 @@ export default {
             }
             return Response.json(await gateway.fixtureLiveState());
         }
-        if (url.pathname === "/live-cdb-state" || url.pathname === "/live-cdb-match") {
+        if (url.pathname === "/live-cdb-state") {
             const shardId = url.searchParams.get("shardId");
             if (!shardId) return new Response("missing shardId", { status: 400 });
             const id = env.CDB_SHARD.idFromName(shardId);
             const cdb = env.CDB_SHARD.get(id) as unknown as CdbFixtureRpc;
-            if (url.pathname === "/live-cdb-match") {
-                return Response.json(await cdb.fixtureMatchOrganization());
-            }
             return Response.json(await cdb.fixtureLiveState());
         }
         return baseWorker.fetch(request, env);
