@@ -102,6 +102,12 @@ function captureCdbError(run: () => unknown): CdbError {
     return caught as CdbError;
 }
 
+function sentMutations(ws: FakeWS): Extract<Up, { t: "mut" }>[] {
+    return ws.sent
+        .map(raw => JSON.parse(raw) as Up)
+        .filter((message): message is Extract<Up, { t: "mut" }> => message.t === "mut");
+}
+
 function spyOnClearTimeout(): { readonly calls: unknown[]; restore: () => void } {
     const original = globalThis.clearTimeout;
     const calls: unknown[] = [];
@@ -1103,6 +1109,200 @@ describe("createChardbClient — wire round-trip", () => {
 
         expect(c.state).toBe("closed");
         expect(subscriptionNotifications).toBe(1);
+    });
+
+    test("rejects an invalid mutation ref before allocating pending capacity", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 1_000 });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await expect(c.mutate("invalid-ref", {})).rejects.toBeInstanceOf(TypeError);
+            expect(timers.scheduledDelays()).toHaveLength(0);
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+
+            const admitted = c.mutate("mutations.ts#after-invalid-ref", {}).catch(error => error);
+            expect(timers.scheduledDelays()).toHaveLength(1);
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+            c.close();
+            await expect(admitted).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
+        } finally {
+            timers.restore();
+            c.close();
+        }
+    });
+
+    test("caps 32 mutations queued before welcome and refills after success and typed failure", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 1_000 });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            const queued = Array.from({ length: 32 }, (_, index) =>
+                c.mutate("mutations.ts#queued", { index }).catch(error => error)
+            );
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+            expect(timers.scheduledDelays()).toHaveLength(32);
+
+            await expect(c.mutate("invalid-ref-at-cap", {})).rejects.toBeInstanceOf(TypeError);
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+            expect(timers.scheduledDelays()).toHaveLength(32);
+            await expect(c.mutate("mutations.ts#limited", {})).rejects.toMatchObject({
+                code: "CDB_RATE_LIMITED",
+                retryable: true,
+            });
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+            expect(timers.scheduledDelays()).toHaveLength(32);
+
+            await welcome(ws);
+            expect(sentMutations(ws)).toHaveLength(32);
+            const first = sentMutations(ws)[0];
+            if (!first) throw new Error("expected first queued mutation");
+            ws.emit({
+                t: "poke",
+                cookie: Cookie("c-test:mutation-success"),
+                patches: [],
+                mutResults: [
+                    {
+                        mutId: first.mutId,
+                        ok: true,
+                        result: { settled: true },
+                        cookie: Cookie("c-test:mutation-success"),
+                    },
+                ],
+            });
+            await expect(queued[0]).resolves.toEqual({ settled: true });
+            const afterSuccess = c.mutate("mutations.ts#after-success", {}).catch(error => error);
+            expect(sentMutations(ws)).toHaveLength(33);
+            expect(timers.scheduledDelays()).toHaveLength(32);
+
+            const second = sentMutations(ws)[1];
+            if (!second) throw new Error("expected second queued mutation");
+            ws.emit({
+                t: "poke",
+                cookie: Cookie("c-test:mutation-failure"),
+                patches: [],
+                mutResults: [
+                    {
+                        mutId: second.mutId,
+                        ok: false,
+                        error: {
+                            code: "CDB_CROSS_PARTITION",
+                            retryable: false,
+                            docs: "https://chardb.dev/errors/cdb_cross_partition",
+                        },
+                    },
+                ],
+            });
+            await expect(queued[1]).resolves.toMatchObject({ code: "CDB_CROSS_PARTITION" });
+            const afterFailure = c.mutate("mutations.ts#after-failure", {}).catch(error => error);
+            expect(sentMutations(ws)).toHaveLength(34);
+            expect(timers.scheduledDelays()).toHaveLength(32);
+
+            c.close();
+            await Promise.all([...queued, afterSuccess, afterFailure]);
+            await expect(c.mutate("mutations.ts#after-close-cap", {})).rejects.toMatchObject({
+                code: "CDB_STREAM_ABORTED",
+            });
+        } finally {
+            timers.restore();
+            c.close();
+        }
+    });
+
+    test("refills capacity after synchronous send failure and timeout", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 1_000 });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const pending = Array.from({ length: 31 }, (_, index) =>
+                c.mutate("mutations.ts#held", { index }).catch(error => error)
+            );
+            expect(timers.scheduledDelays()).toHaveLength(31);
+
+            ws.failNextSend = true;
+            await expect(c.mutate("mutations.ts#send-failure-cap", {})).rejects.toMatchObject({
+                code: "CDB_STREAM_ABORTED",
+            });
+            expect(timers.scheduledDelays()).toHaveLength(31);
+            const admitted = c.mutate("mutations.ts#after-send-failure-cap", {}).catch(error => error);
+            expect(timers.scheduledDelays()).toHaveLength(32);
+            expect(sentMutations(ws)).toHaveLength(32);
+            await expect(c.mutate("mutations.ts#limited-before-timeout", {})).rejects.toMatchObject({
+                code: "CDB_RATE_LIMITED",
+            });
+
+            timers.runDelay(1_000);
+            await expect(pending[0]).resolves.toMatchObject({ code: "CDB_MUTATION_OUTCOME_UNKNOWN" });
+            expect(timers.scheduledDelays()).toHaveLength(31);
+            const afterTimeout = c.mutate("mutations.ts#after-timeout-cap", {}).catch(error => error);
+            expect(timers.scheduledDelays()).toHaveLength(32);
+            expect(sentMutations(ws)).toHaveLength(33);
+
+            c.close();
+            await Promise.all([...pending, admitted, afterTimeout]);
+        } finally {
+            timers.restore();
+            c.close();
+        }
+    });
+
+    test("reconnect resends the same 32 pending mutations without consuming extra capacity", async () => {
+        const timers = installManualTimers();
+        const c = client({ mutationTimeoutMs: 5_000 });
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+            const pending = Array.from({ length: 32 }, (_, index) =>
+                c.mutate("mutations.ts#reconnect-cap", { index }).catch(error => error)
+            );
+            const original = sentMutations(first);
+            expect(original).toHaveLength(32);
+
+            first.close();
+            await flush();
+            timers.runDelay(250);
+            await flush();
+            const reconnected = fakeWebSocket(1);
+            await welcome(reconnected);
+            const resent = sentMutations(reconnected);
+            expect(resent).toEqual(original);
+            expect(timers.scheduledDelays()).toHaveLength(32);
+            await expect(c.mutate("mutations.ts#reconnect-limited", {})).rejects.toMatchObject({
+                code: "CDB_RATE_LIMITED",
+            });
+            expect(sentMutations(reconnected)).toHaveLength(32);
+
+            const settled = resent[0];
+            if (!settled) throw new Error("expected resent mutation");
+            reconnected.emit({
+                t: "poke",
+                cookie: Cookie("c-test:reconnect-cap-settle"),
+                patches: [],
+                mutResults: [
+                    {
+                        mutId: settled.mutId,
+                        ok: true,
+                        result: null,
+                        cookie: Cookie("c-test:reconnect-cap-settle"),
+                    },
+                ],
+            });
+            await expect(pending[0]).resolves.toBeNull();
+            const replacement = c.mutate("mutations.ts#reconnect-replacement", {}).catch(error => error);
+            expect(sentMutations(reconnected)).toHaveLength(33);
+            expect(sentMutations(reconnected).at(-1)?.mutId).not.toBe(settled.mutId);
+            expect(timers.scheduledDelays()).toHaveLength(32);
+
+            c.close();
+            await Promise.all([...pending, replacement]);
+        } finally {
+            timers.restore();
+            c.close();
+        }
     });
 
     test("mutate → server poke.mutResults ok=true resolves the promise with the result", async () => {

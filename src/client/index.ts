@@ -37,6 +37,7 @@ const MAX_OPTIMISTIC_PATCHES = 4_096;
 const MAX_OPTIMISTIC_PATCH_BYTES = 512 * 1_024;
 const MAX_PATCHES_PER_BATCH = 4_096;
 const MAX_PATCH_BATCH_BYTES = 512 * 1_024;
+const MAX_PENDING_MUTATIONS = 32;
 
 export interface ChardbClientOptions {
     readonly endpoint: string;
@@ -618,11 +619,25 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 })
             );
         }
+        let mutationRef: ChardbRef;
+        try {
+            mutationRef = ChardbRef(ref);
+        } catch (error) {
+            return Promise.reject(error);
+        }
+        if (pending.size >= MAX_PENDING_MUTATIONS) {
+            return Promise.reject(
+                new CdbError({
+                    code: "CDB_RATE_LIMITED",
+                    message: `cannot queue more than ${MAX_PENDING_MUTATIONS} unsettled mutations`,
+                })
+            );
+        }
         const mutId = MutId(uuidv7());
         return new Promise<TResult>((resolve, reject) => {
             const rec: PendingMutation = {
                 mutId,
-                ref: ChardbRef(ref),
+                ref: mutationRef,
                 args,
                 resolve: resolve as (r: RawJson) => void,
                 reject,
