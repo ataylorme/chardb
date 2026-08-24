@@ -2,8 +2,14 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { CdbError } from "../../src/errors.ts";
 import { Gateway, type GatewayEnv, type VerifiedGwAttachment } from "../../src/server/do/gateway.ts";
+import {
+    CDB_JSON_MAX_AGGREGATE_MEMBERS,
+    CDB_MUTATION_ARGS_MAX_BYTES,
+    CDB_MUTATION_ARGS_MAX_DEPTH,
+} from "../../src/server/result_limits.ts";
 import type { CdbMutationResponse } from "../../src/server/rpc.ts";
 import { ClientId, Cookie, PrincipalId } from "../../src/types.ts";
+import type { RawJson } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -69,11 +75,17 @@ function attachment(connectionId: string, cookie = `cookie-${connectionId}`): Ve
     };
 }
 
-function mutation(gateway: Gateway, socket: FakeSocket, mutId: string): Promise<void> {
+function mutation(gateway: Gateway, socket: FakeSocket, mutId: string, args: RawJson = {}): Promise<void> {
     return gateway.webSocketMessage(
         socket as unknown as WebSocket,
-        JSON.stringify({ t: "mut", mutId, ref: "mutations.ts#write", args: {} })
+        JSON.stringify({ t: "mut", mutId, ref: "mutations.ts#write", args })
     );
+}
+
+function nestedArray(depth: number): RawJson {
+    let value: RawJson = null;
+    for (let level = 0; level < depth; level++) value = [value];
+    return value;
 }
 
 describe("Gateway unsettled mutation admission", () => {
@@ -242,5 +254,89 @@ describe("Gateway unsettled mutation admission", () => {
         await mutation(gateway, socket, "send-failed");
         expect(internals.unsettledMutationCount).toBe(0);
         expect(internals.unsettledMutationsByConnection.size).toBe(0);
+    });
+
+    test("caps exact serialized mutation argument bytes before auth waiting or reservation", async () => {
+        expect(CDB_MUTATION_ARGS_MAX_BYTES).toBe(524_288);
+        const internals = gateway as unknown as GatewayInternals;
+        const socket = new FakeSocket(attachment("connection-1", "cookie-base"));
+        let dispatches = 0;
+        internals.settleMut = async () => {
+            dispatches += 1;
+        };
+
+        const exactBoundary = "a".repeat(CDB_MUTATION_ARGS_MAX_BYTES - 2);
+        await mutation(gateway, socket, "exact-boundary", exactBoundary);
+        expect(dispatches).toBe(1);
+        expect(internals.unsettledMutationCount).toBe(0);
+
+        internals.authRefreshBarriers.set("connection-1", new Promise(() => {}));
+        socket.attachment = { ...socket.attachment, lastCookie: Cookie("cookie-latest") };
+        await mutation(gateway, socket, "one-over", `${exactBoundary}a`);
+        expect(dispatches).toBe(1);
+        expect(internals.unsettledMutationCount).toBe(0);
+        expect(internals.unsettledMutationsByConnection.size).toBe(0);
+        expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
+            t: "poke",
+            cookie: "cookie-latest",
+            mutResults: [{ mutId: "one-over", ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } }],
+        });
+
+        const multibyteBoundary = "é".repeat((CDB_MUTATION_ARGS_MAX_BYTES - 2) / 2);
+        await mutation(gateway, socket, "multibyte-over", `${multibyteBoundary}a`);
+        expect(dispatches).toBe(1);
+        expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
+            t: "poke",
+            cookie: "cookie-latest",
+            mutResults: [{ mutId: "multibyte-over", ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } }],
+        });
+
+        internals.authRefreshBarriers.delete("connection-1");
+        await mutation(gateway, socket, "after-overflow", { organizationId: "org-1" });
+        expect(dispatches).toBe(2);
+        expect(internals.unsettledMutationCount).toBe(0);
+        expect(internals.unsettledMutationsByConnection.size).toBe(0);
+    });
+
+    test("caps aggregate mutation argument members and nesting before auth waiting or reservation", async () => {
+        const internals = gateway as unknown as GatewayInternals;
+        const socket = new FakeSocket(attachment("connection-1", "cookie-structure"));
+        let dispatches = 0;
+        internals.settleMut = async () => {
+            dispatches += 1;
+        };
+
+        await mutation(
+            gateway,
+            socket,
+            "member-boundary",
+            Array.from({ length: CDB_JSON_MAX_AGGREGATE_MEMBERS }, () => null)
+        );
+        await mutation(gateway, socket, "depth-boundary", nestedArray(CDB_MUTATION_ARGS_MAX_DEPTH));
+        expect(dispatches).toBe(2);
+
+        internals.authRefreshBarriers.set("connection-1", new Promise(() => {}));
+        await mutation(
+            gateway,
+            socket,
+            "member-over",
+            Array.from({ length: CDB_JSON_MAX_AGGREGATE_MEMBERS + 1 }, () => null)
+        );
+        expect(dispatches).toBe(2);
+        expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
+            t: "poke",
+            cookie: "cookie-structure",
+            mutResults: [{ mutId: "member-over", ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } }],
+        });
+
+        await mutation(gateway, socket, "depth-over", nestedArray(CDB_MUTATION_ARGS_MAX_DEPTH + 1));
+        expect(dispatches).toBe(2);
+        expect(internals.unsettledMutationCount).toBe(0);
+        expect(internals.unsettledMutationsByConnection.size).toBe(0);
+        expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
+            t: "error",
+            code: "CDB_UNSUPPORTED_FEATURE",
+            retryable: false,
+        });
     });
 });

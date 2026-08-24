@@ -33,7 +33,11 @@ import { cdbPolicyDigest } from "../cdb-policy.ts";
 import { collectCdbTables } from "../cdb-table-registry.ts";
 import { resolveCdbMeta } from "../cdb-table.ts";
 import { type ChardbManifest, emptyManifest, resolveMutation, resolveQuery, routeValidatedQuery } from "../manifest.ts";
-import { CDB_QUERY_RESULT_MAX_ROWS, assertCdbResultByteLimit } from "../result_limits.ts";
+import {
+    CDB_QUERY_RESULT_MAX_ROWS,
+    assertCdbMutationArgsByteLimit,
+    assertCdbResultByteLimit,
+} from "../result_limits.ts";
 import type {
     CdbMutationRequest,
     CdbMutationResponse,
@@ -964,6 +968,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     async mutate(request: CdbMutationRequest): Promise<CdbMutationResponse> {
         let response: CdbMutationResponse;
         try {
+            assertCdbMutationArgsByteLimit(request.args);
             const descriptor = resolveMutation(this.mutationManifest(), request.ref as ChardbRef);
             try {
                 await this.ctx.storage.setAlarm(this.invalidationNowMs() + 1);

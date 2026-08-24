@@ -55,6 +55,7 @@ import {
     routeMutation as resolveMutationRoute,
     routeQuery as resolveQueryRoute,
 } from "../manifest.ts";
+import { assertCdbMutationArgsByteLimit } from "../result_limits.ts";
 import type {
     CatalogMutationRpc,
     CatalogOrganizationAuthorityRpc,
@@ -2219,6 +2220,14 @@ export async function dispatchTrustedMutation(
     deps: TrustedMutationDispatchDeps,
     request: TrustedMutationDispatchRequest
 ): Promise<CdbMutationResponse> {
+    try {
+        assertCdbMutationArgsByteLimit(request.args);
+    } catch (error) {
+        return mutationFailure(
+            error instanceof CdbError ? error.code : "CDB_INVARIANT",
+            error instanceof Error ? error.message : "mutation argument sizing failed"
+        );
+    }
     let routed: MutationRouteResponse;
     try {
         routed = deps.routeMutation({ ref: request.ref, args: request.args });
@@ -2226,6 +2235,14 @@ export async function dispatchTrustedMutation(
         return mutationFailure("CDB_INVARIANT", "local mutation routing failed");
     }
     if (!routed.ok) return routed;
+    try {
+        assertCdbMutationArgsByteLimit(routed.args);
+    } catch (error) {
+        return mutationFailure(
+            error instanceof CdbError ? error.code : "CDB_INVARIANT",
+            error instanceof Error ? error.message : "routed mutation argument sizing failed"
+        );
+    }
     if (routed.authority !== "organization") {
         return mutationFailure("CDB_AUTH_NOT_BOUND", "mutation has no declared organization authority");
     }
@@ -4040,6 +4057,16 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const attachment = ws.deserializeAttachment() as GwAttachment | null;
         if (!isVerifiedAttachment(attachment) || !isCurrentVerifiedAttachment(attachment)) {
             await this.admitMutation(ws, msg);
+            return;
+        }
+        try {
+            assertCdbMutationArgsByteLimit(msg.args);
+        } catch (error) {
+            const failure =
+                error instanceof CdbError
+                    ? error
+                    : new CdbError({ code: "CDB_INVARIANT", message: "mutation argument sizing failed" });
+            this.sendMutFailure(ws, msg.mutId, failure.toJSON(), attachment.lastCookie);
             return;
         }
         if (!this.reserveMutation(attachment.connectionId)) {

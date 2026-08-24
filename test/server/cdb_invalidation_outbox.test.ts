@@ -6,6 +6,7 @@ import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { globalScope } from "../../src/server/index.ts";
 import { manifestFromExports } from "../../src/server/manifest.ts";
+import { CDB_JSON_MAX_AGGREGATE_MEMBERS, CDB_MUTATION_ARGS_MAX_DEPTH } from "../../src/server/result_limits.ts";
 import type {
     CdbMutationRequest,
     CdbSubscriptionRequest,
@@ -13,7 +14,7 @@ import type {
     GatewayInvalidationResponse,
     LiveSubscriptionId,
 } from "../../src/server/rpc.ts";
-import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
+import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -90,7 +91,17 @@ const failAfterWrite = api.mutation({
     },
 });
 
-const manifest = manifestFromExports({ putMessage, putBoth, inspectMessages, failAfterWrite });
+let hostileHandlerRuns = 0;
+const acceptHostileArgs = api.mutation({
+    args: z.any(),
+    handler: function acceptHostileArgsHandler(ctx) {
+        hostileHandlerRuns += 1;
+        ctx.db.insert(messages).values({ id: "hostile-args", value: 1 }).run();
+        return null;
+    },
+});
+
+const manifest = manifestFromExports({ putMessage, putBoth, inspectMessages, failAfterWrite, acceptHostileArgs });
 const ConfiguredCdb = configureCdbRuntime({ schema: () => schema, manifest: () => manifest });
 const AUTH = {
     userId: "user-1",
@@ -134,6 +145,12 @@ function mutation(
         auth: AUTH,
         schemaEpoch: 1,
     };
+}
+
+function nestedArray(depth: number): RawJson {
+    let value: RawJson = null;
+    for (let level = 0; level < depth; level++) value = [value];
+    return value;
 }
 
 function changeSeq(db: Database): number {
@@ -227,6 +244,78 @@ describe("Cdb invalidation outbox", () => {
         await ready;
         return { db, cdb, clock, alarms, gateway, alarm };
     }
+
+    test("rejects hostile mutation args before descriptor lookup, alarm, handler, or transaction", async () => {
+        const { db, cdb, alarms } = await setup();
+        hostileHandlerRuns = 0;
+        const overMembers = await cdb.mutate(
+            mutation(
+                acceptHostileArgs,
+                "hostile-members",
+                Array.from({ length: CDB_JSON_MAX_AGGREGATE_MEMBERS + 1 }, () => null)
+            )
+        );
+        expect(overMembers).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } });
+
+        const overDepth = await cdb.mutate({
+            principalId: "user-1",
+            mutId: "hostile-depth",
+            ref: "missing.ts#descriptor",
+            args: nestedArray(CDB_MUTATION_ARGS_MAX_DEPTH + 1),
+            auth: AUTH,
+            schemaEpoch: 1,
+        });
+        expect(overDepth).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } });
+        expect(alarms).toEqual([]);
+        expect(hostileHandlerRuns).toBe(0);
+        expect(db.prepare("SELECT * FROM outbox_messages").all()).toEqual([]);
+        expect(db.prepare("SELECT * FROM _chardb_op_log").all()).toEqual([]);
+    });
+
+    test("rejects non-JSON direct mutation args without invoking accessors or side effects", async () => {
+        const { db, cdb, alarms } = await setup();
+        hostileHandlerRuns = 0;
+        let getterRuns = 0;
+        const accessor = Object.defineProperty({}, "value", {
+            enumerable: true,
+            get() {
+                getterRuns += 1;
+                return "must-not-run";
+            },
+        });
+        const sparse = new Array<RawJson>(1);
+        const extraArray = [null] as RawJson[] & { extra?: RawJson };
+        extraArray.extra = null;
+        const symbolObject = { value: null } as Record<PropertyKey, unknown>;
+        symbolObject[Symbol("hostile")] = null;
+        class HostileClass {
+            readonly value = null;
+        }
+        const hostileArgs = [
+            Number.NaN,
+            Number.POSITIVE_INFINITY,
+            -0,
+            new Date(0),
+            new HostileClass(),
+            sparse,
+            extraArray,
+            symbolObject,
+            accessor,
+        ];
+
+        for (let index = 0; index < hostileArgs.length; index++) {
+            const response = await cdb.mutate(
+                mutation(acceptHostileArgs, `hostile-json-${index}`, hostileArgs[index] as unknown as RawJson)
+            );
+            expect(response).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } });
+        }
+
+        expect(getterRuns).toBe(0);
+        expect(alarms).toEqual([]);
+        expect(hostileHandlerRuns).toBe(0);
+        expect(db.prepare("SELECT * FROM outbox_messages").all()).toEqual([]);
+        expect(db.prepare("SELECT * FROM _chardb_op_log").all()).toEqual([]);
+    });
 
     test("advances once per committed write set and coalesces matching registrations", async () => {
         const { db, cdb } = await setup();

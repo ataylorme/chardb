@@ -11,8 +11,18 @@ import {
     projectOrganizationMutationAuth,
 } from "../../src/server/do/gateway.ts";
 import { manifestFromExports, routeMutation } from "../../src/server/manifest.ts";
+import { CDB_JSON_MAX_AGGREGATE_MEMBERS, CDB_MUTATION_ARGS_MAX_DEPTH } from "../../src/server/result_limits.ts";
 import type { CdbMutationRequest, TrustedMutationDispatchRequest } from "../../src/server/rpc.ts";
-import { ChardbRef, ClientId, CorrelationId, PrincipalId, ShardId, SubId, TenantId } from "../../src/types.ts";
+import {
+    ChardbRef,
+    ClientId,
+    CorrelationId,
+    PrincipalId,
+    type RawJson,
+    ShardId,
+    SubId,
+    TenantId,
+} from "../../src/types.ts";
 import { vshardOf } from "../../src/vshard.ts";
 import { decodeWire, encodeWire } from "../../src/wire.ts";
 
@@ -77,6 +87,12 @@ function workingDeps(): TrustedMutationDispatchDeps {
             };
         },
     };
+}
+
+function nestedArray(depth: number): RawJson {
+    let value: RawJson = null;
+    for (let level = 0; level < depth; level++) value = [value];
+    return value;
 }
 
 describe("trusted Gateway mutation dispatch", () => {
@@ -195,6 +211,43 @@ describe("trusted Gateway mutation dispatch", () => {
         });
         expect(invalid).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS" } });
         expect({ authorityCalls, routeCalls, cdbCalls }).toEqual({ authorityCalls: 1, routeCalls: 1, cdbCalls: 1 });
+    });
+
+    test("rejects hostile argument structure before local routing or any RPC", async () => {
+        let localRoutes = 0;
+        let catalogCalls = 0;
+        let cdbCalls = 0;
+        const deps: TrustedMutationDispatchDeps = {
+            routeMutation: () => {
+                localRoutes += 1;
+                return { ok: false, error: new CdbError({ code: "CDB_INVALID_ARGS", message: "unused" }).toJSON() };
+            },
+            catalog: {
+                async resolveOrganizationAuthority() {
+                    catalogCalls += 1;
+                    return authority;
+                },
+                async route() {
+                    catalogCalls += 1;
+                    return { shardId: ShardId("unused"), schemaEpoch: 1 };
+                },
+            },
+            cdb: () => {
+                cdbCalls += 1;
+                throw new Error("Cdb must not be selected");
+            },
+        };
+
+        for (const args of [
+            Array.from({ length: CDB_JSON_MAX_AGGREGATE_MEMBERS + 1 }, () => null),
+            nestedArray(CDB_MUTATION_ARGS_MAX_DEPTH + 1),
+        ] satisfies RawJson[]) {
+            await expect(dispatchTrustedMutation(deps, { ...request, args })).resolves.toMatchObject({
+                ok: false,
+                error: { code: "CDB_INVALID_ARGS", retryable: false },
+            });
+        }
+        expect({ localRoutes, catalogCalls, cdbCalls }).toEqual({ localRoutes: 0, catalogCalls: 0, cdbCalls: 0 });
     });
 
     test("preserves a typed local routing rejection", async () => {
