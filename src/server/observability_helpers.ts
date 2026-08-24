@@ -45,9 +45,20 @@ export function decorateResponse(
     headers.set("Server-Timing", `cdb;dur=${dt};desc="chardb total"`);
     headers.set("Cf-Chardb-Server-Version", serverVersion);
     headers.set("cf-chardb-correlation-id", correlationId);
-    return new Response(response.body, {
+    const webSocket = (response as Response & { readonly webSocket?: WebSocket }).webSocket;
+    const decorated = new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
         headers,
-    });
+        ...(webSocket === undefined ? {} : { webSocket }),
+    } as ResponseInit);
+    // Bun's standard Response ignores Cloudflare's WebSocket extension.
+    // Keep the pure helper testable without changing workerd behavior.
+    if (
+        webSocket !== undefined &&
+        (decorated as Response & { readonly webSocket?: WebSocket }).webSocket !== webSocket
+    ) {
+        Object.defineProperty(decorated, "webSocket", { value: webSocket });
+    }
+    return decorated;
 }

@@ -104,4 +104,14 @@ describe("decorateResponse", () => {
         // change that wants to merge user timings has to be deliberate.
         expect(decorated.headers.get("Server-Timing")).toBe('cdb;dur=7;desc="chardb total"');
     });
+
+    test("preserves the Cloudflare WebSocket upgrade extension", () => {
+        const webSocket = {} as WebSocket;
+        const inner = new Response(null);
+        Object.defineProperty(inner, "webSocket", { value: webSocket });
+
+        const decorated = decorateResponse(inner, 0, "co-ws", "0.1.0", 1);
+
+        expect((decorated as Response & { readonly webSocket?: WebSocket }).webSocket).toBe(webSocket);
+    });
 });
