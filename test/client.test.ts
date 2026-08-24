@@ -14,7 +14,7 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import { type ChardbClientOptions, createChardbClient } from "../src/client/index.ts";
 import { CdbError } from "../src/errors.ts";
-import { ChardbRef, ClientId, Cookie, SubId } from "../src/types.ts";
+import { ChardbRef, ClientId, Cookie, type RawJson, SubId } from "../src/types.ts";
 import { type Down, PROTOCOL_V, type Up, encodeWire } from "../src/wire.ts";
 
 class FakeWS {
@@ -596,7 +596,180 @@ describe("createChardbClient — wire round-trip", () => {
         c.close();
     });
 
-    test("a duplicate snapshot does not notify or regress the connection cookie", async () => {
+    test("accepts 4096 snapshot rows and terminates before storing one over", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: RawJson[][] = [];
+        c.subscribe("queries.ts#bounded-snapshot", {}, rows => seen.push([...rows]));
+        const boundaryRows = Array.from({ length: 4_096 }, (_, index) => ({ id: index }));
+        ws.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-test:rows-boundary"), rows: boundaryRows });
+        await flush();
+        expect(c.state).toBe("open");
+        expect(seen.at(-1)).toHaveLength(4_096);
+
+        const pendingMutation = c.mutate("mutations.ts#pending-at-row-overflow", {}).catch(error => error);
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-test:rows-over"),
+            rows: [...boundaryRows, { id: 4_096 }],
+        });
+        await flush();
+        expect(c.state).toBe("closed");
+        expect(ws.readyState).toBe(FakeWS.CLOSED);
+        expect(seen.at(-1)).toHaveLength(4_096);
+        expect(ws.sent.map(raw => JSON.parse(raw) as Up)).not.toContainEqual({
+            t: "ack",
+            cookie: Cookie("c-test:rows-over"),
+        });
+        await expect(pendingMutation).resolves.toMatchObject({ code: "CDB_INVARIANT" });
+    });
+
+    test("accepts an exact 512 KiB snapshot and terminates on one serialized byte over", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: RawJson[][] = [];
+        c.subscribe("queries.ts#bounded-snapshot-bytes", {}, rows => seen.push([...rows]));
+        const exact = "x".repeat(512 * 1_024 - 4);
+        ws.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-test:bytes-boundary"), rows: [exact] });
+        await flush();
+        expect(c.state).toBe("open");
+        expect(seen.at(-1)).toEqual([exact]);
+
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-test:bytes-over"),
+            rows: [`${exact}x`],
+        });
+        await flush();
+        expect(c.state).toBe("closed");
+        expect(seen.at(-1)).toEqual([exact]);
+    });
+
+    test("applies patch batches atomically and terminates before a 4097th cached row", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: RawJson[][] = [];
+        c.subscribe("queries.ts#bounded-patches", {}, rows => seen.push([...rows]));
+        ws.emit({
+            t: "poke",
+            cookie: Cookie("c-test:patch-boundary"),
+            patches: Array.from({ length: 4_096 }, (_, index) => ({
+                op: "put" as const,
+                subId: SubId(1),
+                rowKey: `row-${index}`,
+                row: { value: index },
+            })),
+        });
+        await flush();
+        expect(c.state).toBe("open");
+        expect(seen).toHaveLength(1);
+        expect(seen[0]).toHaveLength(4_096);
+
+        const pendingMutation = c.mutate("mutations.ts#pending-at-patch-overflow", {}).catch(error => error);
+        ws.emit({
+            t: "poke",
+            cookie: Cookie("c-test:patch-over"),
+            patches: [
+                { op: "put", subId: SubId(1), rowKey: "row-0", row: { value: "must-not-apply" } },
+                { op: "put", subId: SubId(1), rowKey: "row-over", row: { value: "must-not-apply" } },
+            ],
+        });
+        await flush();
+        expect(c.state).toBe("closed");
+        expect(seen.at(-1)).toHaveLength(4_096);
+        expect((seen.at(-1)?.[0] as { value?: unknown }).value).toBe(0);
+        expect(seen.at(-1)?.some(row => (row as { __key?: string }).__key === "row-over")).toBe(false);
+        await expect(pendingMutation).resolves.toMatchObject({ code: "CDB_INVARIANT" });
+    });
+
+    test("rejects a whole canonical batch of 4097 repeated same-row updates", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const seen: RawJson[][] = [];
+        c.subscribe("queries.ts#bounded-batch", {}, rows => seen.push([...rows]));
+        ws.emit({
+            t: "poke",
+            cookie: Cookie("c-test:batch-count-over"),
+            patches: Array.from({ length: 4_097 }, (_, index) => ({
+                op: "put" as const,
+                subId: SubId(1),
+                rowKey: "same-row",
+                row: { value: index },
+            })),
+        });
+        await flush();
+        expect(c.state).toBe("closed");
+        expect(seen.at(-1)).toEqual([]);
+    });
+
+    test("validates oversized and malformed patches even when their subscription is unknown", async () => {
+        const oversized = client();
+        await flush();
+        const oversizedSocket = fakeWebSocket();
+        await welcome(oversizedSocket);
+        oversizedSocket.emit({
+            t: "poke",
+            cookie: Cookie("c-test:unknown-byte-over"),
+            patches: [
+                {
+                    op: "put",
+                    subId: SubId(999),
+                    rowKey: "x".repeat(512 * 1_024),
+                    row: { value: true },
+                },
+            ],
+        });
+        await flush();
+        expect(oversized.state).toBe("closed");
+
+        const malformed = client();
+        await flush();
+        const malformedSocket = fakeWebSocket(1);
+        await welcome(malformedSocket);
+        malformedSocket.emit({
+            t: "poke",
+            cookie: Cookie("c-test:unknown-malformed"),
+            patches: [{ op: "put", subId: SubId(999), rowKey: "unknown", row: "not-an-object" }],
+        });
+        await flush();
+        expect(malformed.state).toBe("closed");
+    });
+
+    test("commits every affected subscription before notifying a throwing listener", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        c.subscribe("queries.ts#first-patched", {}, rows => {
+            if (rows.length > 0) throw new Error("first listener failed");
+        });
+        const secondSeen: RawJson[][] = [];
+        c.subscribe("queries.ts#second-patched", {}, rows => secondSeen.push([...rows]));
+
+        ws.emit({
+            t: "poke",
+            cookie: Cookie("c-test:multi-sub"),
+            patches: [
+                { op: "put", subId: SubId(1), rowKey: "first", row: { value: 1 } },
+                { op: "put", subId: SubId(2), rowKey: "second", row: { value: 2 } },
+            ],
+        });
+        await flush();
+        expect(c.state).toBe("closed");
+        expect(secondSeen).toEqual([[{ value: 2, __key: "second" }]]);
+    });
+
+    test("a duplicate snapshot is re-acknowledged before sizing and does not regress the connection cookie", async () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
@@ -618,9 +791,20 @@ describe("createChardbClient — wire round-trip", () => {
             cookie: Cookie("c-1:1"),
             rows: [{ id: "duplicate-must-not-apply" }],
         });
+        ws.emit({
+            t: "snapshot",
+            subId: SubId(1),
+            cookie: Cookie("c-1:1"),
+            rows: Array.from({ length: 4_097 }, (_, index) => ({ id: `oversized-duplicate-${index}` })),
+        });
         await flush();
 
         expect(seen).toEqual([[{ id: "first" }]]);
+        expect(
+            ws.sent
+                .map(raw => JSON.parse(raw) as Up)
+                .filter(message => message.t === "ack" && message.cookie === Cookie("c-1:1"))
+        ).toHaveLength(3);
         ws.close();
         await new Promise(resolve => setTimeout(resolve, 350));
         const reconnected = fakeWebSocket(1);
@@ -712,6 +896,112 @@ describe("createChardbClient — wire round-trip", () => {
                     .map(message => message.cookie)
             ).toEqual([Cookie("c-1:1"), Cookie("c-1:1"), Cookie("c-1:1"), Cookie("c-1:2")]);
             c.close();
+        } finally {
+            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
+            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
+        }
+    });
+
+    test("bounds cross-tab optimistic patch history without partial row application", async () => {
+        class BoundedBroadcastChannel {
+            static instance: BoundedBroadcastChannel | undefined;
+            onmessage: ((event: { data: unknown }) => void) | null = null;
+            closeCalls = 0;
+
+            constructor(_name: string) {
+                BoundedBroadcastChannel.instance = this;
+            }
+
+            postMessage(): void {}
+            close(): void {
+                this.closeCalls += 1;
+            }
+            emit(data: unknown): void {
+                this.onmessage?.({ data });
+            }
+        }
+
+        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = BoundedBroadcastChannel;
+        try {
+            const c = createChardbClient({
+                endpoint: "wss://example.com/ws",
+                getJwt: async () => "jwt-stub",
+                clientId: "c-optimistic-bound",
+                logicalDb: "optimistic-bound",
+            });
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const seen: RawJson[][] = [];
+            c.subscribe("queries.ts#bounded-optimistic", {}, rows => seen.push([...rows]));
+            BoundedBroadcastChannel.instance?.emit({
+                kind: "optimistic",
+                patches: Array.from({ length: 4_096 }, (_, index) => ({
+                    op: "put",
+                    subId: 1,
+                    rowKey: "same-row",
+                    row: { value: index },
+                })),
+            });
+            expect(c.state).toBe("open");
+            expect(seen).toHaveLength(1);
+            expect(seen.at(-1)).toEqual([{ value: 4_095, __key: "same-row" }]);
+
+            BoundedBroadcastChannel.instance?.emit({
+                kind: "optimistic",
+                patches: [{ op: "put", subId: 1, rowKey: "same-row", row: { value: "must-not-apply" } }],
+            });
+            expect(c.state).toBe("closed");
+            expect(ws.readyState).toBe(FakeWS.CLOSED);
+            expect(seen.at(-1)).toEqual([{ value: 4_095, __key: "same-row" }]);
+            expect(BoundedBroadcastChannel.instance?.closeCalls).toBe(1);
+        } finally {
+            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
+            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
+        }
+    });
+
+    test("preflights raw cross-tab patch batches before wire decoding or subscription lookup", async () => {
+        class RawBroadcastChannel {
+            static instance: RawBroadcastChannel | undefined;
+            onmessage: ((event: { data: unknown }) => void) | null = null;
+            closeCalls = 0;
+
+            constructor(_name: string) {
+                RawBroadcastChannel.instance = this;
+            }
+
+            close(): void {
+                this.closeCalls += 1;
+            }
+            emit(data: unknown): void {
+                this.onmessage?.({ data });
+            }
+        }
+
+        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = RawBroadcastChannel;
+        try {
+            const c = createChardbClient({
+                endpoint: "wss://example.com/ws",
+                getJwt: async () => "jwt-stub",
+                clientId: "c-raw-cross-tab",
+                logicalDb: "raw-cross-tab",
+            });
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            RawBroadcastChannel.instance?.emit({
+                kind: "optimistic",
+                patches: Array.from({ length: 4_097 }, () => ({
+                    op: "put",
+                    subId: 999,
+                    rowKey: "same-unknown-row",
+                    row: { value: true },
+                })),
+            });
+            expect(c.state).toBe("closed");
+            expect(ws.readyState).toBe(FakeWS.CLOSED);
+            expect(RawBroadcastChannel.instance?.closeCalls).toBe(1);
         } finally {
             if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
             else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;

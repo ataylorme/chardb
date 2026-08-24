@@ -31,6 +31,12 @@ const RECONNECT_INITIAL_BACKOFF_MS = 250;
 const RECONNECT_MAX_BACKOFF_MS = 10_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_ACTIVE_SUBSCRIPTIONS = 64;
+const MAX_SUBSCRIPTION_ROWS = 4_096;
+const MAX_SUBSCRIPTION_BYTES = 512 * 1_024;
+const MAX_OPTIMISTIC_PATCHES = 4_096;
+const MAX_OPTIMISTIC_PATCH_BYTES = 512 * 1_024;
+const MAX_PATCHES_PER_BATCH = 4_096;
+const MAX_PATCH_BATCH_BYTES = 512 * 1_024;
 
 export interface ChardbClientOptions {
     readonly endpoint: string;
@@ -115,12 +121,24 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     const bc =
         enableCrossTab && opts.logicalDb ? new BroadcastChannel(`chardb:${opts.logicalDb}:${"todo-principal"}`) : null;
     if (bc) {
-        bc.onmessage = ev => onCrossTab(ev.data as { kind: string; mutId?: string; patches?: RowPatch[] });
+        bc.onmessage = ev => onCrossTab(ev.data);
     }
 
-    function onCrossTab(msg: { kind: string; mutId?: string; patches?: RowPatch[] }): void {
-        if (msg.kind === "optimistic" && msg.patches) applyPatches(msg.patches, true);
-        // canonical patches arrive via the server poke, deduped on cookie.
+    function onCrossTab(value: unknown): void {
+        try {
+            if (value === null || typeof value !== "object" || Array.isArray(value)) {
+                throw new TypeError("malformed Chardb cross-tab message");
+            }
+            const message = value as { readonly kind?: unknown; readonly patches?: unknown };
+            if (message.kind !== "optimistic") return;
+            assertPatchBatchLimits(message.patches);
+            const decoded = decodeWire(JSON.stringify({ t: "poke", cookie: "cross-tab", patches: message.patches }));
+            if (decoded.t !== "poke") throw new TypeError("malformed Chardb optimistic patch message");
+            applyPatches(decoded.patches, true);
+            // Canonical patches arrive via the server poke, deduped on cookie.
+        } catch {
+            failSession("CDB_INVARIANT", "received invalid cross-tab subscription state");
+        }
     }
 
     async function connect(): Promise<void> {
@@ -229,8 +247,8 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                 sendSessionState();
                 return;
             case "poke":
-                lastCookie = msg.cookie;
                 applyPatches(msg.patches, false);
+                lastCookie = msg.cookie;
                 if (msg.mutResults) {
                     for (const r of msg.mutResults) {
                         const m = takePendingMutation(r.mutId);
@@ -255,6 +273,7 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
                     acknowledgeSnapshot(msg.cookie);
                     return;
                 }
+                assertSubscriptionRows(msg.rows, "snapshot");
                 lastCookie = msg.cookie;
                 sub.rows = [...msg.rows];
                 sub.optimisticPatches = [];
@@ -300,22 +319,162 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     }
 
     function applyPatches(patches: readonly RowPatch[], optimistic: boolean): void {
+        assertPatchBatchLimits(patches);
+        for (const patch of patches) assertPatchRowShape(patch);
+        const planned = new Map<SubRecord, { rows: RawJson[]; optimisticPatches: RowPatch[] }>();
         for (const p of patches) {
             const sub = subs.get(p.subId);
             if (!sub) continue;
-            const idx = sub.rows.findIndex(r => (r as { __key?: string }).__key === p.rowKey);
-            if (p.op === "del") {
-                if (idx >= 0) sub.rows.splice(idx, 1);
-            } else if (p.row) {
-                const next = { ...(p.row as object), __key: p.rowKey } as RawJson;
-                if (idx >= 0) sub.rows[idx] = next;
-                else sub.rows.push(next);
+            let next = planned.get(sub);
+            if (!next) {
+                next = { rows: [...sub.rows], optimisticPatches: [...sub.optimisticPatches] };
+                planned.set(sub, next);
             }
-            if (optimistic) sub.optimisticPatches.push(p);
-            else sub.optimisticPatches = sub.optimisticPatches.filter(op => op.rowKey !== p.rowKey);
+            const idx = next.rows.findIndex(r => (r as { __key?: string }).__key === p.rowKey);
+            if (p.op === "del") {
+                if (idx >= 0) next.rows.splice(idx, 1);
+            } else {
+                const row = { ...(p.row as { readonly [key: string]: RawJson }), __key: p.rowKey } as RawJson;
+                if (idx >= 0) next.rows[idx] = row;
+                else next.rows.push(row);
+            }
+            if (optimistic) next.optimisticPatches.push(p);
+            else next.optimisticPatches = next.optimisticPatches.filter(op => op.rowKey !== p.rowKey);
+        }
+        for (const next of planned.values()) {
+            assertSubscriptionRows(next.rows, optimistic ? "optimistic patch result" : "patch result");
+            assertOptimisticPatchHistory(next.optimisticPatches);
+        }
+        for (const [sub, next] of planned) {
+            sub.rows = next.rows;
+            sub.optimisticPatches = next.optimisticPatches;
             sub.state = "live";
+        }
+        for (const sub of planned.keys()) {
             notify(sub);
         }
+    }
+
+    function assertPatchRowShape(patch: RowPatch): void {
+        if (patch.op === "del" && patch.row === undefined) return;
+        if (patch.row === null || typeof patch.row !== "object" || Array.isArray(patch.row)) {
+            throw new CdbError({ code: "CDB_INVARIANT", message: "row patch must contain an object row" });
+        }
+    }
+
+    function assertPatchBatchLimits(value: unknown): asserts value is readonly unknown[] {
+        if (!Array.isArray(value))
+            throw new CdbError({ code: "CDB_INVARIANT", message: "patch batch must be an array" });
+        if (value.length > MAX_PATCHES_PER_BATCH) {
+            throw new CdbError({ code: "CDB_INVARIANT", message: "patch batch exceeds the client count limit" });
+        }
+        assertSerializedSize(value, MAX_PATCH_BATCH_BYTES, "patch batch");
+    }
+
+    function assertSerializedSize(value: unknown, limit: number, subject: string): void {
+        let bytes = 0;
+        const ancestors = new WeakSet<object>();
+        const add = (amount: number): void => {
+            bytes += amount;
+            if (bytes > limit) {
+                throw new CdbError({ code: "CDB_INVARIANT", message: `${subject} exceeds the client byte limit` });
+            }
+        };
+        const addString = (text: string): void => {
+            add(2);
+            for (let index = 0; index < text.length; index++) {
+                const code = text.charCodeAt(index);
+                if (
+                    code === 34 ||
+                    code === 92 ||
+                    code === 8 ||
+                    code === 9 ||
+                    code === 10 ||
+                    code === 12 ||
+                    code === 13
+                ) {
+                    add(2);
+                } else if (code <= 31) {
+                    add(6);
+                } else if (code <= 127) {
+                    add(1);
+                } else if (code <= 2_047) {
+                    add(2);
+                } else if (code >= 55_296 && code <= 56_319) {
+                    const next = text.charCodeAt(index + 1);
+                    if (next >= 56_320 && next <= 57_343) {
+                        add(4);
+                        index++;
+                    } else {
+                        add(6);
+                    }
+                } else if (code >= 56_320 && code <= 57_343) {
+                    add(6);
+                } else {
+                    add(3);
+                }
+            }
+        };
+        const visit = (item: unknown): void => {
+            if (item === null) {
+                add(4);
+            } else if (typeof item === "string") {
+                addString(item);
+            } else if (typeof item === "number") {
+                if (!Number.isFinite(item)) throw new TypeError(`${subject} is not JSON-compatible`);
+                add(JSON.stringify(item).length);
+            } else if (typeof item === "boolean") {
+                add(item ? 4 : 5);
+            } else if (typeof item === "object") {
+                if (ancestors.has(item)) throw new TypeError(`${subject} is cyclic`);
+                ancestors.add(item);
+                if (Array.isArray(item)) {
+                    add(2);
+                    for (let index = 0; index < item.length; index++) {
+                        if (index > 0) add(1);
+                        visit(item[index]);
+                    }
+                } else {
+                    const prototype = Object.getPrototypeOf(item);
+                    if (prototype !== Object.prototype && prototype !== null) {
+                        throw new TypeError(`${subject} is not a plain JSON object`);
+                    }
+                    add(2);
+                    let first = true;
+                    for (const [key, child] of Object.entries(item)) {
+                        if (!first) add(1);
+                        first = false;
+                        addString(key);
+                        add(1);
+                        visit(child);
+                    }
+                }
+                ancestors.delete(item);
+            } else {
+                throw new TypeError(`${subject} is not JSON-compatible`);
+            }
+        };
+        visit(value);
+    }
+
+    function assertSubscriptionRows(rows: readonly RawJson[], subject: string): void {
+        if (rows.length > MAX_SUBSCRIPTION_ROWS) {
+            throw new CdbError({
+                code: "CDB_INVARIANT",
+                message: `${subject} exceeds the ${MAX_SUBSCRIPTION_ROWS}-row client limit`,
+            });
+        }
+        assertSerializedSize(rows, MAX_SUBSCRIPTION_BYTES, subject);
+    }
+
+    function assertOptimisticPatchHistory(patches: readonly RowPatch[]): void {
+        if (patches.length > MAX_OPTIMISTIC_PATCHES) {
+            throw new CdbError({
+                code: "CDB_INVARIANT",
+                message: "optimistic patch history exceeds the client limit",
+            });
+        }
+        assertSerializedSize(patches, MAX_OPTIMISTIC_PATCH_BYTES, "optimistic patch history");
     }
 
     function applyError(code: CdbErrorCode, subId: SubId | undefined, correlationId: CorrelationId): void {
