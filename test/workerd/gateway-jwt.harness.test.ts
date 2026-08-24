@@ -264,7 +264,15 @@ function sendAndReceive(socket: WebSocket, message: Up): Promise<Down> {
 function nextDowns(socket: WebSocket, count: number): Promise<Down[]> {
     return new Promise((resolve, reject) => {
         const messages: Down[] = [];
-        const timeout = setTimeout(() => reject(new Error("timed out waiting for Gateway messages")), 3_000);
+        const timeout = setTimeout(
+            () =>
+                reject(
+                    new Error(
+                        `timed out waiting for ${count} Gateway messages after receiving ${JSON.stringify(messages)}`
+                    )
+                ),
+            3_000
+        );
         const onMessage = (event: MessageEvent) => {
             messages.push(decodeWire(String(event.data)) as Down);
             if (messages.length !== count) return;
@@ -725,7 +733,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         socket.close();
     });
 
-    test("updateAuth drains a query snapshot before switching subscription identity", async () => {
+    test("updateAuth retires an admitted query before switching identity and gates the next query", async () => {
         if (!mutationRef || !queryRef) throw new Error("public refs were not seeded");
         const { socket, first } = await openSocket(await signed());
         await first;
@@ -743,7 +751,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         expect(seeded).toMatchObject({ t: "poke", mutResults: [{ ok: true }] });
 
         await setAuthorityFault("hold");
-        const ordered = nextDowns(socket, 3);
+        const ordered = nextDowns(socket, 2);
         socket.send(
             encodeWire({
                 t: "sub",
@@ -765,18 +773,14 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         await expectNoDown(socket);
         await authorityControl("/authority-release");
 
-        const [before, refresh, after] = await ordered;
-        expect(before).toMatchObject({
-            t: "snapshot",
-            subId: 40,
-            rows: [{ id: "query-refresh-row", viewerId: "workerd-user" }],
-        });
+        const [refresh, after] = await ordered;
         expect(refresh).toMatchObject({ t: "mustRefetch", subIds: [40], reason: "authChanged" });
         expect(after).toMatchObject({
             t: "snapshot",
             subId: 41,
             rows: [{ id: "query-refresh-row", viewerId: "workerd-user-2" }],
         });
+        await expectNoDown(socket);
         socket.close();
     });
 
