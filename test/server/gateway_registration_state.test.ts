@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { CdbError } from "../../src/errors.ts";
 import type { SyncSql } from "../../src/oplog/wrapper.ts";
 import {
     GATEWAY_REGISTRATION_DDL,
@@ -11,11 +12,13 @@ import {
     ensureGatewayRegistrationColumns,
     installGatewayRegistration,
     listCurrentGatewayRegistrationsForConnection,
+    projectCdbSubscriptionResponse,
     retireCurrentGatewayRegistration,
     retireCurrentGatewayRegistrationsForConnection,
     retireGatewayRegistration,
     settleInitialGatewaySnapshot,
 } from "../../src/server/do/gateway.ts";
+import type { LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 
 function syncSql(db: Database): SyncSql {
@@ -98,6 +101,43 @@ describe("Gateway durable registration generations", () => {
     });
 
     afterEach(() => db.close());
+
+    test("strictly validates both Cdb subscribe response branches", () => {
+        const expected: LiveSubscriptionId = {
+            gatewayId: "gateway-1",
+            registrationId: "registration-1",
+            connectionId: "connection-1",
+            clientId: ClientId("client-1"),
+            subId: SubId(1),
+        };
+        const success = { ok: true, subscription: expected, changeSeq: 0 } as const;
+        const failure = {
+            ok: false,
+            registrationState: "absent",
+            subscription: expected,
+            error: new CdbError({ code: "CDB_RATE_LIMITED", retryAfterMs: 1_000 }).toJSON(),
+        } as const;
+        expect(projectCdbSubscriptionResponse(success, expected)).toEqual(success);
+        expect(projectCdbSubscriptionResponse(failure, expected)).toEqual(failure);
+
+        for (const malformed of [
+            null,
+            [],
+            { ...success, extra: true },
+            { ...success, ok: "true" },
+            { ...success, changeSeq: -1 },
+            { ...success, changeSeq: 1.5 },
+            { ...success, changeSeq: Number.MAX_SAFE_INTEGER + 1 },
+            { ...failure, subscription: { ...expected, registrationId: "wrong" } },
+            { ...failure, error: { ...failure.error, retryable: false } },
+            { ...failure, error: { ...failure.error, retryAfterMs: -1 } },
+            { ...failure, error: { ...failure.error, retryAfterMs: 1.5 } },
+            { ...failure, error: { ...failure.error, retryAfterMs: 2_147_483_648 } },
+            { ...failure, error: { ...failure.error, extra: true } },
+        ]) {
+            expect(() => projectCdbSubscriptionResponse(malformed, expected)).toThrow();
+        }
+    });
 
     test("installs canonical state and supersedes the old generation into retiring", () => {
         const first = registration("registration-1");
@@ -261,7 +301,7 @@ describe("Gateway durable registration generations", () => {
             installGatewayRegistration(sql, replacement);
         })();
 
-        expect(db.transaction(() => cleanupGatewayRegistration(sql, old, old.registrationId))()).toBe(true);
+        expect(db.transaction(() => cleanupGatewayRegistration(sql, old, old.registrationId))()).toBe(false);
         expect(db.transaction(() => cleanupGatewayRegistration(sql, replacement, replacement.registrationId))()).toBe(
             false
         );
@@ -275,7 +315,29 @@ describe("Gateway durable registration generations", () => {
         ]);
         expect(
             db.query("SELECT registration_id FROM _gw_registration_generations ORDER BY registration_id").all()
-        ).toEqual([{ registration_id: "registration-new" }]);
+        ).toEqual([{ registration_id: "registration-new" }, { registration_id: "registration-old" }]);
+    });
+
+    test("bootstrap repairs a missing pending recovery deadline without making cleanup eligible", () => {
+        const pending = registration("registration-pending");
+        db.transaction(() => {
+            installGatewayRegistration(sql, pending);
+            retireGatewayRegistration(sql, pending, pending.registrationId, 150);
+        })();
+        expect(db.query("SELECT lifecycle, cdb_state, retry_at FROM _gw_registration_generations").get()).toEqual({
+            lifecycle: "retiring",
+            cdb_state: "pending",
+            retry_at: null,
+        });
+
+        ensureGatewayRegistrationColumns(sql);
+
+        expect(db.query("SELECT lifecycle, cdb_state, retry_at FROM _gw_registration_generations").get()).toEqual({
+            lifecycle: "retiring",
+            cdb_state: "pending",
+            retry_at: 30_150,
+        });
+        expect(cleanupGatewayRegistration(sql, pending, pending.registrationId)).toBe(false);
     });
 
     test("begins an initial query without claiming delivery before snapshot settlement", () => {
@@ -508,13 +570,13 @@ describe("Gateway durable registration generations", () => {
             {
                 registration_id: first.registrationId,
                 lifecycle: "retiring",
-                cdb_state: "retiring",
+                cdb_state: "pending",
                 run_version: 1,
             },
             {
                 registration_id: second.registrationId,
                 lifecycle: "retiring",
-                cdb_state: "retiring",
+                cdb_state: "pending",
                 run_version: 1,
             },
             {

@@ -66,8 +66,22 @@ export interface CdbSubscriptionRequest {
     }[];
 }
 
+export type CdbSubscriptionResponse =
+    | {
+          readonly ok: true;
+          readonly subscription: LiveSubscriptionId;
+          readonly changeSeq: number;
+      }
+    | {
+          readonly ok: false;
+          /** The Cdb transaction proved that this registration was never inserted. */
+          readonly registrationState: "absent";
+          readonly subscription: LiveSubscriptionId;
+          readonly error: CdbErrorWire;
+      };
+
 export interface CdbSubscriptionRpc {
-    subscribe(args: CdbSubscriptionRequest): Promise<{ subscription: LiveSubscriptionId; changeSeq: number }>;
+    subscribe(args: CdbSubscriptionRequest): Promise<CdbSubscriptionResponse>;
     unsubscribe(subscription: LiveSubscriptionId): Promise<void>;
 }
 

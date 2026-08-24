@@ -45,6 +45,7 @@ import type {
     CdbQueryResponse,
     CdbRegisteredQueryRequest,
     CdbSubscriptionRequest,
+    CdbSubscriptionResponse,
     GatewayInvalidationAck,
     GatewayInvalidationRequest,
     GatewayInvalidationResponse,
@@ -113,6 +114,8 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
     )
   )
 );
+CREATE INDEX IF NOT EXISTS _chardb_live_subscriptions_by_state
+  ON _chardb_live_subscriptions (state, gateway_id, registration_id);
 CREATE TABLE IF NOT EXISTS _chardb_change_clock (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   change_seq INTEGER NOT NULL CHECK (change_seq >= 0)
@@ -191,6 +194,9 @@ const INVALIDATION_BATCH_SIZE = 64;
 const INVALIDATION_MAX_ATTEMPTS = 8;
 const INVALIDATION_BASE_RETRY_MS = 1_000;
 const INVALIDATION_MAX_RETRY_MS = 60_000;
+const CDB_MAX_ACTIVE_LIVE_REGISTRATIONS = 4_096;
+const CDB_MAX_INVALIDATION_OUTBOX_ROWS = 4_096;
+const CDB_MAX_INVALIDATIONS_PER_MUTATION = 4_096;
 
 function assertCdbQueryResultLimits(result: RawJson, subject: string): void {
     if (Array.isArray(result) && result.length > CDB_QUERY_RESULT_MAX_ROWS) {
@@ -226,6 +232,24 @@ function subscriptionPayloadHash(args: CdbSubscriptionRequest, policyDigest: str
 
 function subscriptionInvariant(message: string): CdbError {
     return new CdbError({ code: "CDB_INVARIANT", message });
+}
+
+function subscriptionCapacityExceeded(subject: string, limit: number): CdbError {
+    return new CdbError({
+        code: "CDB_RATE_LIMITED",
+        message: `Cdb ${subject} capacity is limited to ${limit}`,
+        retryAfterMs: INVALIDATION_BASE_RETRY_MS,
+        hint: "unsubscribe unused live queries or wait for queued invalidations to drain",
+    });
+}
+
+function durableRowCount(sql: SyncSql, query: string, subject: string): number {
+    const row = sql.one<{ count: number | bigint }>(query);
+    const count = Number(row?.count);
+    if (!Number.isSafeInteger(count) || count < 0) {
+        throw subscriptionInvariant(`Cdb ${subject} count is missing or invalid`);
+    }
+    return count;
 }
 
 function assertQueryIntentCoversReads(
@@ -424,28 +448,63 @@ function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionReq
 }
 
 function enqueueInvalidations(sql: SyncSql, touchedTables: readonly string[]): number {
+    const uniqueTables = [...new Set(touchedTables)];
+    const registrations =
+        uniqueTables.length === 0
+            ? []
+            : sql
+                  .all<{ gateway_id: string; registration_id: string }>(
+                      `SELECT DISTINCT mappings.gateway_id, mappings.registration_id
+                       FROM _chardb_live_subscription_tables AS mappings
+                       INNER JOIN _chardb_live_subscriptions AS subscriptions
+                         ON subscriptions.gateway_id = mappings.gateway_id
+                        AND subscriptions.registration_id = mappings.registration_id
+                       WHERE mappings.table_name IN (${uniqueTables.map(() => "?").join(", ")})
+                         AND subscriptions.state = 'active'
+                       ORDER BY mappings.gateway_id, mappings.registration_id
+                       LIMIT ?`,
+                      ...uniqueTables,
+                      CDB_MAX_INVALIDATIONS_PER_MUTATION + 1
+                  )
+                  .map(row => ({ gatewayId: row.gateway_id, registrationId: row.registration_id }));
+    if (registrations.length > CDB_MAX_INVALIDATIONS_PER_MUTATION) {
+        throw subscriptionCapacityExceeded("mutation invalidation fanout", CDB_MAX_INVALIDATIONS_PER_MUTATION);
+    }
+    let projectedOutboxRows = durableRowCount(
+        sql,
+        "SELECT COUNT(*) AS count FROM _chardb_invalidation_outbox",
+        "invalidation outbox"
+    );
+    const existingOutboxKeys = new Set(
+        sql
+            .all<{ gateway_id: string; registration_id: string }>(
+                `SELECT gateway_id, registration_id FROM _chardb_invalidation_outbox
+                 LIMIT ?`,
+                CDB_MAX_INVALIDATION_OUTBOX_ROWS + 1
+            )
+            .map(row => JSON.stringify([row.gateway_id, row.registration_id]))
+    );
+    for (const registration of registrations) {
+        const key = JSON.stringify([registration.gatewayId, registration.registrationId]);
+        if (existingOutboxKeys.has(key)) continue;
+        if (projectedOutboxRows > CDB_MAX_INVALIDATION_OUTBOX_ROWS) {
+            const legacyExisting = sql.one<{ present: number }>(
+                `SELECT 1 AS present FROM _chardb_invalidation_outbox
+                 WHERE gateway_id = ? AND registration_id = ?`,
+                registration.gatewayId,
+                registration.registrationId
+            );
+            if (legacyExisting) continue;
+        }
+        projectedOutboxRows++;
+        if (projectedOutboxRows > CDB_MAX_INVALIDATION_OUTBOX_ROWS) {
+            throw subscriptionCapacityExceeded("invalidation outbox", CDB_MAX_INVALIDATION_OUTBOX_ROWS);
+        }
+    }
     sql.exec("UPDATE _chardb_change_clock SET change_seq = change_seq + 1 WHERE singleton = 1");
     if (sql.changes() !== 1) throw subscriptionInvariant("Cdb change clock update did not affect one row");
     const changeSeq = currentChangeSeq(sql);
-    const registrations = new Map<string, { gatewayId: string; registrationId: string }>();
-    for (const tableName of touchedTables) {
-        const rows = sql.all<{ gateway_id: string; registration_id: string }>(
-            `SELECT mappings.gateway_id, mappings.registration_id
-             FROM _chardb_live_subscription_tables AS mappings
-             INNER JOIN _chardb_live_subscriptions AS subscriptions
-               ON subscriptions.gateway_id = mappings.gateway_id
-              AND subscriptions.registration_id = mappings.registration_id
-             WHERE mappings.table_name = ? AND subscriptions.state = 'active'`,
-            tableName
-        );
-        for (const row of rows) {
-            registrations.set(JSON.stringify([row.gateway_id, row.registration_id]), {
-                gatewayId: row.gateway_id,
-                registrationId: row.registration_id,
-            });
-        }
-    }
-    for (const registration of registrations.values()) {
+    for (const registration of registrations) {
         sql.exec(
             `INSERT INTO _chardb_invalidation_outbox (gateway_id, registration_id, change_seq)
              VALUES (?, ?, ?)
@@ -842,12 +901,12 @@ export class Cdb extends DurableObject<CdbEnv> {
     /**
      * Register a live-query subscription on this shard. Caller is the Gateway DO.
      */
-    async subscribe(args: SubscribeArgs): Promise<{ subscription: LiveSubscriptionId; changeSeq: number }> {
+    async subscribe(args: SubscribeArgs): Promise<CdbSubscriptionResponse> {
         const intervals = this.prepareIntervals(args);
         const policyDigest = cdbPolicyDigest(this.mutationSchema(), args.tables);
         const payloadHash = subscriptionPayloadHash(args, policyDigest);
         const tableNames = [...new Set(args.tables)].sort();
-        let changeSeq: number | undefined;
+        let response: CdbSubscriptionResponse | undefined;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             const existing = sql.one<StoredSubscriptionRow>(
@@ -871,6 +930,23 @@ export class Cdb extends DurableObject<CdbEnv> {
                 }
                 assertSubscriptionTables(sql, args.subscription, tableNames);
             } else {
+                const activeRegistrations = durableRowCount(
+                    sql,
+                    "SELECT COUNT(*) AS count FROM _chardb_live_subscriptions WHERE state = 'active'",
+                    "active live registration"
+                );
+                if (activeRegistrations >= CDB_MAX_ACTIVE_LIVE_REGISTRATIONS) {
+                    response = {
+                        ok: false,
+                        registrationState: "absent",
+                        subscription: args.subscription,
+                        error: subscriptionCapacityExceeded(
+                            "active live registration",
+                            CDB_MAX_ACTIVE_LIVE_REGISTRATIONS
+                        ).toJSON(),
+                    };
+                    return;
+                }
                 sql.exec(
                     `INSERT INTO _chardb_live_subscriptions
                      (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
@@ -903,11 +979,12 @@ export class Cdb extends DurableObject<CdbEnv> {
                     );
                 }
             }
-            changeSeq = currentChangeSeq(sql);
+            response = { ok: true, subscription: args.subscription, changeSeq: currentChangeSeq(sql) };
         });
-        if (changeSeq === undefined) throw subscriptionInvariant("subscription completed without a change clock");
+        if (!response) throw subscriptionInvariant("subscription completed without a durable outcome");
+        if (!response.ok) return response;
         this.installSubscription(args.subscription, intervals);
-        return { subscription: args.subscription, changeSeq };
+        return response;
     }
 
     async unsubscribe(subscription: LiveSubscriptionId): Promise<void> {

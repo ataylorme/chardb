@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { CdbError } from "../../src/errors.ts";
 import {
     GATEWAY_ABANDONED_REGISTRATION_BATCH_SIZE,
     Gateway,
@@ -75,9 +76,7 @@ describe("Gateway public durable registration", () => {
     let subscribeCalls: CdbSubscriptionRequest[];
     let unsubscribeCalls: LiveSubscriptionId[];
     let registeredQueryCalls: unknown[];
-    let subscribeBehavior: (
-        request: CdbSubscriptionRequest
-    ) => unknown | Promise<{ subscription: LiveSubscriptionId; changeSeq: number }>;
+    let subscribeBehavior: (request: CdbSubscriptionRequest) => unknown | Promise<unknown>;
 
     const route: QueryRouteResponse = {
         ok: true,
@@ -114,7 +113,7 @@ describe("Gateway public durable registration", () => {
             lastCookie: Cookie("cookie-base"),
             snapshotSubIds: [],
         });
-        subscribeBehavior = request => ({ subscription: request.subscription, changeSeq: 0 });
+        subscribeBehavior = request => ({ ok: true, subscription: request.subscription, changeSeq: 0 });
         const catalog = {
             async resolveOrganizationAuthority() {
                 return {
@@ -269,7 +268,7 @@ describe("Gateway public durable registration", () => {
                 source_cdb_id: "physical-cdb-1",
             });
             expect(currentAlarm).toBe(30_100);
-            return { subscription: request.subscription, changeSeq: 0 };
+            return { ok: true, subscription: request.subscription, changeSeq: 0 };
         };
 
         await subscribe();
@@ -380,7 +379,7 @@ describe("Gateway public durable registration", () => {
                 sourceCdbId: "physical-cdb-1",
                 invalidations: [{ subscription: request.subscription, changeSeq: 7 }],
             });
-            return { subscription: request.subscription, changeSeq: 3 };
+            return { ok: true, subscription: request.subscription, changeSeq: 3 };
         };
 
         await subscribe();
@@ -390,7 +389,7 @@ describe("Gateway public durable registration", () => {
     });
 
     test("unsubscribing during subscribe retires the exact install and schedules cleanup", async () => {
-        let release: (value: { subscription: LiveSubscriptionId; changeSeq: number }) => void = () => {};
+        let release: (value: unknown) => void = () => {};
         subscribeBehavior = () =>
             new Promise(resolve => {
                 release = resolve;
@@ -405,7 +404,7 @@ describe("Gateway public durable registration", () => {
         expect(originSettled).toBe(false);
 
         await gateway.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({ t: "unsub", subId: 1 }));
-        release({ subscription, changeSeq: 0 });
+        release({ ok: true, subscription, changeSeq: 0 });
         await subscriptionTask;
         expect(originSettled).toBe(true);
         await waitFor(() => head() === null, "retirement");
@@ -416,7 +415,7 @@ describe("Gateway public durable registration", () => {
     });
 
     test("socket close during subscribe retires the exact install", async () => {
-        let release: (value: { subscription: LiveSubscriptionId; changeSeq: number }) => void = () => {};
+        let release: (value: unknown) => void = () => {};
         subscribeBehavior = () =>
             new Promise(resolve => {
                 release = resolve;
@@ -427,7 +426,7 @@ describe("Gateway public durable registration", () => {
 
         socketConnected = false;
         await gateway.webSocketClose(socket as unknown as WebSocket);
-        release({ subscription, changeSeq: 0 });
+        release({ ok: true, subscription, changeSeq: 0 });
         await subscriptionTask;
         await waitFor(() => head() === null, "close retirement");
 
@@ -689,20 +688,24 @@ describe("Gateway public durable registration", () => {
     });
 
     test("latest duplicate wins after the earlier subscribe settles", async () => {
-        let releaseFirst: (value: { subscription: LiveSubscriptionId; changeSeq: number }) => void = () => {};
+        let releaseFirst: (value: unknown) => void = () => {};
         subscribeBehavior = request => {
             if (subscribeCalls.length === 1) {
                 return new Promise(resolve => {
                     releaseFirst = resolve;
                 });
             }
-            return { subscription: request.subscription, changeSeq: 2 };
+            return { ok: true, subscription: request.subscription, changeSeq: 2 };
         };
         const firstTask = subscribe();
         await waitFor(() => subscribeCalls.length === 1, "first subscribe RPC");
         const secondTask = subscribe();
         expect(subscribeCalls).toHaveLength(1);
-        releaseFirst({ subscription: subscribeCalls[0]?.subscription as LiveSubscriptionId, changeSeq: 1 });
+        releaseFirst({
+            ok: true,
+            subscription: subscribeCalls[0]?.subscription as LiveSubscriptionId,
+            changeSeq: 1,
+        });
         await waitFor(() => subscribeCalls.length === 2, "replacement subscribe RPC");
         await Promise.all([firstTask, secondTask]);
         const replacementId = subscribeCalls[1]?.subscription.registrationId as string;
@@ -788,6 +791,152 @@ describe("Gateway public durable registration", () => {
         expect(generation()).toBeNull();
     });
 
+    test("unsubscribe during ambiguous settlement suppresses the stale response-loss error", async () => {
+        subscribeBehavior = () => {
+            throw new Error("response lost");
+        };
+        let schedulerCalls = 0;
+        let releaseAmbiguousSchedule: () => void = () => {};
+        (gateway as unknown as GatewaySchedulerInternals).scheduleGatewayWork = async () => {
+            schedulerCalls += 1;
+            if (schedulerCalls !== 2) return;
+            await new Promise<void>(resolve => {
+                releaseAmbiguousSchedule = resolve;
+            });
+        };
+
+        const pending = subscribe();
+        await waitFor(() => schedulerCalls === 2, "held ambiguous scheduler call");
+        await gateway.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({ t: "unsub", subId: 1 }));
+        releaseAmbiguousSchedule();
+        await pending;
+
+        expect(socket.sent.map(message => JSON.parse(message))).not.toContainEqual(
+            expect.objectContaining({ t: "error", code: "CDB_SHARD_UNAVAILABLE" })
+        );
+    });
+
+    test("a definitive Cdb capacity failure removes the install without an unsubscribe tombstone", async () => {
+        subscribeBehavior = request => ({
+            ok: false,
+            registrationState: "absent",
+            subscription: request.subscription,
+            error: new CdbError({ code: "CDB_RATE_LIMITED", retryAfterMs: 1_000 }).toJSON(),
+        });
+
+        await subscribe();
+
+        expect(head()).toBeNull();
+        expect(generation()).toBeNull();
+        expect(unsubscribeCalls).toEqual([]);
+        expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
+            t: "error",
+            code: "CDB_RATE_LIMITED",
+            subId: 1,
+            retryable: true,
+        });
+    });
+
+    test("a replacement capacity failure preserves cleanup only for the older active generation", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "first subscription activation");
+        const oldSubscription = subscribeCalls[0]?.subscription;
+        if (!oldSubscription) throw new Error("first subscribe call was not recorded");
+        subscribeBehavior = request => ({
+            ok: false,
+            registrationState: "absent",
+            subscription: request.subscription,
+            error: new CdbError({ code: "CDB_RATE_LIMITED", retryAfterMs: 1_000 }).toJSON(),
+        });
+
+        await subscribe();
+
+        expect(head()).toBeNull();
+        expect(
+            db.query("SELECT registration_id, lifecycle, cdb_state FROM _gw_registration_generations").all()
+        ).toEqual([{ registration_id: oldSubscription.registrationId, lifecycle: "retiring", cdb_state: "retiring" }]);
+        currentAlarm = null;
+        await gateway.alarm();
+        expect(unsubscribeCalls).toEqual([oldSubscription]);
+        expect(generation()).toBeNull();
+    });
+
+    test("a held definitive failure raced with unsubscribe deletes headless pending state without cleanup", async () => {
+        let release: (value: unknown) => void = () => {};
+        subscribeBehavior = () =>
+            new Promise(resolve => {
+                release = resolve;
+            });
+        const subscriptionTask = subscribe();
+        await waitFor(() => subscribeCalls.length === 1, "held subscribe RPC");
+        const held = subscribeCalls[0];
+        if (!held) throw new Error("held subscribe call was not recorded");
+
+        await gateway.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({ t: "unsub", subId: 1 }));
+        expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "pending", retry_at: 30_100 });
+        currentAlarm = null;
+        await gateway.alarm();
+        expect(unsubscribeCalls).toEqual([]);
+        expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "pending" });
+
+        release({
+            ok: false,
+            registrationState: "absent",
+            subscription: held.subscription,
+            error: new CdbError({ code: "CDB_RATE_LIMITED", retryAfterMs: 1_000 }).toJSON(),
+        });
+        await subscriptionTask;
+        expect(generation()).toBeNull();
+        expect(unsubscribeCalls).toEqual([]);
+        expect(socket.sent).toEqual([]);
+    });
+
+    test("a held definitive failure raced with socket close also avoids cleanup", async () => {
+        let release: (value: unknown) => void = () => {};
+        subscribeBehavior = () =>
+            new Promise(resolve => {
+                release = resolve;
+            });
+        const subscriptionTask = subscribe();
+        await waitFor(() => subscribeCalls.length === 1, "held close subscribe RPC");
+        const held = subscribeCalls[0];
+        if (!held) throw new Error("held subscribe call was not recorded");
+
+        socketConnected = false;
+        await gateway.webSocketClose(socket as unknown as WebSocket);
+        expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "pending" });
+        expect(unsubscribeCalls).toEqual([]);
+        release({
+            ok: false,
+            registrationState: "absent",
+            subscription: held.subscription,
+            error: new CdbError({ code: "CDB_RATE_LIMITED", retryAfterMs: 1_000 }).toJSON(),
+        });
+        await subscriptionTask;
+
+        expect(generation()).toBeNull();
+        expect(unsubscribeCalls).toEqual([]);
+        expect(socket.sent).toEqual([]);
+    });
+
+    test("a mismatched definitive failure is ambiguous and compensates by exact unsubscribe", async () => {
+        subscribeBehavior = request => ({
+            ok: false,
+            registrationState: "absent",
+            subscription: { ...request.subscription, registrationId: "mismatched-registration" },
+            error: new CdbError({ code: "CDB_RATE_LIMITED", retryAfterMs: 1_000 }).toJSON(),
+        });
+
+        await subscribe();
+        expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "retiring" });
+        currentAlarm = null;
+        await gateway.alarm();
+        const attempted = subscribeCalls[0];
+        if (!attempted) throw new Error("subscribe call was not recorded");
+        expect(unsubscribeCalls).toEqual([attempted.subscription]);
+        expect(generation()).toBeNull();
+    });
+
     test("a failed recovery alarm prevents install and subscribe", async () => {
         alarmFailures = 1;
 
@@ -800,7 +949,7 @@ describe("Gateway public durable registration", () => {
     });
 
     test("restart reconciles an abandoned installing generation at its durable deadline", async () => {
-        let release: (value: { subscription: LiveSubscriptionId; changeSeq: number }) => void = () => {};
+        let release: (value: unknown) => void = () => {};
         subscribeBehavior = () =>
             new Promise(resolve => {
                 release = resolve;
@@ -817,7 +966,7 @@ describe("Gateway public durable registration", () => {
         await gateway.alarm();
         const abandonedSubscribe = subscribeCalls[0];
         if (!abandonedSubscribe) throw new Error("subscribe call was not recorded");
-        release({ subscription: abandonedSubscribe.subscription, changeSeq: 0 });
+        release({ ok: true, subscription: abandonedSubscribe.subscription, changeSeq: 0 });
         await subscriptionTask;
 
         expect(head()).toBeNull();

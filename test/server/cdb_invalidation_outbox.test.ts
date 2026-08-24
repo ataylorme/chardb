@@ -392,6 +392,113 @@ describe("Cdb invalidation outbox", () => {
         ]);
     });
 
+    test("coalesces existing rows at capacity and rolls back clock, mutation, and op-log before outbox growth", async () => {
+        const { db, cdb, gateway } = await setup();
+        const first = identity("capacity-first", 1);
+        const second = identity("capacity-second", 2);
+        const excess = identity("capacity-excess", 3);
+        await cdb.subscribe(subscription(first, ["outbox_messages"]));
+        await cdb.subscribe(subscription(second, ["outbox_messages"]));
+        await cdb.subscribe(subscription(excess, ["outbox_reactions"]));
+        db.run("UPDATE _chardb_change_clock SET change_seq = 1 WHERE singleton = 1");
+        db.prepare(
+            `INSERT INTO _chardb_invalidation_outbox (gateway_id, registration_id, change_seq)
+             VALUES (?, ?, 1), (?, ?, 1)`
+        ).run(first.gatewayId, first.registrationId, second.gatewayId, second.registrationId);
+        db.run(
+            `WITH RECURSIVE filler(n) AS (
+               SELECT 1 UNION ALL SELECT n + 1 FROM filler WHERE n < 4094
+             )
+             INSERT INTO _chardb_live_subscriptions
+               (gateway_id, registration_id, connection_id, client_id, sub_id, state)
+             SELECT 'gateway-filler', 'registration-filler-' || n, 'connection-filler-' || n,
+                    'client-filler-' || n, n, 'retired'
+             FROM filler`
+        );
+        db.run(
+            `WITH RECURSIVE filler(n) AS (
+               SELECT 1 UNION ALL SELECT n + 1 FROM filler WHERE n < 4094
+             )
+             INSERT INTO _chardb_invalidation_outbox
+               (gateway_id, registration_id, change_seq, next_attempt_at)
+             SELECT 'gateway-filler', 'registration-filler-' || n, 1, 999999999
+             FROM filler`
+        );
+
+        await expect(
+            cdb.mutate(mutation(putMessage, "capacity-coalesce", { id: "capacity-coalesce", value: 1 }))
+        ).resolves.toMatchObject({ ok: true, ran: true });
+        expect(gateway.calls).toHaveLength(1);
+        expect(gateway.calls[0]?.invalidations).toHaveLength(2);
+        expect(changeSeq(db)).toBe(2);
+        expect(db.prepare("SELECT COUNT(*) AS count FROM _chardb_invalidation_outbox").get()).toEqual({ count: 4_096 });
+        const outboxBefore = db.prepare("SELECT * FROM _chardb_invalidation_outbox ORDER BY registration_id").all();
+
+        await expect(
+            cdb.mutate(mutation(putBoth, "capacity-over", { id: "capacity-over", value: 2 }))
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_RATE_LIMITED", retryable: true } });
+        expect(changeSeq(db)).toBe(2);
+        expect(db.prepare("SELECT id FROM outbox_messages WHERE id = 'capacity-over'").get()).toBeNull();
+        expect(db.prepare("SELECT id FROM outbox_reactions WHERE id = 'capacity-over'").get()).toBeNull();
+        expect(db.prepare("SELECT mut_id FROM _chardb_op_log WHERE mut_id = 'capacity-over'").get()).toBeNull();
+        expect(db.prepare("SELECT * FROM _chardb_invalidation_outbox ORDER BY registration_id").all()).toEqual(
+            outboxBefore
+        );
+        expect(gateway.calls).toHaveLength(1);
+    });
+
+    test("bounds legacy invalidation fanout at exactly 4096 before accumulating another registration", async () => {
+        const { db, cdb } = await setup();
+        db.run(
+            `WITH RECURSIVE registrations(n) AS (
+               SELECT 1 UNION ALL SELECT n + 1 FROM registrations WHERE n < 4096
+             )
+             INSERT INTO _chardb_live_subscriptions
+               (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+                principal_id, organization_id, ref, args_json, policy_digest, query_hash, tables_json, intervals_json)
+             SELECT 'gateway-fanout', 'registration-fanout-' || n, 'connection-fanout-' || n,
+                    'client-fanout-' || n, n, 'active', 'legacy-hash', 'principal-fanout', 'org-1',
+                    'queries.ts#legacy', 'null', 'legacy-policy', 'legacy-query',
+                    '["outbox_messages"]', '[]'
+             FROM registrations`
+        );
+        db.run(
+            `WITH RECURSIVE registrations(n) AS (
+               SELECT 1 UNION ALL SELECT n + 1 FROM registrations WHERE n < 4096
+             )
+             INSERT INTO _chardb_live_subscription_tables (gateway_id, registration_id, table_name)
+             SELECT 'gateway-fanout', 'registration-fanout-' || n, 'outbox_messages'
+             FROM registrations`
+        );
+
+        await expect(
+            cdb.mutate(mutation(putMessage, "fanout-boundary", { id: "fanout-boundary", value: 1 }))
+        ).resolves.toMatchObject({ ok: true, ran: true });
+        expect(changeSeq(db)).toBe(1);
+        expect(db.prepare("SELECT COUNT(*) AS count FROM _chardb_invalidation_outbox").get()).toEqual({ count: 4_096 });
+
+        db.prepare(
+            `INSERT INTO _chardb_live_subscriptions
+             (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+              principal_id, organization_id, ref, args_json, policy_digest, query_hash, tables_json, intervals_json)
+             VALUES ('gateway-fanout', 'registration-fanout-4097', 'connection-fanout-4097',
+                     'client-fanout-4097', 4097, 'active', 'legacy-hash', 'principal-fanout', 'org-1',
+                     'queries.ts#legacy', 'null', 'legacy-policy', 'legacy-query', '["outbox_messages"]', '[]')`
+        ).run();
+        db.prepare(
+            `INSERT INTO _chardb_live_subscription_tables (gateway_id, registration_id, table_name)
+             VALUES ('gateway-fanout', 'registration-fanout-4097', 'outbox_messages')`
+        ).run();
+
+        await expect(
+            cdb.mutate(mutation(putMessage, "fanout-over", { id: "fanout-over", value: 2 }))
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_RATE_LIMITED", retryable: true } });
+        expect(changeSeq(db)).toBe(1);
+        expect(db.prepare("SELECT id FROM outbox_messages WHERE id = 'fanout-over'").get()).toBeNull();
+        expect(db.prepare("SELECT mut_id FROM _chardb_op_log WHERE mut_id = 'fanout-over'").get()).toBeNull();
+        expect(db.prepare("SELECT COUNT(*) AS count FROM _chardb_invalidation_outbox").get()).toEqual({ count: 4_096 });
+    });
+
     test("rolls back the domain write and clock when outbox enqueue fails", async () => {
         const { db, cdb } = await setup();
         await cdb.subscribe(subscription(identity("messages", 1), ["outbox_messages"]));

@@ -7,6 +7,7 @@ import { Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { emptyManifest } from "../../src/server/manifest.ts";
 import type { CdbSubscriptionRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
+import { stableHashHex } from "../../src/util/canonical.ts";
 
 const organization = sqliteTable("organization", { id: text("id").primaryKey() });
 const { cdbTable } = forOrg();
@@ -213,14 +214,14 @@ describe("Cdb live subscription identity", () => {
             args: { organizationId: "org-1", filter: { archived: false, channel: "general" } },
         });
 
-        await expect(cdb.subscribe(original)).resolves.toEqual({ subscription: identity, changeSeq: 0 });
+        await expect(cdb.subscribe(original)).resolves.toEqual({ ok: true, subscription: identity, changeSeq: 0 });
         await expect(
             cdb.subscribe(
                 request(identity, {
                     args: { filter: { channel: "general", archived: false }, organizationId: "org-1" },
                 })
             )
-        ).resolves.toEqual({ subscription: identity, changeSeq: 0 });
+        ).resolves.toEqual({ ok: true, subscription: identity, changeSeq: 0 });
 
         await expect(cdb.subscribe(request(identity, { args: { organizationId: "org-2" } }))).rejects.toMatchObject({
             code: "CDB_INVARIANT",
@@ -236,6 +237,115 @@ describe("Cdb live subscription identity", () => {
             tables: [durableTable(identity)],
             invalidations: [],
         });
+    });
+
+    test("enforces the fixed active cap across reconstruction, replay, release, and legacy over-cap state", async () => {
+        const active = Array.from({ length: 4_096 }, (_, index) =>
+            subscription("gateway-do-capacity", `capacity-${index}`, `registration-capacity-${index}`)
+        );
+        for (const identity of active) {
+            await cdb.subscribe(request(identity));
+        }
+        const excess = subscription("gateway-do-capacity", "capacity-excess", "registration-capacity-excess");
+        const intervalInstall = spyOn(IntervalMap.prototype, "register");
+        try {
+            await expect(cdb.subscribe(request(excess))).resolves.toMatchObject({
+                ok: false,
+                registrationState: "absent",
+                subscription: excess,
+                error: { code: "CDB_RATE_LIMITED", retryable: true },
+            });
+            expect(intervalInstall).not.toHaveBeenCalled();
+        } finally {
+            intervalInstall.mockRestore();
+        }
+        expect(
+            db.prepare("SELECT COUNT(*) AS count FROM _chardb_live_subscriptions WHERE state = 'active'").get()
+        ).toEqual({ count: 4_096 });
+        expect(
+            db
+                .prepare("SELECT 1 AS present FROM _chardb_live_subscriptions WHERE registration_id = ?")
+                .get(excess.registrationId)
+        ).toBeNull();
+        expect(
+            db
+                .prepare("SELECT 1 AS present FROM _chardb_live_subscription_tables WHERE registration_id = ?")
+                .get(excess.registrationId)
+        ).toBeNull();
+        expect(db.prepare("SELECT change_seq FROM _chardb_change_clock WHERE singleton = 1").get()).toEqual({
+            change_seq: 0,
+        });
+
+        await reconstruct();
+        const first = active[0] as LiveSubscriptionId;
+        await expect(cdb.subscribe(request(first))).resolves.toEqual({
+            ok: true,
+            subscription: first,
+            changeSeq: 0,
+        });
+
+        const legacy = subscription("gateway-do-capacity", "capacity-legacy", "registration-capacity-legacy");
+        const legacyRequest = request(legacy);
+        const policy = db
+            .prepare("SELECT policy_digest FROM _chardb_live_subscriptions WHERE registration_id = ?")
+            .get(first.registrationId) as { policy_digest: string };
+        const payloadHash = stableHashHex({
+            connectionId: legacy.connectionId,
+            clientId: legacy.clientId,
+            subId: legacy.subId,
+            principalId: legacyRequest.principalId,
+            organizationId: legacyRequest.organizationId,
+            ref: legacyRequest.ref,
+            args: legacyRequest.args,
+            policyDigest: policy.policy_digest,
+            queryHash: legacyRequest.queryHash,
+            tables: legacyRequest.tables,
+            intervals: legacyRequest.intervals,
+        });
+        db.prepare(
+            `INSERT INTO _chardb_live_subscriptions
+             (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+              principal_id, organization_id, ref, args_json, policy_digest, query_hash, tables_json, intervals_json)
+             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+            legacy.gatewayId,
+            legacy.registrationId,
+            legacy.connectionId,
+            legacy.clientId,
+            legacy.subId,
+            payloadHash,
+            legacyRequest.principalId,
+            legacyRequest.organizationId,
+            legacyRequest.ref,
+            JSON.stringify(legacyRequest.args),
+            policy.policy_digest,
+            legacyRequest.queryHash,
+            JSON.stringify(legacyRequest.tables),
+            JSON.stringify(legacyRequest.intervals)
+        );
+        db.prepare(
+            `INSERT INTO _chardb_live_subscription_tables (gateway_id, registration_id, table_name)
+             VALUES (?, ?, 'messages')`
+        ).run(legacy.gatewayId, legacy.registrationId);
+
+        await reconstruct();
+        await expect(cdb.subscribe(legacyRequest)).resolves.toEqual({ ok: true, subscription: legacy, changeSeq: 0 });
+        await expect(cdb.subscribe(request(excess))).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_RATE_LIMITED" },
+        });
+        await cdb.unsubscribe(first);
+        await expect(cdb.subscribe(request(excess))).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_RATE_LIMITED" },
+        });
+        await cdb.unsubscribe(active[1] as LiveSubscriptionId);
+        await expect(cdb.subscribe(request(excess))).resolves.toEqual({
+            ok: true,
+            subscription: excess,
+            changeSeq: 0,
+        });
+        await expect(cdb.subscribe(request(first))).rejects.toMatchObject({ code: "CDB_INVARIANT" });
     });
 
     test("fails closed when an active replay has lost its normalized table mapping", async () => {

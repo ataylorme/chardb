@@ -67,6 +67,7 @@ import type {
     CdbQueryRpc,
     CdbRegisteredQueryRpc,
     CdbSubscriptionRequest,
+    CdbSubscriptionResponse,
     CdbSubscriptionRpc,
     GatewayInvalidationAck,
     GatewayInvalidationRequest,
@@ -409,6 +410,7 @@ interface StoredGatewayInstallRecovery {
     readonly client_id: string;
     readonly sub_id: number;
     readonly registration_id: string;
+    readonly connection_id: string;
 }
 
 export interface VerifiedGwAttachment {
@@ -716,18 +718,13 @@ export function cdbSubscriptionRequest(input: {
     };
 }
 
-function cdbSubscriptionChangeSeq(value: unknown, expected: LiveSubscriptionId): number {
+export function projectCdbSubscriptionResponse(value: unknown, expected: LiveSubscriptionId): CdbSubscriptionResponse {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
         throw new TypeError("Cdb returned a malformed subscribe response");
     }
     const response = value as Record<string, unknown>;
     const subscription = response.subscription;
-    if (
-        !hasExactKeys(response, ["subscription", "changeSeq"]) ||
-        typeof subscription !== "object" ||
-        subscription === null ||
-        Array.isArray(subscription)
-    ) {
+    if (typeof subscription !== "object" || subscription === null || Array.isArray(subscription)) {
         throw new TypeError("Cdb returned a malformed subscribe response");
     }
     const identity = subscription as Record<string, unknown>;
@@ -737,13 +734,47 @@ function cdbSubscriptionChangeSeq(value: unknown, expected: LiveSubscriptionId):
         identity.registrationId !== expected.registrationId ||
         identity.connectionId !== expected.connectionId ||
         identity.clientId !== expected.clientId ||
-        identity.subId !== expected.subId ||
-        !Number.isSafeInteger(response.changeSeq) ||
-        (response.changeSeq as number) < 0
+        identity.subId !== expected.subId
     ) {
         throw new TypeError("Cdb returned a mismatched subscribe response");
     }
-    return response.changeSeq as number;
+    if (response.ok === true) {
+        if (
+            !hasExactKeys(response, ["ok", "subscription", "changeSeq"]) ||
+            !Number.isSafeInteger(response.changeSeq) ||
+            (response.changeSeq as number) < 0
+        ) {
+            throw new TypeError("Cdb returned a malformed subscribe success");
+        }
+        return response as unknown as Extract<CdbSubscriptionResponse, { readonly ok: true }>;
+    }
+    if (response.ok !== false || !hasExactKeys(response, ["ok", "registrationState", "subscription", "error"])) {
+        throw new TypeError("Cdb returned a malformed subscribe response");
+    }
+    if (response.registrationState !== "absent") {
+        throw new TypeError("Cdb returned a malformed subscribe failure state");
+    }
+    const error = response.error;
+    if (typeof error !== "object" || error === null || Array.isArray(error)) {
+        throw new TypeError("Cdb returned a malformed subscribe failure");
+    }
+    const wire = error as Record<string, unknown>;
+    if (
+        !hasExactKeys(wire, ["code", "retryable", "message", "correlationId", "docs", "retryAfterMs", "hint"]) ||
+        !isCdbErrorCode(wire.code) ||
+        wire.retryable !== isRetryable(wire.code) ||
+        typeof wire.message !== "string" ||
+        wire.docs !== docsUrlFor(wire.code) ||
+        (wire.correlationId !== undefined && typeof wire.correlationId !== "string") ||
+        (wire.retryAfterMs !== undefined &&
+            (!Number.isSafeInteger(wire.retryAfterMs) ||
+                (wire.retryAfterMs as number) < 0 ||
+                (wire.retryAfterMs as number) > 2_147_483_647)) ||
+        (wire.hint !== undefined && typeof wire.hint !== "string")
+    ) {
+        throw new TypeError("Cdb returned a malformed subscribe failure");
+    }
+    return response as unknown as Extract<CdbSubscriptionResponse, { readonly ok: false }>;
 }
 
 interface StoredCdbRegistration {
@@ -1051,9 +1082,13 @@ export function installGatewayRegistration(
         sql.exec(
             `UPDATE _gw_registration_generations
              SET ${GATEWAY_RETIRED_PAYLOAD_ASSIGNMENTS},
-                 lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
+                 lifecycle = 'retiring',
+                 cdb_state = CASE WHEN cdb_state = 'pending' THEN 'pending' ELSE 'retiring' END,
+                 run_token = NULL, run_target_version = NULL,
                  run_lease_expires_at = NULL,
-                 run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
+                 run_version = run_version + 1, retry_count = 0,
+                 retry_at = CASE WHEN cdb_state = 'pending' THEN retry_at ELSE ? END,
+                 retry_error = NULL, updated_at = ?
              WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
             input.nowMs,
             input.nowMs,
@@ -1143,6 +1178,94 @@ function activateGatewaySubscription(sql: SyncSql, input: GatewaySubscriptionAct
         input.connectionId
     );
     return sql.changes() === 1;
+}
+
+function deleteNeverRegisteredGatewaySubscription(
+    sql: SyncSql,
+    input: GatewayRegistrationKey & { readonly registrationId: string; readonly connectionId: string }
+): boolean {
+    assertGatewayRegistrationIdentity(input);
+    const pending = sql.one<{ registration_id: string }>(
+        `SELECT registration_id FROM _gw_registration_generations
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND cdb_state = 'pending'`,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    if (!pending) return false;
+    sql.exec(
+        `DELETE FROM _gw_registration_heads
+         WHERE principal_id = ? AND client_id = ? AND sub_id = ? AND registration_id = ?`,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.registrationId
+    );
+    sql.exec("DELETE FROM _gw_snapshot_outbox WHERE registration_id = ?", input.registrationId);
+    sql.exec(
+        `DELETE FROM _gw_registration_generations
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND cdb_state = 'pending'`,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    return sql.changes() === 1;
+}
+
+function markPendingGatewaySubscriptionAmbiguous(
+    sql: SyncSql,
+    input: GatewayRegistrationKey & {
+        readonly registrationId: string;
+        readonly connectionId: string;
+        readonly nowMs: number;
+    }
+): boolean {
+    assertGatewayRegistrationIdentity(input);
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    const pending = sql.one<{ registration_id: string }>(
+        `SELECT registration_id FROM _gw_registration_generations
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND cdb_state = 'pending'`,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    if (!pending) return false;
+    sql.exec(
+        `DELETE FROM _gw_registration_heads
+         WHERE principal_id = ? AND client_id = ? AND sub_id = ? AND registration_id = ?`,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.registrationId
+    );
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET ${GATEWAY_RETIRED_PAYLOAD_ASSIGNMENTS},
+             lifecycle = 'retiring', cdb_state = 'retiring',
+             run_token = NULL, run_target_version = NULL, run_lease_expires_at = NULL,
+             run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
+         WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
+           AND connection_id = ? AND cdb_state = 'pending'`,
+        input.nowMs,
+        input.nowMs,
+        input.registrationId,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.connectionId
+    );
+    if (sql.changes() !== 1) return false;
+    sql.exec("DELETE FROM _gw_snapshot_outbox WHERE registration_id = ?", input.registrationId);
+    return true;
 }
 
 /** Advance state only when this registration still owns its logical head and run version. */
@@ -1939,9 +2062,13 @@ export function retireCurrentGatewayRegistration(
     sql.exec(
         `UPDATE _gw_registration_generations
          SET ${GATEWAY_RETIRED_PAYLOAD_ASSIGNMENTS},
-             lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
+             lifecycle = 'retiring',
+             cdb_state = CASE WHEN cdb_state = 'pending' THEN 'pending' ELSE 'retiring' END,
+             run_token = NULL, run_target_version = NULL,
              run_lease_expires_at = NULL,
-             run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
+             run_version = run_version + 1, retry_count = 0,
+             retry_at = CASE WHEN cdb_state = 'pending' THEN retry_at ELSE ? END,
+             retry_error = NULL, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
            AND connection_id = ?`,
         input.nowMs,
@@ -2022,9 +2149,13 @@ export function retireGatewayRegistration(
     sql.exec(
         `UPDATE _gw_registration_generations
          SET ${GATEWAY_RETIRED_PAYLOAD_ASSIGNMENTS},
-             lifecycle = 'retiring', cdb_state = 'retiring', run_token = NULL, run_target_version = NULL,
+             lifecycle = 'retiring',
+             cdb_state = CASE WHEN cdb_state = 'pending' THEN 'pending' ELSE 'retiring' END,
+             run_token = NULL, run_target_version = NULL,
              run_lease_expires_at = NULL,
-             run_version = run_version + 1, retry_count = 0, retry_at = ?, retry_error = NULL, updated_at = ?
+             run_version = run_version + 1, retry_count = 0,
+             retry_at = CASE WHEN cdb_state = 'pending' THEN retry_at ELSE ? END,
+             retry_error = NULL, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?`,
         nowMs,
         nowMs,
@@ -2101,7 +2232,7 @@ export function cleanupGatewayRegistration(sql: SyncSql, key: GatewayRegistratio
     sql.exec(
         `DELETE FROM _gw_registration_generations
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
-           AND lifecycle = 'retiring'
+           AND lifecycle = 'retiring' AND cdb_state = 'retiring'
            AND NOT EXISTS (
              SELECT 1 FROM _gw_registration_heads h
              WHERE h.registration_id = _gw_registration_generations.registration_id
@@ -2266,6 +2397,12 @@ export function ensureGatewayRegistrationColumns(sql: SyncSql): void {
              run_token = NULL, run_target_version = NULL, run_lease_expires_at = NULL,
              retry_error = NULL
          WHERE lifecycle = 'retiring'`
+    );
+    sql.exec(
+        `UPDATE _gw_registration_generations
+         SET retry_at = updated_at + ?, retry_error = 'subscription install recovery'
+         WHERE cdb_state = 'pending' AND retry_at IS NULL`,
+        GATEWAY_SUBSCRIBE_RECOVERY_MS
     );
     // Run this after every restart. A crash after ALTER but before repair must
     // not leave a partial run triple that no claimant can recover.
@@ -2657,14 +2794,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     private dueGatewayInstallRecoveries(nowMs: number): readonly StoredGatewayInstallRecovery[] {
         return adaptSqlStorage(this.ctx.storage.sql).all<StoredGatewayInstallRecovery>(
-            `SELECT g.principal_id, g.client_id, g.sub_id, g.registration_id
+            `SELECT g.principal_id, g.client_id, g.sub_id, g.registration_id, g.connection_id
              FROM _gw_registration_generations g
-             INNER JOIN _gw_registration_heads h
-               ON h.registration_id = g.registration_id
-              AND h.principal_id = g.principal_id
-              AND h.client_id = g.client_id
-              AND h.sub_id = g.sub_id
-             WHERE g.lifecycle = 'installing' AND g.cdb_state = 'pending'
+             WHERE g.cdb_state = 'pending'
+               AND g.lifecycle IN ('installing', 'retiring')
                AND g.retry_at IS NOT NULL AND g.retry_at <= ?
              ORDER BY g.retry_at, g.registration_id
              LIMIT ?`,
@@ -3163,12 +3296,8 @@ export class Gateway extends DurableObject<GatewayEnv> {
             adaptSqlStorage(this.ctx.storage.sql).one<{ retry_at: number | null }>(
                 `SELECT MIN(g.retry_at) AS retry_at
                  FROM _gw_registration_generations g
-                 INNER JOIN _gw_registration_heads h
-                   ON h.registration_id = g.registration_id
-                  AND h.principal_id = g.principal_id
-                  AND h.client_id = g.client_id
-                  AND h.sub_id = g.sub_id
-                 WHERE g.lifecycle = 'installing' AND g.cdb_state = 'pending'
+                 WHERE g.cdb_state = 'pending'
+                   AND g.lifecycle IN ('installing', 'retiring')
                    AND g.retry_at IS NOT NULL`
             )?.retry_at ?? null
         );
@@ -3336,16 +3465,14 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const nowMs = this.gatewayNowMs();
         for (const recovery of this.dueGatewayInstallRecoveries(nowMs)) {
             this.ctx.storage.transactionSync(() => {
-                retireGatewayRegistration(
-                    adaptSqlStorage(this.ctx.storage.sql),
-                    {
-                        principalId: PrincipalId(recovery.principal_id),
-                        clientId: ClientId(recovery.client_id),
-                        subId: SubId(recovery.sub_id),
-                    },
-                    recovery.registration_id,
-                    nowMs
-                );
+                markPendingGatewaySubscriptionAmbiguous(adaptSqlStorage(this.ctx.storage.sql), {
+                    principalId: PrincipalId(recovery.principal_id),
+                    clientId: ClientId(recovery.client_id),
+                    subId: SubId(recovery.sub_id),
+                    registrationId: recovery.registration_id,
+                    connectionId: recovery.connection_id,
+                    nowMs,
+                });
             });
         }
         const cleanupRows = this.dueGatewayCleanupRows(nowMs);
@@ -4160,16 +4287,20 @@ export class Gateway extends DurableObject<GatewayEnv> {
             }
             throw error;
         }
-        const retireInstalled = async (): Promise<void> => {
-            this.ctx.storage.transactionSync(() => {
-                retireGatewayRegistration(
-                    adaptSqlStorage(this.ctx.storage.sql),
-                    identity,
-                    registrationId,
-                    this.gatewayNowMs()
+        const deleteNeverRegistered = (): boolean =>
+            this.ctx.storage.transactionSync(() =>
+                deleteNeverRegisteredGatewaySubscription(adaptSqlStorage(this.ctx.storage.sql), identity)
+            );
+        const settleAmbiguous = async (): Promise<void> => {
+            const nowMs = this.gatewayNowMs();
+            const changed = this.ctx.storage.transactionSync(() => {
+                const sql = adaptSqlStorage(this.ctx.storage.sql);
+                return (
+                    markPendingGatewaySubscriptionAmbiguous(sql, { ...identity, nowMs }) ||
+                    retireGatewayRegistration(sql, identity, registrationId, nowMs)
                 );
             });
-            await this.scheduleGatewayWork(this.gatewayNowMs());
+            if (changed) await this.scheduleGatewayWork(nowMs);
         };
         const isCancelledOrStale = (): boolean => {
             const current = ws.deserializeAttachment() as GwAttachment | null;
@@ -4188,7 +4319,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         // scheduling attempt fails.
         await this.scheduleGatewayWork(installedAt).catch(() => {});
         if (isCancelledOrStale()) {
-            await retireInstalled();
+            deleteNeverRegistered();
             return;
         }
 
@@ -4201,29 +4332,34 @@ export class Gateway extends DurableObject<GatewayEnv> {
             queryHash: routed.queryHash,
             intent: routed.intent,
         });
-        let changeSeq: number;
+        let response: CdbSubscriptionResponse;
         try {
             const cdb = this.env.CDB_SHARD.get(cdbId) as unknown as CdbSubscriptionRpc;
-            changeSeq = cdbSubscriptionChangeSeq(await cdb.subscribe(request), request.subscription);
+            response = projectCdbSubscriptionResponse(await cdb.subscribe(request), request.subscription);
         } catch {
-            await retireInstalled();
-            if (!pending.cancelled) this.sendError(ws, "CDB_SHARD_UNAVAILABLE", msg.subId);
+            await settleAmbiguous();
+            if (!isCancelledOrStale()) this.sendError(ws, "CDB_SHARD_UNAVAILABLE", msg.subId);
+            return;
+        }
+        if (!response.ok) {
+            const deleted = deleteNeverRegistered();
+            if (deleted && !isCancelledOrStale()) this.sendError(ws, response.error.code, msg.subId);
             return;
         }
         if (isCancelledOrStale()) {
-            await retireInstalled();
+            await settleAmbiguous();
             return;
         }
         const activatedAt = this.gatewayNowMs();
         const activated = this.ctx.storage.transactionSync(() =>
             activateGatewaySubscription(adaptSqlStorage(this.ctx.storage.sql), {
                 ...identity,
-                changeSeq,
+                changeSeq: response.changeSeq,
                 nowMs: activatedAt,
             })
         );
         if (!activated || isCancelledOrStale()) {
-            await retireInstalled();
+            await settleAmbiguous();
             return;
         }
         const current = ws.deserializeAttachment() as VerifiedGwAttachment;
@@ -4541,7 +4677,17 @@ export class Gateway extends DurableObject<GatewayEnv> {
         await Promise.all(
             shardIds.map(async shardId => {
                 const cdb = this.cdb(shardId);
-                await cdb.subscribe(request);
+                const response = projectCdbSubscriptionResponse(await cdb.subscribe(request), request.subscription);
+                if (!response.ok) {
+                    throw new CdbError({
+                        code: response.error.code,
+                        message: response.error.message,
+                        ...(response.error.retryAfterMs === undefined
+                            ? {}
+                            : { retryAfterMs: response.error.retryAfterMs }),
+                        ...(response.error.hint === undefined ? {} : { hint: response.error.hint }),
+                    });
+                }
             })
         );
     }
