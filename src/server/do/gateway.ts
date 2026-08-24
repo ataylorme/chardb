@@ -196,6 +196,9 @@ export const GATEWAY_SEND_LEASE_MS = 10_000 as const;
 export const GATEWAY_SUBSCRIBE_RECOVERY_MS = 30_000 as const;
 
 const GATEWAY_ABANDONED_REGISTRATION_CURSOR_KEY = "abandoned-registration-cursor" as const;
+// Match the Gateway-wide unsettled mutation budget so one isolate has a
+// single aggregate concurrency scale for client-originated work.
+const GATEWAY_MAX_CURRENT_AND_PENDING_REGISTRATIONS = 256;
 // Preserve the platform's original 1 MiB WebSocket message ceiling even on
 // runtimes that accept larger frames. File payloads belong on the upload path.
 const GATEWAY_MAX_INBOUND_WEBSOCKET_BYTES = 1024 * 1024;
@@ -217,6 +220,7 @@ interface RejectedGwAttachment {
 interface PendingSubscription {
     readonly connectionId: string;
     readonly subId: SubId;
+    readonly capacityKey: string;
     cancelled: boolean;
     task: Promise<void>;
 }
@@ -3518,7 +3522,15 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return;
         }
         const operationKey = `${attachment.connectionId}:${msg.subId}`;
+        const capacityKey = stableJson([attachment.principalId, attachment.clientId, msg.subId]);
         const previous = this.pendingSubscriptions.get(operationKey);
+        const duplicatePending = [...this.pendingSubscriptions.values()].some(
+            pending => !pending.cancelled && pending !== previous && pending.capacityKey === capacityKey
+        );
+        if (duplicatePending) {
+            this.sendError(ws, "CDB_RATE_LIMITED", msg.subId);
+            return;
+        }
         const deliveredSubIds = new Set(attachment.snapshotSubIds ?? []);
         if (!previous && !deliveredSubIds.has(msg.subId)) {
             const reservedSubIds = new Set(
@@ -3536,10 +3548,15 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 return;
             }
         }
+        if (!this.hasRegistrationCapacity(attachment, msg.subId, capacityKey)) {
+            this.sendError(ws, "CDB_RATE_LIMITED", msg.subId);
+            return;
+        }
         if (previous) previous.cancelled = true;
         const pending: PendingSubscription = {
             connectionId: attachment.connectionId,
             subId: msg.subId,
+            capacityKey,
             cancelled: false,
             task: Promise.resolve(),
         };
@@ -3563,6 +3580,42 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return;
         }
         await this.admitSubscription(ws, msg, pending, operationKey);
+    }
+
+    private hasRegistrationCapacity(attachment: VerifiedGwAttachment, subId: SubId, capacityKey: string): boolean {
+        if (
+            [...this.pendingSubscriptions.values()].some(
+                pending => !pending.cancelled && pending.capacityKey === capacityKey
+            )
+        ) {
+            return true;
+        }
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        if (
+            sql.one<{ registration_id: string }>(
+                `SELECT registration_id FROM _gw_registration_heads
+                 WHERE principal_id = ? AND client_id = ? AND sub_id = ?`,
+                attachment.principalId,
+                attachment.clientId,
+                subId
+            )
+        ) {
+            return true;
+        }
+        const capacityKeys = new Set(
+            sql
+                .all<{ principal_id: string; client_id: string; sub_id: number }>(
+                    `SELECT principal_id, client_id, sub_id FROM _gw_registration_heads
+                     LIMIT ?`,
+                    GATEWAY_MAX_CURRENT_AND_PENDING_REGISTRATIONS
+                )
+                .map(row => stableJson([row.principal_id, row.client_id, row.sub_id]))
+        );
+        if (capacityKeys.size >= GATEWAY_MAX_CURRENT_AND_PENDING_REGISTRATIONS) return false;
+        for (const pending of this.pendingSubscriptions.values()) {
+            if (!pending.cancelled) capacityKeys.add(pending.capacityKey);
+        }
+        return capacityKeys.size < GATEWAY_MAX_CURRENT_AND_PENDING_REGISTRATIONS;
     }
 
     private async admitSubscription(
