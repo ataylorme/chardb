@@ -15,7 +15,7 @@ import {
     stageGatewaySnapshot,
 } from "../../src/server/do/gateway.ts";
 import type { LiveSubscriptionId } from "../../src/server/rpc.ts";
-import { ChardbRef, ClientId, Cookie, PrincipalId, ShardId, SubId, TenantId } from "../../src/types.ts";
+import { ChardbRef, ClientId, Cookie, PrincipalId, type RawJson, ShardId, SubId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -214,6 +214,22 @@ describe("Gateway active snapshot runner", () => {
             },
         } as unknown as DurableObjectState;
         class TestGateway extends Gateway {
+            override async routeQuery(request: { readonly ref: string; readonly args: RawJson }) {
+                return {
+                    ok: true as const,
+                    args: request.args,
+                    intent: {
+                        kind: "select" as const,
+                        tables: ["messages"],
+                        partitionKey: { table: "messages", column: "organization_id", values: ["org-1"] },
+                    },
+                    policyDigest: currentPolicyDigest,
+                    queryHash: "query-hash-1",
+                    authority: "organization" as const,
+                    partitionKey: "org-1",
+                };
+            }
+
             protected override gatewayNowMs(): number {
                 return clock;
             }

@@ -244,6 +244,8 @@ async function main() {
         ).join("\n");
         assert(built.includes("src/server/api.ts#postMessage"), "Vite output lost the stable mutation ref");
         assert(built.includes("src/server/queries.ts#listMessages"), "Vite output lost the stable query ref");
+        assert(built.includes("src/server/api.ts#createUserPreference"), "Vite output lost the user mutation ref");
+        assert(built.includes("src/server/queries.ts#listUserPreferences"), "Vite output lost the user query ref");
 
         const bundlePath = join(scratch, "chat-worker.mjs");
         const worker = await bundleWorker(consumer, bundlePath);
@@ -336,6 +338,122 @@ async function main() {
         );
         const observer = await connectGateway(origin, "packed-chat-observer", secondTokenBody.token);
         sockets.push(observer.socket);
+
+        const preferenceMutationRequest = {
+            id: "packed-user-preference",
+            userId: sessionBody.user.id,
+            theme: "dark",
+            mutId: "packed-user-preference-mut",
+        };
+        const preferenceMutation = await mf.dispatchFetch(new URL("/api/db/preferences", origin), {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${tokenBody.token}`,
+                "content-type": "application/json",
+            },
+            body: JSON.stringify(preferenceMutationRequest),
+        });
+        const preferenceMutationBody = await preferenceMutation.json();
+        assert(
+            preferenceMutation.ok &&
+                preferenceMutationBody?.id === "packed-user-preference" &&
+                preferenceMutationBody?.userId === sessionBody.user.id,
+            `native env.DB user mutation failed: ${JSON.stringify(preferenceMutationBody)}`
+        );
+        const primaryPreferenceUrl = new URL("/api/db/preferences", origin);
+        primaryPreferenceUrl.searchParams.set("userId", sessionBody.user.id);
+        const secondPreferenceUrl = new URL("/api/db/preferences", origin);
+        secondPreferenceUrl.searchParams.set("userId", secondUserId);
+        const [primaryPreferenceResponse, secondPreferenceResponse] = await Promise.all([
+            mf.dispatchFetch(primaryPreferenceUrl, {
+                headers: { authorization: `Bearer ${tokenBody.token}` },
+            }),
+            mf.dispatchFetch(secondPreferenceUrl, {
+                headers: { authorization: `Bearer ${secondTokenBody.token}` },
+            }),
+        ]);
+        const [primaryPreferences, secondPreferences] = await Promise.all([
+            primaryPreferenceResponse.json(),
+            secondPreferenceResponse.json(),
+        ]);
+        assert(
+            primaryPreferenceResponse.ok &&
+                Array.isArray(primaryPreferences) &&
+                primaryPreferences.length === 1 &&
+                primaryPreferences[0]?.theme === "dark",
+            `native env.DB user query failed: ${JSON.stringify(primaryPreferences)}`
+        );
+        assert(
+            secondPreferenceResponse.ok && Array.isArray(secondPreferences) && secondPreferences.length === 0,
+            `native env.DB cross-user isolation failed: ${JSON.stringify(secondPreferences)}`
+        );
+        const forgedPreferenceResponse = await mf.dispatchFetch(secondPreferenceUrl, {
+            headers: { authorization: `Bearer ${tokenBody.token}` },
+        });
+        assert(!forgedPreferenceResponse.ok, "native env.DB accepted a forged user partition");
+
+        const preferenceReplay = await mf.dispatchFetch(new URL("/api/db/preferences", origin), {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${tokenBody.token}`,
+                "content-type": "application/json",
+            },
+            body: JSON.stringify(preferenceMutationRequest),
+        });
+        const preferenceReplayBody = await preferenceReplay.json();
+        assert(
+            preferenceReplay.ok && JSON.stringify(preferenceReplayBody) === JSON.stringify(preferenceMutationBody),
+            `native env.DB user mutation replay changed its result: ${JSON.stringify(preferenceReplayBody)}`
+        );
+
+        const userQueryLatenciesMs = [];
+        const userBenchmarkStartedAt = performance.now();
+        for (let offset = 0; offset < bindingBenchmarkProfile.queries; offset += bindingBenchmarkProfile.concurrency) {
+            const batchSize = Math.min(bindingBenchmarkProfile.concurrency, bindingBenchmarkProfile.queries - offset);
+            await Promise.all(
+                Array.from({ length: batchSize }, async (_, batchIndex) => {
+                    const primary = (offset + batchIndex) % 2 === 0;
+                    const startedAt = performance.now();
+                    const response = await mf.dispatchFetch(primary ? primaryPreferenceUrl : secondPreferenceUrl, {
+                        headers: {
+                            authorization: `Bearer ${primary ? tokenBody.token : secondTokenBody.token}`,
+                        },
+                    });
+                    const rows = await response.json();
+                    userQueryLatenciesMs.push(performance.now() - startedAt);
+                    assert(
+                        response.ok && Array.isArray(rows) && rows.length === (primary ? 1 : 0),
+                        `native env.DB user benchmark diverged: ${JSON.stringify(rows)}`
+                    );
+                })
+            );
+        }
+        const userBenchmarkElapsedMs = performance.now() - userBenchmarkStartedAt;
+        const sortedUserQueryLatenciesMs = [...userQueryLatenciesMs].sort((left, right) => left - right);
+        console.log(
+            JSON.stringify({
+                type: "chardb-user-binding-benchmark",
+                version: 1,
+                profile: bindingBenchmarkProfileName,
+                principals: 2,
+                queries: bindingBenchmarkProfile.queries,
+                concurrency: bindingBenchmarkProfile.concurrency,
+                elapsedMs: userBenchmarkElapsedMs,
+                queriesPerSecond: (bindingBenchmarkProfile.queries * 1_000) / userBenchmarkElapsedMs,
+                latencyMs: {
+                    min: sortedUserQueryLatenciesMs[0],
+                    p50: percentile(sortedUserQueryLatenciesMs, 0.5),
+                    p95: percentile(sortedUserQueryLatenciesMs, 0.95),
+                    max: sortedUserQueryLatenciesMs.at(-1),
+                },
+                invariants: {
+                    exactPrimaryRowsPerQuery: 1,
+                    exactSecondUserRowsPerQuery: 0,
+                    forgedPartitionDenied: true,
+                    mutationReplayStable: true,
+                },
+            })
+        );
 
         const queryArgs = { organizationId: "demo-org", channelId: "general", limit: 50 };
         socket.send(JSON.stringify({ t: "sub", subId: 1, ref: "src/server/queries.ts#listMessages", args: queryArgs }));
@@ -547,6 +665,43 @@ async function main() {
         assert(
             reconstructedTokenResponse.ok && typeof reconstructedTokenBody?.token === "string",
             `JWT issue from the reconstructed session failed: ${JSON.stringify(reconstructedTokenBody)}`
+        );
+        const reconstructedSecondTokenResponse = await mf.dispatchFetch(new URL("/api/auth/token", origin), {
+            headers: { cookie: secondCookie },
+        });
+        const reconstructedSecondTokenBody = await reconstructedSecondTokenResponse.json();
+        assert(
+            reconstructedSecondTokenResponse.ok && typeof reconstructedSecondTokenBody?.token === "string",
+            `second JWT issue after restart failed: ${JSON.stringify(reconstructedSecondTokenBody)}`
+        );
+        const reconstructedPrimaryPreferenceUrl = new URL("/api/db/preferences", origin);
+        reconstructedPrimaryPreferenceUrl.searchParams.set("userId", sessionBody.user.id);
+        const reconstructedSecondPreferenceUrl = new URL("/api/db/preferences", origin);
+        reconstructedSecondPreferenceUrl.searchParams.set("userId", secondUserId);
+        const [reconstructedPrimaryPreference, reconstructedSecondPreference] = await Promise.all([
+            mf.dispatchFetch(reconstructedPrimaryPreferenceUrl, {
+                headers: { authorization: `Bearer ${reconstructedTokenBody.token}` },
+            }),
+            mf.dispatchFetch(reconstructedSecondPreferenceUrl, {
+                headers: { authorization: `Bearer ${reconstructedSecondTokenBody.token}` },
+            }),
+        ]);
+        const [reconstructedPrimaryRows, reconstructedSecondRows] = await Promise.all([
+            reconstructedPrimaryPreference.json(),
+            reconstructedSecondPreference.json(),
+        ]);
+        assert(
+            reconstructedPrimaryPreference.ok &&
+                Array.isArray(reconstructedPrimaryRows) &&
+                reconstructedPrimaryRows.length === 1 &&
+                reconstructedPrimaryRows[0]?.id === "packed-user-preference",
+            `user preference did not survive Miniflare restart: ${JSON.stringify(reconstructedPrimaryRows)}`
+        );
+        assert(
+            reconstructedSecondPreference.ok &&
+                Array.isArray(reconstructedSecondRows) &&
+                reconstructedSecondRows.length === 0,
+            `user isolation changed after Miniflare restart: ${JSON.stringify(reconstructedSecondRows)}`
         );
 
         primary = await connectGateway(origin, "packed-chat-client", reconstructedTokenBody.token);

@@ -9,8 +9,8 @@ export function Tenancy() {
             <SectionLead>
                 <InlineCode>forOrg()</InlineCode>, <InlineCode>forUser()</InlineCode>, and{" "}
                 <InlineCode>globalScope()</InlineCode> should declare placement, transaction, and policy boundaries
-                once. The organization path works end to end today. User and global paths still need the same public
-                runtime proof.
+                once. Organization and user paths work through the binding, WebSocket live queries, Catalog authority,
+                and Cdb policy enforcement today. Global placement and cross-boundary transactions remain closed.
             </SectionLead>
 
             <div className="mt-10">

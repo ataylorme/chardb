@@ -77,12 +77,12 @@ function jsonStringOfByteLength(byteLength: number): string {
 function fillRegistrationUsage(db: Database, sql: SyncSql, registrationId: string, targetBytes: number): void {
     const current = gatewayDurablePayloadUsage(sql).chargedRegistrationBytes;
     const row = db
-        .query("SELECT args_json FROM _gw_registration_generations WHERE registration_id = ?")
-        .get(registrationId) as { args_json: string };
-    const currentArgsBytes = new TextEncoder().encode(row.args_json).byteLength;
-    const desiredArgsBytes = currentArgsBytes + targetBytes - current;
-    db.query("UPDATE _gw_registration_generations SET args_json = ? WHERE registration_id = ?").run(
-        jsonStringOfByteLength(desiredArgsBytes),
+        .query("SELECT query_hash FROM _gw_registration_generations WHERE registration_id = ?")
+        .get(registrationId) as { query_hash: string };
+    const currentHashBytes = new TextEncoder().encode(row.query_hash).byteLength;
+    const desiredHashBytes = currentHashBytes + targetBytes - current;
+    db.query("UPDATE _gw_registration_generations SET query_hash = ? WHERE registration_id = ?").run(
+        "x".repeat(desiredHashBytes),
         registrationId
     );
     expect(gatewayDurablePayloadUsage(sql).chargedRegistrationBytes).toBe(targetBytes);

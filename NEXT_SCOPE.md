@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-08-25
 
-The narrow organization-tenanted runtime is the current supported path. The one-binding package below is complete for that path. The remaining packages are not implemented and may appear on the landing page only when clearly labeled as the destination or target interface. Pick one package before starting another.
+The narrow organization- and user-tenanted runtimes are the current supported paths. The one-binding package works for both. The remaining packages are not implemented and may appear on the landing page only when clearly labeled as the destination or target interface. Pick one package before starting another.
 
 ## Product contract
 
@@ -23,7 +23,7 @@ A package is complete only when its public API, failure contract, resource bound
 
 ## One-binding developer surface: completed 2026-08-25
 
-Same-Worker apps expose one typed `env.DB` handle and resolve Chardb's internal classes through native `ctx.exports`; consumers do not declare the six internal Durable Object bindings. `wrangler.toml` is the scaffold default, and doctor also accepts `wrangler.jsonc`. The handle accepts registered query and mutation functions through `client(env.DB, { jwt, authOrigin })`, converts them to stable refs before RPC, verifies the JWT, re-derives current organization authority in Catalog, and uses the same manifest, migration epoch, policy, and Cdb execution paths as live traffic.
+Same-Worker apps expose one typed `env.DB` handle and resolve Chardb's internal classes through native `ctx.exports`; consumers do not declare the six internal Durable Object bindings. `wrangler.toml` is the scaffold default, and doctor also accepts `wrangler.jsonc`. The handle accepts registered query and mutation functions through `client(env.DB, { jwt, authOrigin })`, converts them to stable refs before RPC, verifies the JWT, re-derives current organization or user authority in Catalog, and uses the same manifest, migration epoch, policy, and Cdb execution paths as live traffic.
 
 - `chardb init`, local Miniflare, Wrangler deployment, migration, and production share the same exported `DB` entrypoint.
 - Explicit stable refs, server-owned query intent, current Catalog authority, policy checks, and migration epochs remain behind the handle.
@@ -41,12 +41,12 @@ Full-row single-table queries are the only supported shape.
 
 ## Complete tenancy axes
 
-`forOrg()`, `forUser()`, and `globalScope()` exist as schema primitives. Only the organization path has the complete public mutation, query, auth, and live-update proof.
+`forOrg()`, `forUser()`, and `globalScope()` exist as schema primitives. Organization and user scopes have public mutation, query, auth, binding, and live-update proofs. Global scope still lacks a public runtime contract.
 
-- Give user-scoped tables a public route, authority derivation, policy floor, mutation path, and live-query path.
+- User scope completed 2026-08-25. Gateway binds its declared partition to the verified JWT subject, Catalog re-derives the current user row, system role, and principal epoch, and Cdb applies the `forUser()` policy floor. Workerd proves forged-subject denial, two-user isolation, invalidation, Gateway hibernation, Cdb reconstruction, and concurrent principal fanout. The exact-tarball chat proves native `env.DB` query, mutation replay, isolation, restart, and a frozen two-principal query profile.
 - Give global tables an explicit placement and transaction contract instead of silently treating them as tenant data.
 - Define and reject cross-boundary joins and transactions until a bounded, atomic contract exists.
-- Run the same isolation, reconnect, revocation, migration, and reconstruction matrix for every supported axis.
+- Run the same isolation, reconnect, revocation, migration, and reconstruction matrix for global scope if it becomes public.
 
 ## Auth profile expansion
 

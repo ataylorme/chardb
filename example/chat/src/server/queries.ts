@@ -9,7 +9,7 @@
 import { api } from "chardb/server";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
-import { messages } from "./schema.ts";
+import { messages, userPreferences } from "./schema.ts";
 
 const listMessagesArgs = z.object({
     organizationId: z.string(),
@@ -53,4 +53,20 @@ export const listMessages = api.query({
             .from(messages)
             .where(and(eq(messages.organizationId, args.organizationId), eq(messages.channelId, args.channelId)))
             .limit(args.limit),
+});
+
+export const listUserPreferences = api.query({
+    ref: "src/server/queries.ts#listUserPreferences",
+    args: z.object({ userId: z.string() }),
+    authority: "user",
+    partitionKey: "userId",
+    intent: args => ({
+        kind: "select",
+        tables: ["user_preferences"],
+        partitionKey: { table: "user_preferences", column: "user_id", values: [args.userId] },
+        joinShape: "colocated",
+        intervals: [{ table: "user_preferences", indexName: "user_id", intervals: [{ kind: "full" }] }],
+    }),
+    handler: async (ctx, args) =>
+        ctx.db.select().from(userPreferences).where(eq(userPreferences.userId, args.userId)).all(),
 });

@@ -20,11 +20,11 @@ Implemented and tested in isolation:
 - Strict protocol-v3 decoding and server-owned query routing metadata
 - Better Auth schema synthesis with all auth rows stored in Catalog
 - Constraint-complete Catalog auth DDL with exact `auth_ddl_v1` compatibility checks
-- Configured Catalog reconstruction with stored auth rows and organization authority preserved
+- Configured Catalog reconstruction with stored auth rows and organization and user authority preserved
 - Atomic Catalog auth mutations with directly derivable old and new epoch bumps
 - Gateway JWT signature and registered-claim verification
-- Public organization-authorized mutations with explicit stable refs
-- Catalog-derived membership, roles, and auth epochs for each declared organization mutation
+- Public organization- and user-authorized mutations with explicit stable refs
+- Catalog-derived organization membership or user authority, roles, and auth epochs for each declared operation
 - Single-pass mutation schema transformation before partition routing, with bounded argument checks at every trust boundary
 - Client mutation settlement bounded by a configurable timeout across reconnects
 - Schema-first insert, update, delete, and full-row select authorization, including writable-column checks and readable-column masks
@@ -32,7 +32,7 @@ Implemented and tested in isolation:
 - Read-only shard-local query execution with JSON result validation
 - A native same-Worker `env.DB` RPC binding with typed stable-handle queries and mutations
 - Protocol-v3 snapshot decoding and client replacement handling
-- Durable public registrations and live replacement snapshots for explicit, exact-single-partition organization queries
+- Durable public registrations and live replacement snapshots for explicit, exact-partition organization and user queries
 - Conservative `cdbTable` dependency checks against each live query's declared table intent
 - Static `cdbTable` policy digests in Gateway and Cdb registered-query identity
 - Transactional Cdb invalidation outbox delivery with durable retries
@@ -51,7 +51,7 @@ Still missing from the application path:
 
 Files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding remain experiments. They are not supported product features.
 
-The WebSocket protocol does not trust client routing or authority metadata. Gateway verifies the JWT signature and registered claims, then keeps only the verified subject and time bounds in the socket attachment. A mutation becomes public only when its server definition declares `authority: "organization"` and an explicit stable `ref`. An organization query additionally declares a partition key and a server-side intent callback written by the developer. Gateway validates arguments, requires the declared partition and intent to resolve to the same exact organization and one virtual shard, and asks Catalog to re-derive membership, role, roles, and global, tenant, and principal auth epochs. Token tenant, role, and custom claims never become authority. Undeclared, mismatched, scatter, and cross-partition queries remain closed. Presence remains closed.
+The WebSocket protocol does not trust client routing or authority metadata. Gateway verifies the JWT signature and registered claims, then keeps only the verified subject and time bounds in the socket attachment. A mutation or query becomes public only when its server definition declares `authority: "organization"` or `authority: "user"` and an explicit stable `ref`; queries also declare a partition key and server-side intent. Gateway validates arguments, requires the declared partition and intent to resolve to one exact authority boundary and one virtual shard, and asks Catalog to re-derive current authority and auth epochs. A user partition must equal the verified JWT subject. Token tenant, role, and custom claims never become authority. Undeclared, mismatched, scatter, and cross-partition queries remain closed. Presence remains closed.
 
 Subjectless Gateway queries remain closed. Better Auth anonymous sign-in creates an authenticated account. After JWT issuance and organization membership, that account is a principal like any other. A table's `publicRead` flag removes the table-role requirement for selects only. It does not remove JWT verification, Catalog membership, the tenant predicate, write grants, or cross-organization isolation. A four-case workerd proof covers an allowed same-organization read, a denied cross-organization read, a missing JWT, and an invalid JWT.
 
@@ -232,7 +232,7 @@ await client(c.env.DB, { jwt, authOrigin }).mutate(postMessage, args, {
 });
 ```
 
-Pass a stable `mutId` when an outer request may be retried. If omitted, `client` creates a UUID for that invocation. Binding failures throw `CdbError` with the same locked code and retryability contract as the WebSocket client. The current binding accepts registered organization-scoped handles. It does not expose raw Drizzle builders, caller-supplied authority, scatter queries, or cross-partition work.
+Pass a stable `mutId` when an outer request may be retried. If omitted, `client` creates a UUID for that invocation. Binding failures throw `CdbError` with the same locked code and retryability contract as the WebSocket client. The current binding accepts registered organization- and user-scoped handles. It does not expose raw Drizzle builders, caller-supplied authority, scatter queries, or cross-partition work.
 
 ## Repository development
 

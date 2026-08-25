@@ -135,6 +135,25 @@ app.post("/api/db/messages", async c => {
     });
     return c.json(result);
 });
+app.get("/api/db/preferences", async c => {
+    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
+    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
+    const url = new URL(c.req.url);
+    const rows = await client(c.env.DB, { jwt, authOrigin: url.origin }).query(queries.listUserPreferences, {
+        userId: url.searchParams.get("userId") ?? "",
+    });
+    return c.json(rows);
+});
+app.post("/api/db/preferences", async c => {
+    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
+    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
+    const url = new URL(c.req.url);
+    const body = await c.req.json<{ id: string; userId: string; theme: string; mutId?: string }>();
+    const result = await client(c.env.DB, { jwt, authOrigin: url.origin }).mutate(api.createUserPreference, body, {
+        ...(body.mutId ? { mutId: body.mutId } : {}),
+    });
+    return c.json(result);
+});
 
 export default app;
 export const { DB, BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;

@@ -1,10 +1,11 @@
-import { forOrg } from "chardb/server";
+import { forOrg, forUser } from "chardb/server";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { auth } from "./worker.ts";
 
 // Every cdbTable in this file is org-tenanted. The tenant column is
 // auto-discovered from the `.references(() => auth.organization.id)`
 const { cdbTable } = forOrg();
+const { cdbTable: userTable } = forUser();
 
 export const channels = cdbTable(
     "channels",
@@ -56,6 +57,23 @@ export const messages = cdbTable(
                 update: ["body"],
                 delete: true,
             },
+        },
+    }
+);
+
+export const userPreferences = userTable(
+    "user_preferences",
+    {
+        id: text("id").primaryKey(),
+        userId: text("user_id")
+            .notNull()
+            .references(() => auth.user.id, { onDelete: "cascade" }),
+        theme: text("theme").notNull(),
+    },
+    {
+        roles: {
+            user: { create: ["id", "theme"], read: "*", update: ["theme"] },
+            admin: "*",
         },
     }
 );
