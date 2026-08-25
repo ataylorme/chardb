@@ -69,6 +69,8 @@ If a verified `hello` cannot send `welcome`, Gateway marks that exact connection
 
 The client option `mutationTimeoutMs` defaults to 60 seconds and covers the full pending lifetime, including reconnects. A reconnect resends a pending mutation with its original `mutId` without resetting the deadline. If that deadline expires, the promise rejects with nonretryable `CDB_MUTATION_OUTCOME_UNKNOWN` because the server may already have committed the mutation. A synchronous send failure, client close, session failure, or terminal server result clears the timer. `ChardbProvider` forwards the same option. The client does not expose a retry handle or automatically retry terminal errors.
 
+A transient transport disconnect retains pending mutations for reconnect under the original id and deadline. Explicit `client.close()` and terminal session failure instead reject every remaining mutation once with `CDB_STREAM_ABORTED`. The client never reports those cases as a confirmed server rollback.
+
 Pre-welcome closes advance reconnect delay through 250 ms, 500 ms, 1 second, 2 seconds, 4 seconds, 8 seconds, and a repeating 10-second cap. A WebSocket opening does not reset the delay. Only an accepted `welcome` restores the initial 250 ms delay.
 
 Pending JWT continuations and all socket callbacks check terminal state, connection-attempt number, and exact socket identity. Error and close revoke the current socket before reconnect processing. A stale JWT or callback therefore cannot send, apply rows, settle work, schedule another reconnect, or change the replacement socket. The existing backoff sequence and welcome-only reset remain unchanged.
@@ -92,6 +94,8 @@ Keyless mutation routing uses stable canonical JSON, so nested object insertion 
 Server query and subscription arguments use the same exact 512 KiB UTF-8, 4,096-member, and 99-level strict JSON contract. Gateway owns raw subscription arguments before pending capacity or routing. Built-in routing takes separate owned snapshots around validation and declared intent and partition callbacks, including the callback-mutated arguments and returned intent. Gateway rechecks the arguments from an overridden route before Catalog, Cdb, or durable installation. Each snapshot is built from data descriptors in one traversal without invoking getters or enumerating and reading a proxy again, so later caller, validator, or callback mutation cannot alter downstream work.
 
 `Cdb.subscribe` enforces the contract before interval or durable registration work. Direct `Cdb.query` enforces it before descriptor lookup or handler invocation, and registered execution checks persisted arguments before routing callbacks or the handler. Cdb bootstrap streams the active-registration cursor and rebuilds each table and interval mapping as its row arrives, including a full 4,096-row set. A legacy active row with over-limit arguments stays mapped and invalidatable but returns terminal `CDB_INVALID_ARGS` when executed; valid sibling registrations still run. The configured snapshot suite reconstructs that legacy row, invalidates it through a real mutation, observes terminal Gateway settlement, and completes exact Cdb cleanup.
+
+Query handlers return ordered JSON arrays. Cdb preserves that order, so handlers must use a deterministic SQL `orderBy` when consumers depend on it. The supported live path sends full replacement snapshots. It does not require or infer a protocol row key, and incremental row patches remain unsupported.
 
 Mutation results accept the exact 512 KiB serialized JSON boundary. A fresh result is copied from data descriptors inside the transaction before op-log finalization or the write-set hook, without invoking getters or rereading a proxy. The fresh response and replay therefore remain equal if the handler later mutates its retained object. A fresh oversized result returns `CDB_INVARIANT`; its domain SQL and provisional op-log row roll back. Replay applies the same limit to the stored result. An oversized legacy row is rejected without running the handler or hook and without changing the stored row. The error guidance directs larger reads to a paginated query.
 
@@ -243,6 +247,8 @@ bun run build
 - `landing` contains the project site.
 
 The npm tarball contains built `dist` files and the public documents. It does not contain `src`. CI runs `chardb init` from that tarball in a temporary project, installs its pinned dependencies without workspace aliases, typechecks it, and runs a Wrangler dry-run build. CI then runs the packed chat smoke, which installs version 0.1.0 into another clean temporary consumer and proves sign-in, mutation, live delivery, persistent Miniflare restart, session reconstruction, op-log replay, one-row readback, and organization isolation. Domain migrations, exact resume-cookie replay, and broader recovery guarantees remain unfinished.
+
+Repository tooling and the `chardb` CLI support Bun 1.2.22. The package does not claim Node runtime support. CI also fetches complete Git history and runs `bun run security:history`, which scans every reachable text blob for high-confidence private-key and provider-token formats without printing matched secret values.
 
 ## License
 

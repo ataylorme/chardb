@@ -185,7 +185,7 @@ Protocol v3 subscription requests send a query reference and raw arguments. Quer
 - [x] Add an explicit protocol-v3 snapshot envelope, including empty row arrays, and replace client subscription state when it arrives.
 - [x] Send an explicit initial snapshot, including an empty snapshot, for the exact-partition organization query path.
 - [x] Move the client subscription from `pending` to `live` when a valid snapshot arrives.
-- [ ] Define ordering and stable row keys for collection results.
+- [x] Define collection ordering and row identity for the full-snapshot path. Cdb preserves the handler's array order, so a handler must use a deterministic `orderBy` when order matters. Replacement snapshots replace the whole collection and require no protocol row key; incremental patches remain unsupported.
 - [x] Reject undeclared, mismatched, scatter, and cross-partition queries instead of silently routing them.
 - [x] Conservatively record every `cdbTable` dependency exposed by supported full-row queries and reject results when a recorded table is absent from developer-declared `intent.tables`.
 - [x] At each supported full-row query execution, record the actual typed predicate with the row-policy floor and require each declared interval bundle's union to contain every observed range for its table and index.
@@ -264,7 +264,7 @@ The current cookie is a generated string, not a replay coordinate. A replacement
 - [ ] Bound retired Cdb subscription-tombstone total bytes and define its compaction watermark, plus presence state, other queues, slow-consumer backpressure, and other retention watermarks.
 - [x] Define and test snapshot acknowledgement, durable retry until exact acknowledgement, and client same-cookie deduplication with re-acknowledgement.
 - [ ] Apply backpressure or disconnect slow consumers.
-- [ ] Make disconnect and shutdown reject or retain pending mutations according to a documented rule.
+- [x] Define and test pending mutation behavior across disconnect and shutdown. A transient disconnect retains the original request, `mutId`, and deadline for reconnect. Explicit `client.close()` or terminal session failure rejects each pending promise once with `CDB_STREAM_ABORTED`, while deadline expiry returns `CDB_MUTATION_OUTCOME_UNKNOWN` because commit status may be unknown.
 - [x] Cover malformed and throwing Catalog authority responses in the configured Gateway workerd harness.
 - [x] Add default-small, environment-scalable SDK workerd scenarios for two-tenant mutation fanout and selective subscription refresh. Assert exact rows, durable convergence, drained outboxes, and cleanup; emit timing telemetry without performance thresholds.
 - [x] Split scaled two-tenant fanout into two write phases, replace half the clients after the first convergence point, rematerialize exact tenant rows, then complete the workload without duplicates or cross-tenant rows.
@@ -327,7 +327,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Add direct metadata for `@standard-schema/spec` and packages referenced by emitted validator, auth, and React declarations.
 - [x] Remove the unused `ulid` dependency.
 - [x] Declare Bun 1.2.22 as the package-manager baseline.
-- [ ] Decide whether Node is supported and declare its version if so.
+- [x] Declare Bun 1.2.22 as the only supported package tooling and CLI runtime. Do not claim Node runtime support or publish a Node engine range until the package has a Node test matrix.
 - [x] Use `bun.lock` at the root and keep `package-lock.json` only for the npm consumer fixture.
 - [x] Stop tracking generated landing `.js`, `.d.ts`, and `.tsbuildinfo` files.
 - [x] Add `prepack` so a clean package build always produces `dist`.
@@ -342,7 +342,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Add CI for frozen install, typecheck, lint, unit tests, serialized workerd tests, package build, package consumer tests, generated-project smoke, packed chat smoke, landing build, and example build.
 - [x] Upgrade compatible `nanoid`, PostCSS, Sharp, SVGO, and `ws` dependency paths past their published advisories.
 - [ ] Upgrade Miniflare when a compatible stable release stops pinning vulnerable `undici@7.28.0`; do not hide the advisory with an override.
-- [ ] Run a full-history secret scan before changing repository visibility.
+- [x] Add and run a repeatable full-history scan for high-confidence private keys and provider credentials. CI checks out full history and runs `bun run security:history`; the local full-history run completed with no findings.
 
 ## 13. Rewrite the public story
 

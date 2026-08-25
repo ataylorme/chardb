@@ -20,3 +20,5 @@ Include enough information to reproduce and assess the problem with synthetic da
 Issues involving tenant-boundary bypass, authorization policy bypass, JWT verification, mutation replay, SQL injection, cross-shard routing, data corruption, migration, resharding, snapshot integrity, or secret exposure should be reported privately.
 
 Ordinary bugs without a security impact belong in the [public issue tracker](https://github.com/zpg6/chardb/issues).
+
+CI checks out complete Git history and runs `bun run security:history`. The scanner reads every reachable text blob and reports the object id, path, and rule for high-confidence private-key and provider-token formats. It does not print the matched value. This check complements provider-side secret scanning; it is not a substitute for credential rotation after an exposure.
