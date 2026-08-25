@@ -23,9 +23,8 @@ A package is complete only when its public API, failure contract, resource bound
 
 ## One-binding developer surface
 
-The target interface is one schema entry and one typed `env.DB` handle. The current scaffold exposes the underlying Durable Object bindings, service boundary, assets routes, and generated Worker.
+The target interface is one schema entry and one typed `env.DB` handle. Generated same-Worker apps now provision Chardb's exported classes through standard Wrangler migrations and resolve them through native `ctx.exports`; consumers do not declare the six internal Durable Object bindings. `wrangler.toml` is the scaffold default, and doctor also accepts `wrangler.jsonc`. The remaining product work is the public typed database handle and a shared application-facing path for local development, migration, and production.
 
-- Define whether the binding is implemented by generated Wrangler configuration, a service binding adapter, or a platform-native mechanism.
 - Make `chardb init`, local development, deployment, migration, and production use share the same application-facing handle.
 - Preserve explicit stable refs, server-owned query intent, tenancy enforcement, and migration epochs behind that handle.
 - Prove a clean package can scaffold, typecheck, build, migrate, and run the chat end to end without the consumer wiring Chardb internals.

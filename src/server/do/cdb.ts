@@ -32,6 +32,7 @@ import { cdbPolicyDigest } from "../cdb-policy.ts";
 import { collectCdbTables } from "../cdb-table-registry.ts";
 import { resolveCdbMeta } from "../cdb-table.ts";
 import type { AuthCtx } from "../define.ts";
+import { withChardbLoopbacks } from "../loopback.ts";
 import { type ChardbManifest, emptyManifest, resolveMutation, resolveQuery, routeValidatedQuery } from "../manifest.ts";
 import {
     CDB_JSON_MAX_AGGREGATE_MEMBERS,
@@ -877,7 +878,7 @@ export interface CdbRuntimeConfig<TSchema extends Record<string, unknown>> {
 }
 
 /**
- * Cdb shard. Bound as `class_name = "Cdb"` in wrangler.jsonc.
+ * Cdb shard. Provisioned as `class_name = "Cdb"` by Wrangler migrations.
  */
 export class Cdb extends DurableObject<CdbEnv> {
     private readonly intervalMap = new IntervalMap<string>();
@@ -885,7 +886,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     private bootstrapped = false;
 
     constructor(state: DurableObjectState, env: CdbEnv) {
-        super(state, env);
+        super(state, withChardbLoopbacks(env, state));
         state.blockConcurrencyWhile(async () => this.bootstrap());
     }
 

@@ -1,0 +1,42 @@
+# Worker name and entry. The default export of src/server/worker.ts is the
+# mounted fetch handler. Its exported Durable Object classes live beside it.
+name = "chardb-chat-example"
+main = "src/server/worker.ts"
+compatibility_date = "2026-05-10"
+compatibility_flags = ["nodejs_compat"]
+
+# These migrations provision the exported classes. Wrangler exposes them to
+# the Worker and each Durable Object through native ctx.exports, so the
+# application does not declare six internal CDB_* bindings.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Cdb", "Catalog", "Gateway", "BlobMeta", "Resharder", "GsiShard"]
+
+# Static assets. The live Chardb routes run through the Worker first.
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/ws", "/_chardb/*"]
+
+# Tail-capture queue for GSI write fan-out.
+[[queues.producers]]
+queue = "chardb-gsi"
+binding = "CDB_GSI_QUEUE"
+
+[[queues.consumers]]
+queue = "chardb-gsi"
+max_batch_size = 100
+
+# Optional blob storage and vector index for chardb/files and vector().
+[[r2_buckets]]
+binding = "CDB_R2"
+bucket_name = "chardb-chat-blobs"
+
+[[vectorize]]
+binding = "CDB_VECTORIZE"
+index_name = "chardb-chat"
+
+# PITR barrier tick plus user defineCron callbacks dispatch.
+[triggers]
+crons = ["* * * * *"]

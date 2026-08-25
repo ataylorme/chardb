@@ -1,6 +1,6 @@
 # chardb chat example
 
-This is a compile-checked concept example for chardb's chat API: Drizzle tables, better-auth configuration, a packaged schema journal, typed mutations and queries, and React hooks in one small application. It typechecks and produces a Vite build against a packed chardb package. The `postMessage` mutation and `listMessages` query opt into organization authority with explicit stable refs and partition metadata. [`scripts/smoke-packed-chat.mjs`](../../scripts/smoke-packed-chat.mjs) installs version 0.1.0 from a clean tarball, applies its packaged journal through that tarball's CLI, and proves actual Better Auth anonymous sign-in, live replacement, same-`mutId` replay, persistent restart, independent readback, and denial between two principals in different organizations. Resume replay remains unfinished, and this example is not ready for production data.
+This is a compile-checked example for chardb's chat API: Drizzle tables, better-auth configuration, a packaged schema journal, typed mutations and queries, and React hooks in one small application. It typechecks and produces a Vite build against a packed chardb package. The `postMessage` mutation and `listMessages` query opt into organization authority with explicit stable refs and partition metadata. [`scripts/smoke-packed-chat.mjs`](../../scripts/smoke-packed-chat.mjs) installs version 0.1.0 from a clean tarball, applies its packaged journal through that tarball's CLI, and proves Better Auth anonymous sign-in, live replacement, exact same-`mutId` replay, persistent restart, independent readback, and denial between principals in different organizations. The Miniflare environment uses the exported class names and no internal `CDB_*` Durable Object bindings. This example is not ready for production data.
 
 The intended backend surface is one factory call:
 
@@ -147,7 +147,7 @@ src/
 
 index.html                   Vite entry → /src/web/main.tsx
 vite.config.ts               vite + @vitejs/plugin-react + chardb/vite plugin
-wrangler.template.jsonc      illustrative bindings for a future workerd demo
+wrangler.template.toml       native migrations and optional platform resources
 test/e2e/                    bun:test + bun:sqlite stress tests for the pure layers
 ```
 

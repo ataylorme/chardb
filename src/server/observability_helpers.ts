@@ -14,7 +14,7 @@ import type { ChardbManifest } from "./manifest.ts";
  * Selects the manifest cron entries whose expression equals `cronExpr`.
  *
  * Cloudflare's `ScheduledEvent.cron` field is the literal cron string
- * the user wrote in `wrangler.jsonc`, so the entrypoint dispatch is
+ * the user wrote in Wrangler config, so the entrypoint dispatch is
  * exact-string equality. Cron-grammar normalisation (`* * * * *` vs
  * `0 * * * *`) is the bundler's job, not the runtime's.
  */

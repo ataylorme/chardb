@@ -59,6 +59,7 @@ import {
     defineChardb,
     mountChardb,
 } from "./entrypoint.ts";
+import { sourceChardbEnv } from "./loopback.ts";
 import { type ChardbMigrationJournal, defineMigrations } from "./schema-migrations.ts";
 
 /**
@@ -311,7 +312,7 @@ function buildDefaultAuthHandler(
     const cache = new WeakMap<object, (request: Request) => Response | Promise<Response>>();
     let cachedAcOptions: BetterAuthOptions | undefined;
     return (request, env) => {
-        const e = env as unknown as object;
+        const e = sourceChardbEnv(env as unknown as object);
         let handler = cache.get(e);
         if (!handler) {
             if (!cachedAcOptions) cachedAcOptions = applyCdbAccessControl(authOptions, getSchema());

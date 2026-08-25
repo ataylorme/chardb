@@ -9,9 +9,9 @@ export function Binding() {
         <Section id="binding" num="02" label="binding">
             <SectionHeading>It should feel like any other Worker binding.</SectionHeading>
             <SectionLead>
-                The target is one package, one schema entry, and one typed database handle beside KV, R2, and D1. The
-                current scaffold exposes the underlying Durable Object wiring; this is the interface we are working to
-                collapse it into.
+                The target is one package, one schema entry, and one typed database handle beside KV, R2, and D1.
+                Today's scaffold already hides its internal Durable Object bindings behind Wrangler migrations and
+                native loopback exports. The typed DB handle shown below is the remaining interface work.
             </SectionLead>
 
             <div className="mt-10 grid grid-cols-1 gap-5">

@@ -1,7 +1,7 @@
 /**
  * `chardb/miniflare-plugin` — dev-time helpers (DEV ONLY).
  *
- * Production binds via the standard Cloudflare primitives in `wrangler.jsonc`;
+ * Production binds via standard Cloudflare primitives in Wrangler config;
  * this module never ships to prod. It exposes three small dev-loop utilities:
  *
  *   - `InMemoryVectorize` — drop-in stub for `@cloudflare/workers-types`'s
@@ -9,7 +9,7 @@
  *     similarity. Bind under `CDB_VECTORIZE` for local tests.
  *   - `cronMatches(expr, date)` — evaluates a 5-field cron expression against
  *     a `Date`. Used by `runCronSimulator` to drive `defineCron` callbacks at
- *     the cadence the user wrote in `wrangler.jsonc`, without waiting on the
+ *     the cadence the user wrote in Wrangler config, without waiting on the
  *     real Cloudflare cron tick.
  *   - `chardbMiniflarePlugin` — a Miniflare external-plugin shape; today it
  *     attaches the helpers above to the user's options object so dev wiring

@@ -32,11 +32,12 @@ export async function runDoctor(ctx: CliContext, opts: DoctorOptions = {}): Prom
 }
 
 async function doctorWrangler(ctx: CliContext): Promise<DoctorResult> {
-    const path = `${ctx.cwd}/wrangler.jsonc`;
-    if (!(await ctx.exists(path))) {
+    const candidates = [`${ctx.cwd}/wrangler.toml`, `${ctx.cwd}/wrangler.jsonc`];
+    const path = await firstExisting(ctx, candidates);
+    if (!path) {
         return {
             ok: false,
-            errors: [`wrangler.jsonc not found at ${path}; run \`chardb init\``],
+            errors: [`Wrangler config not found at ${candidates.join(" or ")}; run \`chardb init\``],
             warnings: [],
         };
     }
@@ -44,6 +45,13 @@ async function doctorWrangler(ctx: CliContext): Promise<DoctorResult> {
     const r = checkWrangler(text);
     for (const e of r.errors) ctx.stderr(`error: ${e}\n`);
     for (const w of r.warnings) ctx.stderr(`warn:  ${w}\n`);
-    if (r.ok) ctx.stdout("chardb doctor: wrangler.jsonc passes\n");
+    if (r.ok) ctx.stdout(`chardb doctor: ${path.slice(ctx.cwd.length + 1)} passes\n`);
     return r;
+}
+
+async function firstExisting(ctx: CliContext, paths: readonly string[]): Promise<string | undefined> {
+    for (const path of paths) {
+        if (await ctx.exists(path)) return path;
+    }
+    return undefined;
 }

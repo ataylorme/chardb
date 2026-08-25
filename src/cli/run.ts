@@ -7,8 +7,8 @@ import type { CliContext } from "./context.ts";
 const HELP = `chardb — experimental tenant-sharding prototype for Cloudflare Durable Objects
 
 Commands:
-  chardb init <name>            scaffold a new chardb app (writes wrangler.jsonc, schema, worker)
-  chardb doctor [wrangler]      validate required wrangler.jsonc bindings
+  chardb init <name>            scaffold a new chardb app (writes wrangler.toml, schema, worker)
+  chardb doctor [wrangler]      validate wrangler.toml or wrangler.jsonc
   chardb explain <intent-json>  planner decision + estimated fanout (use --strict for CI)
   chardb shards ...             not implemented
   chardb snapshot ...           not implemented

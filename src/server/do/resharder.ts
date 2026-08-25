@@ -18,6 +18,7 @@ import { DurableObject } from "cloudflare:workers";
 import { CdbError } from "../../errors.ts";
 import type { TableSpec } from "../../reshard/triggers.ts";
 import type { RawJson } from "../../types.ts";
+import { withChardbLoopbacks } from "../loopback.ts";
 import type { TailEntry } from "./cdb.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
@@ -138,7 +139,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
     private bootstrapped = false;
 
     constructor(state: DurableObjectState, env: ResharderEnv) {
-        super(state, env);
+        super(state, withChardbLoopbacks(env, state));
         state.blockConcurrencyWhile(async () => this.bootstrap());
     }
 

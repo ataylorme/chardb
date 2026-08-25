@@ -25,6 +25,7 @@ import { bindAuthRuntime } from "../auth/runtime.ts";
 import { type SynthesizedAuthSchema, assertNoReservedTableShadow, synthesizeAuthSchema } from "../auth/synthesize.ts";
 import { buildColocationOverrides } from "./cdb-colocation.ts";
 import type { CatalogSchemaShardState, CatalogSchemaState } from "./do/catalog.ts";
+import { withChardbLoopbacks } from "./loopback.ts";
 import { type ChardbManifest, emptyManifest, manifestFromExports } from "./manifest.ts";
 import { decorateResponse, extractCorrelationId, selectMatchingCrons } from "./observability_helpers.ts";
 
@@ -288,6 +289,10 @@ export async function handleMigrationAdminRequest(request: Request, env: ChardbE
 }
 
 class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
+    constructor(ctx: ExecutionContext, env: ChardbEnv) {
+        super(ctx, withChardbLoopbacks(env, ctx));
+    }
+
     /** Subclass overrides this via `defineChardb({ manifest })`. */
     protected manifest(): ChardbManifest {
         return emptyManifest();
@@ -338,7 +343,7 @@ class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
 
     /**
      * Cron entry point. Cloudflare invokes this on every Cron Trigger; the
-     * scheduled cron expression is set in `wrangler.jsonc`. We run two pipelines
+     * scheduled cron expression is set in Wrangler config. We run two pipelines
      * here:
      *
      *   1. PITR barrier tick — opens a fresh barrier on the Catalog, then fans
@@ -356,7 +361,7 @@ class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
     /**
      * Dispatch any user `defineCron` whose expression matches `event.cron`. The
      * Cloudflare runtime sets `event.cron` to the same string the user wrote in
-     * `wrangler.jsonc`, so we use string-equality dispatch — translation between
+     * Wrangler config, so we use string-equality dispatch — translation between
      * cron grammars is the bundler's job, not ours.
      */
     private async runUserCrons(event: ScheduledEvent): Promise<void> {
@@ -562,15 +567,16 @@ export function mountChardb(
     const authHandler = options.authHandler;
     return {
         async fetch(request, env, ctx): Promise<Response> {
+            const resolvedEnv = withChardbLoopbacks(env, ctx);
             const url = new URL(request.url);
             if (isReserved(url.pathname)) {
-                const instance = new Chardb(ctx, env);
+                const instance = new Chardb(ctx, resolvedEnv);
                 return instance.fetch(request);
             }
             if (authHandler && (url.pathname === authBase || url.pathname.startsWith(`${authBase}/`))) {
-                return authHandler(request, env, ctx);
+                return authHandler(request, resolvedEnv, ctx);
             }
-            return app.fetch(request, env, ctx);
+            return app.fetch(request, resolvedEnv, ctx);
         },
     };
 }

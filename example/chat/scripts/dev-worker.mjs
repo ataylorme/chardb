@@ -11,7 +11,7 @@ const worker = Bun.spawn(
         wranglerBin,
         "dev",
         "--config",
-        "wrangler.template.jsonc",
+        "wrangler.template.toml",
         "--ip",
         origin.hostname,
         "--port",

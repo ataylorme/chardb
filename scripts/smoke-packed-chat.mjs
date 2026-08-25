@@ -9,6 +9,14 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CHAT = join(ROOT, "example", "chat");
 const tarball = resolve(process.argv[2] ?? "");
 const ADMIN_TOKEN = "packed-chat-migration-secret";
+const LOOPBACK_DURABLE_OBJECTS = {
+    Catalog: { className: "Catalog", useSQLite: true },
+    Gateway: { className: "Gateway", useSQLite: true },
+    Cdb: { className: "Cdb", useSQLite: true },
+    BlobMeta: { className: "BlobMeta", useSQLite: true },
+    Resharder: { className: "Resharder", useSQLite: true },
+    GsiShard: { className: "GsiShard", useSQLite: true },
+};
 
 if (!process.argv[2]) throw new Error("usage: bun scripts/smoke-packed-chat.mjs <package.tgz>");
 
@@ -181,6 +189,10 @@ async function migratePackedWorker(consumer, origin) {
 }
 
 async function main() {
+    assert(
+        Object.keys(LOOPBACK_DURABLE_OBJECTS).every(name => !name.startsWith("CDB_")),
+        "packed chat must provision Miniflare by exported class name, not legacy CDB_* binding"
+    );
     const scratch = await mkdtemp(join(tmpdir(), "chardb-packed-chat-"));
     const consumer = join(scratch, "consumer");
     const persistencePath = join(scratch, "durable-objects");
@@ -230,13 +242,9 @@ async function main() {
                     BETTER_AUTH_SECRET: "packed-chat-secret-that-is-at-least-32-characters",
                     CDB_ADMIN_TOKEN: ADMIN_TOKEN,
                 },
-                durableObjects: {
-                    CDB_CATALOG: { className: "Catalog", useSQLite: true },
-                    CDB_GATEWAY: { className: "Gateway", useSQLite: true },
-                    CDB_SHARD: { className: "Cdb", useSQLite: true },
-                },
+                durableObjects: LOOPBACK_DURABLE_OBJECTS,
                 durableObjectsPersist: persistencePath,
-                compatibilityDate: "2025-09-01",
+                compatibilityDate: "2026-05-10",
                 compatibilityFlags: ["nodejs_compat", "nodejs_compat_populate_process_env"],
             });
         mf = startMiniflare();

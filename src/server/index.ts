@@ -5,7 +5,7 @@
  * `defineMutation`, `defineQuery`, `defineCron`, `defineStream`,
  * `defineLedger`, `defineGsi`, `definePresenceKey`, `chardbPolicy`,
  * `vector`, `inlineVector`) and the Durable Object classes the user binds in
- * `wrangler.jsonc`.
+ * Wrangler configuration.
  */
 
 export {

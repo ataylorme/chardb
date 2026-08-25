@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { runDoctor } from "../../src/cli/commands/doctor.ts";
 import { runInit } from "../../src/cli/commands/init.ts";
 import type { CliContext } from "../../src/cli/context.ts";
-import { checkWrangler, renderWrangler } from "../../src/cli/wrangler_template.ts";
+import { checkWrangler, renderWrangler, renderWranglerJsonc } from "../../src/cli/wrangler_template.ts";
 
 function fakeCtx(): { ctx: CliContext; files: Map<string, string>; out: string[]; err: string[] } {
     const files = new Map<string, string>();
@@ -39,8 +39,19 @@ describe("renderWrangler / checkWrangler", () => {
         expect(r.ok).toBe(true);
         expect(r.errors).toEqual([]);
         expect(r.warnings).toEqual([]);
-        const config = JSON.parse(text);
+        const config = Bun.TOML.parse(text) as {
+            services?: unknown;
+            durable_objects?: unknown;
+            r2_buckets?: unknown;
+            vectorize?: unknown;
+            queues?: unknown;
+            triggers?: unknown;
+            tail_consumers?: unknown;
+            compatibility_flags?: unknown;
+            assets: { run_worker_first?: unknown };
+        };
         expect(config.services).toBeUndefined();
+        expect(config.durable_objects).toBeUndefined();
         expect(config.r2_buckets).toBeUndefined();
         expect(config.vectorize).toBeUndefined();
         expect(config.queues).toBeUndefined();
@@ -50,15 +61,30 @@ describe("renderWrangler / checkWrangler", () => {
         expect(config.assets.run_worker_first).toEqual(["/_chardb/*", "/ws"]);
     });
 
-    test("checkWrangler reports each missing DO binding", () => {
+    test("checkWrangler reports each missing Durable Object migration", () => {
         const r = checkWrangler('{"name":"x","main":"y","compatibility_date":"2026-05-10"}');
         expect(r.ok).toBe(false);
-        expect(r.errors.some(e => e.includes("CDB_CATALOG"))).toBe(true);
-        expect(r.errors.some(e => e.includes("CDB_SHARD"))).toBe(true);
+        expect(r.errors.some(e => e.includes('"Catalog"'))).toBe(true);
+        expect(r.errors.some(e => e.includes('"Cdb"'))).toBe(true);
+    });
+
+    test("requires native loopback compatibility by date or explicit flag", () => {
+        const oldConfig = JSON.parse(
+            renderWranglerJsonc({ name: "old", compatibilityDate: "2025-11-16", assetsDir: "public" })
+        );
+        expect(checkWrangler(JSON.stringify(oldConfig)).errors).toContain(
+            'native loopback exports require compatibility_date >= "2025-11-17" or compatibility_flags to include "enable_ctx_exports"'
+        );
+
+        oldConfig.compatibility_flags.push("enable_ctx_exports");
+        expect(checkWrangler(JSON.stringify(oldConfig)).ok).toBe(true);
+
+        oldConfig.compatibility_flags.push("disable_ctx_exports");
+        expect(checkWrangler(JSON.stringify(oldConfig)).ok).toBe(false);
     });
 
     test("checkWrangler tolerates JSONC comments", () => {
-        const text = `${renderWrangler({
+        const text = `${renderWranglerJsonc({
             name: "x",
             compatibilityDate: "2026-05-10",
             assetsDir: ".chardb/dashboard",
@@ -69,7 +95,7 @@ describe("renderWrangler / checkWrangler", () => {
 
     test("checkWrangler warns only about missing live reserved routes", () => {
         const cfg = JSON.parse(
-            renderWrangler({
+            renderWranglerJsonc({
                 name: "x",
                 compatibilityDate: "2026-05-10",
                 assetsDir: ".chardb/dashboard",
@@ -87,14 +113,15 @@ describe("renderWrangler / checkWrangler", () => {
 });
 
 describe("chardb init + doctor end-to-end", () => {
-    test("init writes wrangler.jsonc + scaffolding; doctor passes", async () => {
+    test("init writes wrangler.toml + scaffolding; doctor passes", async () => {
         const { ctx, files } = fakeCtx();
         await runInit(ctx, { name: "myapp" });
         expect(files.has("/tmp/proj/package.json")).toBe(true);
         expect(files.has("/tmp/proj/tsconfig.json")).toBe(true);
         expect(files.has("/tmp/proj/.gitignore")).toBe(true);
         expect(files.has("/tmp/proj/README.md")).toBe(true);
-        expect(files.has("/tmp/proj/wrangler.jsonc")).toBe(true);
+        expect(files.has("/tmp/proj/wrangler.toml")).toBe(true);
+        expect(files.has("/tmp/proj/wrangler.jsonc")).toBe(false);
         expect(files.has("/tmp/proj/src/schema.ts")).toBe(true);
         expect(files.has("/tmp/proj/src/api.ts")).toBe(true);
         expect(files.has("/tmp/proj/src/worker.ts")).toBe(true);
@@ -112,7 +139,7 @@ describe("chardb init + doctor end-to-end", () => {
         // Worker template must be specialised to the app name.
         expect(files.get("/tmp/proj/src/worker.ts")).toContain('appName: "myapp"');
         expect(files.get("/tmp/proj/src/worker.ts")).not.toContain("ChardbWorker");
-        expect(files.get("/tmp/proj/wrangler.jsonc")).not.toContain("CDB_WORKER");
+        expect(files.get("/tmp/proj/wrangler.toml")).not.toContain("CDB_WORKER");
         expect(files.get("/tmp/proj/src/schema.ts")).toContain("const { cdbTable } = forOrg()");
         expect(files.get("/tmp/proj/src/schema.ts")).toContain('selfBy: "authorId"');
         expect(files.get("/tmp/proj/src/api.ts")).toContain('partitionKey: "organizationId"');
@@ -122,10 +149,25 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.get("/tmp/proj/src/api.ts")).toContain("}).run()");
         expect(files.get("/tmp/proj/src/api.ts")).not.toContain("handler: async");
         expect(files.get("/tmp/proj/src/api.ts")).not.toContain("tenantScope");
-        expect(files.get("/tmp/proj/README.md")).toContain("does not apply domain migrations");
+        expect(files.get("/tmp/proj/README.md")).toContain("no application-visible Durable Object bindings");
+        expect(files.get("/tmp/proj/wrangler.toml")).not.toContain("durable_objects");
+        expect(files.get("/tmp/proj/wrangler.toml")).toContain("new_sqlite_classes");
 
         const r = await runDoctor(ctx, { which: "wrangler" });
         expect(r.ok).toBe(true);
+    });
+
+    test("doctor accepts an existing wrangler.jsonc project", async () => {
+        const { ctx, files, out } = fakeCtx();
+        files.set(
+            "/tmp/proj/wrangler.jsonc",
+            renderWranglerJsonc({ name: "legacy-jsonc", compatibilityDate: "2026-05-10", assetsDir: "public" })
+        );
+
+        const result = await runDoctor(ctx, { which: "wrangler" });
+
+        expect(result.ok).toBe(true);
+        expect(out).toEqual(["chardb doctor: wrangler.jsonc passes\n"]);
     });
 
     test("escapes the application name in generated TypeScript", async () => {

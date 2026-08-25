@@ -51,6 +51,7 @@ import { CdbError } from "../../errors.ts";
 import type { RawJson } from "../../types.ts";
 import { type PrincipalId, ShardId, type TenantId, type Vshard } from "../../types.ts";
 import { VSHARD_COUNT, VshardMap, type VshardRange } from "../../vshard.ts";
+import { withChardbLoopbacks } from "../loopback.ts";
 import {
     type ChardbMigrationJournal,
     defineMigrations,
@@ -348,7 +349,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
     private readonly jwksRefreshes = new Map<string, Promise<JwksRefreshOutcome>>();
 
     constructor(state: DurableObjectState, env: CatalogEnv) {
-        super(state, env);
+        super(state, withChardbLoopbacks(env, state));
         state.blockConcurrencyWhile(async () => this.bootstrap());
     }
 

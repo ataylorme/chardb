@@ -48,6 +48,7 @@ import {
 } from "../../wire.ts";
 import { cdbPolicyDigest } from "../cdb-policy.ts";
 import type { AuthCtx } from "../define.ts";
+import { withChardbLoopbacks } from "../loopback.ts";
 import {
     type ChardbManifest,
     type QueryRouteResponse,
@@ -3006,7 +3007,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
     private unsettledMutationCount = 0;
 
     constructor(state: DurableObjectState, env: GatewayEnv) {
-        super(state, env);
+        super(state, withChardbLoopbacks(env, state));
         state.blockConcurrencyWhile(async () => this.bootstrap());
     }
 
