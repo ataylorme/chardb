@@ -238,6 +238,7 @@ function subscriptionRequest(gatewayId: string): CdbSubscriptionRequest {
         },
         principalId: PrincipalId(AUTH.userId),
         organizationId: TenantId(AUTH.tenantId),
+        domainSchemaEpoch: 1,
         ref: ChardbRef("queries.ts#registryEntries"),
         args: {},
         queryHash: "registry-invalidation-query-hash",
@@ -261,6 +262,7 @@ function registeredSubscriptionRequest(gatewayId: string, registrationId: string
         },
         principalId: PrincipalId(AUTH.userId),
         organizationId: TenantId(AUTH.tenantId),
+        domainSchemaEpoch: 1,
         ref: registryEntries.__chardbRef,
         args: routed.args,
         queryHash: routed.queryHash,
@@ -340,6 +342,7 @@ export default {
                             tenantId: body.forgedOrganization ? "forged-organization" : AUTH.tenantId,
                             claims: { probe: "fresh-query-auth" },
                         },
+                        domainSchemaEpoch: 1,
                     })
                 );
             }
@@ -363,6 +366,7 @@ export default {
             args: route.args,
             auth: AUTH,
             schemaEpoch: 1,
+            domainSchemaEpoch: 1,
         };
         return Response.json(await stub.mutate(mutationRequest));
     },

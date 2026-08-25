@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chardbAuthAdapter } from "../../src/auth/chardb_adapter.ts";
+import { renderSqliteTableDdl } from "../../src/auth/ddl.ts";
 import { bindAuthRuntime, resetAuthRuntime } from "../../src/auth/runtime.ts";
 import {
     AUTH_BULK_PRELOAD_MAX_ROWS,
@@ -10,7 +11,8 @@ import {
 } from "../../src/auth/sql.ts";
 import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import { chardb } from "../../src/server/chardb.ts";
-import { Catalog } from "../../src/server/do/catalog.ts";
+import { Catalog, configureCatalogRuntime } from "../../src/server/do/catalog.ts";
+import { defineMigrations } from "../../src/server/schema-migrations.ts";
 import { PrincipalId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
@@ -42,11 +44,19 @@ class CatalogHarness {
     readonly sqlStatements: string[] = [];
     private bootstrap: Promise<unknown> = Promise.resolve();
     private readonly state: DurableObjectState;
+    private CatalogClass: typeof Catalog = Catalog;
+    private env: Record<string, unknown> = {};
     catalog: Catalog;
 
-    constructor(prepare?: (db: Database) => void) {
+    constructor(
+        prepare?: (db: Database) => void,
+        CatalogClass: typeof Catalog = Catalog,
+        env: Record<string, unknown> = {}
+    ) {
         this.db = new Database(":memory:");
         prepare?.(this.db);
+        this.CatalogClass = CatalogClass;
+        this.env = env;
         this.state = {
             storage: {
                 sql: sqlStorage(this.db, this.sqlStatements),
@@ -56,7 +66,7 @@ class CatalogHarness {
                 this.bootstrap = callback();
             },
         } as unknown as DurableObjectState;
-        this.catalog = new Catalog(this.state, {});
+        this.catalog = new CatalogClass(this.state, env);
     }
 
     async ready(): Promise<void> {
@@ -64,7 +74,14 @@ class CatalogHarness {
     }
 
     async restart(): Promise<void> {
-        this.catalog = new Catalog(this.state as never, {});
+        this.catalog = new this.CatalogClass(this.state as never, this.env);
+        await this.ready();
+    }
+
+    async reconfigure(CatalogClass: typeof Catalog, env: Record<string, unknown> = {}): Promise<void> {
+        this.CatalogClass = CatalogClass;
+        this.env = env;
+        this.catalog = new CatalogClass(this.state as never, env);
         await this.ready();
     }
 
@@ -86,6 +103,9 @@ function namespaceFor(harness: CatalogHarness): DurableObjectNamespace {
 }
 
 const auth = defineAuth({});
+const authWithNickname = defineAuth({
+    user: { additionalFields: { nickname: { type: "string", required: false } } },
+});
 const rateLimitAuth = defineAuth({ rateLimit: { storage: "database" } });
 const renamedRateLimitAuth = defineAuth({
     rateLimit: {
@@ -1255,6 +1275,152 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
             message: expect.stringContaining("predates auth DDL v1"),
         });
+    });
+
+    test("applies a versioned auth migration, preserves rows, and fences auth traffic until activation", async () => {
+        const now = Date.parse("2026-08-23T00:00:00Z");
+        await harness.catalog.mutateAuth({
+            model: "user",
+            op: "create",
+            payload: {
+                id: "migrated-user",
+                name: "Before migration",
+                email: "migration@example.com",
+                emailVerified: true,
+                createdAt: now,
+                updatedAt: now,
+            },
+        });
+        const journal = defineMigrations([
+            {
+                version: 1,
+                name: "add_user_nickname",
+                statements: ["SELECT 1"],
+                catalogStatements: ['ALTER TABLE "user" ADD COLUMN "nickname" text'],
+            },
+        ]);
+        resetAuthRuntime();
+        bindAuthRuntime({
+            schema: synthesizeAuthSchema(authWithNickname.options as never) as never,
+            options: authWithNickname.options as { readonly [key: string]: unknown },
+        });
+        const FutureCatalog = configureCatalogRuntime({ migrations: () => journal });
+        const shardCalls: string[] = [];
+        await harness.reconfigure(FutureCatalog, {
+            CDB_SHARD: {
+                idFromName: (name: string) => name,
+                get: () => ({
+                    async prepareSchemaMigration() {
+                        shardCalls.push("prepare");
+                    },
+                    async applySchemaMigration(input: { version: number }) {
+                        shardCalls.push(`apply:${input.version}`);
+                    },
+                    async activateSchemaMigration() {
+                        shardCalls.push("activate");
+                    },
+                }),
+            } as unknown as DurableObjectNamespace,
+        });
+        await expect(
+            harness.catalog.queryAuth({
+                model: "user",
+                where: [{ field: "id", operator: "eq", value: "migrated-user" }],
+            })
+        ).rejects.toMatchObject({ code: "CDB_STALE_EPOCH" });
+
+        expect(harness.catalog.beginSchemaMigration({ migrationId: "auth-v1", targetVersion: 1 })).toMatchObject({
+            status: "migrating",
+            targetVersion: 1,
+        });
+        await expect(
+            harness.catalog.migrateSchemaShard({ migrationId: "auth-v1", shardId: "ShardDO_0" })
+        ).resolves.toMatchObject({ status: "active" });
+        expect(shardCalls).toEqual(["prepare", "apply:1", "activate"]);
+        expect(harness.catalog.applyCatalogSchemaMigration({ migrationId: "auth-v1", version: 1 })).toMatchObject({
+            status: "migrating",
+        });
+        expect(harness.db.query('SELECT nickname FROM "user" WHERE id = ?').get("migrated-user")).toEqual({
+            nickname: null,
+        });
+        expect(harness.catalog.completeSchemaMigration({ migrationId: "auth-v1" })).toMatchObject({
+            activeVersion: 1,
+            activeEpoch: 2,
+            status: "active",
+        });
+
+        await harness.restart();
+        await expect(
+            harness.catalog.mutateAuth({
+                model: "user",
+                op: "update",
+                where: { id: "migrated-user" },
+                payload: { nickname: "after" },
+            })
+        ).resolves.toMatchObject({ row: expect.objectContaining({ id: "migrated-user", nickname: "after" }) });
+        expect(harness.db.query('SELECT id, nickname FROM "user"').all()).toEqual([
+            { id: "migrated-user", nickname: "after" },
+        ]);
+    });
+
+    test("creates a fresh auth schema by applying the complete Catalog journal", async () => {
+        harness.close();
+        resetAuthRuntime();
+        const schema = synthesizeAuthSchema(authWithNickname.options as never) as Record<string, unknown>;
+        bindAuthRuntime({
+            schema: schema as never,
+            options: authWithNickname.options as { readonly [key: string]: unknown },
+        });
+        const catalogStatements = Object.values(schema).flatMap(table => {
+            const ddl = renderSqliteTableDdl(table as never);
+            return [ddl.createTable, ...ddl.indexes];
+        });
+        const journal = defineMigrations([
+            { version: 1, name: "create_auth", statements: ["SELECT 1"], catalogStatements },
+        ]);
+        const FreshCatalog = configureCatalogRuntime({ migrations: () => journal });
+        const shard = {
+            async prepareSchemaMigration() {},
+            async applySchemaMigration() {},
+            async activateSchemaMigration() {},
+        };
+        harness = new CatalogHarness(undefined, FreshCatalog, {
+            CDB_SHARD: {
+                idFromName: (name: string) => name,
+                get: () => shard,
+            } as unknown as DurableObjectNamespace,
+        });
+        await harness.ready();
+        expect(harness.catalog.schemaState()).toMatchObject({ activeVersion: 0, activeEpoch: 1, status: "active" });
+        expect(harness.db.query("SELECT name FROM sqlite_master WHERE name = 'user'").get()).toBeNull();
+        await expect(harness.catalog.queryAuth({ model: "user", where: [] })).rejects.toMatchObject({
+            code: "CDB_STALE_EPOCH",
+        });
+
+        harness.catalog.beginSchemaMigration({ migrationId: "fresh-auth-v1", targetVersion: 1 });
+        await harness.catalog.migrateSchemaShard({ migrationId: "fresh-auth-v1", shardId: "ShardDO_0" });
+        harness.catalog.applyCatalogSchemaMigration({ migrationId: "fresh-auth-v1", version: 1 });
+        expect(harness.catalog.completeSchemaMigration({ migrationId: "fresh-auth-v1" })).toMatchObject({
+            activeVersion: 1,
+            activeEpoch: 2,
+            status: "active",
+        });
+        await expect(
+            harness.catalog.mutateAuth({
+                model: "user",
+                op: "create",
+                payload: {
+                    id: "fresh-user",
+                    name: "Fresh",
+                    email: "fresh@example.com",
+                    emailVerified: true,
+                    createdAt: 1,
+                    updatedAt: 1,
+                    nickname: "new",
+                },
+            })
+        ).resolves.toMatchObject({ row: expect.objectContaining({ id: "fresh-user", nickname: "new" }) });
+        expect(harness.db.query("SELECT COUNT(*) AS count FROM catalog_schema_steps").get()).toEqual({ count: 1 });
     });
 
     test("Catalog keeps tenant and principal epochs independent across restart", async () => {

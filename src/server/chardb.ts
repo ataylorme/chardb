@@ -182,11 +182,12 @@ export function chardb<
         readonly schema: Record<string, unknown>;
         readonly chardbManifest: import("./manifest.ts").ChardbManifest;
     };
+    const migrationJournal = input.migrations ?? defineMigrations([]);
     const ConfiguredCdb = configureCdbRuntime({
         schema: () => runtimeEntrypoint.schema,
         manifest: () => runtimeEntrypoint.chardbManifest,
+        migrations: () => migrationJournal,
     });
-    const migrationJournal = input.migrations ?? defineMigrations([]);
     const ConfiguredCatalog = configureCatalogRuntime({ migrations: () => migrationJournal });
     const authBasePath = input.authBasePath ?? auth.options.basePath ?? "/api/auth";
     const ConfiguredGateway = configureGatewayRuntime({

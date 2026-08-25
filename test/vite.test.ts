@@ -237,4 +237,17 @@ describe("@chardb/vite-plugin", () => {
         expect(src).toContain('from "/abs/proj/src/m1.ts"');
         expect(src).toContain('from "/abs/proj/src/m2.ts"');
     });
+
+    test("packages the configured migration journal through the virtual module", () => {
+        const configured = chardb({ migrations: "./src/server/migrations.ts" }) as unknown as PluginShape;
+        const id = configured.resolveId("virtual:chardb/migrations");
+        expect(id).toBe("\0virtual:chardb/migrations");
+        if (!id) throw new Error("Expected migrations virtual module id");
+        expect(configured.load(id)).toBe('export { migrations } from "./src/server/migrations.ts";');
+
+        const fallback = makePlugin();
+        const fallbackId = fallback.resolveId("virtual:chardb/migrations");
+        if (!fallbackId) throw new Error("Expected migrations fallback module id");
+        expect(fallback.load(fallbackId)).toContain("defineMigrations([])");
+    });
 });

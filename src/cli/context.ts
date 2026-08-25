@@ -3,6 +3,8 @@
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
+export type CliFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
 export interface CliContext {
     readonly cwd: string;
     readonly env: { readonly [k: string]: string | undefined };
@@ -11,6 +13,7 @@ export interface CliContext {
     readonly read: (path: string) => Promise<string>;
     readonly write: (path: string, contents: string) => Promise<void>;
     readonly exists: (path: string) => Promise<boolean>;
+    readonly fetch?: CliFetch;
 }
 
 export const REAL_CONTEXT: CliContext = {
@@ -32,4 +35,5 @@ export const REAL_CONTEXT: CliContext = {
     async exists(path) {
         return await Bun.file(path).exists();
     },
+    fetch: globalThis.fetch,
 };

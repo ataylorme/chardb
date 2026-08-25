@@ -1,6 +1,6 @@
 # chardb completion plan
 
-Last reviewed: 2026-08-24
+Last reviewed: 2026-08-25
 
 ## What this project is
 
@@ -82,7 +82,7 @@ Online schema changes can wait. A maintenance-mode migration is enough for the f
 
 ## 4. Simplify and fix auth storage
 
-The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lookups no longer depend on a shard partition column. Catalog now renders constraint-complete table and index DDL from the synthesized schema. Existing tables must carry the matching `auth_ddl_v1` signature; there is no versioned upgrade path. Each auth mutation and every directly derivable old and new global, tenant, or principal epoch bump commit in one Catalog transaction. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. The packed chat smoke proves anonymous sign-in, session lookup, organization creation and selection, bounded membership lookup, JWT issue, domain access, and logout through the configured organization plugin. A configured Catalog workerd test proves stored auth rows and organization authority survive reconstruction. Versioned auth migrations remain open.
+The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lookups no longer depend on a shard partition column. Catalog renders constraint-complete table and index DDL from the synthesized schema. Existing tables must carry the matching `auth_ddl_v1` signature, and versioned Catalog migration statements can upgrade older layouts before the final signatures are verified. Each auth mutation and every directly derivable old and new global, tenant, or principal epoch bump commit in one Catalog transaction. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. The packed chat smoke proves anonymous sign-in, session lookup, organization creation and selection, bounded membership lookup, JWT issue, domain access, and logout through the configured organization plugin. A configured Catalog workerd test proves stored auth rows and organization authority survive reconstruction.
 
 - [x] Put all Better Auth tables in Catalog for the first working version.
 - [x] Remove auth sharding from the adapter and Cdb storage path.
@@ -271,11 +271,11 @@ The public retry handle and automatic retry policy remain a separate API package
 - [x] Prove through configured workerd that an already delivered but unacknowledged snapshot redelivers with the exact cookie and rows after Gateway and Cdb reconstruct around the same hibernated socket, then accepts one acknowledgement and delivers a later mutation.
 - [x] Prove through configured workerd that socket loss after delivery but before acknowledgement retires the lost generation, performs explicit lagged refetch on the replacement SDK connection, receives and acknowledges authoritative rows under a fresh cookie, and delivers a later mutation.
 - [x] Prove through the configured workerd Gateway that an unsupported protocol returns `mustRefetch{protocolMismatch}` and closes with 1002 before JWT or JWKS verification.
-Configured stale-epoch rejection, the remaining named RPC and shard-eviction inventory, and declared-platform performance targets remain in [`NEXT_SCOPE.md`](NEXT_SCOPE.md). The current benchmark output is telemetry and never decides correctness.
+The remaining named RPC and shard-eviction inventory and declared-platform performance targets remain in [`NEXT_SCOPE.md`](NEXT_SCOPE.md). The current benchmark output is telemetry and never decides correctness.
 
 ## 10. Make one real example
 
-The chat directory consumes the packed package and passes compile-time checks. Its mutation and query declare the public organization authority contract. The clean-tarball smoke now runs Better Auth anonymous sign-in, the demo organization hook, an empty initial query, `postMessage`, and live replacement under workerd. It then restarts Miniflare over the same Durable Object storage, reconstructs the original session before any new sign-in, issues a fresh JWT, replays the exact mutation with an identical result and one stored row, and continues the second-principal isolation proof. Domain migrations and broader failure coverage remain incomplete.
+The chat directory consumes the packed package and passes compile-time checks. Its mutation and query declare the public organization authority contract. The clean-tarball smoke applies the packaged journal through the packed CLI, then runs Better Auth anonymous sign-in, the demo organization hook, an empty initial query, `postMessage`, and live replacement under workerd. It restarts Miniflare over the same Durable Object storage, reconstructs the original session before any new sign-in, issues a fresh JWT, replays the exact mutation with an identical result and one stored row, and continues the second-principal isolation proof. Online migration traffic and broader failure coverage remain incomplete.
 
 - [x] Install the package through npm's packed file-dependency path with a committed consumer lockfile.
 - [x] Declare every dependency used by the example.
@@ -283,7 +283,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Replace `chardb/vite/index.ts` with `chardb/vite`.
 - [x] Give `postMessage` a concrete organization partition key and reject an auth tenant mismatch.
 - [x] Delete stale `tenantScope`, `ownerScope`, and `requirePermission` documentation.
-- The example still bootstraps a fresh schema. Migration-generated example setup belongs to the migration package in [`NEXT_SCOPE.md`](NEXT_SCOPE.md).
+- [x] Package the example's immutable schema journal through the Vite plugin and apply it before runtime traffic.
 - [x] Add an idempotent auth hook that reuses the demo organization and user membership, tolerates confirmed concurrent creation, then sets the active organization.
 - [x] Give `postMessage` an explicit stable ref and organization authority, and call it through the public mutation hook.
 - [x] Make opening a channel in the clean packed chat consumer return and acknowledge an empty initial query result under workerd.
@@ -308,7 +308,14 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Remove placeholder file and vector APIs from the main product description.
 - [x] Run each workerd harness in a separate sequential CI process to avoid shared Miniflare ports.
 - [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 7/7 including the aggregate registration boundary and two default-small scale scenarios, `gateway-jwt` 22/22, and `gateway-snapshot` 5/5. Give the snapshot recovery cases 15-second test budgets. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
-- A migration-aware local start command belongs to the same next-scope package.
+- [x] Add `bun run dev:worker`, which starts the exact local Wrangler worker, waits for health, applies the packaged journal through `chardb migrate`, prints the ready origin, forwards termination signals, and cleans up its full process group.
+- [x] Define immutable contiguous migrations with ordered Cdb and Catalog SQL, bounded statement counts and bytes, stable digests, and rendered final-schema baselines.
+- [x] Persist Catalog and Cdb active version, domain epoch, digest, migration id, phase, and completed steps. Keep the routing topology epoch separate from the domain schema epoch.
+- [x] Make nonempty journals start at version zero and fail closed until the exact packaged target is active. Fence mutation, direct query, subscription, and registered-query work against the active domain epoch, including post-handler query checks.
+- [x] Implement maintenance-mode `chardb migrate` over a token-protected internal HTTP API. Resume exact shard and Catalog steps with bounded concurrency, verify final rendered DDL, and publish the new epoch only after every step succeeds.
+- [x] Implement explicit version-zero baseline adoption. Verify every existing Cdb and Catalog against the final rendered schema, execute no packaged SQL, preserve rows and op-log entries, and record the packaged version and digest.
+- [x] Prove through configured workerd: persisted version-zero upgrade with data, fresh full-journal install, Catalog and Cdb reconstruction, stale and future epoch rejection, exact old mutation replay without handler rerun, final-schema baseline adoption without SQL replay, and baseline reconstruction.
+- [x] Keep migrations forward-only and maintenance-mode. Do not claim down migrations or concurrent application reads and writes during an upgrade.
 
 ## 12. Fix package and repository hygiene
 
@@ -345,7 +352,7 @@ The README and landing page now describe the repository as an experiment. Keep e
 - [x] Remove "Unlimited SQL."
 - [x] Remove the 160 TB claim.
 - [x] Stop presenting automatic online resharding as supported and label it unfinished.
-- [x] Label files, vectors, search, presence, scheduling, and migrations as unsupported or experimental.
+- [x] Label files, vectors, search, presence, scheduling, and automatic online migration as unsupported or experimental.
 - [x] Remove the fake `[[chardb]]` binding and nonexistent `client(env.DB)` example.
 - [x] Remove unpublished-package install commands from the README and landing page.
 - [x] Replace dead Docs links with links to repository documents.
@@ -356,7 +363,7 @@ The README and landing page now describe the repository as an experiment. Keep e
 
 ## 14. Work that stays deferred
 
-Keep these out of the supported path while the remaining migration, replay, isolation, and recovery work is unfinished:
+Keep these out of the supported path while the remaining replay, isolation, online-migration, and recovery work is unfinished:
 
 - Files and R2 upload lifecycle
 - Vector search and Vectorize integration

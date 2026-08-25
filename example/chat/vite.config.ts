@@ -17,6 +17,7 @@ export default defineConfig({
         react(),
         chardbVitePlugin({
             schema: "./src/server/schema.ts",
+            migrations: "./src/server/worker.ts",
             serverModuleGlob: "./src/server/**/*.ts",
         }),
     ],

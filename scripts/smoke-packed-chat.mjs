@@ -8,6 +8,7 @@ import { Miniflare } from "miniflare";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CHAT = join(ROOT, "example", "chat");
 const tarball = resolve(process.argv[2] ?? "");
+const ADMIN_TOKEN = "packed-chat-migration-secret";
 
 if (!process.argv[2]) throw new Error("usage: bun scripts/smoke-packed-chat.mjs <package.tgz>");
 
@@ -148,6 +149,37 @@ async function bundleWorker(consumer, bundlePath) {
     return source;
 }
 
+async function migratePackedWorker(consumer, origin) {
+    const proc = Bun.spawn(
+        [
+            "bun",
+            join(consumer, "node_modules", "chardb", "dist", "cli", "bin.mjs"),
+            "migrate",
+            "--url",
+            origin.origin,
+            "--id",
+            "packed-chat-initial-schema",
+            "--target",
+            "1",
+            "--concurrency",
+            "2",
+        ],
+        {
+            cwd: consumer,
+            env: { ...process.env, CHARDB_ADMIN_TOKEN: ADMIN_TOKEN },
+            stdout: "pipe",
+            stderr: "pipe",
+        }
+    );
+    const [exitCode, stdout, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+    ]);
+    assert(exitCode === 0, `packed migration failed (${exitCode})\n${stdout}${stderr}`);
+    assert(stdout.includes("schema version 1 active at epoch 2"), `packed migration output drifted: ${stdout}`);
+}
+
 async function main() {
     const scratch = await mkdtemp(join(tmpdir(), "chardb-packed-chat-"));
     const consumer = join(scratch, "consumer");
@@ -194,7 +226,10 @@ async function main() {
             new Miniflare({
                 modules: true,
                 script: worker,
-                bindings: { BETTER_AUTH_SECRET: "packed-chat-secret-that-is-at-least-32-characters" },
+                bindings: {
+                    BETTER_AUTH_SECRET: "packed-chat-secret-that-is-at-least-32-characters",
+                    CDB_ADMIN_TOKEN: ADMIN_TOKEN,
+                },
                 durableObjects: {
                     CDB_CATALOG: { className: "Catalog", useSQLite: true },
                     CDB_GATEWAY: { className: "Gateway", useSQLite: true },
@@ -206,6 +241,7 @@ async function main() {
             });
         mf = startMiniflare();
         let origin = await mf.ready;
+        await migratePackedWorker(consumer, origin);
 
         const signIn = await mf.dispatchFetch(new URL("/api/auth/sign-in/anonymous", origin), {
             method: "POST",

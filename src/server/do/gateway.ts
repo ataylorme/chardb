@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS _gw_registration_generations (
   shard_id TEXT NOT NULL,
   source_cdb_id TEXT NOT NULL,
   schema_epoch INTEGER NOT NULL CHECK (schema_epoch >= 0),
+  domain_schema_epoch INTEGER NOT NULL CHECK (domain_schema_epoch > 0),
   auth_global_epoch INTEGER NOT NULL CHECK (auth_global_epoch >= 0),
   auth_tenant_epoch INTEGER NOT NULL CHECK (auth_tenant_epoch >= 0),
   auth_principal_epoch INTEGER NOT NULL CHECK (auth_principal_epoch >= 0),
@@ -693,6 +694,7 @@ export function cdbSubscriptionRequest(input: {
     readonly subId: SubId;
     readonly principalId: PrincipalId;
     readonly organizationId: TenantId;
+    readonly domainSchemaEpoch: number;
     readonly ref: ChardbRef;
     readonly args: RawJson;
     readonly queryHash: string;
@@ -708,6 +710,7 @@ export function cdbSubscriptionRequest(input: {
         ),
         principalId: input.principalId,
         organizationId: input.organizationId,
+        domainSchemaEpoch: input.domainSchemaEpoch,
         ref: input.ref,
         args: input.args,
         queryHash: input.queryHash,
@@ -823,6 +826,7 @@ export interface GatewayRegistrationInstall extends GatewayRegistrationKey {
     /** Physical Cdb Durable Object identifier that emits invalidations. */
     readonly sourceCdbId: string;
     readonly schemaEpoch: number;
+    readonly domainSchemaEpoch: number;
     readonly authEpochs: {
         readonly global: number;
         readonly tenant: number;
@@ -890,6 +894,7 @@ export interface GatewayDirtyRun {
     readonly organizationId: TenantId;
     readonly shardId: string;
     readonly sourceCdbId: string;
+    readonly domainSchemaEpoch: number;
     readonly intentJson: string;
     readonly policyDigest: string;
 }
@@ -1053,11 +1058,12 @@ export function installGatewayRegistration(
         `INSERT INTO _gw_registration_generations
          (registration_id, principal_id, client_id, sub_id, connection_id, organization_id,
           ref, args_json, intent_json, policy_digest, query_hash, shard_id, source_cdb_id, schema_epoch,
+          domain_schema_epoch,
           auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
           lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_target_version,
           run_lease_expires_at, run_version,
           last_cookie, retry_count, retry_at, retry_error, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                  'installing', 'pending', 0, 0, NULL, NULL, NULL, 0, ?, 0, NULL, NULL, ?, ?)`,
         input.registrationId,
         input.principalId,
@@ -1073,6 +1079,7 @@ export function installGatewayRegistration(
         input.shardId,
         input.sourceCdbId,
         input.schemaEpoch,
+        input.domainSchemaEpoch,
         input.authEpochs.global,
         input.authEpochs.tenant,
         input.authEpochs.principal,
@@ -1454,11 +1461,13 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         organization_id: string;
         shard_id: string;
         source_cdb_id: string;
+        domain_schema_epoch: number;
         intent_json: string;
         policy_digest: string;
     }>(
         `SELECT g.dirty_version, g.delivered_version, g.run_token, g.run_version,
-                g.organization_id, g.shard_id, g.source_cdb_id, g.intent_json, g.policy_digest
+                g.organization_id, g.shard_id, g.source_cdb_id, g.domain_schema_epoch,
+                g.intent_json, g.policy_digest
          FROM _gw_registration_generations g
          INNER JOIN _gw_registration_heads h
            ON h.registration_id = g.registration_id
@@ -1542,6 +1551,7 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         organizationId: TenantId(current.organization_id),
         shardId: current.shard_id,
         sourceCdbId: current.source_cdb_id,
+        domainSchemaEpoch: current.domain_schema_epoch,
         intentJson: current.intent_json,
         policyDigest: current.policy_digest,
     };
@@ -2251,6 +2261,7 @@ function assertGatewayRegistrationInstall(input: GatewayRegistrationInstall): vo
     for (const [name, value] of [
         ["subId", input.subId],
         ["schemaEpoch", input.schemaEpoch],
+        ["domainSchemaEpoch", input.domainSchemaEpoch],
         ["authEpochs.global", input.authEpochs.global],
         ["authEpochs.tenant", input.authEpochs.tenant],
         ["authEpochs.principal", input.authEpochs.principal],
@@ -2320,6 +2331,13 @@ export function ensureGatewayRegistrationColumns(sql: SyncSql): void {
         // intentionally stale until that logical subscription is replaced.
         sql.exec("ALTER TABLE _gw_registration_generations ADD COLUMN source_cdb_id TEXT");
     }
+    if (!columns.has("domain_schema_epoch")) {
+        // Existing generations predate domain-version fencing. Retire them
+        // below so no old registration can execute under an assumed epoch.
+        sql.exec(
+            "ALTER TABLE _gw_registration_generations ADD COLUMN domain_schema_epoch INTEGER CHECK (domain_schema_epoch IS NULL OR domain_schema_epoch > 0)"
+        );
+    }
     if (!columns.has("policy_digest")) {
         sql.exec("ALTER TABLE _gw_registration_generations ADD COLUMN policy_digest TEXT");
     }
@@ -2367,13 +2385,15 @@ export function ensureGatewayRegistrationColumns(sql: SyncSql): void {
     sql.exec(
         `DELETE FROM _gw_registration_heads
          WHERE registration_id IN (
-           SELECT registration_id FROM _gw_registration_generations WHERE policy_digest IS NULL
+           SELECT registration_id FROM _gw_registration_generations
+           WHERE policy_digest IS NULL OR domain_schema_epoch IS NULL
          )`
     );
     sql.exec(
         `DELETE FROM _gw_snapshot_outbox
          WHERE registration_id IN (
-           SELECT registration_id FROM _gw_registration_generations WHERE policy_digest IS NULL
+           SELECT registration_id FROM _gw_registration_generations
+           WHERE policy_digest IS NULL OR domain_schema_epoch IS NULL
          )`
     );
     sql.exec(
@@ -2383,7 +2403,7 @@ export function ensureGatewayRegistrationColumns(sql: SyncSql): void {
              run_target_version = NULL, run_lease_expires_at = NULL,
              run_version = run_version + 1, retry_count = 0,
              retry_at = updated_at, retry_error = NULL
-         WHERE policy_digest IS NULL AND lifecycle != 'retiring'`
+         WHERE (policy_digest IS NULL OR domain_schema_epoch IS NULL) AND lifecycle != 'retiring'`
     );
     // Legacy retired generations can predate payload compaction. Keep only
     // the exact identity needed for idempotent Cdb unsubscribe and deletion.
@@ -2657,6 +2677,16 @@ export async function dispatchTrustedMutation(
     } catch {
         return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog routing RPC failed");
     }
+    if (
+        typeof location.shardId !== "string" ||
+        location.shardId.length === 0 ||
+        !Number.isSafeInteger(location.schemaEpoch) ||
+        location.schemaEpoch < 0 ||
+        !Number.isSafeInteger(location.domainSchemaEpoch) ||
+        location.domainSchemaEpoch < 1
+    ) {
+        return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog returned a malformed shard route");
+    }
 
     try {
         const response = await deps.cdb(location.shardId).mutate({
@@ -2666,6 +2696,7 @@ export async function dispatchTrustedMutation(
             args: routedArgs,
             auth: projected.auth,
             schemaEpoch: location.schemaEpoch,
+            domainSchemaEpoch: location.domainSchemaEpoch,
         });
         return projectCdbMutationResponse(response);
     } catch {
@@ -2999,11 +3030,16 @@ export class Gateway extends DurableObject<GatewayEnv> {
             }
 
             const route = await catalog.route(Number(vshardOf([run.organizationId])));
-            if (typeof route?.shardId !== "string" || route.shardId.length === 0) {
+            if (
+                typeof route?.shardId !== "string" ||
+                route.shardId.length === 0 ||
+                !Number.isSafeInteger(route.domainSchemaEpoch) ||
+                route.domainSchemaEpoch < 1
+            ) {
                 throw new TypeError("Catalog returned a malformed shard route");
             }
             const routedPhysicalId = this.env.CDB_SHARD.idFromName(route.shardId).toString();
-            if (routedPhysicalId !== run.sourceCdbId) {
+            if (routedPhysicalId !== run.sourceCdbId || route.domainSchemaEpoch !== run.domainSchemaEpoch) {
                 const retiredAt = this.gatewayNowMs();
                 const retired = this.retireGatewayRunnerRegistration(identity, retiredAt, run);
                 if (retired) {
@@ -3024,6 +3060,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                         subId: identity.subId,
                     },
                     auth: projected.auth,
+                    domainSchemaEpoch: route.domainSchemaEpoch,
                 })
             );
             if (!response.ok) {
@@ -4294,18 +4331,22 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
         let shardId: string;
         let schemaEpoch: number;
+        let domainSchemaEpoch: number;
         try {
             const route = await catalog.route(vshard);
             if (
                 typeof route?.shardId !== "string" ||
                 route.shardId.length === 0 ||
                 !Number.isSafeInteger(route.schemaEpoch) ||
-                route.schemaEpoch < 0
+                route.schemaEpoch < 0 ||
+                !Number.isSafeInteger(route.domainSchemaEpoch) ||
+                route.domainSchemaEpoch < 1
             ) {
                 throw new TypeError("Catalog returned a malformed shard route");
             }
             shardId = route.shardId;
             schemaEpoch = route.schemaEpoch;
+            domainSchemaEpoch = route.domainSchemaEpoch;
         } catch {
             if (pending.cancelled) return;
             this.sendError(ws, "CDB_CATALOG_UNAVAILABLE", msg.subId);
@@ -4373,6 +4414,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                     shardId,
                     sourceCdbId,
                     schemaEpoch,
+                    domainSchemaEpoch,
                     authEpochs,
                     ...(att.lastCookie === undefined ? {} : { lastCookie: att.lastCookie }),
                     nowMs: installedAt,
@@ -4428,6 +4470,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             gatewayId: this.ctx.id.toString(),
             ...identity,
             organizationId: TenantId(organizationId),
+            domainSchemaEpoch,
             ref: msg.ref,
             args: routed.args,
             queryHash: routed.queryHash,
@@ -4759,7 +4802,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
         connectionId: string,
         registrationId: string
     ): Promise<void> {
-        const shardIds = await shardsForIntent(this.catalog(), intent);
+        const catalog = this.catalog();
+        const shardIds = await shardsForIntent(catalog, intent);
+        const domainSchemaEpoch = (await catalog.route(0)).domainSchemaEpoch;
         const sql = adaptSqlStorage(this.ctx.storage.sql);
         sql.exec(
             `INSERT OR REPLACE INTO _gw_subs
@@ -4788,6 +4833,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             subId,
             principalId,
             organizationId,
+            domainSchemaEpoch,
             ref,
             args,
             queryHash,

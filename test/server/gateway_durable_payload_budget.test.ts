@@ -61,6 +61,7 @@ function registration(
         shardId: "logical-shard-1",
         sourceCdbId: "physical-cdb-1",
         schemaEpoch: 1,
+        domainSchemaEpoch: 1,
         authEpochs: { global: 1, tenant: 2, principal: 3 },
         nowMs: 100,
         ...overrides,

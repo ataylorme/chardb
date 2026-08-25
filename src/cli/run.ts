@@ -1,6 +1,7 @@
 import { runDoctor } from "./commands/doctor.ts";
 import { runExplain } from "./commands/explain.ts";
 import { runInit } from "./commands/init.ts";
+import { runMigrate } from "./commands/migrate.ts";
 import type { CliContext } from "./context.ts";
 
 const HELP = `chardb — experimental tenant-sharding prototype for Cloudflare Durable Objects
@@ -12,13 +13,13 @@ Commands:
   chardb shards ...             not implemented
   chardb snapshot ...           not implemented
   chardb restore ...            not implemented
-  chardb migrate ...            not implemented
+  chardb migrate --url <worker> --id <id> --target <version> [--concurrency <1-32>] [--baseline]
   chardb export ...             not implemented
   chardb schedule ...           not implemented
   chardb deploy ...             not implemented
 `;
 
-const NOT_IMPLEMENTED = new Set(["migrate", "deploy", "shards", "snapshot", "restore", "export", "schedule"]);
+const NOT_IMPLEMENTED = new Set(["deploy", "shards", "snapshot", "restore", "export", "schedule"]);
 
 export async function runCli(ctx: CliContext, argv: readonly string[]): Promise<number> {
     const [cmd, ...rest] = argv;
@@ -65,6 +66,36 @@ export async function runCli(ctx: CliContext, argv: readonly string[]): Promise<
                 prod: rest.includes("--prod"),
             });
             return result.path === "rejected" ? 1 : 0;
+        }
+        case "migrate": {
+            const baseUrl = valueAfterFlag(rest, "--url") ?? ctx.env.CHARDB_URL;
+            const migrationId = valueAfterFlag(rest, "--id");
+            const rawTarget = valueAfterFlag(rest, "--target");
+            const rawConcurrency = valueAfterFlag(rest, "--concurrency") ?? "4";
+            const token = ctx.env.CHARDB_ADMIN_TOKEN;
+            if (!baseUrl || !migrationId || !rawTarget || !token || !ctx.fetch) {
+                ctx.stderr(
+                    "usage: CHARDB_ADMIN_TOKEN=<secret> chardb migrate --url <worker> --id <id> --target <version> [--concurrency <1-32>] [--baseline]\n"
+                );
+                return 2;
+            }
+            const targetVersion = Number(rawTarget);
+            const concurrency = Number(rawConcurrency);
+            try {
+                await runMigrate(ctx, {
+                    baseUrl,
+                    token,
+                    migrationId,
+                    targetVersion,
+                    concurrency,
+                    baseline: rest.includes("--baseline"),
+                    fetch: ctx.fetch,
+                });
+                return 0;
+            } catch (error) {
+                ctx.stderr(`chardb migrate: ${error instanceof Error ? error.message : String(error)}\n`);
+                return 1;
+            }
         }
         default:
             if (NOT_IMPLEMENTED.has(cmd)) {

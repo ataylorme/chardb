@@ -1,6 +1,6 @@
 # chardb chat example
 
-This is a compile-checked concept example for chardb's chat API: Drizzle tables, better-auth configuration, typed mutations and queries, and React hooks in one small application. It typechecks and produces a Vite build against a packed chardb package. The `postMessage` mutation and `listMessages` query opt into organization authority with explicit stable refs and partition metadata. [`scripts/smoke-packed-chat.mjs`](../../scripts/smoke-packed-chat.mjs) installs version 0.1.0 from a clean tarball. It proves actual Better Auth anonymous sign-in, live replacement, same-`mutId` replay, independent readback, and denial between two principals in different organizations. Resume replay remains unfinished, and this example is not ready for production data.
+This is a compile-checked concept example for chardb's chat API: Drizzle tables, better-auth configuration, a packaged schema journal, typed mutations and queries, and React hooks in one small application. It typechecks and produces a Vite build against a packed chardb package. The `postMessage` mutation and `listMessages` query opt into organization authority with explicit stable refs and partition metadata. [`scripts/smoke-packed-chat.mjs`](../../scripts/smoke-packed-chat.mjs) installs version 0.1.0 from a clean tarball, applies its packaged journal through that tarball's CLI, and proves actual Better Auth anonymous sign-in, live replacement, same-`mutId` replay, persistent restart, independent readback, and denial between two principals in different organizations. Resume replay remains unfinished, and this example is not ready for production data.
 
 The intended backend surface is one factory call:
 
@@ -8,7 +8,7 @@ The intended backend surface is one factory call:
 // src/server/worker.ts, abbreviated. See the source for the full concept.
 import { anonymous } from "better-auth/plugins/anonymous";
 import { jwt } from "better-auth/plugins/jwt";
-import { chardb, defineAuth } from "chardb/server";
+import { chardb, defineAuth, defineMigrations, defineSchemaBaseline } from "chardb/server";
 import * as api from "./api.ts";
 import * as queries from "./queries.ts";
 import * as domain from "./schema.ts";
@@ -21,7 +21,16 @@ export const auth = defineAuth({
   databaseHooks: { /* see worker.ts for the full hook */ },
 });
 
-export const app = chardb({ auth, schema: domain, api: { ...api, ...queries } });
+export const migrations = defineMigrations([
+  defineSchemaBaseline({
+    version: 1,
+    name: "initial_schema",
+    domainSchema: domain,
+    authOptions: auth.options,
+  }),
+]);
+
+export const app = chardb({ auth, schema: domain, api: { ...api, ...queries }, migrations });
 
 app.get("/health", (c) => c.text("ok"));
 
@@ -206,9 +215,9 @@ Wire argument types live at the validator. The protocol decoder also rejects mis
 
 The merged auth + domain schema is automatic: `chardb({ schema: domain, auth })` calls `synthesizeAuthSchema(auth.options)` internally and merges the synthesized tables into the runtime schema before the manifest is built. `schema.ts` only declares domain tables. Better Auth rows live in the singleton Catalog; Cdb stores domain rows, not auth models.
 
-Catalog generates auth DDL with keys, uniqueness, foreign keys, indexes, supported defaults, nullability, and SQLite types. An existing table must have the exact matching `auth_ddl_v1` signature. Older layouts have no versioned upgrade path yet.
+Catalog generates auth DDL with keys, uniqueness, foreign keys, indexes, supported defaults, nullability, and SQLite types. Migration completion verifies every table and index against that rendered schema before recording current `auth_ddl_v1` signatures.
 
-Fresh Cdb storage also renders the configured domain tables and indexes, records their signatures, and rejects drift. This bootstrap does not migrate an existing shard to a newer schema.
+The example's version-one journal is a rendered baseline containing its full domain and Catalog auth DDL. Fresh and existing version-zero storage remains closed until `chardb migrate` applies that exact packaged version. Later forward migrations can supply ordered Cdb and Catalog SQL. This is a maintenance path, not an online migration protocol.
 
 The demo session hook finds or creates the shared organization, reuses the user's existing membership, and sets the session's active organization. It confirms a row exists before treating a concurrent create error as success. Focused tests cover repeated bootstrap, so returning users no longer collide with the demo membership primary key.
 
@@ -226,7 +235,7 @@ If a domain table shadows a reserved name (`organization`, `user`, `member`, …
 
 The repository's focused workerd harnesses prove that refs imported from a real emitted Vite browser chunk match an independently bundled Worker and run a declared organization mutation through Gateway, Catalog, Cdb policy, and the atomic op-log. The live harness connects two org-A clients and one org-B client. It covers initial snapshots and acknowledgements, a public mutation, Cdb invalidation delivery, replacement snapshots and acknowledgements, an org-B rerun that stays empty under policy, outbox drain, and reconnect with a fresh subscription. It also evicts Gateway and Cdb with a hibernated socket and a staged replacement, then delivers and acknowledges the stored snapshot after both objects restart. Those harnesses use test-only auth setup.
 
-The separate packed smoke copies this example into a clean temporary consumer, installs chardb 0.1.0 from its tarball, and builds the Vite client with both stable refs. Its first Better Auth principal confirms the demo organization hook selected `demo-org`, acknowledges an empty initial snapshot, executes `postMessage`, acknowledges the live replacement, replays the same `mutId`, and reads exactly one row through a second subscription. A second principal moves to another organization. Its `demo-org` query receives `CDB_FORBIDDEN`, while its own organization returns an empty snapshot. The smoke does not restart the Worker or Durable Objects and does not cover outbound JWKS rotation, resume replay, or migrations. Presence, upload, stream, and vector hooks are not exported.
+The separate packed smoke copies this example into a clean temporary consumer, installs chardb 0.1.0 from its tarball, builds the Vite client with both stable refs, starts workerd, and applies version one through the packed CLI. Two Better Auth principals initially share `demo-org`; both acknowledge the empty initial result and the same live replacement. The smoke closes both sockets, restarts Miniflare over the same Durable Object storage, reconstructs both sessions, replays the exact mutation with an identical result and one row, then moves the second principal to another organization and proves cross-organization denial. It does not cover outbound JWKS rotation, exact resume replay, or a multi-version production upgrade. Presence, upload, stream, and vector hooks are not exported.
 
 Client mutations use `mutationTimeoutMs`, which defaults to 60 seconds and is also accepted by `ChardbProvider`. The original deadline continues across reconnects, and each resend uses the same pending `mutId`. Timeout rejects with nonretryable `CDB_MUTATION_OUTCOME_UNKNOWN` because the server may have committed the request. Synchronous send failure, client close or session failure, and a terminal server result clear the timer. The public API does not expose a retry handle or automatic retry policy.
 
@@ -242,6 +251,9 @@ npm ci
 npm run typecheck          # strict typecheck of server and web
 npm run build              # production Vite build
 
+# Start the local Worker and apply the packaged journal before it reports ready.
+bun run dev:worker
+
 # 3) Run the repository-only pure-layer test.
 bun test test/e2e/
 ```
@@ -254,10 +266,10 @@ These commands verify package consumption, TypeScript contracts, the browser bun
 
 ## Runtime wiring still required
 
-The packed smoke proves two anonymous principals in different organizations. It covers same-`mutId` replay, live replacement, independent readback, denial of a cross-organization query, and an empty result inside the second principal's own organization. It still needs Worker and Durable Object restart, outbound JWKS rotation, versioned domain migrations, and missed-change replay. The narrow runtime persists exact Gateway and Cdb generations, auth epochs, the static table-policy digest, retry state, and delivery cookies. Intent interval verification remains open. Existing `auth_ddl_v1` layouts need a versioned upgrade path.
+The packed smoke proves two anonymous principals across the packed migration, same-organization live delivery, persistent Worker and Durable Object restart, same-`mutId` replay, independent readback, and later organization isolation. It still needs outbound JWKS rotation and exact missed-change replay. The narrow runtime persists exact Gateway and Cdb generations, auth epochs, the static table-policy digest, retry state, and delivery cookies. Intent interval verification remains open. The separate configured migration harness proves a real version-zero to version-one domain and Catalog upgrade, fresh journal install, baseline adoption, stale and future epoch rejection, replay, and reconstruction.
 
 The repository audit still reports five advisories through `miniflare@4.20260730.0 -> undici@7.28.0`. Miniflare 4 pins that version, and the fixed `undici@7.29.0` currently requires Miniflare 5 alpha. The example does not override the dependency.
 
 Each auth mutation commits with every directly derivable old and new global, tenant, or principal epoch bump. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. Bulk updates and deletes preload matched rows to derive epoch scopes. Indirect plugin relationships without placement metadata or conventional `organizationId` or `userId` fields may lack a secondary scope. Coverage uses a Bun fake-Durable-Object harness, not workerd.
 
-JWT coverage includes real signatures, the Catalog resolver contract, and configured Gateway Durable Object WebSocket dispatch under Miniflare workerd with ES256 tokens, a real Catalog SQLite cache, and a configured Cdb. The verified attachment stores the subject only. Catalog supplies current organization authority for each declared mutation, initial query, and dirty live-query rerun. A workerd test keeps a socket open through role downgrade, role restoration, and membership deletion. Auth refresh barriers use a server connection id, drain admitted operations, retire current durable registrations, report affected subscription ids through `mustRefetch`, gate later work, and store a terminal rejected attachment before closing on failure. Catalog's authority read does not cancel an in-flight Cdb call that it already authorized. A configured Catalog workerd test creates a user, session, organization, and member, evicts the Catalog Durable Object, proves a new instance started, and reads identical stored auth rows and canonical organization authority after reconstruction. Focused harnesses seed JWKs and auth rows through test-only routes, while the packed smoke separately uses Better Auth HTTP anonymous sign-in and token issue for both principals. Outbound JWKS fetch, cache refresh, key rotation, packed restart recovery, and general versioned auth migrations remain untested. The Wrangler file remains a template until those broader tests pass.
+JWT coverage includes real signatures, the Catalog resolver contract, and configured Gateway Durable Object WebSocket dispatch under Miniflare workerd with ES256 tokens, a real Catalog SQLite cache, and a configured Cdb. The verified attachment stores the subject only. Catalog supplies current organization authority for each declared mutation, initial query, and dirty live-query rerun. A workerd test keeps a socket open through role downgrade, role restoration, and membership deletion. Auth refresh barriers use a server connection id, drain admitted operations, retire current durable registrations, report affected subscription ids through `mustRefetch`, gate later work, and store a terminal rejected attachment before closing on failure. Catalog's authority read does not cancel an in-flight Cdb call that it already authorized. A configured Catalog workerd test creates a user, session, organization, and member, evicts the Catalog Durable Object, proves a new instance started, and reads identical stored auth rows and canonical organization authority after reconstruction. Focused harnesses seed JWKs and auth rows through test-only routes, while the packed smoke separately uses Better Auth HTTP anonymous sign-in and token issue for both principals. Outbound JWKS fetch, cache refresh, key rotation, and packed restart recovery have configured or packed coverage. The Wrangler file remains a template because exact resume replay and broader operational claims are still open.

@@ -108,6 +108,7 @@ function request(
         subscription: identity,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-1"),
+        domainSchemaEpoch: 1,
         ref: ChardbRef("queries.ts#messages"),
         args: { organizationId: "org-1" },
         queryHash: "query-hash-1",
@@ -357,6 +358,7 @@ describe("Cdb live subscription identity", () => {
             subId: legacy.subId,
             principalId: legacyRequest.principalId,
             organizationId: legacyRequest.organizationId,
+            domainSchemaEpoch: legacyRequest.domainSchemaEpoch,
             ref: legacyRequest.ref,
             args: legacyRequest.args,
             policyDigest: policy.policy_digest,
@@ -367,8 +369,9 @@ describe("Cdb live subscription identity", () => {
         db.prepare(
             `INSERT INTO _chardb_live_subscriptions
              (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-              principal_id, organization_id, ref, args_json, policy_digest, query_hash, tables_json, intervals_json)
-             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+              tables_json, intervals_json)
+             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(
             legacy.gatewayId,
             legacy.registrationId,
@@ -378,6 +381,7 @@ describe("Cdb live subscription identity", () => {
             payloadHash,
             legacyRequest.principalId,
             legacyRequest.organizationId,
+            legacyRequest.domainSchemaEpoch,
             legacyRequest.ref,
             JSON.stringify(legacyRequest.args),
             policy.policy_digest,

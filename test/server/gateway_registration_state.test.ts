@@ -62,6 +62,7 @@ function registration(
         shardId: "shard-1",
         sourceCdbId: "cdb-object-1",
         schemaEpoch: 4,
+        domainSchemaEpoch: 1,
         authEpochs: { global: 5, tenant: 6, principal: 7 },
         lastCookie: Cookie("cookie-0"),
         nowMs: 100,

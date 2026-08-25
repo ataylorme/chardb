@@ -20,7 +20,7 @@ export function OgImage() {
 
                     <p className="mt-7 text-fg-muted" style={{ fontSize: 24, lineHeight: 1.5, maxWidth: 640 }}>
                         Tested organization mutations and acknowledged live snapshots derived from Drizzle. Resume
-                        replay and migrations remain unfinished.
+                        replay and online migrations remain unfinished.
                     </p>
 
                     <div className="mt-8 inline-flex items-center rounded-full border border-line2 bg-ink-850 px-6 py-2.5 font-mono">

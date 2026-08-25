@@ -15,7 +15,7 @@ describe("Gateway query routing", () => {
         const catalog: CatalogRoutingRpc = {
             async route() {
                 routeCalls++;
-                return { shardId: ShardId("unexpected"), schemaEpoch: 1 };
+                return { shardId: ShardId("unexpected"), schemaEpoch: 1, domainSchemaEpoch: 1 };
             },
             async listShardIds() {
                 inventoryCalls++;
@@ -36,7 +36,7 @@ describe("Gateway query routing", () => {
         const catalog: CatalogRoutingRpc = {
             async route(vshard) {
                 routedVshards.push(vshard);
-                return { shardId: ShardId("ShardDO_one"), schemaEpoch: 1 };
+                return { shardId: ShardId("ShardDO_one"), schemaEpoch: 1, domainSchemaEpoch: 1 };
             },
             async listShardIds() {
                 throw new Error("point routing must not enumerate shards");
@@ -57,7 +57,7 @@ describe("Gateway query routing", () => {
         const catalog: CatalogRoutingRpc = {
             async route(vshard) {
                 routedVshards.push(vshard);
-                return { shardId: ShardId("ShardDO_reference"), schemaEpoch: 1 };
+                return { shardId: ShardId("ShardDO_reference"), schemaEpoch: 1, domainSchemaEpoch: 1 };
             },
             async listShardIds() {
                 throw new Error("reference routing must not enumerate shards");

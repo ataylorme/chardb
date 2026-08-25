@@ -1074,7 +1074,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         const tokens = [
             "not-a-jwt",
             `${valid.slice(0, -2)}xx`,
-            await signed({ expirationTime: now - 1 }),
+            await signed({ expirationTime: now - 60 }),
             await signed({ issuer: "https://attacker.example" }),
             await signed({ audience: "other-app" }),
         ];

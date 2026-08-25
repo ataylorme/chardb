@@ -46,6 +46,7 @@ describe("renderWrangler / checkWrangler", () => {
         expect(config.queues).toBeUndefined();
         expect(config.triggers).toBeUndefined();
         expect(config.tail_consumers).toBeUndefined();
+        expect(config.compatibility_flags).toEqual(["nodejs_compat"]);
         expect(config.assets.run_worker_first).toEqual(["/_chardb/*", "/ws"]);
     });
 

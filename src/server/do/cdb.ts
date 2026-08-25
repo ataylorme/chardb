@@ -57,6 +57,12 @@ import type {
     GatewayInvalidationRpc,
     LiveSubscriptionId,
 } from "../rpc.ts";
+import {
+    type ChardbMigrationJournal,
+    defineMigrations,
+    migrationDigestAt,
+    pendingMigrations,
+} from "../schema-migrations.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
 export type {
@@ -85,6 +91,7 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
   payload_hash TEXT,
   principal_id TEXT,
   organization_id TEXT,
+  domain_schema_epoch INTEGER CHECK (domain_schema_epoch IS NULL OR domain_schema_epoch > 0),
   ref TEXT,
   args_json TEXT,
   policy_digest TEXT,
@@ -98,6 +105,7 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
       AND payload_hash IS NULL
       AND principal_id IS NULL
       AND organization_id IS NULL
+      AND domain_schema_epoch IS NULL
       AND ref IS NULL
       AND args_json IS NULL
       AND policy_digest IS NULL
@@ -110,6 +118,7 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
       AND payload_hash IS NOT NULL
       AND principal_id IS NOT NULL
       AND organization_id IS NOT NULL
+      AND domain_schema_epoch IS NOT NULL
       AND ref IS NOT NULL
       AND args_json IS NOT NULL
       AND policy_digest IS NOT NULL
@@ -154,7 +163,57 @@ CREATE TABLE IF NOT EXISTS _chardb_domain_schema (
   table_name TEXT PRIMARY KEY,
   signature TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS _chardb_schema_state (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  active_version INTEGER NOT NULL CHECK (active_version >= 0),
+  active_epoch INTEGER NOT NULL CHECK (active_epoch > 0),
+  active_digest TEXT NOT NULL,
+  last_migration_id TEXT,
+  status TEXT NOT NULL CHECK (status IN ('active', 'migrating')),
+  migration_id TEXT,
+  target_version INTEGER,
+  target_epoch INTEGER,
+  target_digest TEXT,
+  CHECK (
+    (status = 'active' AND migration_id IS NULL AND target_version IS NULL AND target_epoch IS NULL AND target_digest IS NULL)
+    OR
+    (status = 'migrating' AND migration_id IS NOT NULL AND target_version IS NOT NULL AND target_epoch IS NOT NULL AND target_digest IS NOT NULL)
+  )
+);
+CREATE TABLE IF NOT EXISTS _chardb_schema_steps (
+  migration_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version > 0),
+  digest TEXT NOT NULL,
+  applied_at INTEGER NOT NULL CHECK (applied_at >= 0),
+  PRIMARY KEY (migration_id, version)
+);
 ` as const;
+
+export interface CdbSchemaState {
+    readonly activeVersion: number;
+    readonly activeEpoch: number;
+    readonly activeDigest: string;
+    readonly lastMigrationId: string | null;
+    readonly status: "active" | "migrating";
+    readonly migrationId: string | null;
+    readonly targetVersion: number | null;
+    readonly targetEpoch: number | null;
+    readonly targetDigest: string | null;
+}
+
+interface StoredCdbSchemaState {
+    readonly active_version: number;
+    readonly active_epoch: number;
+    readonly active_digest: string;
+    readonly last_migration_id: string | null;
+    readonly status: "active" | "migrating";
+    readonly migration_id: string | null;
+    readonly target_version: number | null;
+    readonly target_epoch: number | null;
+    readonly target_digest: string | null;
+}
+
+const EMPTY_MIGRATION_JOURNAL = defineMigrations([]);
 
 interface StoredSubscriptionRow {
     readonly [column: string]: string | number | null;
@@ -167,6 +226,7 @@ interface StoredSubscriptionRow {
     readonly payload_hash: string | null;
     readonly principal_id: string | null;
     readonly organization_id: string | null;
+    readonly domain_schema_epoch: number | null;
     readonly ref: string | null;
     readonly args_json: string | null;
     readonly policy_digest: string | null;
@@ -281,6 +341,7 @@ function subscriptionPayloadHash(args: CdbSubscriptionRequest, policyDigest: str
         subId: args.subscription.subId,
         principalId: args.principalId,
         organizationId: args.organizationId,
+        domainSchemaEpoch: args.domainSchemaEpoch,
         ref: args.ref,
         args: args.args,
         policyDigest,
@@ -378,6 +439,11 @@ function ensureLiveSubscriptionAuthorityColumns(sql: SyncSql): void {
     if (!columns.has("policy_digest")) {
         sql.exec("ALTER TABLE _chardb_live_subscriptions ADD COLUMN policy_digest TEXT");
     }
+    if (!columns.has("domain_schema_epoch")) {
+        sql.exec(
+            "ALTER TABLE _chardb_live_subscriptions ADD COLUMN domain_schema_epoch INTEGER CHECK (domain_schema_epoch IS NULL OR domain_schema_epoch > 0)"
+        );
+    }
 }
 
 function retireLegacyLiveSubscriptions(sql: SyncSql): void {
@@ -387,13 +453,15 @@ function retireLegacyLiveSubscriptions(sql: SyncSql): void {
              payload_hash = NULL,
              principal_id = NULL,
              organization_id = NULL,
+             domain_schema_epoch = NULL,
              ref = NULL,
              args_json = NULL,
              policy_digest = NULL,
              query_hash = NULL,
              tables_json = NULL,
              intervals_json = NULL
-         WHERE state = 'active' AND (organization_id IS NULL OR query_hash IS NULL OR policy_digest IS NULL)`
+         WHERE state = 'active'
+           AND (organization_id IS NULL OR query_hash IS NULL OR policy_digest IS NULL OR domain_schema_epoch IS NULL)`
     );
     sql.exec(
         `DELETE FROM _chardb_live_subscription_tables
@@ -456,6 +524,7 @@ function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionReq
         row.payload_hash === null ||
         row.principal_id === null ||
         row.organization_id === null ||
+        row.domain_schema_epoch === null ||
         row.ref === null ||
         row.args_json === null ||
         row.policy_digest === null ||
@@ -479,6 +548,9 @@ function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionReq
         );
     }
     const args = snapshotCdbQueryArgs(parsedArgs as RawJson);
+    if (!Number.isSafeInteger(row.domain_schema_epoch) || row.domain_schema_epoch < 1) {
+        throw subscriptionInvariant("active live subscription domain schema epoch is invalid");
+    }
     if (!Array.isArray(tables) || tables.some(table => typeof table !== "string")) {
         throw subscriptionInvariant("active live subscription tables payload is corrupt");
     }
@@ -496,6 +568,7 @@ function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionReq
         },
         principalId: PrincipalId(row.principal_id),
         organizationId: TenantId(row.organization_id),
+        domainSchemaEpoch: row.domain_schema_epoch,
         ref: ChardbRef(row.ref),
         args,
         queryHash: row.query_hash,
@@ -800,6 +873,7 @@ function snapshotMutationAuth(input: AuthCtx): AuthCtx {
 export interface CdbRuntimeConfig<TSchema extends Record<string, unknown>> {
     readonly schema: () => TSchema;
     readonly manifest: () => ChardbManifest;
+    readonly migrations?: () => ChardbMigrationJournal;
 }
 
 /**
@@ -823,6 +897,10 @@ export class Cdb extends DurableObject<CdbEnv> {
         return emptyManifest();
     }
 
+    protected migrationJournal(): ChardbMigrationJournal {
+        return EMPTY_MIGRATION_JOURNAL;
+    }
+
     private async bootstrap(): Promise<void> {
         if (this.bootstrapped) return;
         const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -836,10 +914,26 @@ export class Cdb extends DurableObject<CdbEnv> {
         ensureInvalidationOutboxColumns(sql);
         sql.exec("PRAGMA foreign_keys = ON");
         this.ctx.storage.transactionSync(() => retireLegacyLiveSubscriptions(adaptSqlStorage(this.ctx.storage.sql)));
-        this.ensureDomainTables();
+        const journal = this.migrationJournal();
+        const storedState = this.readSchemaStateOrNull();
+        if (storedState === null) {
+            sql.exec(
+                `INSERT INTO _chardb_schema_state
+                 (singleton, active_version, active_epoch, active_digest, status)
+                 VALUES (1, ?, 1, ?, 'active')`,
+                0,
+                migrationDigestAt(journal, 0)
+            );
+            if (journal.version === 0) this.ensureDomainTables();
+        } else {
+            this.assertPackagedSchemaState(storedState, journal);
+            if (storedState.status === "active" && storedState.activeVersion === journal.version) {
+                this.ensureDomainTables();
+            }
+        }
         const cursor = this.ctx.storage.sql.exec<StoredSubscriptionRow>(
             `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                    principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                    principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                     tables_json, intervals_json
              FROM _chardb_live_subscriptions
              WHERE state = 'active'
@@ -863,11 +957,40 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     private ensureDomainTables(): void {
+        const tables = this.renderDomainTables();
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            for (const ddl of tables) {
+                const existing = sql.one<{ sql: string }>(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    ddl.tableName
+                );
+                const recorded = sql.one<{ signature: string }>(
+                    "SELECT signature FROM _chardb_domain_schema WHERE table_name = ?",
+                    ddl.tableName
+                );
+                if (existing) {
+                    this.assertRenderedDomainTable(sql, ddl, existing.sql, recorded?.signature ?? null, true);
+                    continue;
+                }
+                if (recorded) throw domainSchemaMismatch(ddl.tableName);
+                sql.exec(ddl.createTable);
+                for (const statement of ddl.indexes) sql.exec(statement);
+                sql.exec(
+                    "INSERT INTO _chardb_domain_schema (table_name, signature) VALUES (?, ?)",
+                    ddl.tableName,
+                    ddl.signature
+                );
+            }
+        });
+    }
+
+    private renderDomainTables() {
         const tables = [...collectCdbTables(this.mutationSchema())].sort((a, b) =>
             a.meta.name.localeCompare(b.meta.name)
         );
         const domainTableNames = new Set(tables.map(entry => entry.meta.name));
-        const rendered = tables.map(({ table }) => {
+        return tables.map(({ table }) => {
             const meta = resolveCdbMeta(table);
             const authorityColumns = new Set([meta.tenantBy, meta.selfBy].filter(column => column !== undefined));
             return renderSqliteTableDdl(table, {
@@ -885,44 +1008,398 @@ export class Cdb extends DurableObject<CdbEnv> {
                 },
             });
         });
+    }
+
+    private assertRenderedDomainTable(
+        sql: SyncSql,
+        ddl: ReturnType<typeof renderSqliteTableDdl>,
+        actualCreateTable: string,
+        recordedSignature: string | null,
+        requireRecordedSignature: boolean
+    ): void {
+        if (
+            (requireRecordedSignature && recordedSignature !== ddl.signature) ||
+            actualCreateTable !== ddl.createTable
+        ) {
+            throw domainSchemaMismatch(ddl.tableName);
+        }
+        for (let index = 0; index < ddl.indexNames.length; index++) {
+            const indexName = ddl.indexNames[index];
+            const expectedSql = ddl.indexes[index];
+            if (!indexName || !expectedSql) throw domainSchemaMismatch(ddl.tableName);
+            const present = sql.one<{ sql: string }>(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?",
+                indexName,
+                ddl.tableName
+            );
+            if (present?.sql !== expectedSql) throw domainSchemaMismatch(ddl.tableName);
+        }
+    }
+
+    private recordMigratedDomainSchema(sql: SyncSql): void {
+        const rendered = this.renderDomainTables();
+        const expectedNames = new Set(rendered.map(ddl => ddl.tableName));
+        const physical = sql.all<{ name: string }>(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'table'
+               AND substr(name, 1, 8) != '_chardb_'
+               AND substr(name, 1, 4) != '_cf_'
+               AND substr(name, 1, 12) != '__miniflare_'
+               AND substr(name, 1, 7) != 'sqlite_'
+             ORDER BY name`
+        );
+        for (const row of physical) {
+            if (!expectedNames.has(row.name)) throw domainSchemaMismatch(row.name);
+        }
+        for (const ddl of rendered) {
+            const existing = sql.one<{ sql: string }>(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ddl.tableName
+            );
+            if (!existing) throw domainSchemaMismatch(ddl.tableName);
+            this.assertRenderedDomainTable(sql, ddl, existing.sql, null, false);
+            sql.exec(
+                `INSERT INTO _chardb_domain_schema (table_name, signature) VALUES (?, ?)
+                 ON CONFLICT(table_name) DO UPDATE SET signature = excluded.signature`,
+                ddl.tableName,
+                ddl.signature
+            );
+        }
+        const recorded = sql.all<{ table_name: string }>(
+            "SELECT table_name FROM _chardb_domain_schema ORDER BY table_name"
+        );
+        for (const row of recorded) {
+            if (expectedNames.has(row.table_name)) continue;
+            const existing = sql.one<{ present: number }>(
+                "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?",
+                row.table_name
+            );
+            if (existing) throw domainSchemaMismatch(row.table_name);
+            sql.exec("DELETE FROM _chardb_domain_schema WHERE table_name = ?", row.table_name);
+        }
+    }
+
+    private readSchemaStateOrNull(sql = adaptSqlStorage(this.ctx.storage.sql)): CdbSchemaState | null {
+        const row = sql.one<StoredCdbSchemaState>(
+            `SELECT active_version, active_epoch, active_digest, last_migration_id, status, migration_id,
+                    target_version, target_epoch, target_digest
+             FROM _chardb_schema_state WHERE singleton = 1`
+        );
+        if (!row) return null;
+        return {
+            activeVersion: row.active_version,
+            activeEpoch: row.active_epoch,
+            activeDigest: row.active_digest,
+            lastMigrationId: row.last_migration_id,
+            status: row.status,
+            migrationId: row.migration_id,
+            targetVersion: row.target_version,
+            targetEpoch: row.target_epoch,
+            targetDigest: row.target_digest,
+        };
+    }
+
+    private readSchemaState(sql = adaptSqlStorage(this.ctx.storage.sql)): CdbSchemaState {
+        const state = this.readSchemaStateOrNull(sql);
+        if (!state) throw new CdbError({ code: "CDB_INVARIANT", message: "Cdb schema state is missing" });
+        return state;
+    }
+
+    private assertPackagedSchemaState(state: CdbSchemaState, journal = this.migrationJournal()): void {
+        if (
+            state.activeVersion > journal.version ||
+            state.activeDigest !== migrationDigestAt(journal, state.activeVersion)
+        ) {
+            throw new CdbError({
+                code: "CDB_PARTITION_CONTRACT_CHANGED",
+                message: `Cdb schema version ${state.activeVersion} does not match the packaged migration journal`,
+            });
+        }
+        if (
+            state.status === "migrating" &&
+            (state.targetVersion === null ||
+                state.targetVersion <= state.activeVersion ||
+                state.targetVersion > journal.version ||
+                state.targetEpoch !== state.activeEpoch + 1 ||
+                state.targetDigest !== migrationDigestAt(journal, state.targetVersion))
+        ) {
+            throw new CdbError({
+                code: "CDB_PARTITION_CONTRACT_CHANGED",
+                message: "Cdb pending schema migration does not match the packaged journal",
+            });
+        }
+    }
+
+    private assertActiveSchemaEpoch(
+        expectedEpoch: number,
+        sql = adaptSqlStorage(this.ctx.storage.sql)
+    ): CdbSchemaState {
+        if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch < 1) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "domain schema epoch is invalid" });
+        }
+        const state = this.readSchemaState(sql);
+        if (
+            state.status !== "active" ||
+            state.activeVersion !== this.migrationJournal().version ||
+            state.activeEpoch !== expectedEpoch
+        ) {
+            throw new CdbError({
+                code: "CDB_STALE_EPOCH",
+                message: `Cdb domain schema epoch ${state.activeEpoch} does not match request epoch ${expectedEpoch}`,
+                hint: "retry after routing against the active schema version",
+            });
+        }
+        return state;
+    }
+
+    schemaState(): CdbSchemaState {
+        return this.readSchemaState();
+    }
+
+    baselineSchemaMigration(args: {
+        readonly migrationId: string;
+        readonly targetVersion: number;
+        readonly targetEpoch: number;
+        readonly targetDigest: string;
+    }): CdbSchemaState {
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(args.migrationId)) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema baseline id is invalid" });
+        }
+        const journal = this.migrationJournal();
+        if (
+            args.targetVersion !== journal.version ||
+            args.targetVersion < 1 ||
+            !Number.isSafeInteger(args.targetEpoch) ||
+            args.targetEpoch < 2 ||
+            args.targetDigest !== journal.digest
+        ) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema baseline target is invalid" });
+        }
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
-            for (const ddl of rendered) {
-                const existing = sql.one<{ sql: string }>(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-                    ddl.tableName
-                );
-                const recorded = sql.one<{ signature: string }>(
-                    "SELECT signature FROM _chardb_domain_schema WHERE table_name = ?",
-                    ddl.tableName
-                );
-                if (existing) {
-                    if (recorded?.signature !== ddl.signature || existing.sql !== ddl.createTable) {
-                        throw domainSchemaMismatch(ddl.tableName);
-                    }
-                    for (let index = 0; index < ddl.indexNames.length; index++) {
-                        const indexName = ddl.indexNames[index];
-                        const expectedSql = ddl.indexes[index];
-                        if (!indexName || !expectedSql) throw domainSchemaMismatch(ddl.tableName);
-                        const present = sql.one<{ sql: string }>(
-                            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?",
-                            indexName,
-                            ddl.tableName
-                        );
-                        if (present?.sql !== expectedSql) throw domainSchemaMismatch(ddl.tableName);
-                    }
-                    continue;
-                }
-                if (recorded) throw domainSchemaMismatch(ddl.tableName);
-                sql.exec(ddl.createTable);
-                for (const statement of ddl.indexes) sql.exec(statement);
-                sql.exec(
-                    "INSERT INTO _chardb_domain_schema (table_name, signature) VALUES (?, ?)",
-                    ddl.tableName,
-                    ddl.signature
-                );
+            const current = this.readSchemaState(sql);
+            if (
+                current.status === "active" &&
+                current.lastMigrationId === args.migrationId &&
+                current.activeVersion === args.targetVersion &&
+                current.activeEpoch === args.targetEpoch &&
+                current.activeDigest === args.targetDigest
+            ) {
+                return;
+            }
+            if (
+                current.status !== "active" ||
+                current.activeVersion !== 0 ||
+                current.activeDigest !== migrationDigestAt(journal, 0) ||
+                args.targetEpoch !== current.activeEpoch + 1
+            ) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "Cdb is not eligible for schema baseline" });
+            }
+            this.recordMigratedDomainSchema(sql);
+            sql.exec(
+                `UPDATE _chardb_schema_state
+                 SET active_version = ?, active_epoch = ?, active_digest = ?, last_migration_id = ?
+                 WHERE singleton = 1 AND status = 'active' AND active_version = 0 AND active_epoch = ?`,
+                args.targetVersion,
+                args.targetEpoch,
+                args.targetDigest,
+                args.migrationId,
+                current.activeEpoch
+            );
+            if (sql.changes() !== 1) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "Cdb changed during schema baseline" });
             }
         });
+        return this.readSchemaState();
+    }
+
+    prepareSchemaMigration(args: {
+        readonly migrationId: string;
+        readonly activeVersion: number;
+        readonly activeDigest: string;
+        readonly targetVersion: number;
+        readonly targetEpoch: number;
+        readonly targetDigest: string;
+    }): CdbSchemaState {
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(args.migrationId)) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration id is invalid" });
+        }
+        const journal = this.migrationJournal();
+        if (
+            !Number.isSafeInteger(args.activeVersion) ||
+            args.activeVersion < 0 ||
+            !Number.isSafeInteger(args.targetVersion) ||
+            args.targetVersion <= args.activeVersion ||
+            args.targetVersion !== journal.version ||
+            !Number.isSafeInteger(args.targetEpoch) ||
+            args.targetEpoch < 1 ||
+            args.activeDigest !== migrationDigestAt(journal, args.activeVersion) ||
+            args.targetDigest !== migrationDigestAt(journal, args.targetVersion)
+        ) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration target is invalid" });
+        }
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const current = this.readSchemaState();
+            if (current.status === "migrating") {
+                if (
+                    current.migrationId === args.migrationId &&
+                    current.activeVersion === args.activeVersion &&
+                    current.activeDigest === args.activeDigest &&
+                    current.targetVersion === args.targetVersion &&
+                    current.targetEpoch === args.targetEpoch &&
+                    current.targetDigest === args.targetDigest
+                ) {
+                    return;
+                }
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "another schema migration owns this Cdb" });
+            }
+            if (
+                current.lastMigrationId === args.migrationId &&
+                current.activeVersion === args.targetVersion &&
+                current.activeEpoch === args.targetEpoch &&
+                current.activeDigest === args.targetDigest
+            ) {
+                return;
+            }
+            if (
+                current.activeVersion !== args.activeVersion ||
+                current.activeDigest !== args.activeDigest ||
+                args.targetEpoch !== current.activeEpoch + 1
+            ) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "Cdb schema state changed before prepare" });
+            }
+            sql.exec(
+                `UPDATE _chardb_schema_state
+                 SET status = 'migrating', migration_id = ?, target_version = ?, target_epoch = ?, target_digest = ?
+                 WHERE singleton = 1 AND status = 'active' AND active_version = ? AND active_digest = ?`,
+                args.migrationId,
+                args.targetVersion,
+                args.targetEpoch,
+                args.targetDigest,
+                args.activeVersion,
+                args.activeDigest
+            );
+            if (sql.changes() !== 1) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "Cdb schema state changed before prepare" });
+            }
+        });
+        return this.readSchemaState();
+    }
+
+    applySchemaMigration(args: { readonly migrationId: string; readonly version: number }): CdbSchemaState {
+        const journal = this.migrationJournal();
+        if (!Number.isSafeInteger(args.version) || args.version < 1 || args.version > journal.version) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration version is invalid" });
+        }
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const current = this.readSchemaState();
+            if (current.status !== "migrating" || current.migrationId !== args.migrationId) {
+                if (current.status === "active" && current.lastMigrationId === args.migrationId) return;
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration does not own this Cdb" });
+            }
+            if (current.targetVersion === null || args.version > current.targetVersion) {
+                throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration step exceeds its target" });
+            }
+            const targetVersion = current.targetVersion;
+            const migration = journal.migrations[args.version - 1];
+            if (!migration || migration.version !== args.version) {
+                throw new CdbError({
+                    code: "CDB_PARTITION_CONTRACT_CHANGED",
+                    message: "schema migration step is missing",
+                });
+            }
+            const existing = sql.one<{ digest: string }>(
+                "SELECT digest FROM _chardb_schema_steps WHERE migration_id = ? AND version = ?",
+                args.migrationId,
+                args.version
+            );
+            if (existing) {
+                if (existing.digest !== migration.digest) {
+                    throw new CdbError({
+                        code: "CDB_PARTITION_CONTRACT_CHANGED",
+                        message: "applied schema migration digest changed",
+                    });
+                }
+                return;
+            }
+            const applied = sql.all<{ version: number; digest: string }>(
+                "SELECT version, digest FROM _chardb_schema_steps WHERE migration_id = ? ORDER BY version",
+                args.migrationId
+            );
+            const expected = pendingMigrations(journal, current.activeVersion).filter(
+                step => step.version <= targetVersion
+            );
+            for (let index = 0; index < applied.length; index++) {
+                const stored = applied[index];
+                const packaged = expected[index];
+                if (!stored || !packaged || stored.version !== packaged.version || stored.digest !== packaged.digest) {
+                    throw new CdbError({
+                        code: "CDB_PARTITION_CONTRACT_CHANGED",
+                        message: "applied schema migration sequence is corrupt",
+                    });
+                }
+            }
+            const next = expected[applied.length];
+            if (!next || next.version !== args.version) {
+                throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration steps must apply in order" });
+            }
+            for (const statement of migration.statements) sql.exec(statement);
+            sql.exec(
+                `INSERT INTO _chardb_schema_steps (migration_id, version, digest, applied_at)
+                 VALUES (?, ?, ?, ?)`,
+                args.migrationId,
+                migration.version,
+                migration.digest,
+                Date.now()
+            );
+        });
+        return this.readSchemaState();
+    }
+
+    activateSchemaMigration(args: { readonly migrationId: string }): CdbSchemaState {
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const current = this.readSchemaState();
+            if (current.status === "active") {
+                if (current.lastMigrationId === args.migrationId) return;
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration is not active" });
+            }
+            if (current.migrationId !== args.migrationId || current.targetVersion === null) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration does not own this Cdb" });
+            }
+            const targetVersion = current.targetVersion;
+            const expected = pendingMigrations(this.migrationJournal(), current.activeVersion).filter(
+                step => step.version <= targetVersion
+            );
+            const applied = sql.all<{ version: number; digest: string }>(
+                "SELECT version, digest FROM _chardb_schema_steps WHERE migration_id = ? ORDER BY version",
+                args.migrationId
+            );
+            if (
+                applied.length !== expected.length ||
+                applied.some(
+                    (stored, index) =>
+                        stored.version !== expected[index]?.version || stored.digest !== expected[index]?.digest
+                )
+            ) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration steps are incomplete" });
+            }
+            this.recordMigratedDomainSchema(sql);
+            sql.exec(
+                `UPDATE _chardb_schema_state
+                 SET active_version = target_version, active_epoch = target_epoch, active_digest = target_digest,
+                     last_migration_id = migration_id, status = 'active', migration_id = NULL,
+                     target_version = NULL, target_epoch = NULL, target_digest = NULL
+                 WHERE singleton = 1 AND status = 'migrating' AND migration_id = ?`,
+                args.migrationId
+            );
+            if (sql.changes() !== 1) {
+                throw new CdbError({ code: "CDB_INVARIANT", message: "Cdb schema state changed during activation" });
+            }
+        });
+        return this.readSchemaState();
     }
 
     private prepareIntervals(args: { readonly intervals: CdbSubscriptionRequest["intervals"] }): PreparedInterval[] {
@@ -1098,6 +1575,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     async subscribe(input: SubscribeArgs): Promise<CdbSubscriptionResponse> {
         assertLiveSubscriptionIdentity(input.subscription);
         const args = { ...input, args: snapshotCdbQueryArgs(input.args) };
+        this.assertActiveSchemaEpoch(args.domainSchemaEpoch);
         const intervals = this.prepareIntervals(args);
         const policyDigest = cdbPolicyDigest(this.mutationSchema(), args.tables);
         const payloadHash = subscriptionPayloadHash(args, policyDigest);
@@ -1105,9 +1583,10 @@ export class Cdb extends DurableObject<CdbEnv> {
         let response: CdbSubscriptionResponse | undefined;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertActiveSchemaEpoch(args.domainSchemaEpoch, sql);
             const existing = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                        principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
@@ -1163,9 +1642,9 @@ export class Cdb extends DurableObject<CdbEnv> {
                 sql.exec(
                     `INSERT INTO _chardb_live_subscriptions
                      (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                      principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                      principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                       tables_json, intervals_json)
-                     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                     args.subscription.gatewayId,
                     args.subscription.registrationId,
                     args.subscription.connectionId,
@@ -1174,6 +1653,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                     payloadHash,
                     args.principalId,
                     args.organizationId,
+                    args.domainSchemaEpoch,
                     args.ref,
                     JSON.stringify(args.args),
                     policyDigest,
@@ -1207,7 +1687,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             const existing = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                        principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
@@ -1243,6 +1723,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                    payload_hash = NULL,
                    principal_id = NULL,
                    organization_id = NULL,
+                   domain_schema_epoch = NULL,
                    ref = NULL,
                    args_json = NULL,
                    policy_digest = NULL,
@@ -1279,7 +1760,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             const existing = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                        principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
@@ -1315,6 +1796,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             const mutId = input.mutId;
             const ref = input.ref;
             const schemaEpoch = input.schemaEpoch;
+            const domainSchemaEpoch = input.domainSchemaEpoch;
             const auth = snapshotMutationAuth(input.auth);
             const args = snapshotCdbMutationArgs(input.args);
             const request: CdbMutationRequest = {
@@ -1324,7 +1806,9 @@ export class Cdb extends DurableObject<CdbEnv> {
                 args,
                 auth,
                 schemaEpoch,
+                domainSchemaEpoch,
             };
+            this.assertActiveSchemaEpoch(request.domainSchemaEpoch);
             const descriptor = resolveMutation(this.mutationManifest(), request.ref as ChardbRef);
             try {
                 await this.ctx.storage.setAlarm(this.invalidationNowMs() + 1);
@@ -1343,6 +1827,9 @@ export class Cdb extends DurableObject<CdbEnv> {
                 // Gateway validates raw wire args and forwards this exact value.
                 handler: (ctx, args) => descriptor.invokeValidated(ctx, args),
                 cookie: `${this.ctx.id.toString()}:${Date.now()}:${crypto.randomUUID()}`,
+                beforeRun: sql => {
+                    this.assertActiveSchemaEpoch(request.domainSchemaEpoch, sql);
+                },
                 onWriteSet: ({ touchedTables, sql }) => {
                     enqueueInvalidations(sql, touchedTables);
                 },
@@ -1368,6 +1855,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     async query(input: CdbQueryRequest): Promise<CdbQueryResponse> {
         try {
             const request = { ...input, args: snapshotCdbQueryArgs(input.args) };
+            this.assertActiveSchemaEpoch(request.domainSchemaEpoch);
             const descriptor = resolveQuery(this.mutationManifest(), request.ref);
             const declaredIntent = descriptor.extractIntent ? descriptor.extractIntent(request.args) : undefined;
             const readTables = new Set<string>();
@@ -1386,6 +1874,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 assertQueryIntentCoversReads(request.ref, declaredIntent.tables, readTables);
                 assertQueryIntentCoversRanges(request.ref, declaredIntent, readRanges);
             }
+            this.assertActiveSchemaEpoch(request.domainSchemaEpoch);
             return { ok: true, result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
@@ -1396,9 +1885,10 @@ export class Cdb extends DurableObject<CdbEnv> {
     async queryRegistered(request: CdbRegisteredQueryRequest): Promise<CdbQueryResponse> {
         try {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertActiveSchemaEpoch(request.domainSchemaEpoch, sql);
             const row = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                        principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
@@ -1418,6 +1908,12 @@ export class Cdb extends DurableObject<CdbEnv> {
             }
 
             const subscription = parseStoredSubscription(row);
+            if (subscription.domainSchemaEpoch !== request.domainSchemaEpoch) {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "registered query belongs to an older domain schema epoch",
+                });
+            }
             assertSubscriptionTables(sql, subscription.subscription, [...new Set(subscription.tables)].sort());
             this.prepareIntervals(subscription);
 
@@ -1463,7 +1959,7 @@ export class Cdb extends DurableObject<CdbEnv> {
 
             const current = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                        principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
@@ -1478,12 +1974,14 @@ export class Cdb extends DurableObject<CdbEnv> {
                 current.organization_id !== row.organization_id ||
                 current.payload_hash !== row.payload_hash ||
                 current.policy_digest !== row.policy_digest ||
-                current.query_hash !== row.query_hash
+                current.query_hash !== row.query_hash ||
+                current.domain_schema_epoch !== row.domain_schema_epoch
             ) {
                 throw subscriptionInvariant("registered query changed while its handler was running");
             }
             parseStoredSubscription(current);
             assertSubscriptionTables(sql, request.subscription, [...new Set(subscription.tables)].sort());
+            this.assertActiveSchemaEpoch(request.domainSchemaEpoch, sql);
             return { ok: true, result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
@@ -1756,6 +2254,10 @@ export function configureCdbRuntime<TSchema extends Record<string, unknown>>(
 
         protected override mutationManifest(): ChardbManifest {
             return config.manifest();
+        }
+
+        protected override migrationJournal(): ChardbMigrationJournal {
+            return config.migrations?.() ?? EMPTY_MIGRATION_JOURNAL;
         }
     };
 }

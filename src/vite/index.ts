@@ -78,6 +78,7 @@ function loadTypeScript(): typeof import("typescript") | null {
 
 export interface ChardbVitePluginOptions {
     readonly schema?: string;
+    readonly migrations?: string;
     readonly serverModuleGlob?: string;
     readonly registryOut?: string;
 }
@@ -140,7 +141,9 @@ export function chardb(options: ChardbVitePluginOptions = {}): Plugin {
                 case "schema":
                     return options.schema ? `export * from ${JSON.stringify(options.schema)};` : "export {};";
                 case "migrations":
-                    return "export const migrations = [];";
+                    return options.migrations
+                        ? `export { migrations } from ${JSON.stringify(options.migrations)};`
+                        : 'import { defineMigrations } from "chardb/server";\nexport const migrations = defineMigrations([]);';
                 case "dashboard-config":
                     return "export const dashboardConfig = { version: 1 };";
                 default:

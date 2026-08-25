@@ -163,6 +163,7 @@ function subscription(registration: LiveSubscriptionId, tables: readonly string[
         subscription: registration,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-1"),
+        domainSchemaEpoch: 1,
         ref: ChardbRef("queries.ts#outboxProbe"),
         args: {},
         queryHash: "outbox-query-hash",
@@ -183,6 +184,7 @@ function mutation(
         args,
         auth: AUTH,
         schemaEpoch: 1,
+        domainSchemaEpoch: 1,
     };
 }
 
@@ -304,6 +306,7 @@ describe("Cdb invalidation outbox", () => {
             args: nestedArray(CDB_MUTATION_ARGS_MAX_DEPTH + 1),
             auth: AUTH,
             schemaEpoch: 1,
+            domainSchemaEpoch: 1,
         });
         expect(overDepth).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } });
         expect(alarms).toEqual([]);
@@ -391,6 +394,7 @@ describe("Cdb invalidation outbox", () => {
             args: callerArgs as RawJson,
             auth: callerAuth,
             schemaEpoch: 1,
+            domainSchemaEpoch: 1,
         };
         let ownKeysRuns = 0;
         callerRequest.args = new Proxy(callerArgs, {
@@ -648,9 +652,10 @@ describe("Cdb invalidation outbox", () => {
              )
              INSERT INTO _chardb_live_subscriptions
                (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                principal_id, organization_id, ref, args_json, policy_digest, query_hash, tables_json, intervals_json)
+                principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+                tables_json, intervals_json)
              SELECT 'gateway-fanout', 'registration-fanout-' || n, 'connection-fanout-' || n,
-                    'client-fanout-' || n, n, 'active', 'legacy-hash', 'principal-fanout', 'org-1',
+                    'client-fanout-' || n, n, 'active', 'legacy-hash', 'principal-fanout', 'org-1', 1,
                     'queries.ts#legacy', 'null', 'legacy-policy', 'legacy-query',
                     '["outbox_messages"]', '[]'
              FROM registrations`
@@ -673,9 +678,10 @@ describe("Cdb invalidation outbox", () => {
         db.prepare(
             `INSERT INTO _chardb_live_subscriptions
              (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-              principal_id, organization_id, ref, args_json, policy_digest, query_hash, tables_json, intervals_json)
+              principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+              tables_json, intervals_json)
              VALUES ('gateway-fanout', 'registration-fanout-4097', 'connection-fanout-4097',
-                     'client-fanout-4097', 4097, 'active', 'legacy-hash', 'principal-fanout', 'org-1',
+                     'client-fanout-4097', 4097, 'active', 'legacy-hash', 'principal-fanout', 'org-1', 1,
                      'queries.ts#legacy', 'null', 'legacy-policy', 'legacy-query', '["outbox_messages"]', '[]')`
         ).run();
         db.prepare(

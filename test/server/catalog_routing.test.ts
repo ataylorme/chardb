@@ -85,7 +85,11 @@ describe("Catalog routing inventory", () => {
         const epochBefore = db
             .query("SELECT epoch FROM catalog_epoch WHERE scope = 'schema' AND scope_id = 'global'")
             .get() as { epoch: number };
-        expect(await catalog.route(0)).toEqual({ shardId: ShardId("ShardDO_0"), schemaEpoch: epochBefore.epoch });
+        expect(await catalog.route(0)).toEqual({
+            shardId: ShardId("ShardDO_0"),
+            schemaEpoch: epochBefore.epoch,
+            domainSchemaEpoch: 1,
+        });
 
         const request = {
             migId: "migration-commit-failure",
@@ -102,12 +106,17 @@ describe("Catalog routing inventory", () => {
             db.query("SELECT epoch FROM catalog_epoch WHERE scope = 'schema' AND scope_id = 'global'").get()
         ).toEqual(epochBefore);
         expect(db.query("SELECT v FROM catalog_meta WHERE k = ?").get(`cutover:${request.migId}`)).toBeNull();
-        expect(await catalog.route(0)).toEqual({ shardId: ShardId("ShardDO_0"), schemaEpoch: epochBefore.epoch });
+        expect(await catalog.route(0)).toEqual({
+            shardId: ShardId("ShardDO_0"),
+            schemaEpoch: epochBefore.epoch,
+            domainSchemaEpoch: 1,
+        });
 
         await expect(catalog.cutover(request)).resolves.toEqual({ applied: true, newEpoch: epochBefore.epoch + 1 });
         expect(await catalog.route(0)).toEqual({
             shardId: ShardId("ShardDO_1"),
             schemaEpoch: epochBefore.epoch + 1,
+            domainSchemaEpoch: 1,
         });
         await expect(catalog.cutover(request)).resolves.toEqual({ applied: false, newEpoch: epochBefore.epoch + 1 });
         expect(db.query("SELECT v FROM catalog_meta WHERE k = ?").get(`cutover:${request.migId}`)).toEqual({
@@ -116,10 +125,7 @@ describe("Catalog routing inventory", () => {
     });
 
     test("persists migration ownership, fences routes, and activates one exact journal version", async () => {
-        const journal = defineMigrations([
-            { version: 1, name: "baseline", statements: ["CREATE TABLE example (id TEXT PRIMARY KEY)"] },
-            { version: 2, name: "add_name", statements: ["ALTER TABLE example ADD COLUMN name TEXT"] },
-        ]);
+        const journal = defineMigrations([]);
         const ConfiguredCatalog = configureCatalogRuntime({ migrations: () => journal });
         db.close();
         db = new Database(":memory:");
@@ -134,65 +140,175 @@ describe("Catalog routing inventory", () => {
         await configuredReady;
 
         expect(configured.schemaState()).toMatchObject({
-            activeVersion: 2,
+            activeVersion: 0,
             activeEpoch: 1,
             activeDigest: journal.digest,
             status: "active",
         });
 
         const future = defineMigrations([
-            ...journal.migrations.map(migration => ({
-                version: migration.version,
-                name: migration.name,
-                statements: migration.statements,
-            })),
-            { version: 3, name: "add_slug", statements: ["ALTER TABLE example ADD COLUMN slug TEXT"] },
+            {
+                version: 1,
+                name: "add_slug",
+                statements: ["ALTER TABLE example ADD COLUMN slug TEXT"],
+                catalogStatements: ["SELECT 3"],
+            },
         ]);
         const FutureCatalog = configureCatalogRuntime({ migrations: () => future });
+        const migrationCalls: string[] = [];
+        const migrationCdb = {
+            async prepareSchemaMigration() {
+                migrationCalls.push("prepare");
+            },
+            async applySchemaMigration(input: { version: number }) {
+                migrationCalls.push(`apply:${input.version}`);
+            },
+            async activateSchemaMigration() {
+                migrationCalls.push("activate");
+            },
+        };
         let futureReady: Promise<unknown> = Promise.resolve();
         (
             state as unknown as { blockConcurrencyWhile: (callback: () => Promise<unknown>) => void }
         ).blockConcurrencyWhile = callback => {
             futureReady = callback();
         };
-        const reconstructed = new FutureCatalog(state, {});
+        const reconstructed = new FutureCatalog(state, {
+            CDB_SHARD: {
+                idFromName: (name: string) => ({ toString: () => name }),
+                get: () => migrationCdb,
+            } as unknown as DurableObjectNamespace,
+        });
         await futureReady;
         failNextTransactionCommit = true;
-        expect(() => reconstructed.beginSchemaMigration({ migrationId: "deploy-3", targetVersion: 3 })).toThrow(
+        expect(() => reconstructed.beginSchemaMigration({ migrationId: "deploy-3", targetVersion: 1 })).toThrow(
             /injected transaction commit failure/
         );
-        expect(reconstructed.schemaState()).toMatchObject({ activeVersion: 2, status: "active" });
-        await expect(reconstructed.route(0)).resolves.toMatchObject({ shardId: "ShardDO_0" });
-        expect(reconstructed.beginSchemaMigration({ migrationId: "deploy-3", targetVersion: 3 })).toMatchObject({
-            activeVersion: 2,
+        expect(reconstructed.schemaState()).toMatchObject({ activeVersion: 0, status: "active" });
+        await expect(reconstructed.route(0)).rejects.toMatchObject({ code: "CDB_STALE_EPOCH", retryable: true });
+        expect(reconstructed.beginSchemaMigration({ migrationId: "deploy-3", targetVersion: 1 })).toMatchObject({
+            activeVersion: 0,
             activeEpoch: 1,
             status: "migrating",
             migrationId: "deploy-3",
-            targetVersion: 3,
+            targetVersion: 1,
             targetEpoch: 2,
         });
-        expect(reconstructed.beginSchemaMigration({ migrationId: "deploy-3", targetVersion: 3 })).toMatchObject({
+        expect(reconstructed.beginSchemaMigration({ migrationId: "deploy-3", targetVersion: 1 })).toMatchObject({
             status: "migrating",
         });
         await expect(reconstructed.route(0)).rejects.toMatchObject({ code: "CDB_STALE_EPOCH", retryable: true });
+        expect(() => reconstructed.completeSchemaMigration({ migrationId: "deploy-3" })).toThrow(/incomplete/);
+        failNextTransactionCommit = true;
+        await expect(
+            reconstructed.migrateSchemaShard({ migrationId: "deploy-3", shardId: "ShardDO_0" })
+        ).rejects.toThrow(/injected transaction commit failure/);
+        expect(reconstructed.schemaMigrationShards({ migrationId: "deploy-3" })).toEqual([
+            expect.objectContaining({ shardId: "ShardDO_0", status: "pending" }),
+        ]);
+        expect(migrationCalls).toEqual(["prepare", "apply:1", "activate"]);
+        await expect(
+            reconstructed.migrateSchemaShard({ migrationId: "deploy-3", shardId: "ShardDO_0" })
+        ).resolves.toMatchObject({ shardId: "ShardDO_0", status: "active" });
+        expect(migrationCalls).toEqual(["prepare", "apply:1", "activate", "prepare", "apply:1", "activate"]);
+        await expect(
+            reconstructed.migrateSchemaShard({ migrationId: "deploy-3", shardId: "ShardDO_0" })
+        ).resolves.toMatchObject({ shardId: "ShardDO_0", status: "active" });
+        expect(migrationCalls).toEqual(["prepare", "apply:1", "activate", "prepare", "apply:1", "activate"]);
+        expect(() => reconstructed.completeSchemaMigration({ migrationId: "deploy-3" })).toThrow(
+            /steps are incomplete/
+        );
+        expect(reconstructed.applyCatalogSchemaMigration({ migrationId: "deploy-3", version: 1 })).toMatchObject({
+            activeVersion: 0,
+            status: "migrating",
+        });
+        expect(reconstructed.applyCatalogSchemaMigration({ migrationId: "deploy-3", version: 1 })).toMatchObject({
+            status: "migrating",
+        });
         failNextTransactionCommit = true;
         expect(() => reconstructed.completeSchemaMigration({ migrationId: "deploy-3" })).toThrow(
             /injected transaction commit failure/
         );
-        expect(reconstructed.schemaState()).toMatchObject({ activeVersion: 2, status: "migrating" });
+        expect(reconstructed.schemaState()).toMatchObject({ activeVersion: 0, status: "migrating" });
         await expect(reconstructed.route(0)).rejects.toMatchObject({ code: "CDB_STALE_EPOCH", retryable: true });
         expect(reconstructed.completeSchemaMigration({ migrationId: "deploy-3" })).toMatchObject({
-            activeVersion: 3,
+            activeVersion: 1,
             activeEpoch: 2,
             activeDigest: future.digest,
             lastMigrationId: "deploy-3",
             status: "active",
         });
         expect(reconstructed.completeSchemaMigration({ migrationId: "deploy-3" })).toMatchObject({
-            activeVersion: 3,
+            activeVersion: 1,
             activeEpoch: 2,
         });
         expect(() => reconstructed.completeSchemaMigration({ migrationId: "another-deploy" })).toThrow(/not active/);
         await expect(reconstructed.route(0)).resolves.toMatchObject({ shardId: "ShardDO_0" });
+    });
+
+    test("baselines every existing shard and skips packaged SQL after exact schema checks", async () => {
+        const journal = defineMigrations([
+            {
+                version: 1,
+                name: "adopt_existing_schema",
+                statements: ["THIS CDB SQL MUST NOT EXECUTE"],
+                catalogStatements: ["THIS CATALOG SQL MUST NOT EXECUTE"],
+            },
+        ]);
+        const FutureCatalog = configureCatalogRuntime({ migrations: () => journal });
+        const calls: unknown[] = [];
+        const migrationCdb = {
+            async baselineSchemaMigration(input: unknown) {
+                calls.push(input);
+            },
+            async prepareSchemaMigration() {
+                throw new Error("baseline must not prepare an applying migration");
+            },
+        };
+        let ready: Promise<unknown> = Promise.resolve();
+        (
+            state as unknown as { blockConcurrencyWhile: (callback: () => Promise<unknown>) => void }
+        ).blockConcurrencyWhile = callback => {
+            ready = callback();
+        };
+        const adopting = new FutureCatalog(state, {
+            CDB_SHARD: {
+                idFromName: (name: string) => ({ toString: () => name }),
+                get: () => migrationCdb,
+            } as unknown as DurableObjectNamespace,
+        });
+        await ready;
+
+        expect(adopting.beginSchemaBaseline({ migrationId: "baseline-v1", targetVersion: 1 })).toMatchObject({
+            activeVersion: 0,
+            status: "migrating",
+            migrationId: "baseline-v1",
+            targetVersion: 1,
+            targetEpoch: 2,
+        });
+        await expect(
+            adopting.migrateSchemaShard({ migrationId: "baseline-v1", shardId: "ShardDO_0" })
+        ).resolves.toMatchObject({ status: "active" });
+        expect(calls).toEqual([
+            {
+                migrationId: "baseline-v1",
+                targetVersion: 1,
+                targetEpoch: 2,
+                targetDigest: journal.digest,
+            },
+        ]);
+        expect(adopting.applyCatalogSchemaMigration({ migrationId: "baseline-v1", version: 1 })).toMatchObject({
+            status: "migrating",
+        });
+        expect(adopting.completeSchemaMigration({ migrationId: "baseline-v1" })).toMatchObject({
+            activeVersion: 1,
+            activeEpoch: 2,
+            activeDigest: journal.digest,
+            lastMigrationId: "baseline-v1",
+            status: "active",
+        });
+        expect(db.query("SELECT COUNT(*) AS count FROM catalog_schema_steps").get()).toEqual({ count: 1 });
+        expect(db.query("SELECT COUNT(*) AS count FROM catalog_schema_baselines").get()).toEqual({ count: 0 });
+        expect(db.query("SELECT COUNT(*) AS count FROM catalog_schema_shards").get()).toEqual({ count: 0 });
     });
 });

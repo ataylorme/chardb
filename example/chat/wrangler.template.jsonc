@@ -5,6 +5,7 @@
     "name": "chardb-chat-example",
     "main": "src/server/worker.ts",
     "compatibility_date": "2025-09-01",
+    "compatibility_flags": ["nodejs_compat"],
 
     // Static assets binding — `vite build` writes the React SPA into ./dist,
     // wrangler serves any file under there ahead of `app.fetch`. The live

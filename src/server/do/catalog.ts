@@ -51,7 +51,12 @@ import { CdbError } from "../../errors.ts";
 import type { RawJson } from "../../types.ts";
 import { type PrincipalId, ShardId, type TenantId, type Vshard } from "../../types.ts";
 import { VSHARD_COUNT, VshardMap, type VshardRange } from "../../vshard.ts";
-import { type ChardbMigrationJournal, defineMigrations, migrationDigestAt } from "../schema-migrations.ts";
+import {
+    type ChardbMigrationJournal,
+    defineMigrations,
+    migrationDigestAt,
+    pendingMigrations,
+} from "../schema-migrations.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
 const CATALOG_DDL = `
@@ -121,9 +126,32 @@ CREATE TABLE IF NOT EXISTS catalog_schema_state (
     (status = 'migrating' AND migration_id IS NOT NULL AND target_version IS NOT NULL AND target_epoch IS NOT NULL AND target_digest IS NOT NULL)
   )
 );
+CREATE TABLE IF NOT EXISTS catalog_schema_shards (
+  migration_id TEXT NOT NULL,
+  shard_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'active')),
+  last_error TEXT,
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (migration_id, shard_id)
+);
+CREATE TABLE IF NOT EXISTS catalog_schema_steps (
+  migration_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version > 0),
+  digest TEXT NOT NULL,
+  applied_at INTEGER NOT NULL CHECK (applied_at >= 0),
+  PRIMARY KEY (migration_id, version)
+);
+CREATE TABLE IF NOT EXISTS catalog_schema_baselines (
+  migration_id TEXT PRIMARY KEY,
+  target_version INTEGER NOT NULL CHECK (target_version > 0),
+  target_digest TEXT NOT NULL,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0)
+);
 ` as const;
 
-export type CatalogEnv = Record<string, never>;
+export interface CatalogEnv {
+    readonly CDB_SHARD?: DurableObjectNamespace;
+}
 
 type AuthEpochScope = "global" | "tenant" | "principal";
 type CatalogSql = ReturnType<typeof adaptSqlStorage>;
@@ -230,6 +258,9 @@ function bumpAuthEpochInSql(sql: CatalogSql, scope: AuthEpochScope, scopeId: str
 
 export interface RouteResult {
     readonly shardId: ShardId;
+    /** Domain schema epoch. Changes only after every shard activates one packaged migration target. */
+    readonly domainSchemaEpoch: number;
+    /** Physical routing generation. Changes on vshard split or cutover. */
     readonly schemaEpoch: number;
 }
 
@@ -243,6 +274,32 @@ export interface CatalogSchemaState {
     readonly targetVersion: number | null;
     readonly targetEpoch: number | null;
     readonly targetDigest: string | null;
+}
+
+export interface CatalogSchemaShardState {
+    readonly shardId: string;
+    readonly status: "pending" | "active";
+    readonly lastError: string | null;
+    readonly updatedAt: number;
+}
+
+interface CdbSchemaMigrationRpc {
+    prepareSchemaMigration(args: {
+        readonly migrationId: string;
+        readonly activeVersion: number;
+        readonly activeDigest: string;
+        readonly targetVersion: number;
+        readonly targetEpoch: number;
+        readonly targetDigest: string;
+    }): Promise<unknown>;
+    applySchemaMigration(args: { readonly migrationId: string; readonly version: number }): Promise<unknown>;
+    activateSchemaMigration(args: { readonly migrationId: string }): Promise<unknown>;
+    baselineSchemaMigration(args: {
+        readonly migrationId: string;
+        readonly targetVersion: number;
+        readonly targetEpoch: number;
+        readonly targetDigest: string;
+    }): Promise<unknown>;
 }
 
 interface StoredCatalogSchemaState {
@@ -327,8 +384,8 @@ export class Catalog extends DurableObject<CatalogEnv> {
             `INSERT OR IGNORE INTO catalog_schema_state
              (singleton, active_version, active_epoch, active_digest, status)
              VALUES (1, ?, 1, ?, 'active')`,
-            journal.version,
-            journal.digest
+            0,
+            migrationDigestAt(journal, 0)
         );
         const schemaState = this.readSchemaState();
         if (schemaState.activeVersion > journal.version) {
@@ -362,7 +419,9 @@ export class Catalog extends DurableObject<CatalogEnv> {
             "global",
             1
         );
-        this.ensureAuthTables();
+        if (schemaState.status === "active" && schemaState.activeVersion === journal.version) {
+            this.ensureAuthTables();
+        }
         this.bootstrapped = true;
     }
 
@@ -375,6 +434,14 @@ export class Catalog extends DurableObject<CatalogEnv> {
      */
     private ensureAuthTables(): void {
         if (this.authTablesBootstrapped) return;
+        const schemaState = this.readSchemaState();
+        if (schemaState.status !== "active" || schemaState.activeVersion !== this.migrationJournal().version) {
+            throw new CdbError({
+                code: "CDB_STALE_EPOCH",
+                message: "Catalog auth schema migration is not active",
+                hint: "retry after the schema migration activates",
+            });
+        }
         let runtime: ReturnType<typeof getAuthRuntime>;
         try {
             runtime = getAuthRuntime();
@@ -401,16 +468,24 @@ export class Catalog extends DurableObject<CatalogEnv> {
                             hint: "recreate pre-release Catalog storage or add an explicit auth schema migration",
                         });
                     }
-                    for (const indexName of ddl.indexNames) {
-                        const present = sql.one<{ name: string }>(
-                            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?",
+                    for (let index = 0; index < ddl.indexNames.length; index++) {
+                        const indexName = ddl.indexNames[index];
+                        const expectedSql = ddl.indexes[index];
+                        if (!indexName || !expectedSql) {
+                            throw new CdbError({
+                                code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                                message: `Catalog auth table "${ddl.tableName}" has invalid index metadata`,
+                            });
+                        }
+                        const present = sql.one<{ sql: string }>(
+                            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?",
                             indexName,
                             ddl.tableName
                         );
-                        if (!present) {
+                        if (present?.sql !== expectedSql) {
                             throw new CdbError({
                                 code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
-                                message: `Catalog auth table "${ddl.tableName}" is missing a declared index`,
+                                message: `Catalog auth table "${ddl.tableName}" has an incompatible declared index`,
                                 hint: "recreate pre-release Catalog storage or add an explicit auth schema migration",
                             });
                         }
@@ -423,6 +498,76 @@ export class Catalog extends DurableObject<CatalogEnv> {
             }
         });
         this.authTablesBootstrapped = true;
+    }
+
+    private recordMigratedAuthSchema(sql: CatalogSql): void {
+        let runtime: ReturnType<typeof getAuthRuntime>;
+        try {
+            runtime = getAuthRuntime();
+        } catch (error) {
+            if (error instanceof CdbError && error.code === "CDB_AUTH_NOT_BOUND") return;
+            throw error;
+        }
+        const rendered = Object.values(runtime.schema)
+            .map(table => renderSqliteTableDdl(table))
+            .sort((left, right) => left.tableName.localeCompare(right.tableName));
+        const expectedNames = new Set(rendered.map(ddl => ddl.tableName));
+        for (const ddl of rendered) {
+            const table = sql.one<{ sql: string }>(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ddl.tableName
+            );
+            if (table?.sql !== ddl.createTable) {
+                throw new CdbError({
+                    code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                    message: `Catalog auth migration did not produce table "${ddl.tableName}"`,
+                });
+            }
+            for (let index = 0; index < ddl.indexNames.length; index++) {
+                const name = ddl.indexNames[index];
+                const expectedSql = ddl.indexes[index];
+                if (!name || !expectedSql) {
+                    throw new CdbError({
+                        code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                        message: `Catalog auth migration has invalid index metadata for "${ddl.tableName}"`,
+                    });
+                }
+                const present = sql.one<{ sql: string }>(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?",
+                    name,
+                    ddl.tableName
+                );
+                if (present?.sql !== expectedSql) {
+                    throw new CdbError({
+                        code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                        message: `Catalog auth migration did not produce index "${String(name)}"`,
+                    });
+                }
+            }
+            sql.exec(
+                "INSERT OR REPLACE INTO catalog_meta (k, v) VALUES (?, ?)",
+                `auth_ddl_v1:${ddl.tableName}`,
+                ddl.signature
+            );
+        }
+        const recorded = sql.all<{ k: string }>(
+            "SELECT k FROM catalog_meta WHERE substr(k, 1, 12) = 'auth_ddl_v1:' ORDER BY k"
+        );
+        for (const row of recorded) {
+            const tableName = row.k.slice(12);
+            if (expectedNames.has(tableName)) continue;
+            const existing = sql.one<{ present: number }>(
+                "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?",
+                tableName
+            );
+            if (existing) {
+                throw new CdbError({
+                    code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                    message: `Catalog auth migration left removed table "${tableName}" in storage`,
+                });
+            }
+            sql.exec("DELETE FROM catalog_meta WHERE k = ?", row.k);
+        }
     }
 
     /** Run a Better Auth model write against Catalog-owned storage. */
@@ -671,7 +816,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
 
     async route(vshard: number): Promise<RouteResult> {
         const schemaState = this.readSchemaState();
-        if (schemaState.status !== "active") {
+        if (schemaState.status !== "active" || schemaState.activeVersion !== this.migrationJournal().version) {
             throw new CdbError({
                 code: "CDB_STALE_EPOCH",
                 message: `schema migration ${schemaState.migrationId ?? "unknown"} is in progress`,
@@ -680,6 +825,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
         }
         return {
             shardId: this.map().routeVshard(vshard as Vshard),
+            domainSchemaEpoch: schemaState.activeEpoch,
             schemaEpoch: this.readEpoch("schema", "global"),
         };
     }
@@ -689,6 +835,17 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }
 
     beginSchemaMigration(args: { readonly migrationId: string; readonly targetVersion: number }): CatalogSchemaState {
+        return this.beginSchemaChange(args, false);
+    }
+
+    beginSchemaBaseline(args: { readonly migrationId: string; readonly targetVersion: number }): CatalogSchemaState {
+        return this.beginSchemaChange(args, true);
+    }
+
+    private beginSchemaChange(
+        args: { readonly migrationId: string; readonly targetVersion: number },
+        baseline: boolean
+    ): CatalogSchemaState {
         if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(args.migrationId)) {
             throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration id is invalid" });
         }
@@ -696,7 +853,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
         if (
             !Number.isSafeInteger(args.targetVersion) ||
             args.targetVersion < 1 ||
-            args.targetVersion > journal.version
+            args.targetVersion !== journal.version
         ) {
             throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration target version is invalid" });
         }
@@ -714,6 +871,12 @@ export class Catalog extends DurableObject<CatalogEnv> {
                     message: "schema migration must advance the active version",
                 });
             }
+            if (baseline && (current.activeVersion !== 0 || args.targetVersion !== journal.version)) {
+                throw new CdbError({
+                    code: "CDB_INVALID_ARGS",
+                    message: "schema baseline requires version-zero storage and the complete packaged journal",
+                });
+            }
             sql.exec(
                 `UPDATE catalog_schema_state
                  SET status = 'migrating', migration_id = ?, target_version = ?,
@@ -724,6 +887,225 @@ export class Catalog extends DurableObject<CatalogEnv> {
                 migrationDigestAt(journal, args.targetVersion)
             );
             if (sql.changes() !== 1) throw new CdbError({ code: "CDB_INVARIANT", message: "schema state changed" });
+            sql.exec(
+                `INSERT INTO catalog_schema_shards (migration_id, shard_id, status, last_error, updated_at)
+                 SELECT ?, shard_id, 'pending', NULL, ?
+                 FROM (SELECT DISTINCT shard_id FROM catalog_ranges)
+                 ORDER BY shard_id`,
+                args.migrationId,
+                Date.now()
+            );
+            if (sql.changes() < 1) {
+                throw new CdbError({ code: "CDB_INVARIANT", message: "schema migration has no target shards" });
+            }
+            if (baseline) {
+                sql.exec(
+                    `INSERT INTO catalog_schema_baselines (migration_id, target_version, target_digest, created_at)
+                     VALUES (?, ?, ?, ?)`,
+                    args.migrationId,
+                    args.targetVersion,
+                    migrationDigestAt(journal, args.targetVersion),
+                    Date.now()
+                );
+            }
+        });
+        return this.readSchemaState();
+    }
+
+    schemaMigrationShards(args: { readonly migrationId: string }): readonly CatalogSchemaShardState[] {
+        const current = this.readSchemaState();
+        if (current.status !== "migrating" || current.migrationId !== args.migrationId) {
+            if (current.status === "active" && current.lastMigrationId === args.migrationId) return [];
+            throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration does not own Catalog" });
+        }
+        return adaptSqlStorage(this.ctx.storage.sql)
+            .all<{ shard_id: string; status: "pending" | "active"; last_error: string | null; updated_at: number }>(
+                `SELECT shard_id, status, last_error, updated_at
+                 FROM catalog_schema_shards WHERE migration_id = ? ORDER BY shard_id`,
+                args.migrationId
+            )
+            .map(row => ({
+                shardId: row.shard_id,
+                status: row.status,
+                lastError: row.last_error,
+                updatedAt: row.updated_at,
+            }));
+    }
+
+    async migrateSchemaShard(args: {
+        readonly migrationId: string;
+        readonly shardId: string;
+    }): Promise<CatalogSchemaShardState> {
+        const current = this.readSchemaState();
+        if (
+            current.status !== "migrating" ||
+            current.migrationId !== args.migrationId ||
+            current.targetVersion === null ||
+            current.targetEpoch === null ||
+            current.targetDigest === null
+        ) {
+            throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration does not own Catalog" });
+        }
+        const stored = this.schemaMigrationShards({ migrationId: args.migrationId }).find(
+            shard => shard.shardId === args.shardId
+        );
+        if (!stored) throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration shard is unknown" });
+        if (stored.status === "active") return stored;
+        if (!this.env.CDB_SHARD) {
+            throw new CdbError({ code: "CDB_SHARD_UNAVAILABLE", message: "CDB_SHARD binding is unavailable" });
+        }
+        try {
+            const id = this.env.CDB_SHARD.idFromName(args.shardId);
+            const cdb = this.env.CDB_SHARD.get(id) as unknown as CdbSchemaMigrationRpc;
+            const baseline = adaptSqlStorage(this.ctx.storage.sql).one<{ present: number }>(
+                "SELECT 1 AS present FROM catalog_schema_baselines WHERE migration_id = ?",
+                args.migrationId
+            );
+            if (baseline) {
+                await cdb.baselineSchemaMigration({
+                    migrationId: args.migrationId,
+                    targetVersion: current.targetVersion,
+                    targetEpoch: current.targetEpoch,
+                    targetDigest: current.targetDigest,
+                });
+            } else {
+                await cdb.prepareSchemaMigration({
+                    migrationId: args.migrationId,
+                    activeVersion: current.activeVersion,
+                    activeDigest: current.activeDigest,
+                    targetVersion: current.targetVersion,
+                    targetEpoch: current.targetEpoch,
+                    targetDigest: current.targetDigest,
+                });
+                for (const migration of pendingMigrations(this.migrationJournal(), current.activeVersion)) {
+                    if (migration.version > current.targetVersion) break;
+                    await cdb.applySchemaMigration({ migrationId: args.migrationId, version: migration.version });
+                }
+                await cdb.activateSchemaMigration({ migrationId: args.migrationId });
+            }
+        } catch (error) {
+            const message = (error instanceof Error ? error.message : String(error)).slice(0, 512);
+            this.ctx.storage.transactionSync(() => {
+                const sql = adaptSqlStorage(this.ctx.storage.sql);
+                sql.exec(
+                    `UPDATE catalog_schema_shards SET last_error = ?, updated_at = ?
+                     WHERE migration_id = ? AND shard_id = ? AND status = 'pending'`,
+                    message,
+                    Date.now(),
+                    args.migrationId,
+                    args.shardId
+                );
+            });
+            throw error;
+        }
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const owner = this.readSchemaState();
+            if (owner.status !== "migrating" || owner.migrationId !== args.migrationId) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration ownership changed" });
+            }
+            sql.exec(
+                `UPDATE catalog_schema_shards
+                 SET status = 'active', last_error = NULL, updated_at = ?
+                 WHERE migration_id = ? AND shard_id = ? AND status = 'pending'`,
+                Date.now(),
+                args.migrationId,
+                args.shardId
+            );
+            if (sql.changes() !== 1) {
+                const active = sql.one<{ status: string }>(
+                    "SELECT status FROM catalog_schema_shards WHERE migration_id = ? AND shard_id = ?",
+                    args.migrationId,
+                    args.shardId
+                );
+                if (active?.status !== "active") {
+                    throw new CdbError({ code: "CDB_INVARIANT", message: "schema migration shard state changed" });
+                }
+            }
+        });
+        const active = this.schemaMigrationShards({ migrationId: args.migrationId }).find(
+            shard => shard.shardId === args.shardId
+        );
+        if (!active) throw new CdbError({ code: "CDB_INVARIANT", message: "schema migration shard disappeared" });
+        return active;
+    }
+
+    applyCatalogSchemaMigration(args: { readonly migrationId: string; readonly version: number }): CatalogSchemaState {
+        const journal = this.migrationJournal();
+        if (!Number.isSafeInteger(args.version) || args.version < 1 || args.version > journal.version) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "Catalog schema migration version is invalid" });
+        }
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const current = this.readSchemaState();
+            if (current.status !== "migrating" || current.migrationId !== args.migrationId) {
+                if (current.status === "active" && current.lastMigrationId === args.migrationId) return;
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration does not own Catalog" });
+            }
+            if (current.targetVersion === null || args.version > current.targetVersion) {
+                throw new CdbError({ code: "CDB_INVALID_ARGS", message: "Catalog migration step exceeds its target" });
+            }
+            const migration = journal.migrations[args.version - 1];
+            if (!migration || migration.version !== args.version) {
+                throw new CdbError({
+                    code: "CDB_PARTITION_CONTRACT_CHANGED",
+                    message: "Catalog schema migration step is missing",
+                });
+            }
+            const existing = sql.one<{ digest: string }>(
+                "SELECT digest FROM catalog_schema_steps WHERE migration_id = ? AND version = ?",
+                args.migrationId,
+                args.version
+            );
+            if (existing) {
+                if (existing.digest !== migration.digest) {
+                    throw new CdbError({
+                        code: "CDB_PARTITION_CONTRACT_CHANGED",
+                        message: "applied Catalog schema migration digest changed",
+                    });
+                }
+                return;
+            }
+            const targetVersion = current.targetVersion;
+            const applied = sql.all<{ version: number; digest: string }>(
+                "SELECT version, digest FROM catalog_schema_steps WHERE migration_id = ? ORDER BY version",
+                args.migrationId
+            );
+            const expected = pendingMigrations(journal, current.activeVersion).filter(
+                step => step.version <= targetVersion
+            );
+            for (let index = 0; index < applied.length; index++) {
+                const stored = applied[index];
+                const packaged = expected[index];
+                if (!stored || !packaged || stored.version !== packaged.version || stored.digest !== packaged.digest) {
+                    throw new CdbError({
+                        code: "CDB_PARTITION_CONTRACT_CHANGED",
+                        message: "applied Catalog schema migration sequence is corrupt",
+                    });
+                }
+            }
+            const next = expected[applied.length];
+            if (!next || next.version !== args.version) {
+                throw new CdbError({
+                    code: "CDB_INVALID_ARGS",
+                    message: "Catalog migration steps must apply in order",
+                });
+            }
+            const baseline = sql.one<{ present: number }>(
+                "SELECT 1 AS present FROM catalog_schema_baselines WHERE migration_id = ?",
+                args.migrationId
+            );
+            if (!baseline) {
+                for (const statement of migration.catalogStatements) sql.exec(statement);
+            }
+            sql.exec(
+                `INSERT INTO catalog_schema_steps (migration_id, version, digest, applied_at)
+                 VALUES (?, ?, ?, ?)`,
+                args.migrationId,
+                migration.version,
+                migration.digest,
+                Date.now()
+            );
         });
         return this.readSchemaState();
     }
@@ -739,6 +1121,40 @@ export class Catalog extends DurableObject<CatalogEnv> {
             if (current.migrationId !== args.migrationId) {
                 throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration id does not own Catalog" });
             }
+            const pending = sql.one<{ count: number }>(
+                `SELECT COUNT(*) AS count FROM catalog_schema_shards
+                 WHERE migration_id = ? AND status != 'active'`,
+                args.migrationId
+            );
+            if (!pending || pending.count !== 0) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration shards are incomplete" });
+            }
+            const targetVersion = current.targetVersion;
+            if (targetVersion === null) {
+                throw new CdbError({ code: "CDB_INVARIANT", message: "Catalog schema migration target is missing" });
+            }
+            const expected = pendingMigrations(this.migrationJournal(), current.activeVersion).filter(
+                step => step.version <= targetVersion
+            );
+            const applied = sql.all<{ version: number; digest: string }>(
+                "SELECT version, digest FROM catalog_schema_steps WHERE migration_id = ? ORDER BY version",
+                args.migrationId
+            );
+            if (
+                applied.length !== expected.length ||
+                applied.some(
+                    (stored, index) =>
+                        stored.version !== expected[index]?.version || stored.digest !== expected[index]?.digest
+                )
+            ) {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "Catalog schema migration steps are incomplete",
+                });
+            }
+            this.recordMigratedAuthSchema(sql);
+            sql.exec("DELETE FROM catalog_schema_shards WHERE migration_id = ?", args.migrationId);
+            sql.exec("DELETE FROM catalog_schema_baselines WHERE migration_id = ?", args.migrationId);
             sql.exec(
                 `UPDATE catalog_schema_state
                  SET active_version = target_version, active_epoch = target_epoch, active_digest = target_digest,
@@ -749,6 +1165,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
             );
             if (sql.changes() !== 1) throw new CdbError({ code: "CDB_INVARIANT", message: "schema state changed" });
         });
+        this.authTablesBootstrapped = true;
         return this.readSchemaState();
     }
 
@@ -779,6 +1196,10 @@ export class Catalog extends DurableObject<CatalogEnv> {
         fromShard: string;
         toShard: string;
     }): Promise<{ applied: boolean; newEpoch: number }> {
+        const schemaState = this.readSchemaState();
+        if (schemaState.status !== "active" || schemaState.activeVersion !== this.migrationJournal().version) {
+            throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration blocks routing cutover" });
+        }
         let applied = false;
         let newEpoch = 0;
         let committedMap: VshardMap | null = null;
@@ -808,6 +1229,10 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }
 
     async splitRange(lo: number, hi: number, toShard: string): Promise<void> {
+        const schemaState = this.readSchemaState();
+        if (schemaState.status !== "active" || schemaState.activeVersion !== this.migrationJournal().version) {
+            throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration blocks routing split" });
+        }
         const next = this.map().split(lo, hi, ShardId(toShard));
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);

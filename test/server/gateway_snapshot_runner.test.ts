@@ -77,6 +77,7 @@ function registration(overrides: Partial<GatewayRegistrationInstall> = {}): Gate
         shardId: "logical-shard-1",
         sourceCdbId: "physical-cdb-1",
         schemaEpoch: 1,
+        domainSchemaEpoch: 1,
         authEpochs: { global: 1, tenant: 2, principal: 3 },
         nowMs: 10,
         ...overrides,
@@ -119,6 +120,7 @@ describe("Gateway active snapshot runner", () => {
     let queryBehavior: () => unknown | Promise<unknown>;
     let authorityBehavior: () => unknown | Promise<unknown>;
     let routePhysicalId: string;
+    let routeDomainSchemaEpoch: number;
     let currentPolicyDigest: string;
     let failAlarmAt: number | null;
     let alarmFailures: number;
@@ -144,6 +146,7 @@ describe("Gateway active snapshot runner", () => {
             authEpochs: { global: 10, tenant: 11, principal: 12 },
         });
         routePhysicalId = "physical-cdb-1";
+        routeDomainSchemaEpoch = 1;
         currentPolicyDigest = "policy-digest-1";
         failAlarmAt = null;
         alarmFailures = 0;
@@ -155,7 +158,11 @@ describe("Gateway active snapshot runner", () => {
             },
             async route() {
                 events.push("route");
-                return { shardId: ShardId("logical-shard-1"), schemaEpoch: 1 };
+                return {
+                    shardId: ShardId("logical-shard-1"),
+                    schemaEpoch: 1,
+                    domainSchemaEpoch: routeDomainSchemaEpoch,
+                };
             },
             async listShardIds() {
                 return [ShardId("logical-shard-1")];
@@ -576,6 +583,24 @@ describe("Gateway active snapshot runner", () => {
         installActive();
         const socket = attach();
         routePhysicalId = "physical-cdb-2";
+
+        await fireAlarm();
+
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
+        expect(queryCalls).toEqual([]);
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
+        expect(JSON.parse(socket.sent[0] as string)).toEqual({
+            t: "mustRefetch",
+            subIds: [1],
+            reason: "shardsChanged",
+        });
+    });
+
+    test("retires an old schema generation before calling Cdb", async () => {
+        installActive();
+        const socket = attach();
+        routeDomainSchemaEpoch = 2;
 
         await fireAlarm();
 

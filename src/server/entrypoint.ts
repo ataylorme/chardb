@@ -24,6 +24,7 @@ import type { BetterAuthOptions } from "better-auth";
 import { bindAuthRuntime } from "../auth/runtime.ts";
 import { type SynthesizedAuthSchema, assertNoReservedTableShadow, synthesizeAuthSchema } from "../auth/synthesize.ts";
 import { buildColocationOverrides } from "./cdb-colocation.ts";
+import type { CatalogSchemaShardState, CatalogSchemaState } from "./do/catalog.ts";
 import { type ChardbManifest, emptyManifest, manifestFromExports } from "./manifest.ts";
 import { decorateResponse, extractCorrelationId, selectMatchingCrons } from "./observability_helpers.ts";
 
@@ -44,7 +45,35 @@ export interface ChardbEnv {
     readonly CDB_VECTORIZE?: unknown;
     readonly CDB_GSI_QUEUE?: Queue<unknown>;
     readonly CDB_DASHBOARD?: Fetcher;
+    /** Secret bearer token for the migration control route. Keep it in Wrangler secrets. */
+    readonly CDB_ADMIN_TOKEN?: string;
 }
+
+interface CatalogMigrationRpc {
+    schemaState(): Promise<CatalogSchemaState>;
+    beginSchemaMigration(args: {
+        readonly migrationId: string;
+        readonly targetVersion: number;
+    }): Promise<CatalogSchemaState>;
+    beginSchemaBaseline(args: {
+        readonly migrationId: string;
+        readonly targetVersion: number;
+    }): Promise<CatalogSchemaState>;
+    schemaMigrationShards(args: { readonly migrationId: string }): Promise<readonly CatalogSchemaShardState[]>;
+    migrateSchemaShard(args: {
+        readonly migrationId: string;
+        readonly shardId: string;
+    }): Promise<CatalogSchemaShardState>;
+    applyCatalogSchemaMigration(args: {
+        readonly migrationId: string;
+        readonly version: number;
+    }): Promise<CatalogSchemaState>;
+    completeSchemaMigration(args: { readonly migrationId: string }): Promise<CatalogSchemaState>;
+}
+
+const MIGRATION_BODY_MAX_BYTES = 4_096;
+const MIGRATION_TOKEN_MAX_BYTES = 512;
+const MIGRATION_TEXT_ENCODER = new TextEncoder();
 
 /**
  * Auth profile for `defineChardb`. Pass either:
@@ -92,6 +121,172 @@ function isReserved(path: string): boolean {
 
 const SERVER_VERSION = "0.1.0";
 
+async function equalSecret(left: string, right: string): Promise<boolean> {
+    const encoder = new TextEncoder();
+    const [leftDigest, rightDigest] = await Promise.all([
+        crypto.subtle.digest("SHA-256", encoder.encode(left)),
+        crypto.subtle.digest("SHA-256", encoder.encode(right)),
+    ]);
+    const a = new Uint8Array(leftDigest);
+    const b = new Uint8Array(rightDigest);
+    let difference = a.byteLength ^ b.byteLength;
+    const length = Math.max(a.byteLength, b.byteLength);
+    for (let index = 0; index < length; index++) difference |= (a[index] ?? 0) ^ (b[index] ?? 0);
+    return difference === 0 && left.length > 0;
+}
+
+async function readMigrationBody(request: Request): Promise<unknown> {
+    const declared = request.headers.get("content-length");
+    if (declared !== null) {
+        const bytes = Number(declared);
+        if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > MIGRATION_BODY_MAX_BYTES) {
+            throw new TypeError("migration request body is too large");
+        }
+    }
+    if (!request.body) throw new TypeError("migration request body is required");
+    const reader = request.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        bytes += next.value.byteLength;
+        if (bytes > MIGRATION_BODY_MAX_BYTES) {
+            await reader.cancel();
+            throw new TypeError("migration request body is too large");
+        }
+        chunks.push(next.value);
+    }
+    const joined = new Uint8Array(bytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+        joined.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(joined));
+}
+
+function exactMigrationObject(value: unknown, keys: readonly string[]): Record<string, unknown> {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new TypeError("migration request body must be an object");
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const actual = Object.keys(descriptors).sort();
+    const expected = [...keys].sort();
+    if (
+        actual.length !== expected.length ||
+        actual.some((key, index) => key !== expected[index]) ||
+        actual.some(key => {
+            const descriptor = descriptors[key];
+            return !descriptor || !("value" in descriptor) || !descriptor.enumerable;
+        })
+    ) {
+        throw new TypeError("migration request body has unexpected fields");
+    }
+    return Object.fromEntries(actual.map(key => [key, descriptors[key]?.value]));
+}
+
+function migrationJsonError(status: number, error: string): Response {
+    return Response.json({ ok: false, error }, { status });
+}
+
+export async function handleMigrationAdminRequest(request: Request, env: ChardbEnv): Promise<Response> {
+    const configuredToken = env.CDB_ADMIN_TOKEN;
+    if (!configuredToken) return new Response("not found", { status: 404 });
+    if (MIGRATION_TEXT_ENCODER.encode(configuredToken).byteLength > MIGRATION_TOKEN_MAX_BYTES) {
+        return migrationJsonError(500, "migration admin token is misconfigured");
+    }
+    const supplied = request.headers.get("authorization");
+    const token = supplied?.startsWith("Bearer ") ? supplied.slice("Bearer ".length) : "";
+    if (
+        MIGRATION_TEXT_ENCODER.encode(token).byteLength > MIGRATION_TOKEN_MAX_BYTES ||
+        !(await equalSecret(token, configuredToken))
+    ) {
+        return new Response("forbidden", { status: 403 });
+    }
+
+    const url = new URL(request.url);
+    const catalogId = env.CDB_CATALOG.idFromName("global");
+    const catalog = env.CDB_CATALOG.get(catalogId) as unknown as CatalogMigrationRpc;
+    try {
+        if (request.method === "GET" && url.pathname === "/_chardb/migrations/state") {
+            return Response.json({ ok: true, state: await catalog.schemaState() });
+        }
+        if (request.method === "GET" && url.pathname === "/_chardb/migrations/shards") {
+            const migrationId = url.searchParams.get("migrationId");
+            if (!migrationId) return migrationJsonError(400, "migrationId is required");
+            return Response.json({ ok: true, shards: await catalog.schemaMigrationShards({ migrationId }) });
+        }
+        if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+        const body = await readMigrationBody(request);
+        if (url.pathname === "/_chardb/migrations/begin") {
+            const input = exactMigrationObject(body, ["migrationId", "targetVersion"]);
+            if (typeof input.migrationId !== "string" || typeof input.targetVersion !== "number") {
+                return migrationJsonError(400, "migrationId and targetVersion are required");
+            }
+            return Response.json({
+                ok: true,
+                state: await catalog.beginSchemaMigration({
+                    migrationId: input.migrationId,
+                    targetVersion: input.targetVersion,
+                }),
+            });
+        }
+        if (url.pathname === "/_chardb/migrations/baseline") {
+            const input = exactMigrationObject(body, ["migrationId", "targetVersion"]);
+            if (typeof input.migrationId !== "string" || typeof input.targetVersion !== "number") {
+                return migrationJsonError(400, "migrationId and targetVersion are required");
+            }
+            return Response.json({
+                ok: true,
+                state: await catalog.beginSchemaBaseline({
+                    migrationId: input.migrationId,
+                    targetVersion: input.targetVersion,
+                }),
+            });
+        }
+        if (url.pathname === "/_chardb/migrations/shard") {
+            const input = exactMigrationObject(body, ["migrationId", "shardId"]);
+            if (typeof input.migrationId !== "string" || typeof input.shardId !== "string") {
+                return migrationJsonError(400, "migrationId and shardId are required");
+            }
+            return Response.json({
+                ok: true,
+                shard: await catalog.migrateSchemaShard({ migrationId: input.migrationId, shardId: input.shardId }),
+            });
+        }
+        if (url.pathname === "/_chardb/migrations/catalog") {
+            const input = exactMigrationObject(body, ["migrationId", "version"]);
+            if (typeof input.migrationId !== "string" || typeof input.version !== "number") {
+                return migrationJsonError(400, "migrationId and version are required");
+            }
+            return Response.json({
+                ok: true,
+                state: await catalog.applyCatalogSchemaMigration({
+                    migrationId: input.migrationId,
+                    version: input.version,
+                }),
+            });
+        }
+        if (url.pathname === "/_chardb/migrations/complete") {
+            const input = exactMigrationObject(body, ["migrationId"]);
+            if (typeof input.migrationId !== "string") {
+                return migrationJsonError(400, "migrationId is required");
+            }
+            return Response.json({
+                ok: true,
+                state: await catalog.completeSchemaMigration({ migrationId: input.migrationId }),
+            });
+        }
+        return new Response("not found", { status: 404 });
+    } catch (error) {
+        if (error instanceof TypeError || error instanceof SyntaxError) {
+            return migrationJsonError(400, error.message);
+        }
+        throw error;
+    }
+}
+
 class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
     /** Subclass overrides this via `defineChardb({ manifest })`. */
     protected manifest(): ChardbManifest {
@@ -106,6 +301,8 @@ class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
         try {
             if (url.pathname === "/ws" || url.pathname.startsWith("/ws/")) {
                 response = await this.handleWebSocket(request);
+            } else if (url.pathname.startsWith("/_chardb/migrations/")) {
+                response = await this.handleMigrations(request);
             } else if (url.pathname.startsWith("/_chardb/")) {
                 response = await this.handleDashboard(request);
             } else {
@@ -133,6 +330,10 @@ class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
         const dash = this.env.CDB_DASHBOARD;
         if (!dash) return new Response("dashboard not bound", { status: 500 });
         return dash.fetch(request);
+    }
+
+    private async handleMigrations(request: Request): Promise<Response> {
+        return handleMigrationAdminRequest(request, this.env);
     }
 
     /**

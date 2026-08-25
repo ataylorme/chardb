@@ -579,6 +579,7 @@ function liveRequest(
         subscription,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-a"),
+        domainSchemaEpoch: 1,
         ref,
         args,
         queryHash: stableJson({ ref, args, intent, policyDigest }),
@@ -591,7 +592,7 @@ function registeredQuery(
     subscription: LiveSubscriptionId,
     auth: CdbRegisteredQueryRequest["auth"] = AUTH
 ): CdbRegisteredQueryRequest {
-    return { subscription, auth };
+    return { subscription, auth, domainSchemaEpoch: 1 };
 }
 
 function sizedResultArgs(rows: number, character: string, characterCount: number) {
@@ -606,6 +607,7 @@ function intentCoverageLiveRequest(subscription: LiveSubscriptionId, mode: Inten
         subscription,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-a"),
+        domainSchemaEpoch: 1,
         ref: registeredIntentCoverage.__chardbRef,
         args,
         queryHash: stableJson({ ref: registeredIntentCoverage.__chardbRef, args, intent, policyDigest }),
@@ -628,6 +630,7 @@ function rangeCoverageLiveRequest(subscription: LiveSubscriptionId, mode: RangeC
         subscription,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-a"),
+        domainSchemaEpoch: 1,
         ref: registeredRangeCoverage.__chardbRef,
         args,
         queryHash: stableJson({ ref: registeredRangeCoverage.__chardbRef, args, intent, policyDigest }),
@@ -710,6 +713,7 @@ describe("Cdb registered query execution", () => {
         const { cdb } = await setup();
         await expect(
             cdb.query({
+                domainSchemaEpoch: 1,
                 ref: argumentProbe.__chardbRef,
                 args: { value: "é".repeat(262_138) },
                 auth: AUTH,
@@ -719,6 +723,7 @@ describe("Cdb registered query execution", () => {
 
         await expect(
             cdb.query({
+                domainSchemaEpoch: 1,
                 ref: ChardbRef("queries.ts#missing-before-query-arg-limit"),
                 args: { value: "é".repeat(262_139) },
                 auth: AUTH,
@@ -812,7 +817,9 @@ describe("Cdb registered query execution", () => {
         const { cdb } = await setup();
         const args = { organizationId: "org-a" };
 
-        await expect(cdb.query({ ref: registeredHostileResult.__chardbRef, args, auth: AUTH })).resolves.toEqual({
+        await expect(
+            cdb.query({ domainSchemaEpoch: 1, ref: registeredHostileResult.__chardbRef, args, auth: AUTH })
+        ).resolves.toEqual({
             ok: true,
             result: [["descriptor-value"]],
         });
@@ -892,6 +899,7 @@ describe("Cdb registered query execution", () => {
 
         await expect(
             cdb.query({
+                domainSchemaEpoch: 1,
                 ref: registeredHostileResult.__chardbRef,
                 args: { organizationId: "org-a" },
                 auth: AUTH,
@@ -909,7 +917,12 @@ describe("Cdb registered query execution", () => {
 
     test("isolates a returned query result from later source mutation", async () => {
         const { cdb } = await setup();
-        const response = await cdb.query({ ref: retainedResult.__chardbRef, args: {}, auth: AUTH });
+        const response = await cdb.query({
+            domainSchemaEpoch: 1,
+            ref: retainedResult.__chardbRef,
+            args: {},
+            auth: AUTH,
+        });
         expect(response).toEqual({ ok: true, result: [{ value: "original" }] });
         if (!retainedQueryResult) throw new Error("query handler did not retain its result");
         const retainedFirst = retainedQueryResult[0];
@@ -951,6 +964,7 @@ describe("Cdb registered query execution", () => {
 
         await expect(
             cdb.query({
+                domainSchemaEpoch: 1,
                 ref: registeredSizedResult.__chardbRef,
                 args: sizedResultArgs(4_097, "", 0),
                 auth: AUTH,
@@ -993,6 +1007,7 @@ describe("Cdb registered query execution", () => {
         for (const mode of ["complete", "duplicate", "empty"] as const) {
             await expect(
                 cdb.query({
+                    domainSchemaEpoch: 1,
                     ref: registeredIntentCoverage.__chardbRef,
                     args: { organizationId: "org-a", mode },
                     auth: AUTH,
@@ -1006,6 +1021,7 @@ describe("Cdb registered query execution", () => {
 
         await expect(
             cdb.query({
+                domainSchemaEpoch: 1,
                 ref: registeredIntentCoverage.__chardbRef,
                 args: { organizationId: "org-a", mode: "omitted" },
                 auth: AUTH,
@@ -1019,6 +1035,7 @@ describe("Cdb registered query execution", () => {
         });
         await expect(
             cdb.query({
+                domainSchemaEpoch: 1,
                 ref: registeredIntentCoverage.__chardbRef,
                 args: { organizationId: "org-a", mode: "failure" },
                 auth: AUTH,
@@ -1034,6 +1051,7 @@ describe("Cdb registered query execution", () => {
         for (const mode of ["point-ok", "open-covered"] as const) {
             await expect(
                 cdb.query({
+                    domainSchemaEpoch: 1,
                     ref: registeredRangeCoverage.__chardbRef,
                     args: { organizationId: "org-a", mode },
                     auth: AUTH,
@@ -1044,6 +1062,7 @@ describe("Cdb registered query execution", () => {
         for (const mode of ["point-outside", "partial-range", "closed-missed", "unfiltered-narrow"] as const) {
             await expect(
                 cdb.query({
+                    domainSchemaEpoch: 1,
                     ref: registeredRangeCoverage.__chardbRef,
                     args: { organizationId: "org-a", mode },
                     auth: AUTH,
@@ -1075,6 +1094,7 @@ describe("Cdb registered query execution", () => {
     test("retains every executed predicate when an empty outside read is discarded before a narrow result", async () => {
         const { cdb } = await setup();
         const response = await cdb.query({
+            domainSchemaEpoch: 1,
             ref: registeredRangeCoverage.__chardbRef,
             args: { organizationId: "org-a", mode: "discarded-outside" },
             auth: AUTH,
@@ -1090,6 +1110,7 @@ describe("Cdb registered query execution", () => {
     test("retains a broad tenant-scoped execution followed by an allowed narrow result", async () => {
         const { cdb } = await setup();
         const response = await cdb.query({
+            domainSchemaEpoch: 1,
             ref: registeredRangeCoverage.__chardbRef,
             args: { organizationId: "org-a", mode: "broad-then-narrow" },
             auth: AUTH,
@@ -1106,6 +1127,7 @@ describe("Cdb registered query execution", () => {
         const { cdb } = await setup();
         await expect(
             cdb.query({
+                domainSchemaEpoch: 1,
                 ref: registeredRangeCoverage.__chardbRef,
                 args: { organizationId: "org-a", mode: "tenant-floor" },
                 auth: AUTH,
@@ -1113,6 +1135,7 @@ describe("Cdb registered query execution", () => {
         ).resolves.toMatchObject({ ok: true, result: [{ organizationId: "org-a" }, { organizationId: "org-a" }] });
         await expect(
             cdb.query({
+                domainSchemaEpoch: 1,
                 ref: registeredRangeCoverage.__chardbRef,
                 args: { organizationId: "org-a", mode: "hostile-tenant" },
                 auth: AUTH,
@@ -1125,6 +1148,7 @@ describe("Cdb registered query execution", () => {
 
         for (const declareInner of [false, true]) {
             const response = await cdb.query({
+                domainSchemaEpoch: 1,
                 ref: subqueryAttempt.__chardbRef,
                 args: { organizationId: "org-a", declareInner },
                 auth: AUTH,
@@ -1143,6 +1167,7 @@ describe("Cdb registered query execution", () => {
     test("blocks raw predicates that hide a table reference", async () => {
         const { cdb } = await setup();
         const response = await cdb.query({
+            domainSchemaEpoch: 1,
             ref: rawPredicateAttempt.__chardbRef,
             args: { organizationId: "org-a" },
             auth: AUTH,
@@ -1326,7 +1351,7 @@ describe("Cdb registered query execution", () => {
     test("reads persisted rows and returns an empty JSON array when nothing matches", async () => {
         const { cdb } = await setup();
         await expect(
-            cdb.query({ ref: listRecords.__chardbRef, args: { groupId: "group-a" }, auth: AUTH })
+            cdb.query({ domainSchemaEpoch: 1, ref: listRecords.__chardbRef, args: { groupId: "group-a" }, auth: AUTH })
         ).resolves.toEqual({
             ok: true,
             result: [
@@ -1349,13 +1374,15 @@ describe("Cdb registered query execution", () => {
             ],
         });
         await expect(
-            cdb.query({ ref: listRecords.__chardbRef, args: { groupId: "missing" }, auth: AUTH })
+            cdb.query({ domainSchemaEpoch: 1, ref: listRecords.__chardbRef, args: { groupId: "missing" }, auth: AUTH })
         ).resolves.toEqual({ ok: true, result: [] });
     });
 
     test("masks get and awaited full-row results while preserving JS field names", async () => {
         const { cdb } = await setup();
-        await expect(cdb.query({ ref: getRecord.__chardbRef, args: { id: "record-2" }, auth: AUTH })).resolves.toEqual({
+        await expect(
+            cdb.query({ domainSchemaEpoch: 1, ref: getRecord.__chardbRef, args: { id: "record-2" }, auth: AUTH })
+        ).resolves.toEqual({
             ok: true,
             result: {
                 id: "record-2",
@@ -1366,7 +1393,9 @@ describe("Cdb registered query execution", () => {
                 secretNote: null,
             },
         });
-        await expect(cdb.query({ ref: awaitRecords.__chardbRef, args: {}, auth: AUTH })).resolves.toMatchObject({
+        await expect(
+            cdb.query({ domainSchemaEpoch: 1, ref: awaitRecords.__chardbRef, args: {}, auth: AUTH })
+        ).resolves.toMatchObject({
             ok: true,
             result: [
                 { id: "record-1", secretNote: "mine" },
@@ -1377,11 +1406,15 @@ describe("Cdb registered query execution", () => {
 
     test("default-denies private reads and permits anonymous publicRead", async () => {
         const { cdb } = await setup();
-        await expect(cdb.query({ ref: listPrivateRecords.__chardbRef, args: {}, auth: AUTH })).resolves.toEqual({
+        await expect(
+            cdb.query({ domainSchemaEpoch: 1, ref: listPrivateRecords.__chardbRef, args: {}, auth: AUTH })
+        ).resolves.toEqual({
             ok: true,
             result: [],
         });
-        await expect(cdb.query({ ref: listPublicRecords.__chardbRef, args: {}, auth: ANONYMOUS })).resolves.toEqual({
+        await expect(
+            cdb.query({ domainSchemaEpoch: 1, ref: listPublicRecords.__chardbRef, args: {}, auth: ANONYMOUS })
+        ).resolves.toEqual({
             ok: true,
             result: [
                 { id: "public-a", organizationId: "org-a", displayName: "Alpha" },
@@ -1402,7 +1435,7 @@ describe("Cdb registered query execution", () => {
             countAttempt.__chardbRef,
             nonCdbAttempt.__chardbRef,
         ]) {
-            await expect(cdb.query({ ref, args: {}, auth: AUTH })).resolves.toMatchObject({
+            await expect(cdb.query({ domainSchemaEpoch: 1, ref, args: {}, auth: AUTH })).resolves.toMatchObject({
                 ok: false,
                 error: { code: "CDB_UNSUPPORTED_FEATURE" },
             });
@@ -1411,15 +1444,21 @@ describe("Cdb registered query execution", () => {
 
     test("returns typed failures for unknown refs, non-JSON results, and thrown handlers", async () => {
         const { cdb } = await setup();
-        await expect(cdb.query({ ref: ChardbRef("queries.ts#missing"), args: {}, auth: AUTH })).resolves.toMatchObject({
+        await expect(
+            cdb.query({ domainSchemaEpoch: 1, ref: ChardbRef("queries.ts#missing"), args: {}, auth: AUTH })
+        ).resolves.toMatchObject({
             ok: false,
             error: { code: "CDB_REF_NOT_FOUND" },
         });
-        await expect(cdb.query({ ref: nonJsonResult.__chardbRef, args: {}, auth: AUTH })).resolves.toMatchObject({
+        await expect(
+            cdb.query({ domainSchemaEpoch: 1, ref: nonJsonResult.__chardbRef, args: {}, auth: AUTH })
+        ).resolves.toMatchObject({
             ok: false,
             error: { code: "CDB_INVARIANT", message: expect.stringContaining("query result is not JSON") },
         });
-        await expect(cdb.query({ ref: thrownQuery.__chardbRef, args: {}, auth: AUTH })).resolves.toMatchObject({
+        await expect(
+            cdb.query({ domainSchemaEpoch: 1, ref: thrownQuery.__chardbRef, args: {}, auth: AUTH })
+        ).resolves.toMatchObject({
             ok: false,
             error: { code: "CDB_INVARIANT", message: "query exploded" },
         });
@@ -1434,7 +1473,7 @@ describe("Cdb registered query execution", () => {
             rawAttempt.__chardbRef,
             transactionAttempt.__chardbRef,
         ]) {
-            await expect(cdb.query({ ref, args: {}, auth: AUTH })).resolves.toMatchObject({
+            await expect(cdb.query({ domainSchemaEpoch: 1, ref, args: {}, auth: AUTH })).resolves.toMatchObject({
                 ok: false,
                 error: { code: "CDB_UNSUPPORTED_FEATURE" },
             });

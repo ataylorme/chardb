@@ -133,7 +133,11 @@ describe("Gateway public durable registration", () => {
                 };
             },
             async route() {
-                return { shardId: ShardId("logical-shard-1"), schemaEpoch: 4 };
+                return {
+                    shardId: ShardId("logical-shard-1"),
+                    schemaEpoch: 4,
+                    domainSchemaEpoch: 1,
+                };
             },
             async listShardIds() {
                 return [ShardId("logical-shard-1")];

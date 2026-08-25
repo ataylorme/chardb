@@ -118,6 +118,7 @@ function registration(index: number): GatewayRegistrationInstall {
         shardId: "shard-1",
         sourceCdbId: "cdb-object-1",
         schemaEpoch: 1,
+        domainSchemaEpoch: 1,
         authEpochs: { global: 1, tenant: 1, principal: 1 },
         lastCookie: Cookie(`cookie-${index}`),
         nowMs: 100,

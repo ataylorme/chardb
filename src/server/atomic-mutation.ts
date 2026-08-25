@@ -39,6 +39,7 @@ interface AtomicMutationWriteSet {
 }
 
 type AtomicMutationWriteSetHook = (writeSet: AtomicMutationWriteSet) => void;
+type AtomicMutationAdmissionHook = (sql: SyncSql) => void;
 
 export interface ExecuteAtomicMutationInput<TSchema extends Record<string, unknown>, TArgs extends RawJson, TResult> {
     readonly storage: DurableObjectStorage;
@@ -47,6 +48,8 @@ export interface ExecuteAtomicMutationInput<TSchema extends Record<string, unkno
     readonly handler: AtomicMutationHandler<TSchema, TArgs, TResult>;
     readonly cookie: string;
     readonly nowMs?: number;
+    /** Internal synchronous fence evaluated inside the mutation transaction before op-log lookup or handler SQL. */
+    readonly beforeRun?: AtomicMutationAdmissionHook;
     readonly onWriteSet?: AtomicMutationWriteSetHook;
 }
 
@@ -93,6 +96,7 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
 
     try {
         input.storage.transactionSync(() => {
+            input.beforeRun?.(sql);
             wrappedResult = runWrappedMutation({
                 sql,
                 principalId: PrincipalId(input.request.principalId),

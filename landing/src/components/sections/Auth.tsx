@@ -24,7 +24,7 @@ export function Auth() {
                     "durable delivery retries until an exact client acknowledgement",
                     "Better Auth anonymous accounts become JWT-authenticated principals",
                     "Catalog-owned JWKS refresh with URL-scoped cache, leases, bounds, and cooldowns",
-                    "resume replay, packed restart, and migrations remain unfinished",
+                    "exact resume replay and online migrations remain unfinished",
                 ]}
             />
 

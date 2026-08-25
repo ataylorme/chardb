@@ -109,13 +109,15 @@ export {
 export { chardb, type ChardbApp, type ChardbFactoryInput } from "./chardb.ts";
 export {
     defineMigrations,
+    defineSchemaBaseline,
     migrationDigestAt,
     pendingMigrations,
     type ChardbMigration,
     type ChardbMigrationInput,
     type ChardbMigrationJournal,
+    type ChardbBaselineInput,
 } from "./schema-migrations.ts";
-export { Cdb } from "./do/cdb.ts";
+export { Cdb, type CdbSchemaState } from "./do/cdb.ts";
 export type {
     CatalogMutationRpc,
     CatalogOrganizationAuthorityRpc,

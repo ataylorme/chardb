@@ -11,6 +11,7 @@ export function renderWrangler(input: WranglerTemplateInput): string {
         name: input.name,
         main: "src/worker.ts",
         compatibility_date: input.compatibilityDate,
+        compatibility_flags: ["nodejs_compat"],
         durable_objects: {
             bindings: [
                 { name: "CDB_CATALOG", class_name: "Catalog" },
@@ -61,6 +62,7 @@ export function checkWrangler(rawJsonc: string): DoctorResult {
     const errors: string[] = [];
     const warnings: string[] = [];
     let cfg: {
+        compatibility_flags?: string[];
         durable_objects?: { bindings?: { name: string; class_name: string }[] };
         migrations?: { new_sqlite_classes?: string[] }[];
         observability?: { traces?: { enabled?: boolean } };
@@ -76,6 +78,9 @@ export function checkWrangler(rawJsonc: string): DoctorResult {
         };
     }
     const bindings = cfg.durable_objects?.bindings ?? [];
+    if (!cfg.compatibility_flags?.includes("nodejs_compat")) {
+        errors.push('compatibility_flags must include "nodejs_compat"');
+    }
     for (const name of REQUIRED_DO_BINDINGS) {
         if (!bindings.some(b => b.name === name)) {
             errors.push(`durable_objects.bindings missing entry for ${name}`);

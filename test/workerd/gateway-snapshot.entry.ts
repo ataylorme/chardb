@@ -31,6 +31,7 @@ const REGISTRATION: GatewayRegistrationInstall = {
     shardId: "logical-shard-workerd",
     sourceCdbId: "physical-cdb-workerd",
     schemaEpoch: 1,
+    domainSchemaEpoch: 1,
     authEpochs: { global: 1, tenant: 2, principal: 3 },
     lastCookie: Cookie("cookie-baseline"),
     nowMs: 100,

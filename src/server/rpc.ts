@@ -55,6 +55,7 @@ export interface CdbSubscriptionRequest {
     readonly subscription: LiveSubscriptionId;
     readonly principalId: PrincipalId;
     readonly organizationId: TenantId;
+    readonly domainSchemaEpoch: number;
     readonly ref: ChardbRef;
     readonly args: RawJson;
     readonly queryHash: string;
@@ -119,6 +120,7 @@ export interface CdbMutationRequest {
     readonly args: RawJson;
     readonly auth: AuthCtx;
     readonly schemaEpoch: number;
+    readonly domainSchemaEpoch: number;
 }
 
 export interface CdbMutationSuccess {
@@ -148,6 +150,7 @@ export interface CdbQueryRequest {
     readonly ref: ChardbRef;
     readonly args: RawJson;
     readonly auth: AuthCtx;
+    readonly domainSchemaEpoch: number;
 }
 
 export type CdbQueryResponse =
@@ -162,6 +165,7 @@ export interface CdbQueryRpc {
 export interface CdbRegisteredQueryRequest {
     readonly subscription: LiveSubscriptionId;
     readonly auth: AuthCtx;
+    readonly domainSchemaEpoch: number;
 }
 
 export interface CdbRegisteredQueryRpc {

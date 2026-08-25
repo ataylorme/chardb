@@ -1,7 +1,7 @@
 import { anonymous } from "better-auth/plugins/anonymous";
 import { jwt } from "better-auth/plugins/jwt";
 import type { DBAdapter, Session } from "better-auth/types";
-import { chardb, defineAuth } from "chardb/server";
+import { chardb, defineAuth, defineMigrations, defineSchemaBaseline } from "chardb/server";
 import * as api from "./api.ts";
 import * as queries from "./queries.ts";
 import * as domain from "./schema.ts";
@@ -93,7 +93,16 @@ export const auth = defineAuth({
     },
 });
 
-export const app = chardb({ auth, schema: domain, api: { ...api, ...queries } });
+export const migrations = defineMigrations([
+    defineSchemaBaseline({
+        version: 1,
+        name: "initial_schema",
+        domainSchema: domain,
+        authOptions: auth.options,
+    }),
+]);
+
+export const app = chardb({ auth, schema: domain, api: { ...api, ...queries }, migrations });
 
 app.get("/health", c => c.text("ok"));
 app.get("/api/version", c => c.json({ name: "chardb-chat-example", version: "0.1.0" }));
