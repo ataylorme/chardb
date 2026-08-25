@@ -89,6 +89,9 @@ interface GatewayLiveState {
 
 interface CdbLiveState {
     readonly instanceId: string;
+    readonly domainRows: number;
+    readonly opLogRows: number;
+    readonly changeSeq: number;
     readonly subscriptions: readonly {
         readonly gatewayId: string;
         readonly registrationId: string;
@@ -224,8 +227,16 @@ export class Cdb extends ProductionCdb {
 
     fixtureLiveState(): CdbLiveState {
         const sql = adaptSqlStorage(this.ctx.storage.sql);
+        const domainRows = sql.one<{ count: number }>("SELECT COUNT(*) AS count FROM gateway_writes")?.count ?? 0;
+        const opLogRows = sql.one<{ count: number }>("SELECT COUNT(*) AS count FROM _chardb_op_log")?.count ?? 0;
+        const changeSeq =
+            sql.one<{ change_seq: number }>("SELECT change_seq FROM _chardb_change_clock WHERE singleton = 1")
+                ?.change_seq ?? 0;
         return {
             instanceId: this.fixtureInstanceId,
+            domainRows,
+            opLogRows,
+            changeSeq,
             subscriptions: sql
                 .all<{
                     gateway_id: string;

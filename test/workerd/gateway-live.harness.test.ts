@@ -58,6 +58,9 @@ interface GatewayLiveState {
 
 interface CdbLiveState {
     readonly instanceId: string;
+    readonly domainRows: number;
+    readonly opLogRows: number;
+    readonly changeSeq: number;
     readonly subscriptions: readonly {
         readonly gatewayId: string;
         readonly registrationId: string;
@@ -535,6 +538,12 @@ async function inBatches<T>(items: readonly T[], batchSize: number, run: (item: 
 
 function rate(count: number, durationMs: number): number {
     return durationMs === 0 ? 0 : Number(((count * 1_000) / durationMs).toFixed(2));
+}
+
+function expectCdbMutationDelta(before: CdbLiveState, after: CdbLiveState, count: number): void {
+    expect(after.domainRows - before.domainRows).toBe(count);
+    expect(after.opLogRows - before.opLogRows).toBe(count);
+    expect(after.changeSeq - before.changeSeq).toBe(count);
 }
 
 beforeAll(async () => {
@@ -1259,6 +1268,7 @@ describe("public durable live queries in real workerd", () => {
                     )
                 );
                 const initialMs = performance.now() - startedAt;
+                const cdbBeforeMutations = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
 
                 const expectedIds = new Map<string, string[]>();
                 const jobsByTenant = tenants.map(tenant => {
@@ -1314,8 +1324,19 @@ describe("public durable live queries in real workerd", () => {
                     )
                 );
                 const midConvergenceMs = performance.now() - midConvergenceStartedAt;
+                const cdbBeforeChurn = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                expectCdbMutationDelta(cdbBeforeMutations, cdbBeforeChurn, tenants.length * firstMutationCount);
+                const fanoutClientIds = new Set(clients.map(entry => entry.clientId));
+                const activeBeforeChurn = cdbBeforeChurn.subscriptions.filter(
+                    row => row.state === "active" && fanoutClientIds.has(row.clientId)
+                );
+                expect(activeBeforeChurn).toHaveLength(clients.length);
+                const registrationBeforeChurn = new Map(
+                    activeBeforeChurn.map(row => [row.clientId, row.registrationId] as const)
+                );
 
                 const churnTargets = clients.filter(entry => entry.slot % 2 === 0);
+                const churnTargetIds = new Set(churnTargets.map(entry => entry.clientId));
                 const churnStartedAt = performance.now();
                 await Promise.all(
                     churnTargets.map(async entry => {
@@ -1343,6 +1364,23 @@ describe("public durable live queries in real workerd", () => {
                     )
                 );
                 const churnMs = performance.now() - churnStartedAt;
+                const cdbAfterChurn = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                expect(cdbAfterChurn.domainRows).toBe(cdbBeforeChurn.domainRows);
+                expect(cdbAfterChurn.opLogRows).toBe(cdbBeforeChurn.opLogRows);
+                expect(cdbAfterChurn.changeSeq).toBe(cdbBeforeChurn.changeSeq);
+                const activeAfterChurn = cdbAfterChurn.subscriptions.filter(
+                    row => row.state === "active" && fanoutClientIds.has(row.clientId)
+                );
+                expect(activeAfterChurn).toHaveLength(clients.length);
+                for (const row of activeAfterChurn) {
+                    const priorRegistrationId = registrationBeforeChurn.get(row.clientId);
+                    if (!priorRegistrationId) throw new Error(`missing pre-churn registration for ${row.clientId}`);
+                    if (churnTargetIds.has(row.clientId)) {
+                        expect(row.registrationId).not.toBe(priorRegistrationId);
+                    } else {
+                        expect(row.registrationId).toBe(priorRegistrationId);
+                    }
+                }
 
                 mutationMs += await runMutationSlice(firstMutationCount, SCALE_MUTATIONS_PER_TENANT);
 
@@ -1387,9 +1425,10 @@ describe("public durable live queries in real workerd", () => {
                     });
                     expect(registration?.dirtyVersion).toBe(registration?.deliveredVersion);
                 }
-                expect((await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId })).invalidations).toEqual([]);
-
                 const mutationCount = tenants.length * SCALE_MUTATIONS_PER_TENANT;
+                const finalCdb = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                expectCdbMutationDelta(cdbBeforeMutations, finalCdb, mutationCount);
+                expect(finalCdb.invalidations).toEqual([]);
                 const finalDeliveryRows =
                     SCALE_MUTATIONS_PER_TENANT > firstMutationCount ? clients.length * SCALE_MUTATIONS_PER_TENANT : 0;
                 const logicalRowDeliveries =
@@ -1408,6 +1447,9 @@ describe("public durable live queries in real workerd", () => {
                         churnMs: Number(churnMs.toFixed(2)),
                         reconnectedClients: churnTargets.length,
                         reconnectedClientsPerSecond: rate(churnTargets.length, churnMs),
+                        committedRows: mutationCount,
+                        opLogEntries: mutationCount,
+                        changeSeqAdvance: mutationCount,
                         convergenceMs: Number(convergenceMs.toFixed(2)),
                         deliveryMs: Number(deliveryMs.toFixed(2)),
                         logicalRowDeliveries,
@@ -1527,6 +1569,9 @@ describe("public durable live queries in real workerd", () => {
                     recoveredHeads.map(row => `${row.registrationId}:${row.subId}`).sort()
                 );
                 expect(cdbAfterRecovery.invalidations).toEqual([]);
+                expect(cdbAfterRecovery.domainRows).toBe(cdbBeforeReconstruction.domainRows);
+                expect(cdbAfterRecovery.opLogRows).toBe(cdbBeforeReconstruction.opLogRows);
+                expect(cdbAfterRecovery.changeSeq).toBe(cdbBeforeReconstruction.changeSeq);
 
                 for (let round = 0; round < SCALE_REFRESH_ROUNDS; round++) {
                     const jobs = bodies.map((body, index) => ({
@@ -1588,10 +1633,11 @@ describe("public durable live queries in real workerd", () => {
                         ).toBe(true);
                     }
                 }
-                expect((await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId })).invalidations).toEqual([]);
-
                 const writes = SCALE_SUBSCRIPTIONS * SCALE_REFRESH_ROUNDS;
                 const materializations = SCALE_SUBSCRIPTIONS * SCALE_REFRESH_ROUNDS;
+                const finalCdb = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                expectCdbMutationDelta(cdbBeforeReconstruction, finalCdb, writes);
+                expect(finalCdb.invalidations).toEqual([]);
                 console.info(
                     JSON.stringify({
                         type: "chardb-workerd-benchmark",
@@ -1604,6 +1650,9 @@ describe("public durable live queries in real workerd", () => {
                         recoveryMs: Number(recoveryMs.toFixed(2)),
                         recoveredRegistrations: SCALE_SUBSCRIPTIONS,
                         recoveredRegistrationsPerSecond: rate(SCALE_SUBSCRIPTIONS, recoveryMs),
+                        committedRows: writes,
+                        opLogEntries: writes,
+                        changeSeqAdvance: writes,
                         writeMs: Number(writeMs.toFixed(2)),
                         writesPerSecond: rate(writes, writeMs),
                         refreshMs: Number(refreshMs.toFixed(2)),
