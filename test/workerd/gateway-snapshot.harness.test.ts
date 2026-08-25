@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { Miniflare } from "miniflare";
+import { createChardbClient } from "../../src/client/index.ts";
 import { type ChardbRef, ClientId, Cookie, MutId, SubId } from "../../src/types.ts";
 import { type Down, PROTOCOL_V, type Up, decodeWire, encodeWire } from "../../src/wire.ts";
 
@@ -99,6 +100,50 @@ interface OpenedSocket {
     readonly socket: WebSocket;
     readonly welcome: Down;
     readonly closed: Promise<CloseEvent>;
+}
+
+interface QueryObservation {
+    readonly rows: readonly Record<string, unknown>[];
+    readonly state: string;
+}
+
+function queryObserver() {
+    const history: QueryObservation[] = [];
+    const waiters = new Set<() => void>();
+    return {
+        count: () => history.length,
+        listener(rows: readonly Record<string, unknown>[], state?: string) {
+            history.push({ rows: rows.map(row => ({ ...row })), state: state ?? "missing" });
+            for (const wake of [...waiters]) wake();
+        },
+        async waitFor(
+            predicate: (observation: QueryObservation) => boolean,
+            label: string,
+            fromIndex = 0
+        ): Promise<QueryObservation> {
+            const deadline = Date.now() + 5_000;
+            while (true) {
+                const match = history.slice(fromIndex).find(predicate);
+                if (match) return match;
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) {
+                    throw new Error(`timed out waiting for ${label}; history=${JSON.stringify(history)}`);
+                }
+                await new Promise<void>((resolve, reject) => {
+                    const wake = () => {
+                        clearTimeout(timeout);
+                        waiters.delete(wake);
+                        resolve();
+                    };
+                    const timeout = setTimeout(() => {
+                        waiters.delete(wake);
+                        reject(new Error(`timed out waiting for ${label}; history=${JSON.stringify(history)}`));
+                    }, remaining);
+                    waiters.add(wake);
+                });
+            }
+        },
+    };
 }
 
 let script = "";
@@ -213,7 +258,7 @@ async function signed(subject: string): Promise<string> {
     return signToken(subject);
 }
 
-async function openSocket(clientId: string): Promise<OpenedSocket> {
+async function openSocket(clientId: string, resumeFromCookie?: Cookie): Promise<OpenedSocket> {
     if (!workerdUrl) throw new Error("miniflare not initialized");
     const url = new URL("/ws", workerdUrl);
     url.searchParams.set("clientId", clientId);
@@ -245,6 +290,7 @@ async function openSocket(clientId: string): Promise<OpenedSocket> {
             t: "hello",
             protocolV: PROTOCOL_V,
             clientId: ClientId(clientId),
+            ...(resumeFromCookie !== undefined ? { resumeFromCookie } : {}),
             jwt: await signed("workerd-user"),
         })
     );
@@ -289,7 +335,17 @@ async function activeRegistration(clientId: string, subId: number): Promise<Gate
 async function subscribe(opened: OpenedSocket, clientId: string, subId: number, body: string) {
     if (!queryRef) throw new Error("query ref was not seeded");
     const snapshot = nextDown(opened.socket);
-    opened.socket.send(
+    sendSubscription(opened.socket, subId, body);
+    await activeRegistration(clientId, subId);
+    await drainGateway(clientId);
+    const message = await snapshot;
+    if (message.t !== "snapshot") throw new Error(`expected snapshot, received ${message.t}`);
+    return message;
+}
+
+function sendSubscription(socket: WebSocket, subId: number, body: string): void {
+    if (!queryRef) throw new Error("query ref was not seeded");
+    socket.send(
         encodeWire({
             t: "sub",
             subId: SubId(subId),
@@ -297,11 +353,6 @@ async function subscribe(opened: OpenedSocket, clientId: string, subId: number, 
             args: { organizationId: ORGANIZATION, body },
         })
     );
-    await activeRegistration(clientId, subId);
-    await drainGateway(clientId);
-    const message = await snapshot;
-    if (message.t !== "snapshot") throw new Error(`expected snapshot, received ${message.t}`);
-    return message;
 }
 
 function acknowledge(socket: WebSocket, snapshot: Extract<Down, { t: "snapshot" }>): void {
@@ -587,5 +638,201 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
         await opened.closed;
         await drainGateway(clientId);
         expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
+    }, 15_000);
+
+    test("socket loss before acknowledgement forces an explicit refetch on the replacement connection", async () => {
+        if (!workerdUrl || !queryRef || !mutationRef) throw new Error("snapshot SDK fixture was not initialized");
+        const clientId = "snapshot-reconnect-01";
+        const body = "snapshot-reconnect-proof";
+        const NativeWebSocket = globalThis.WebSocket;
+        let dropNextAcknowledgement = false;
+        let settleDroppedAcknowledgement: ((cookie: Cookie) => void) | undefined;
+        const droppedAcknowledgement = new Promise<Cookie>(resolve => {
+            settleDroppedAcknowledgement = resolve;
+        });
+
+        class AckDroppingWebSocket {
+            static readonly CONNECTING = NativeWebSocket.CONNECTING;
+            static readonly OPEN = NativeWebSocket.OPEN;
+            static readonly CLOSING = NativeWebSocket.CLOSING;
+            static readonly CLOSED = NativeWebSocket.CLOSED;
+            private readonly inner: WebSocket;
+
+            constructor(url: string | URL) {
+                this.inner = new NativeWebSocket(url);
+            }
+
+            get readyState(): number {
+                return this.inner.readyState;
+            }
+
+            get onopen(): WebSocket["onopen"] {
+                return this.inner.onopen;
+            }
+
+            set onopen(listener: WebSocket["onopen"]) {
+                this.inner.onopen = listener;
+            }
+
+            get onmessage(): WebSocket["onmessage"] {
+                return this.inner.onmessage;
+            }
+
+            set onmessage(listener: WebSocket["onmessage"]) {
+                this.inner.onmessage = listener;
+            }
+
+            get onclose(): WebSocket["onclose"] {
+                return this.inner.onclose;
+            }
+
+            set onclose(listener: WebSocket["onclose"]) {
+                this.inner.onclose = listener;
+            }
+
+            get onerror(): WebSocket["onerror"] {
+                return this.inner.onerror;
+            }
+
+            set onerror(listener: WebSocket["onerror"]) {
+                this.inner.onerror = listener;
+            }
+
+            send(data: Parameters<WebSocket["send"]>[0]): void {
+                if (dropNextAcknowledgement && typeof data === "string") {
+                    const message = decodeWire(data) as Up;
+                    if (message.t === "ack") {
+                        dropNextAcknowledgement = false;
+                        settleDroppedAcknowledgement?.(message.cookie);
+                        this.inner.close();
+                        return;
+                    }
+                }
+                this.inner.send(data);
+            }
+
+            close(code?: number, reason?: string): void {
+                this.inner.close(code, reason);
+            }
+        }
+
+        const observer = queryObserver();
+        let client: ReturnType<typeof createChardbClient> | undefined;
+        let subscription: { unsubscribe: () => void } | undefined;
+        let failure: { readonly value: unknown } | null = null;
+        try {
+            globalThis.WebSocket = AckDroppingWebSocket as unknown as typeof WebSocket;
+            const endpoint = new URL("/ws", workerdUrl);
+            endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
+            const jwt = await signed("workerd-user");
+            client = createChardbClient({
+                endpoint: endpoint.toString(),
+                clientId,
+                getJwt: async () => jwt,
+                crossTab: false,
+            });
+            subscription = client.subscribe<Record<string, unknown>>(
+                queryRef,
+                { organizationId: ORGANIZATION, body },
+                observer.listener
+            );
+            await activeRegistration(clientId, 1);
+            await drainGateway(clientId);
+            await observer.waitFor(
+                observation => observation.state === "live" && observation.rows.length === 0,
+                "initial SDK snapshot"
+            );
+
+            await client.mutate(mutationRef, {
+                id: "snapshot-before-close-row",
+                organizationId: ORGANIZATION,
+                body,
+                createdAt: 24,
+            });
+            await drainCdb();
+            const dirty = await activeRegistration(clientId, 1);
+            await stageGateway(clientId);
+            const staged = await deliveryState(clientId, 1);
+            expect(staged).toMatchObject({
+                registrationId: dirty.registrationId,
+                deliveredVersion: dirty.deliveredVersion,
+                targetVersion: dirty.dirtyVersion,
+                sendAttempts: 0,
+            });
+            if (!staged?.cookie) throw new Error("Gateway did not stage the snapshot lost before acknowledgement");
+
+            dropNextAcknowledgement = true;
+            await drainGateway(clientId);
+            expect(await droppedAcknowledgement).toBe(Cookie(staged.cookie));
+            await observer.waitFor(
+                observation =>
+                    observation.state === "live" &&
+                    observation.rows.some(row => row.id === "snapshot-before-close-row"),
+                "delivered snapshot before transport loss"
+            );
+            const afterLostDelivery = observer.count();
+            await observer.waitFor(
+                observation => observation.state === "refetching" && observation.rows.length === 0,
+                "explicit lagged refetch",
+                afterLostDelivery
+            );
+            await activeRegistration(clientId, 1);
+            await drainGateway(clientId);
+            await observer.waitFor(
+                observation =>
+                    observation.state === "live" &&
+                    observation.rows.some(row => row.id === "snapshot-before-close-row"),
+                "authoritative snapshot after reconnect",
+                afterLostDelivery
+            );
+
+            await drainGateway(clientId);
+            const replacement = await activeRegistration(clientId, 1);
+            expect(replacement.registrationId).not.toBe(dirty.registrationId);
+            expect(replacement.lastSnapshotCookie).toBeString();
+            expect(replacement.lastSnapshotCookie).not.toBe(staged.cookie);
+
+            await client.mutate(mutationRef, {
+                id: "snapshot-after-refetch-row",
+                organizationId: ORGANIZATION,
+                body,
+                createdAt: 25,
+            });
+            await drainCdb();
+            await stageGateway(clientId);
+            await drainGateway(clientId);
+            await observer.waitFor(
+                observation =>
+                    observation.state === "live" &&
+                    observation.rows.some(row => row.id === "snapshot-before-close-row") &&
+                    observation.rows.some(row => row.id === "snapshot-after-refetch-row"),
+                "later delivery after explicit refetch"
+            );
+        } catch (error) {
+            failure = { value: error };
+        } finally {
+            let cleanupFailure: { readonly value: unknown } | null = null;
+            try {
+                subscription?.unsubscribe();
+            } catch (error) {
+                cleanupFailure = { value: error };
+            }
+            try {
+                client?.close();
+            } catch (error) {
+                cleanupFailure ??= { value: error };
+            } finally {
+                globalThis.WebSocket = NativeWebSocket;
+            }
+            failure ??= cleanupFailure;
+        }
+        if (failure !== null) throw failure.value;
+        await drainGateway(clientId);
+        expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
+        const cdbAfterCleanup = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+        expect(
+            cdbAfterCleanup.subscriptions.filter(row => row.clientId === clientId && row.state === "active")
+        ).toEqual([]);
+        expect(cdbAfterCleanup.invalidations).toEqual([]);
     }, 15_000);
 });

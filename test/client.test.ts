@@ -2723,6 +2723,30 @@ describe("createChardbClient — wire round-trip", () => {
         expect(seen.at(-1)).toEqual({ rows: [], state: "live" });
     });
 
+    test("mustRefetch does not resurrect a subscription removed by its refetch listener", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const subscription = c.subscribe("queries.ts#listMessages", { organizationId: "org-1" }, (_rows, state) => {
+            if (state === "refetching") subscription.unsubscribe();
+        });
+        await flush();
+
+        const sentBefore = ws.sent.length;
+        ws.emit({ t: "mustRefetch", subIds: [SubId(1)], reason: "lagged" });
+        await flush();
+
+        expect(
+            ws.sent
+                .slice(sentBefore)
+                .map(raw => JSON.parse(raw) as Up)
+                .map(message => message.t)
+        ).toEqual(["unsub"]);
+        subscription.unsubscribe();
+        expect(sentSubscriptions(ws)).toHaveLength(1);
+    });
+
     test("a subscription error clears rows instead of leaving stale live data", async () => {
         const c = client();
         await flush();
@@ -2776,32 +2800,280 @@ describe("createChardbClient — wire round-trip", () => {
         c.close();
     });
 
-    test("reconnect after RYW window expiry drops lastCookie so server can emit mustRefetch{lagged}", async () => {
-        // Pin wall time so we can advance past RECONNECT_RYW_WINDOW_MS (30s)
-        // between disconnect and reconnect-timer-fires without sleeping for
-        // half a minute. The reconnect timer itself uses real setTimeout, so
-        // we still wait its real delay (250ms initial backoff).
-        const t0 = new Date("2026-05-10T00:00:00Z");
-        setSystemTime(t0);
+    test("reconnect after RYW expiry drops the cookie and retained query state before resubscribing", async () => {
+        const timers = installManualTimers();
         const c = client();
-        await flush();
-        const ws1 = fakeWebSocket();
-        ws1.emit({ t: "welcome", protocolV: PROTOCOL_V, baseCookie: Cookie("c-1:42"), region: "test" });
-        await flush();
-        ws1.close();
-        // Let the onclose microtask run so `lastDisconnectAt` is stamped at t0,
-        // then jump past the RYW window before the reconnect timer fires.
-        await flush();
-        setSystemTime(new Date(t0.getTime() + 31_000));
-        await new Promise(r => setTimeout(r, 350));
-        const ws2 = FakeWS.instances[1];
-        if (!ws2) throw new Error("expected reconnect to spawn a new WS");
-        await flush();
-        const helloAfter = ws2.sent.map(r => JSON.parse(r) as Up).find(m => m.t === "hello");
-        if (!helloAfter || helloAfter.t !== "hello") throw new Error("expected hello on reconnect");
-        expect(helloAfter.resumeFromCookie).toBeUndefined();
-        setSystemTime();
-        c.close();
+        try {
+            await flush();
+            const ws1 = fakeWebSocket();
+            ws1.emit({ t: "welcome", protocolV: PROTOCOL_V, baseCookie: Cookie("c-1:42"), region: "test" });
+            const seen: Array<{ readonly rows: unknown[]; readonly state: string }> = [];
+            c.subscribe<{ id: string }>("queries.ts#listMessages", { organizationId: "org-1" }, (rows, state) =>
+                seen.push({ rows: [...rows], state: state ?? "missing" })
+            );
+            ws1.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-1:43"), rows: [{ id: "stale" }] });
+            await flush();
+            expect(seen.at(-1)).toEqual({ rows: [{ id: "stale" }], state: "live" });
+
+            ws1.close();
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([30_000, 250]);
+            timers.runDelay(30_000);
+            expect(seen.at(-1)).toEqual({ rows: [], state: "refetching" });
+            timers.runDelay(250);
+            await flush();
+
+            const ws2 = FakeWS.instances[1];
+            if (!ws2) throw new Error("expected reconnect to spawn a new WS");
+            await flush();
+            const helloAfter = ws2.sent.map(r => JSON.parse(r) as Up).find(m => m.t === "hello");
+            if (!helloAfter || helloAfter.t !== "hello") throw new Error("expected hello on reconnect");
+            expect(helloAfter.resumeFromCookie).toBeUndefined();
+            await welcome(ws2);
+            expect(sentSubscriptions(ws2)).toHaveLength(1);
+
+            ws2.emit({
+                t: "snapshot",
+                subId: SubId(1),
+                cookie: Cookie("c-1:43"),
+                rows: [{ id: "rematerialized" }],
+            });
+            await flush();
+            expect(seen.at(-1)).toEqual({ rows: [{ id: "rematerialized" }], state: "live" });
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("pre-welcome reconnect failures share one RYW deadline and clear retained state once", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            let socket = fakeWebSocket();
+            await welcome(socket, "c-1:42");
+            const seen: Array<{ readonly rows: unknown[]; readonly state: string }> = [];
+            c.subscribe<{ id: string }>("queries.ts#listMessages", { organizationId: "org-1" }, (rows, state) =>
+                seen.push({ rows: [...rows], state: state ?? "missing" })
+            );
+            socket.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-1:43"), rows: [{ id: "stale" }] });
+            await flush();
+
+            for (const delayMs of [250, 500, 1_000, 2_000, 4_000, 8_000]) {
+                socket.close();
+                await flush();
+                expect(timers.scheduledDelays()).toEqual([30_000, delayMs]);
+                timers.runDelay(delayMs);
+                await flush();
+                socket = fakeWebSocket(FakeWS.instances.length - 1);
+                const hello = socket.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "hello");
+                if (!hello || hello.t !== "hello") throw new Error("expected hello on reconnect");
+                expect(hello.resumeFromCookie).toBe(Cookie("c-1:43"));
+            }
+
+            socket.close();
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([30_000, 10_000]);
+            timers.runDelay(30_000);
+            expect(seen.filter(observation => observation.state === "refetching")).toEqual([
+                { rows: [], state: "refetching" },
+            ]);
+            expect(timers.scheduledDelays()).toEqual([10_000]);
+            timers.runDelay(10_000);
+            await flush();
+            socket = fakeWebSocket(FakeWS.instances.length - 1);
+            const freshHello = socket.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "hello");
+            if (!freshHello || freshHello.t !== "hello") throw new Error("expected fresh retry hello");
+            expect(freshHello.resumeFromCookie).toBeUndefined();
+
+            socket.close();
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([10_000]);
+            timers.runDelay(10_000);
+            await flush();
+            expect(seen.filter(observation => observation.state === "refetching")).toHaveLength(1);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("RYW expiry clears only pre-disconnect state while reconnect JWT is held", async () => {
+        const timers = installManualTimers();
+        let jwtCalls = 0;
+        let resolveHeldJwt: ((jwt: string) => void) | undefined;
+        const heldJwt = new Promise<string>(resolve => {
+            resolveHeldJwt = resolve;
+        });
+        const c = client({
+            getJwt: async () => {
+                jwtCalls += 1;
+                return jwtCalls === 1 ? "jwt-initial" : heldJwt;
+            },
+        });
+        try {
+            await flush();
+            const ws1 = fakeWebSocket();
+            await welcome(ws1, "c-1:42");
+            const retainedStates: string[] = [];
+            c.subscribe("queries.ts#retained", { organizationId: "org-1" }, (_rows, state) =>
+                retainedStates.push(state ?? "missing")
+            );
+            ws1.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-1:43"), rows: [{ id: "stale" }] });
+            await flush();
+
+            ws1.close();
+            await flush();
+            let offlineNotifications = 0;
+            c.subscribe("queries.ts#offline", { organizationId: "org-1" }, () => {
+                offlineNotifications += 1;
+            });
+            timers.runDelay(250);
+            await flush();
+            expect(jwtCalls).toBe(2);
+            expect(FakeWS.instances).toHaveLength(1);
+
+            timers.runDelay(30_000);
+            expect(retainedStates.at(-1)).toBe("refetching");
+            expect(retainedStates.filter(state => state === "refetching")).toHaveLength(1);
+            expect(offlineNotifications).toBe(0);
+
+            resolveHeldJwt?.("jwt-replacement");
+            await flush();
+            const ws2 = FakeWS.instances[1];
+            if (!ws2) throw new Error("expected held JWT reconnect socket");
+            const hello = ws2.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "hello");
+            if (!hello || hello.t !== "hello") throw new Error("expected hello after held JWT");
+            expect(hello.resumeFromCookie).toBeUndefined();
+            await welcome(ws2);
+            expect(sentSubscriptions(ws2).map(message => message.subId)).toEqual([SubId(1), SubId(2)]);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("one duplicate-recovered subscription preserves the cookie while another expires", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const ws1 = fakeWebSocket();
+            await welcome(ws1, "c-1:42");
+            const statesA: string[] = [];
+            const statesB: string[] = [];
+            c.subscribe("queries.ts#a", { organizationId: "org-1" }, (_rows, state) =>
+                statesA.push(state ?? "missing")
+            );
+            c.subscribe("queries.ts#b", { organizationId: "org-1" }, (_rows, state) =>
+                statesB.push(state ?? "missing")
+            );
+            ws1.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-1:43"), rows: [{ id: "a" }] });
+            ws1.emit({ t: "snapshot", subId: SubId(2), cookie: Cookie("c-1:44"), rows: [{ id: "b" }] });
+            await flush();
+
+            ws1.close();
+            await flush();
+            timers.runDelay(250);
+            await flush();
+            const ws2 = FakeWS.instances[1];
+            if (!ws2) throw new Error("expected first replacement socket");
+            ws2.emit({
+                t: "welcome",
+                protocolV: PROTOCOL_V,
+                baseCookie: Cookie("c-test:0"),
+                resumedFromCookie: Cookie("c-1:44"),
+                region: "test",
+            });
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([30_000]);
+
+            ws2.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-1:43"), rows: [{ id: "ignored" }] });
+            await flush();
+            expect(statesA.filter(state => state === "live")).toHaveLength(1);
+            timers.runDelay(30_000);
+            expect(statesA.at(-1)).toBe("live");
+            expect(statesB.at(-1)).toBe("refetching");
+
+            ws2.close();
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([30_000, 250]);
+            timers.runDelay(250);
+            await flush();
+            const ws3 = FakeWS.instances[2];
+            if (!ws3) throw new Error("expected second replacement socket");
+            const hello = ws3.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "hello");
+            if (!hello || hello.t !== "hello") throw new Error("expected second replacement hello");
+            expect(hello.resumeFromCookie).toBe(Cookie("c-1:44"));
+
+            ws3.close();
+            await flush();
+            timers.runDelay(30_000);
+            expect(statesA.at(-1)).toBe("refetching");
+            expect(statesA.filter(state => state === "refetching")).toHaveLength(1);
+            expect(statesB.filter(state => state === "refetching")).toHaveLength(1);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("RYW expiry does not resend a subscription removed by its refetch listener", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const ws1 = fakeWebSocket();
+            await welcome(ws1, "c-1:42");
+            const subscription = c.subscribe("queries.ts#listMessages", { organizationId: "org-1" }, (_rows, state) => {
+                if (state === "refetching") subscription.unsubscribe();
+            });
+            ws1.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-1:43"), rows: [{ id: "stale" }] });
+            await flush();
+
+            ws1.close();
+            await flush();
+            timers.runDelay(30_000);
+            timers.runDelay(250);
+            await flush();
+            const ws2 = FakeWS.instances[1];
+            if (!ws2) throw new Error("expected reconnect to spawn a new WS");
+            await welcome(ws2);
+            expect(sentSubscriptions(ws2)).toEqual([]);
+            subscription.unsubscribe();
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("RYW expiry stops reconnect when a refetch listener closes the client", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const ws1 = fakeWebSocket();
+            await welcome(ws1, "c-1:42");
+            const states: string[] = [];
+            c.subscribe("queries.ts#listMessages", { organizationId: "org-1" }, (_rows, state) => {
+                states.push(state ?? "missing");
+                if (state === "refetching") c.close();
+            });
+            ws1.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-1:43"), rows: [{ id: "stale" }] });
+            await flush();
+
+            ws1.close();
+            await flush();
+            timers.runDelay(30_000);
+            await flush();
+            expect(c.state).toBe("closed");
+            expect(FakeWS.instances).toHaveLength(1);
+            expect(states.slice(-2)).toEqual(["refetching", "closed"]);
+        } finally {
+            c.close();
+            timers.restore();
+        }
     });
 
     test("close() settles queued work once and halts reconnect attempts", async () => {

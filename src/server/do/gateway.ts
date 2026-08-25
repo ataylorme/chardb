@@ -421,6 +421,8 @@ export interface VerifiedGwAttachment {
     readonly lastCookie?: Cookie;
     readonly presenceKeys?: readonly string[];
     readonly snapshotSubIds?: readonly SubId[];
+    /** Resumed subscriptions told to discard retained state and awaiting their replacement frame. */
+    readonly resumeRefetchPendingSubIds?: readonly SubId[];
     /** Subject from a signature-verified token. */
     readonly principalId: PrincipalId;
     /** Required JWT expiry in epoch seconds. */
@@ -3803,6 +3805,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             ws.serializeAttachment({
                 ...attachment,
                 lastCookie: msg.resumeFromCookie ?? baseCookie,
+                ...(msg.resumeFromCookie !== undefined ? { resumeRefetchPendingSubIds: [] } : {}),
             } satisfies VerifiedGwAttachment);
             const welcome: Down = {
                 t: "welcome",
@@ -3908,6 +3911,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
             ...(latest.lastCookie !== undefined ? { lastCookie: latest.lastCookie } : {}),
             ...(latest.presenceKeys !== undefined ? { presenceKeys: latest.presenceKeys } : {}),
             ...(latest.snapshotSubIds !== undefined ? { snapshotSubIds: latest.snapshotSubIds } : {}),
+            ...(latest.resumeRefetchPendingSubIds !== undefined
+                ? { resumeRefetchPendingSubIds: latest.resumeRefetchPendingSubIds }
+                : {}),
         } satisfies VerifiedGwAttachment);
         try {
             const retirementAt = this.gatewayNowMs();
@@ -4037,6 +4043,27 @@ export class Gateway extends DurableObject<GatewayEnv> {
         } catch (error) {
             this.sendError(ws, error instanceof CdbError ? error.code : "CDB_INVARIANT", msg.subId);
             return;
+        }
+        const resumeRefetchPendingSubIds = attachment.resumeRefetchPendingSubIds;
+        if (resumeRefetchPendingSubIds !== undefined) {
+            if (!resumeRefetchPendingSubIds.includes(msg.subId)) {
+                if (resumeRefetchPendingSubIds.length >= MAX_INITIAL_SNAPSHOTS_PER_CONNECTION) {
+                    this.sendError(ws, "CDB_RATE_LIMITED", msg.subId);
+                    return;
+                }
+                ws.serializeAttachment({
+                    ...attachment,
+                    resumeRefetchPendingSubIds: [...resumeRefetchPendingSubIds, msg.subId]
+                        .sort((left, right) => left - right)
+                        .map(SubId),
+                } satisfies VerifiedGwAttachment);
+                this.send(ws, { t: "mustRefetch", subIds: [msg.subId], reason: "lagged" });
+                return;
+            }
+            ws.serializeAttachment({
+                ...attachment,
+                resumeRefetchPendingSubIds: resumeRefetchPendingSubIds.filter(subId => subId !== msg.subId),
+            } satisfies VerifiedGwAttachment);
         }
         const operationKey = `${attachment.connectionId}:${msg.subId}`;
         const previous = this.pendingSubscriptions.get(operationKey);
@@ -4465,13 +4492,20 @@ export class Gateway extends DurableObject<GatewayEnv> {
             isVerifiedAttachment(current) &&
             current.connectionId === att.connectionId &&
             current.clientId === att.clientId &&
-            current.principalId === att.principalId &&
-            current.snapshotSubIds?.includes(msg.subId)
+            current.principalId === att.principalId
         ) {
-            ws.serializeAttachment({
-                ...current,
-                snapshotSubIds: current.snapshotSubIds.filter(subId => subId !== msg.subId),
-            } satisfies VerifiedGwAttachment);
+            const snapshotSubIds = current.snapshotSubIds?.filter(subId => subId !== msg.subId);
+            const resumeRefetchPendingSubIds = current.resumeRefetchPendingSubIds?.filter(subId => subId !== msg.subId);
+            if (
+                snapshotSubIds?.length !== current.snapshotSubIds?.length ||
+                resumeRefetchPendingSubIds?.length !== current.resumeRefetchPendingSubIds?.length
+            ) {
+                ws.serializeAttachment({
+                    ...current,
+                    ...(snapshotSubIds !== undefined ? { snapshotSubIds } : {}),
+                    ...(resumeRefetchPendingSubIds !== undefined ? { resumeRefetchPendingSubIds } : {}),
+                } satisfies VerifiedGwAttachment);
+            }
         }
     }
 

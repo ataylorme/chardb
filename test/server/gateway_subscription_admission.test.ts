@@ -5,6 +5,7 @@ import {
     Gateway,
     type GatewayEnv,
     type GatewayRegistrationInstall,
+    MAX_INITIAL_SNAPSHOTS_PER_CONNECTION,
     type VerifiedGwAttachment,
     installGatewayRegistration,
 } from "../../src/server/do/gateway.ts";
@@ -266,6 +267,42 @@ describe("Gateway aggregate live-query admission", () => {
         expect(calls).toBe(1);
         expect(replacement.sent).toEqual([]);
         expect(db.query("SELECT COUNT(*) AS count FROM _gw_registration_heads").get()).toEqual({ count: 256 });
+    });
+
+    test("requires one bounded refetch round trip before admitting a resumed subscription", async () => {
+        const held = holdSettlements();
+        const socket = new FakeSocket({ ...attachment(0), resumeRefetchPendingSubIds: [] });
+
+        await subscribe(gateway, socket, 7);
+        expect(held.calls()).toBe(0);
+        expect(socket.attachment.resumeRefetchPendingSubIds).toEqual([SubId(7)]);
+        expect(JSON.parse(socket.sent.at(-1) as string)).toEqual({
+            t: "mustRefetch",
+            subIds: [7],
+            reason: "lagged",
+        });
+        expect(db.query("SELECT COUNT(*) AS count FROM _gw_registration_heads").get()).toEqual({ count: 0 });
+
+        const replacement = subscribe(gateway, socket, 7);
+        expect(held.calls()).toBe(1);
+        expect(socket.attachment.resumeRefetchPendingSubIds).toEqual([]);
+        held.releases[0]?.();
+        await replacement;
+
+        socket.attachment = {
+            ...socket.attachment,
+            resumeRefetchPendingSubIds: Array.from({ length: MAX_INITIAL_SNAPSHOTS_PER_CONNECTION }, (_, subId) =>
+                SubId(subId)
+            ),
+        };
+        await subscribe(gateway, socket, MAX_INITIAL_SNAPSHOTS_PER_CONNECTION);
+        expect(held.calls()).toBe(1);
+        expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
+            t: "error",
+            subId: MAX_INITIAL_SNAPSHOTS_PER_CONNECTION,
+            code: "CDB_RATE_LIMITED",
+            retryable: true,
+        });
     });
 
     test("releases durable capacity as soon as unsubscribe retires the current head", async () => {

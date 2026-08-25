@@ -130,7 +130,9 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
     let terminated = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectBackoff = RECONNECT_INITIAL_BACKOFF_MS;
-    let lastDisconnectAt = 0;
+    const resumeRetainedSubs = new Map<number, SubRecord>();
+    let resumeExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+    let resumeExpiryCookie: Cookie | undefined;
     let started = false;
     let connectionAttempt = 0;
 
@@ -261,20 +263,69 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         }
     }
 
+    function releaseResumeRetainedSub(subId: SubId, sub: SubRecord): void {
+        if (resumeRetainedSubs.get(subId) !== sub) return;
+        resumeRetainedSubs.delete(subId);
+        if (resumeRetainedSubs.size === 0 && resumeExpiryTimer !== null) {
+            clearTimeout(resumeExpiryTimer);
+            resumeExpiryTimer = null;
+            resumeExpiryCookie = undefined;
+        }
+    }
+
+    function beginResumeExpiry(): void {
+        if (lastCookie === undefined || resumeExpiryTimer !== null) return;
+        for (const [subId, sub] of subs) {
+            if (
+                sub.rows.length > 0 ||
+                sub.optimisticPatches.length > 0 ||
+                sub.lastSnapshotCookie !== undefined ||
+                sub.state === "live"
+            ) {
+                resumeRetainedSubs.set(subId, sub);
+            }
+        }
+        if (resumeRetainedSubs.size === 0) return;
+        resumeExpiryCookie = lastCookie;
+        resumeExpiryTimer = setTimeout(expireRetainedResumeState, RECONNECT_RYW_WINDOW_MS);
+    }
+
+    function expireRetainedResumeState(): void {
+        resumeExpiryTimer = null;
+        const retained = [...resumeRetainedSubs];
+        const retainedRecords = new Set(retained.map(([, sub]) => sub));
+        const hasAuthoritativeStateOutsideExpiry = [...subs.values()].some(
+            sub => !retainedRecords.has(sub) && (sub.state === "live" || sub.lastSnapshotCookie !== undefined)
+        );
+        const cookieAdvanced = lastCookie !== undefined && lastCookie !== resumeExpiryCookie;
+        if (!cookieAdvanced && !hasAuthoritativeStateOutsideExpiry) lastCookie = undefined;
+        else if (!cookieAdvanced) lastCookie = resumeExpiryCookie;
+        resumeExpiryCookie = undefined;
+        resumeRetainedSubs.clear();
+        for (const [subId, sub] of retained) {
+            if (terminated) return;
+            if (subs.get(subId) !== sub) continue;
+            sub.state = "refetching";
+            sub.rows = [];
+            sub.optimisticPatches = [];
+            sub.lastSnapshotCookie = undefined;
+            try {
+                notify(sub);
+            } catch {
+                failSession("CDB_INVARIANT", "subscription listener failed during reconnect refetch");
+                return;
+            }
+        }
+    }
+
     function onClose(): void {
         if (state === "closed") return;
         state = "reconnecting";
-        lastDisconnectAt = Date.now();
+        beginResumeExpiry();
         for (const m of pending.values()) m.inFlight = false;
         if (reconnectTimer === null) {
             reconnectTimer = setTimeout(() => {
                 reconnectTimer = null;
-                const since = Date.now() - lastDisconnectAt;
-                if (since > RECONNECT_RYW_WINDOW_MS) {
-                    // Outside the cookie-carryover window — drop cookie so the server
-                    // emits mustRefetch{lagged} cleanly.
-                    lastCookie = undefined;
-                }
                 reconnectBackoff = Math.min(reconnectBackoff * 2, RECONNECT_MAX_BACKOFF_MS);
                 startConnect();
             }, reconnectBackoff);
@@ -312,7 +363,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                     failSession("CDB_UNSUPPORTED_FEATURE", "server selected an unsupported Chardb protocol version");
                     return;
                 }
-                lastCookie = msg.baseCookie;
+                lastCookie = msg.resumedFromCookie ?? msg.baseCookie;
                 state = "open";
                 reconnectBackoff = RECONNECT_INITIAL_BACKOFF_MS;
                 sendSessionState();
@@ -341,6 +392,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                 const sub = subs.get(msg.subId);
                 if (!sub) return;
                 if (sub.lastSnapshotCookie === msg.cookie) {
+                    releaseResumeRetainedSub(msg.subId, sub);
                     acknowledgeSnapshot(msg.cookie);
                     return;
                 }
@@ -355,6 +407,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                 sub.optimisticPatches = next.optimisticPatches;
                 sub.lastSnapshotCookie = msg.cookie;
                 sub.state = "live";
+                releaseResumeRetainedSub(msg.subId, sub);
                 notify(sub);
                 acknowledgeSnapshot(msg.cookie);
                 return;
@@ -371,14 +424,18 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                     sub.rows = [];
                     sub.optimisticPatches = [];
                     sub.lastSnapshotCookie = undefined;
+                    releaseResumeRetainedSub(subId, sub);
                     notify(sub);
+                    if (terminated || subs.get(subId) !== sub) continue;
+                    const socket = ws;
+                    if (!socket || state !== "open" || socket.readyState !== WebSocket.OPEN) continue;
                     const up: Up = {
                         t: "sub",
                         subId: sub.subId,
                         ref: sub.ref,
                         args: sub.args,
                     };
-                    ws?.send(encodeWire(up));
+                    socket.send(encodeWire(up));
                 }
                 return;
             case "error":
@@ -543,6 +600,8 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                 sub.state = "error";
                 sub.rows = [];
                 sub.optimisticPatches = [];
+                sub.lastSnapshotCookie = undefined;
+                releaseResumeRetainedSub(subId, sub);
                 notify(sub);
             }
         }
@@ -572,6 +631,12 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
         }
+        if (resumeExpiryTimer !== null) {
+            clearTimeout(resumeExpiryTimer);
+            resumeExpiryTimer = null;
+        }
+        resumeExpiryCookie = undefined;
+        resumeRetainedSubs.clear();
         const subscriptions = [...subs.values()];
         subs.clear();
         for (const sub of subscriptions) {
@@ -655,6 +720,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         return {
             unsubscribe() {
                 if (!subs.delete(subId)) return;
+                releaseResumeRetainedSub(subId, rec);
                 if (ws && state === "open") {
                     const up: Up = { t: "unsub", subId };
                     try {
