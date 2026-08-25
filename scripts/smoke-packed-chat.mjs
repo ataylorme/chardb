@@ -256,6 +256,19 @@ async function main() {
             `second session did not start in demo-org: ${JSON.stringify(secondSessionBody)}`
         );
         const secondUserId = secondSessionBody.user.id;
+        const demoMembersResponse = await mf.dispatchFetch(
+            new URL("/api/auth/organization/list-members?organizationId=demo-org", origin),
+            { headers: { cookie } }
+        );
+        const demoMembers = await demoMembersResponse.json();
+        assert(
+            demoMembersResponse.ok &&
+                demoMembers?.total === 2 &&
+                Array.isArray(demoMembers?.members) &&
+                demoMembers.members.some(member => member.userId === sessionBody.user.id) &&
+                demoMembers.members.some(member => member.userId === secondUserId),
+            `demo organization membership lookup failed: ${JSON.stringify(demoMembers)}`
+        );
         const secondTokenResponse = await mf.dispatchFetch(new URL("/api/auth/token", origin), {
             headers: { cookie: secondCookie },
         });
@@ -463,6 +476,38 @@ async function main() {
             `second tenant snapshot was not isolated: ${JSON.stringify(isolatedSnapshot)}`
         );
         isolated.socket.send(JSON.stringify({ t: "ack", cookie: isolatedSnapshot.cookie }));
+
+        const isolationMembersResponse = await mf.dispatchFetch(
+            new URL(`/api/auth/organization/list-members?organizationId=${isolationOrganization.id}`, origin),
+            { headers: { cookie: secondCookie } }
+        );
+        const isolationMembers = await isolationMembersResponse.json();
+        assert(
+            isolationMembersResponse.ok &&
+                isolationMembers?.total === 1 &&
+                isolationMembers?.members?.[0]?.userId === secondUserId,
+            `isolated organization membership lookup failed: ${JSON.stringify(isolationMembers)}`
+        );
+
+        for (const sessionCookie of [cookie, secondCookie]) {
+            const signOut = await mf.dispatchFetch(new URL("/api/auth/sign-out", origin), {
+                method: "POST",
+                headers: { "content-type": "application/json", cookie: sessionCookie, origin: origin.origin },
+                body: "{}",
+            });
+            const signOutBody = await signOut.json();
+            assert(
+                signOut.ok && signOutBody?.success === true,
+                `packed sign-out failed: ${JSON.stringify(signOutBody)}`
+            );
+            const signedOutSession = await mf.dispatchFetch(new URL("/api/auth/get-session", origin), {
+                headers: { cookie: sessionCookie },
+            });
+            assert(
+                signedOutSession.ok && (await signedOutSession.json()) === null,
+                "signed-out packed session remained active"
+            );
+        }
         console.log(`packed chat proof passed with chardb ${installed.version}`);
     } finally {
         try {
