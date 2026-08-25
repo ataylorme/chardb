@@ -1258,7 +1258,7 @@ describe("public durable live queries in real workerd", () => {
     test(
         "scaled SDK selective subscription refresh stays exact",
         async () => {
-            if (!mutationRef || !queryRef) throw new Error("live fixture refs were not seeded");
+            if (!mf || !mutationRef || !queryRef) throw new Error("live fixture was not initialized");
             const writeRef = mutationRef;
             const readRef = queryRef;
             const clientId = "bench-select-0001";
@@ -1268,6 +1268,7 @@ describe("public durable live queries in real workerd", () => {
             const bodies = observers.map((_, index) => `sdk-scale-filter-${index.toString().padStart(3, "0")}`);
             let writeMs = 0;
             let refreshMs = 0;
+            let reconstructionMs = 0;
             const registrationStartedAt = performance.now();
             try {
                 for (let index = 0; index < observers.length; index++) {
@@ -1290,6 +1291,29 @@ describe("public durable live queries in real workerd", () => {
                     )
                 );
                 const registrationMs = performance.now() - registrationStartedAt;
+
+                const gatewayBeforeReconstruction = await gatewayState(clientId);
+                const cdbBeforeReconstruction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                const activeBeforeReconstruction = cdbBeforeReconstruction.subscriptions.filter(
+                    row => row.clientId === clientId && row.state === "active"
+                );
+                expect(activeBeforeReconstruction).toHaveLength(SCALE_SUBSCRIPTIONS);
+                expect(new Set(activeBeforeReconstruction.map(row => `${row.registrationId}:${row.subId}`)).size).toBe(
+                    SCALE_SUBSCRIPTIONS
+                );
+
+                const reconstructionStartedAt = performance.now();
+                await mf.unsafeEvictDurableObject(WORKER_NAME, "Cdb", { name: shardId });
+                const cdbAfterReconstruction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                reconstructionMs = performance.now() - reconstructionStartedAt;
+                expect(cdbAfterReconstruction.instanceId).not.toBe(cdbBeforeReconstruction.instanceId);
+                expect(
+                    cdbAfterReconstruction.subscriptions.filter(
+                        row => row.clientId === clientId && row.state === "active"
+                    )
+                ).toEqual(activeBeforeReconstruction);
+                expect(cdbAfterReconstruction.invalidations).toEqual(cdbBeforeReconstruction.invalidations);
+                expect(await gatewayState(clientId)).toEqual(gatewayBeforeReconstruction);
 
                 for (let round = 0; round < SCALE_REFRESH_ROUNDS; round++) {
                     const jobs = bodies.map((body, index) => ({
@@ -1364,6 +1388,9 @@ describe("public durable live queries in real workerd", () => {
                         writes,
                         registrationMs: Number(registrationMs.toFixed(2)),
                         registrationsPerSecond: rate(SCALE_SUBSCRIPTIONS, registrationMs),
+                        reconstructionMs: Number(reconstructionMs.toFixed(2)),
+                        recoveredRegistrations: SCALE_SUBSCRIPTIONS,
+                        recoveredRegistrationsPerSecond: rate(SCALE_SUBSCRIPTIONS, reconstructionMs),
                         writeMs: Number(writeMs.toFixed(2)),
                         writesPerSecond: rate(writes, writeMs),
                         refreshMs: Number(refreshMs.toFixed(2)),
