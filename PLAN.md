@@ -90,13 +90,14 @@ Online schema changes can wait. A maintenance-mode migration is enough for the f
 
 ## 4. Simplify and fix auth storage
 
-The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lookups no longer depend on a shard partition column. Catalog now renders constraint-complete table and index DDL from the synthesized schema. Existing tables must carry the matching `auth_ddl_v1` signature; there is no versioned upgrade path. Each auth mutation and every directly derivable old and new global, tenant, or principal epoch bump commit in one Catalog transaction. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. The packed chat smoke separately proves the Better Auth HTTP anonymous sign-in, session, demo organization hook, token, and domain path. A configured Catalog workerd test proves stored auth rows and organization authority survive reconstruction. Broader auth workflows and versioned auth migrations remain open.
+The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lookups no longer depend on a shard partition column. Catalog now renders constraint-complete table and index DDL from the synthesized schema. Existing tables must carry the matching `auth_ddl_v1` signature; there is no versioned upgrade path. Each auth mutation and every directly derivable old and new global, tenant, or principal epoch bump commit in one Catalog transaction. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. The packed chat smoke proves anonymous sign-in, session lookup, organization creation and selection, bounded membership lookup, JWT issue, domain access, and logout through the configured organization plugin. A configured Catalog workerd test proves stored auth rows and organization authority survive reconstruction. Versioned auth migrations remain open.
 
 - [x] Put all Better Auth tables in Catalog for the first working version.
 - [x] Remove auth sharding from the adapter and Cdb storage path.
 - [x] Bind the auth runtime during application-module initialization in every Worker and Durable Object isolate, and let Catalog retry auth-table bootstrap if it started before that binding.
 - [x] Test create and routine lookup by email, session token, provider/account key, and membership field, plus update, delete, rollback, and same-storage Catalog reconstruction in a Bun fake-Durable-Object harness.
 - [x] Route Better Auth counts through a Catalog `COUNT(*)` RPC instead of materializing matching rows. Reuse the adapter's `eq` and `AND` validation, model and column checks, and bound equality predicates.
+- [x] Support the organization plugin's bounded `in` user lookup through parameterized Catalog SQL. Accept at most 256 values, return no rows for an empty list, and keep auth writes equality-only.
 - [x] Forward Better Auth `findMany` offset and sort through Catalog. Map model fields to schema column names, support validated ascending and descending order, add `id ASC` as the tie-breaker and paging default, and bind validated non-negative safe-integer limits and offsets.
 - [x] Make Better Auth single `update` and `delete` select the lowest matching schema-mapped id and mutate only that row. Treat an empty predicate or no match as a no-op, while leaving `updateMany` and `deleteMany` as all-match operations, including for an empty predicate.
 - [x] Implement Better Auth `incrementOne` as one atomic Catalog transaction. Resolve customized model and field names without collision, select the deterministic lowest matching id, repeat the guard on update, enforce mutation budgets, and bump epochs only after a successful write.
@@ -108,10 +109,10 @@ The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lo
 - [x] Preflight auth bulk updates and deletes at 4,096 matched rows, 512 KiB of projected old and replacement scope values, and 512 KiB of mapped replacement values expanded across matched rows. Select only epoch-scope columns, fail with retryable `CDB_RATE_LIMITED` before base or epoch writes, and let `updateMany` skip full-row rereads.
 - [x] Make date and boolean serialization agree with the adapter's capability claims.
 - [ ] Implement adapter transactions for multi-write auth operations, or state and enforce the smaller supported auth profile.
-- [ ] Add integration tests for sign-up or anonymous sign-in, session lookup by token, organization creation, membership lookup, active organization selection, and logout.
+- [x] Add integration tests for anonymous sign-in, session lookup by token, organization creation, membership lookup, active organization selection, and logout.
 - [x] Prove one Better Auth anonymous sign-in, session lookup, demo organization hook execution, JWT issue, and domain mutation in the clean packed chat consumer. Prove repeated-session idempotency in focused bootstrap tests.
 - [x] Add a configured workerd test that creates a user, session, organization, and member, evicts the Catalog Durable Object, proves a new instance started, and reads identical stored auth rows plus canonical organization authority after reconstruction.
-- [ ] Add one configured Better Auth plugin only after the core flow works.
+- [x] Exercise the configured Better Auth organization plugin through the clean packed consumer.
 
 ## 5. Make authentication a real trust boundary
 
