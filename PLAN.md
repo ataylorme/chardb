@@ -191,7 +191,7 @@ Protocol v3 subscription requests send a query reference and raw arguments. Quer
 - [x] At each supported full-row query execution, record the actual typed predicate with the row-policy floor and require each declared interval bundle's union to contain every observed range for its table and index.
 - [x] Connect public authorized registration to `onSub`, installing the exact Gateway generation before `Cdb.subscribe` and pre-arming durable recovery before the RPC.
 - [x] Rebuild 4,096 active Cdb registrations incrementally from the storage cursor. Keep a legacy active row with over-limit arguments in its table and interval maps so invalidation still reaches it, but reject its registered execution with terminal `CDB_INVALID_ARGS` before the handler.
-- [ ] Add dedicated Gateway snapshot-runner integration coverage for terminal execution of a reconstructed legacy registration with over-limit arguments.
+- [x] Add dedicated configured Gateway snapshot-runner coverage for a reconstructed legacy registration with over-limit arguments. Keep the Cdb row active and table-mapped through reconstruction, invalidate it with a real mutation, return terminal `CDB_INVALID_ARGS`, retire the Gateway head, and complete exact Cdb cleanup.
 
 ## 8. Implement live updates with simple invalidation first
 
@@ -315,7 +315,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Remove placeholder React hooks from public exports until implemented.
 - [x] Remove placeholder file and vector APIs from the main product description.
 - [x] Run each workerd harness in a separate sequential CI process to avoid shared Miniflare ports.
-- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 7/7 including the aggregate registration boundary and two default-small scale scenarios, `gateway-jwt` 22/22, and `gateway-snapshot` 3/3. Give the snapshot recovery cases 15-second test budgets. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
+- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 7/7 including the aggregate registration boundary and two default-small scale scenarios, `gateway-jwt` 22/22, and `gateway-snapshot` 4/4. Give the snapshot recovery cases 15-second test budgets. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
 - [ ] Add one command that starts the example locally with migrations applied.
 
 ## 12. Fix package and repository hygiene
