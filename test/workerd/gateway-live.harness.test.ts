@@ -1262,13 +1262,13 @@ describe("public durable live queries in real workerd", () => {
             const writeRef = mutationRef;
             const readRef = queryRef;
             const clientId = "bench-select-0001";
-            const client = await createSdkClient(clientId, "workerd-user");
-            const subscriptions: Array<{ unsubscribe: () => void }> = [];
-            const observers = Array.from({ length: SCALE_SUBSCRIPTIONS }, () => createQueryObserver());
+            let client = await createSdkClient(clientId, "workerd-user");
+            let subscriptions: Array<{ unsubscribe: () => void }> = [];
+            let observers = Array.from({ length: SCALE_SUBSCRIPTIONS }, () => createQueryObserver());
             const bodies = observers.map((_, index) => `sdk-scale-filter-${index.toString().padStart(3, "0")}`);
             let writeMs = 0;
             let refreshMs = 0;
-            let reconstructionMs = 0;
+            let recoveryMs = 0;
             const registrationStartedAt = performance.now();
             try {
                 for (let index = 0; index < observers.length; index++) {
@@ -1301,11 +1301,11 @@ describe("public durable live queries in real workerd", () => {
                 expect(new Set(activeBeforeReconstruction.map(row => `${row.registrationId}:${row.subId}`)).size).toBe(
                     SCALE_SUBSCRIPTIONS
                 );
+                const priorRegistrationIds = new Set(activeBeforeReconstruction.map(row => row.registrationId));
 
                 const reconstructionStartedAt = performance.now();
                 await mf.unsafeEvictDurableObject(WORKER_NAME, "Cdb", { name: shardId });
                 const cdbAfterReconstruction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
-                reconstructionMs = performance.now() - reconstructionStartedAt;
                 expect(cdbAfterReconstruction.instanceId).not.toBe(cdbBeforeReconstruction.instanceId);
                 expect(
                     cdbAfterReconstruction.subscriptions.filter(
@@ -1314,6 +1314,53 @@ describe("public durable live queries in real workerd", () => {
                 ).toEqual(activeBeforeReconstruction);
                 expect(cdbAfterReconstruction.invalidations).toEqual(cdbBeforeReconstruction.invalidations);
                 expect(await gatewayState(clientId)).toEqual(gatewayBeforeReconstruction);
+
+                await cleanupSdkClient(clientId, client, subscriptions);
+                subscriptions = [];
+                await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", {
+                    name: clientId.slice(0, 12),
+                });
+                client = await createSdkClient(clientId, "workerd-user");
+                observers = Array.from({ length: SCALE_SUBSCRIPTIONS }, () => createQueryObserver());
+                for (let index = 0; index < observers.length; index++) {
+                    subscriptions.push(
+                        client.subscribe<ScaleRow>(
+                            readRef,
+                            { organizationId: ORGANIZATION_A, body: bodies[index] as string },
+                            (observers[index] as QueryObserver).listener
+                        )
+                    );
+                }
+                await drainUntilSettled(clientId, subIds);
+                await Promise.all(
+                    observers.map((observer, index) =>
+                        observer.waitFor(
+                            observation => observation.state === "live" && observation.rows.length === 0,
+                            `selective subscription ${index} recovery snapshot`
+                        )
+                    )
+                );
+                const gatewayAfterRecovery = await gatewayState(clientId);
+                const recoveredHeads = gatewayAfterRecovery.registrations.filter(row => row.currentHead);
+                const cdbAfterRecovery = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                const recoveredCdbRegistrations = cdbAfterRecovery.subscriptions.filter(
+                    row => row.clientId === clientId && row.state === "active"
+                );
+                recoveryMs = performance.now() - reconstructionStartedAt;
+                expect(gatewayAfterRecovery.instanceId).not.toBe(gatewayBeforeReconstruction.instanceId);
+                expect(recoveredHeads).toHaveLength(SCALE_SUBSCRIPTIONS);
+                expect(recoveredHeads.every(row => row.lifecycle === "active" && row.cdbState === "active")).toBe(true);
+                expect(recoveredCdbRegistrations).toHaveLength(SCALE_SUBSCRIPTIONS);
+                expect(recoveredCdbRegistrations.every(row => !priorRegistrationIds.has(row.registrationId))).toBe(
+                    true
+                );
+                expect(new Set(recoveredCdbRegistrations.map(row => `${row.registrationId}:${row.subId}`)).size).toBe(
+                    SCALE_SUBSCRIPTIONS
+                );
+                expect(recoveredCdbRegistrations.map(row => `${row.registrationId}:${row.subId}`).sort()).toEqual(
+                    recoveredHeads.map(row => `${row.registrationId}:${row.subId}`).sort()
+                );
+                expect(cdbAfterRecovery.invalidations).toEqual([]);
 
                 for (let round = 0; round < SCALE_REFRESH_ROUNDS; round++) {
                     const jobs = bodies.map((body, index) => ({
@@ -1388,9 +1435,9 @@ describe("public durable live queries in real workerd", () => {
                         writes,
                         registrationMs: Number(registrationMs.toFixed(2)),
                         registrationsPerSecond: rate(SCALE_SUBSCRIPTIONS, registrationMs),
-                        reconstructionMs: Number(reconstructionMs.toFixed(2)),
+                        recoveryMs: Number(recoveryMs.toFixed(2)),
                         recoveredRegistrations: SCALE_SUBSCRIPTIONS,
-                        recoveredRegistrationsPerSecond: rate(SCALE_SUBSCRIPTIONS, reconstructionMs),
+                        recoveredRegistrationsPerSecond: rate(SCALE_SUBSCRIPTIONS, recoveryMs),
                         writeMs: Number(writeMs.toFixed(2)),
                         writesPerSecond: rate(writes, writeMs),
                         refreshMs: Number(refreshMs.toFixed(2)),
