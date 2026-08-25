@@ -216,7 +216,11 @@ describe("workerd Catalog barrier flow", () => {
         }
 
         const queryOne = async (model: string, where: Record<string, string>): Promise<AuthRow> => {
-            const rows = (await call("queryAuth", { model, where, limit: 1 })) as readonly AuthRow[];
+            const rows = (await call("queryAuth", {
+                model,
+                where: Object.entries(where).map(([field, value]) => ({ field, operator: "eq", value })),
+                limit: 1,
+            })) as readonly AuthRow[];
             expect(rows).toHaveLength(1);
             const row = rows[0];
             if (!row) throw new Error(`missing stored ${model} row`);
