@@ -989,7 +989,7 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
             (await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId })).subscriptions.find(
                 row => row.registrationId === installed.registrationId
             )
-        ).toMatchObject({ state: "retired" });
+        ).toBeUndefined();
 
         opened.socket.close();
         await opened.closed;
