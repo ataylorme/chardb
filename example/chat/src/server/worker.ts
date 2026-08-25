@@ -1,6 +1,7 @@
 import { anonymous } from "better-auth/plugins/anonymous";
 import { jwt } from "better-auth/plugins/jwt";
 import type { DBAdapter, Session } from "better-auth/types";
+import { client } from "chardb";
 import { chardb, defineAuth, defineMigrations, defineSchemaBaseline } from "chardb/server";
 import * as api from "./api.ts";
 import * as queries from "./queries.ts";
@@ -106,6 +107,34 @@ export const app = chardb({ auth, schema: domain, api: { ...api, ...queries }, m
 
 app.get("/health", c => c.text("ok"));
 app.get("/api/version", c => c.json({ name: "chardb-chat-example", version: "0.1.0" }));
+app.get("/api/db/messages", async c => {
+    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
+    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
+    const url = new URL(c.req.url);
+    const rows = await client(c.env.DB, { jwt, authOrigin: url.origin }).query(queries.listMessages, {
+        organizationId: url.searchParams.get("organizationId") ?? "",
+        channelId: url.searchParams.get("channelId") ?? "",
+        limit: Number(url.searchParams.get("limit") ?? 50),
+    });
+    return c.json(rows);
+});
+app.post("/api/db/messages", async c => {
+    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
+    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
+    const url = new URL(c.req.url);
+    const body = await c.req.json<{
+        id: string;
+        organizationId: string;
+        channelId: string;
+        body: string;
+        clientCreatedAt: number;
+        mutId?: string;
+    }>();
+    const result = await client(c.env.DB, { jwt, authOrigin: url.origin }).mutate(api.postMessage, body, {
+        ...(body.mutId ? { mutId: body.mutId } : {}),
+    });
+    return c.json(result);
+});
 
 export default app;
-export const { BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;
+export const { DB, BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;

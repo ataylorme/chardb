@@ -9,6 +9,15 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CHAT = join(ROOT, "example", "chat");
 const tarball = resolve(process.argv[2] ?? "");
 const ADMIN_TOKEN = "packed-chat-migration-secret";
+const BINDING_BENCHMARK_PROFILES = {
+    "ci-smoke": { queries: 32, concurrency: 8 },
+    throughput: { queries: 256, concurrency: 32 },
+};
+const bindingBenchmarkProfileName = process.env.CDB_BINDING_BENCH_PROFILE ?? "ci-smoke";
+const bindingBenchmarkProfile = BINDING_BENCHMARK_PROFILES[bindingBenchmarkProfileName];
+if (!bindingBenchmarkProfile) {
+    throw new Error(`unknown CDB_BINDING_BENCH_PROFILE ${JSON.stringify(bindingBenchmarkProfileName)}`);
+}
 const LOOPBACK_DURABLE_OBJECTS = {
     Catalog: { className: "Catalog", useSQLite: true },
     Gateway: { className: "Gateway", useSQLite: true },
@@ -37,6 +46,10 @@ function run(command, args, cwd, env = {}, stdio = ["ignore", "pipe", "pipe"]) {
 
 function assert(condition, message) {
     if (!condition) throw new Error(message);
+}
+
+function percentile(sorted, fraction) {
+    return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)];
 }
 
 function sessionCookies(headers) {
@@ -387,6 +400,129 @@ async function main() {
         socket.send(JSON.stringify({ t: "ack", cookie: replacement.cookie }));
         observer.socket.send(JSON.stringify({ t: "ack", cookie: observerReplacement.cookie }));
 
+        const bindingQueryUrl = new URL("/api/db/messages?organizationId=demo-org&channelId=general&limit=50", origin);
+        const bindingQuery = await mf.dispatchFetch(bindingQueryUrl, {
+            headers: { authorization: `Bearer ${tokenBody.token}` },
+        });
+        const bindingRows = await bindingQuery.json();
+        assert(
+            bindingQuery.ok &&
+                Array.isArray(bindingRows) &&
+                bindingRows.length === 1 &&
+                bindingRows[0]?.id === "packed-message-1",
+            `native env.DB query failed: ${JSON.stringify(bindingRows)}`
+        );
+
+        const bindingMutation = await mf.dispatchFetch(new URL("/api/db/messages", origin), {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${tokenBody.token}`,
+                "content-type": "application/json",
+            },
+            body: JSON.stringify({
+                id: "packed-binding-message-2",
+                organizationId: "demo-org",
+                channelId: "general",
+                body: "env.DB hello",
+                clientCreatedAt: 2,
+                mutId: "packed-binding-mut-2",
+            }),
+        });
+        const bindingMutationBody = await bindingMutation.json();
+        assert(
+            bindingMutation.ok && bindingMutationBody?.id === "packed-binding-message-2",
+            `native env.DB mutation failed: ${JSON.stringify(bindingMutationBody)}`
+        );
+        const bindingReplacement = await next(
+            message =>
+                (message.t === "snapshot" && message.subId === 1 && message.rows.length === 2) || message.t === "error"
+        );
+        const observerBindingReplacement = await observer.next(
+            message =>
+                (message.t === "snapshot" && message.subId === 1 && message.rows.length === 2) || message.t === "error"
+        );
+        assert(
+            bindingReplacement.t === "snapshot" &&
+                bindingReplacement.rows.some(row => row.id === "packed-binding-message-2"),
+            `env.DB mutation did not invalidate the live query: ${JSON.stringify(bindingReplacement)}`
+        );
+        assert(
+            observerBindingReplacement.t === "snapshot" &&
+                observerBindingReplacement.rows.some(row => row.id === "packed-binding-message-2"),
+            `env.DB mutation did not reach the second client: ${JSON.stringify(observerBindingReplacement)}`
+        );
+        socket.send(JSON.stringify({ t: "ack", cookie: bindingReplacement.cookie }));
+        observer.socket.send(JSON.stringify({ t: "ack", cookie: observerBindingReplacement.cookie }));
+
+        const bindingReplay = await mf.dispatchFetch(new URL("/api/db/messages", origin), {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${tokenBody.token}`,
+                "content-type": "application/json",
+            },
+            body: JSON.stringify({
+                id: "packed-binding-message-2",
+                organizationId: "demo-org",
+                channelId: "general",
+                body: "env.DB hello",
+                clientCreatedAt: 2,
+                mutId: "packed-binding-mut-2",
+            }),
+        });
+        const bindingReplayBody = await bindingReplay.json();
+        assert(
+            bindingReplay.ok && JSON.stringify(bindingReplayBody) === JSON.stringify(bindingMutationBody),
+            `native env.DB mutation replay changed its result: ${JSON.stringify(bindingReplayBody)}`
+        );
+
+        const queryLatenciesMs = [];
+        const benchmarkStartedAt = performance.now();
+        for (let offset = 0; offset < bindingBenchmarkProfile.queries; offset += bindingBenchmarkProfile.concurrency) {
+            const batchSize = Math.min(bindingBenchmarkProfile.concurrency, bindingBenchmarkProfile.queries - offset);
+            await Promise.all(
+                Array.from({ length: batchSize }, async () => {
+                    const startedAt = performance.now();
+                    const response = await mf.dispatchFetch(bindingQueryUrl, {
+                        headers: { authorization: `Bearer ${tokenBody.token}` },
+                    });
+                    const rows = await response.json();
+                    queryLatenciesMs.push(performance.now() - startedAt);
+                    assert(
+                        response.ok &&
+                            Array.isArray(rows) &&
+                            rows.length === 2 &&
+                            rows.some(row => row.id === "packed-message-1") &&
+                            rows.some(row => row.id === "packed-binding-message-2"),
+                        `native env.DB benchmark query diverged: ${JSON.stringify(rows)}`
+                    );
+                })
+            );
+        }
+        const bindingBenchmarkElapsedMs = performance.now() - benchmarkStartedAt;
+        const sortedQueryLatenciesMs = [...queryLatenciesMs].sort((left, right) => left - right);
+        console.log(
+            JSON.stringify({
+                type: "chardb-binding-benchmark",
+                version: 1,
+                profile: bindingBenchmarkProfileName,
+                queries: bindingBenchmarkProfile.queries,
+                concurrency: bindingBenchmarkProfile.concurrency,
+                elapsedMs: bindingBenchmarkElapsedMs,
+                queriesPerSecond: (bindingBenchmarkProfile.queries * 1_000) / bindingBenchmarkElapsedMs,
+                latencyMs: {
+                    min: sortedQueryLatenciesMs[0],
+                    p50: percentile(sortedQueryLatenciesMs, 0.5),
+                    p95: percentile(sortedQueryLatenciesMs, 0.95),
+                    max: sortedQueryLatenciesMs.at(-1),
+                },
+                invariants: {
+                    exactRowsPerQuery: 2,
+                    mutationReplayStable: true,
+                    liveClientsConverged: 2,
+                },
+            })
+        );
+
         await Promise.all([closeSocket(socket), closeSocket(observer.socket)]);
         await mf.dispose();
         mf = startMiniflare();
@@ -434,8 +570,9 @@ async function main() {
         );
         assert(
             readback.t === "snapshot" &&
-                readback.rows.length === 1 &&
-                readback.rows.filter(row => row.id === "packed-message-1").length === 1,
+                readback.rows.length === 2 &&
+                readback.rows.filter(row => row.id === "packed-message-1").length === 1 &&
+                readback.rows.filter(row => row.id === "packed-binding-message-2").length === 1,
             `readback snapshot failed: ${JSON.stringify(readback)}`
         );
         socket.send(JSON.stringify({ t: "ack", cookie: readback.cookie }));

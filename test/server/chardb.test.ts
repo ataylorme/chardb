@@ -5,7 +5,7 @@
  * pre-built `defineAuth(...)` value (or inline `plugins`/`options`),
  * the user's Drizzle schema, the API refs, a Hono router, and the
  * `mountChardb` reserved-prefix handler. The shape it returns is a
- * Hono instance augmented with the six chardb Durable Object classes,
+ * Hono instance augmented with the DB entrypoint and six chardb Durable Object classes,
  * a lazy merged `.schema`, the `auth` value, and a chardb-mounted
  * `.fetch`.
  *
@@ -20,6 +20,7 @@ import { organization } from "better-auth/plugins/organization";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { defineAuth } from "../../src/auth/synthesize.ts";
+import type { ChardbBinding } from "../../src/binding.ts";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { chardb } from "../../src/server/chardb.ts";
@@ -94,9 +95,34 @@ describe("chardb({…})", () => {
         expect(await res.text()).toBe("world");
     });
 
-    test("the six Durable Object classes are direct fields and runtime classes are configured", () => {
+    test("exposes the native DB loopback as typed Hono environment state", async () => {
+        const app = chardb({ auth, schema: { items } });
+        const db = {
+            async executeQuery() {
+                return { ok: true as const, result: null };
+            },
+            async executeMutation() {
+                return { ok: true as const, cookie: "cookie", ran: true, result: null, rowsAffected: 0 };
+            },
+        } satisfies ChardbBinding;
+        app.get("/binding", c => c.json({ available: c.env.DB === db }));
+        const res = await app.fetch(
+            new Request("https://example.com/binding"),
+            {} as Parameters<typeof app.fetch>[1],
+            {
+                exports: { DB: db },
+                waitUntil() {},
+                passThroughOnException() {},
+                props: undefined,
+            } as unknown as Parameters<typeof app.fetch>[2]
+        );
+        expect((await res.json()) as unknown).toEqual({ available: true });
+    });
+
+    test("the DB entrypoint and six Durable Object classes are direct configured fields", () => {
         const app = chardb({ auth, schema: { items } });
         // Existence + identity — these are the named exports wrangler binds.
+        expect(typeof app.DB).toBe("function");
         expect(typeof app.Cdb).toBe("function");
         expect(app.Cdb).not.toBe(Cdb);
         expect(typeof app.Catalog).toBe("function");

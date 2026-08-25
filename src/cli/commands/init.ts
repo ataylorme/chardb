@@ -175,7 +175,7 @@ export const app = chardb({ auth, schema: domain, api });
 app.get("/health", (c) => c.text("ok"));
 
 export default app;
-export const { BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;
+export const { DB, BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;
 `;
 
 export async function runInit(ctx: CliContext, opts: InitOptions): Promise<void> {

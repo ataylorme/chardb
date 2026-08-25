@@ -14,6 +14,7 @@ export function Today() {
                 items={[
                     "organization routing, membership, row policy, and column policy are enforced together",
                     "mutations are idempotent across reconnects and lost responses",
+                    "the native env.DB binding runs typed server queries and mutations without internal binding config",
                     "live queries survive Gateway and shard reconstruction with exact bounded snapshot replay",
                     "forward maintenance-mode migrations resume from durable progress",
                     "frozen scale profiles prove convergence, isolation, replay, and counter invariants under churn",
@@ -22,7 +23,7 @@ export function Today() {
 
             <p className="mt-8 max-w-2xl text-sm text-fg-muted">
                 This is still experimental software. Files, vectors, general query shapes, automatic resharding, and the
-                one-binding installation model are not supported product paths yet.
+                raw Drizzle-over-RPC builders are not supported product paths yet.
             </p>
 
             <PullQuote>the proof is real. the product is unfinished.</PullQuote>

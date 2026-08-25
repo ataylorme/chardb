@@ -79,6 +79,7 @@ import type {
     MutationRouteResponse,
     TrustedMutationAuth,
     TrustedMutationDispatchRequest,
+    TrustedQueryDispatchRequest,
 } from "../rpc.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
@@ -498,6 +499,12 @@ export interface TrustedMutationDispatchDeps {
     readonly cdb: (shardId: string) => CdbMutationRpc;
 }
 
+export interface TrustedQueryDispatchDeps {
+    readonly routeQuery: (request: { readonly ref: string; readonly args: RawJson }) => Promise<QueryRouteResponse>;
+    readonly catalog: CatalogMutationRpc & CatalogOrganizationAuthorityRpc;
+    readonly cdb: (shardId: string) => CdbQueryRpc;
+}
+
 export interface GatewayRuntimeConfig {
     readonly schema: () => Record<string, unknown>;
     readonly manifest: () => ChardbManifest;
@@ -613,7 +620,7 @@ type CdbQueryRowsResponse =
     | { readonly ok: true; readonly result: readonly RawJson[] }
     | Extract<CdbQueryResponse, { readonly ok: false }>;
 
-function projectCdbQueryRows(value: unknown): CdbQueryRowsResponse {
+export function projectCdbQueryResponse(value: unknown): CdbQueryResponse {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
         return mutationFailure("CDB_INVARIANT", "Cdb returned a malformed query response");
     }
@@ -621,9 +628,6 @@ function projectCdbQueryRows(value: unknown): CdbQueryRowsResponse {
     if (response.ok === true) {
         try {
             const result = rawJsonResult(response.result, "Cdb query result");
-            if (!Array.isArray(result)) {
-                return mutationFailure("CDB_INVARIANT", "organization query result must be an array");
-            }
             return { ok: true, result };
         } catch {
             return mutationFailure("CDB_INVARIANT", "Cdb returned a non-JSON query result");
@@ -634,6 +638,15 @@ function projectCdbQueryRows(value: unknown): CdbQueryRowsResponse {
         return projected.ok ? mutationFailure("CDB_INVARIANT", "Cdb returned a malformed query failure") : projected;
     }
     return mutationFailure("CDB_INVARIANT", "Cdb returned a malformed query response");
+}
+
+function projectCdbQueryRows(value: unknown): CdbQueryRowsResponse {
+    const response = projectCdbQueryResponse(value);
+    if (!response.ok) return response;
+    if (!Array.isArray(response.result)) {
+        return mutationFailure("CDB_INVARIANT", "organization query result must be an array");
+    }
+    return { ok: true, result: response.result };
 }
 
 function isTerminalRegisteredQueryFailure(code: string): boolean {
@@ -2971,6 +2984,111 @@ export async function dispatchTrustedMutation(
         return projectCdbMutationResponse(response);
     } catch {
         return mutationFailure("CDB_SHARD_UNAVAILABLE", "Cdb mutation RPC failed");
+    }
+}
+
+/**
+ * Execute one registered query from an already-verified auth boundary.
+ * Routing metadata comes only from the configured server manifest. Catalog
+ * supplies current organization membership, epochs, and physical placement.
+ */
+export async function dispatchTrustedQuery(
+    deps: TrustedQueryDispatchDeps,
+    request: TrustedQueryDispatchRequest
+): Promise<CdbQueryResponse> {
+    let rawArgs: RawJson;
+    try {
+        rawArgs = snapshotCdbQueryArgs(request.args);
+    } catch (error) {
+        return mutationFailure(
+            error instanceof CdbError ? error.code : "CDB_INVARIANT",
+            error instanceof Error ? error.message : "query argument sizing failed"
+        );
+    }
+
+    let routedResult: QueryRouteResponse;
+    try {
+        routedResult = await deps.routeQuery({ ref: request.ref, args: rawArgs });
+    } catch {
+        return mutationFailure("CDB_INVARIANT", "local query routing failed");
+    }
+    if (!routedResult.ok) return routedResult;
+
+    let routed: Extract<QueryRouteResponse, { readonly ok: true }>;
+    try {
+        routed = { ...routedResult, args: snapshotCdbQueryArgs(routedResult.args) };
+    } catch (error) {
+        return mutationFailure(
+            error instanceof CdbError ? error.code : "CDB_INVARIANT",
+            error instanceof Error ? error.message : "routed query argument sizing failed"
+        );
+    }
+    if (routed.authority !== "organization") {
+        return mutationFailure("CDB_AUTH_NOT_BOUND", "query has no declared organization authority");
+    }
+    const organizationId = routed.partitionKey;
+    const partition = routed.intent.partitionKey;
+    if (
+        !organizationId ||
+        !partition ||
+        partition.values.length === 0 ||
+        routed.intent.joinShape === "cross-partition" ||
+        !partition.values.every(value => typeof value === "string" && value === organizationId)
+    ) {
+        return mutationFailure("CDB_CROSS_PARTITION", "query intent is not bound to one organization partition");
+    }
+    const vshards = new Set(partition.values.map(value => Number(vshardOf([value as string]))));
+    if (vshards.size !== 1) {
+        return mutationFailure("CDB_CROSS_PARTITION", "query intent spans more than one virtual shard");
+    }
+    const vshard = [...vshards][0];
+    if (vshard === undefined) {
+        return mutationFailure("CDB_CROSS_PARTITION", "query intent has no routable virtual shard");
+    }
+
+    let authority: Awaited<ReturnType<CatalogOrganizationAuthorityRpc["resolveOrganizationAuthority"]>>;
+    try {
+        authority = await deps.catalog.resolveOrganizationAuthority({
+            principalId: request.principalId,
+            organizationId: TenantId(organizationId),
+        });
+    } catch {
+        return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog organization authority RPC failed");
+    }
+    const projected = projectOrganizationMutationAuth(authority, {
+        principalId: request.principalId,
+        organizationId: TenantId(organizationId),
+    });
+    if (!projected.ok) return mutationFailure(projected.code, projected.message);
+
+    let location: Awaited<ReturnType<CatalogMutationRpc["route"]>>;
+    try {
+        location = await deps.catalog.route(vshard);
+    } catch {
+        return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog routing RPC failed");
+    }
+    if (
+        typeof location.shardId !== "string" ||
+        location.shardId.length === 0 ||
+        !Number.isSafeInteger(location.schemaEpoch) ||
+        location.schemaEpoch < 0 ||
+        !Number.isSafeInteger(location.domainSchemaEpoch) ||
+        location.domainSchemaEpoch < 1
+    ) {
+        return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog returned a malformed shard route");
+    }
+
+    try {
+        return projectCdbQueryResponse(
+            await deps.cdb(location.shardId).query({
+                ref: request.ref as ChardbRef,
+                args: routed.args,
+                auth: projected.auth,
+                domainSchemaEpoch: location.domainSchemaEpoch,
+            })
+        );
+    } catch {
+        return mutationFailure("CDB_SHARD_UNAVAILABLE", "Cdb query RPC failed");
     }
 }
 

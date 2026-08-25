@@ -35,7 +35,7 @@ export const app = chardb({ auth, schema: domain, api: { ...api, ...queries }, m
 app.get("/health", (c) => c.text("ok"));
 
 export default app;
-export const { BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;
+export const { DB, BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;
 ```
 
 The source shows the composition of auth, schema, API handles, routes, and Durable Object exports used by the packed smoke proof.

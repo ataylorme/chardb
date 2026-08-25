@@ -30,6 +30,7 @@ Implemented and tested in isolation:
 - Schema-first insert, update, delete, and full-row select authorization, including writable-column checks and readable-column masks
 - A fail-closed database wrapper that rejects raw, session, client, plain-table, insert-select, conflict, returning, and unsupported builder paths
 - Read-only shard-local query execution with JSON result validation
+- A native same-Worker `env.DB` RPC binding with typed stable-handle queries and mutations
 - Protocol-v3 snapshot decoding and client replacement handling
 - Durable public registrations and live replacement snapshots for explicit, exact-single-partition organization queries
 - Conservative `cdbTable` dependency checks against each live query's declared table intent
@@ -42,7 +43,7 @@ Implemented and tested in isolation:
 - Persistent composite Gateway, client, and subscription identities on Cdb shards
 - TLA+ models for snapshot barriers and resharding
 - Packed-package import checks and a standalone `chardb init` scaffold
-- A clean-tarball packed chat smoke from anonymous sign-in through organization membership lookup, live replacement, persistent Miniflare restart, session reconstruction, exact mutation replay, one-row readback, organization isolation, and logout
+- A clean-tarball packed chat smoke from anonymous sign-in through native `env.DB` query and mutation RPC, live invalidation, persistent Miniflare restart, exact mutation replay, organization isolation, and logout
 
 Still missing from the application path:
 
@@ -82,7 +83,7 @@ Client subscription and mutation arguments must be strict JSON primitives, dense
 
 After ref validation, the client enforces the limits and constructs an owned copy in one descriptor traversal. It does not invoke getters or enumerate and read a proxy again, so later caller mutation cannot change the admitted request. Both subscribe and mutate complete this work before capacity checks, id allocation, record insertion, or send; mutate also does so before timer creation. Immediate sends, the first welcome flush, and reconnect reuse the stored owned payload and original subscription or mutation id.
 
-Direct `createChardbClient` calls remain eager, and the package exports have not changed. `ChardbProvider` uses an internal deferred controller only for clients it creates, so connection work begins after the provider commits. Aborted renders start no WebSocket, JWT, or broadcast work. StrictMode rehearsal keeps the committed client alive, replacement closes an old owned client once, and a transfer of that same object to the `client` prop cancels its pending close. The provider never closes a borrowed client. `useQuery` validates and owns arguments before canonical identity using the exact 512 KiB UTF-8, 4,096-member, and 99-level strict JSON limits. Invalid arguments fail with `CDB_INVALID_ARGS` without a subscription. Valid queries return `pending` as soon as their client, ref, or canonical owned arguments change and ignore late listener calls from the prior subscription.
+Direct `createChardbClient` calls remain eager. `ChardbProvider` uses an internal deferred controller only for clients it creates, so connection work begins after the provider commits. Aborted renders start no WebSocket, JWT, or broadcast work. StrictMode rehearsal keeps the committed client alive, replacement closes an old owned client once, and a transfer of that same object to the `client` prop cancels its pending close. The provider never closes a borrowed client. `useQuery` validates and owns arguments before canonical identity using the exact 512 KiB UTF-8, 4,096-member, and 99-level strict JSON limits. Invalid arguments fail with `CDB_INVALID_ARGS` without a subscription. Valid queries return `pending` as soon as their client, ref, or canonical owned arguments change and ignore late listener calls from the prior subscription.
 
 With an explicit stable `getJwt`, changing only the provider's `auth` object updates `useSession` context without replacing the owned client, socket, subscriptions, or pending mutations. If the provider derives JWTs from `auth`, an auth-object change replaces the client and closes the old one once.
 
@@ -193,6 +194,46 @@ export const messages = cdbTable(
 
 The organization foreign key identifies the intended transaction and placement boundary. Related rows colocate through their foreign-key chain. Declared organization mutations enforce that boundary by checking the extracted organization against Catalog membership. An explicit organization query crosses the same authority boundary only when its declared partition and developer-declared server-side intent identify that exact organization and one virtual shard. That narrow path registers the query and sends replacement snapshots after matching commits.
 
+## Worker binding
+
+`chardb({ schema, api, auth })` returns the configured public `DB` WorkerEntrypoint beside its internal Durable Object classes. Export it with the app. The generated `wrangler.toml` needs only the standard Durable Object migrations; same-Worker bindings come from Cloudflare's native `ctx.exports`.
+
+```ts
+export const app = chardb({ auth, schema: domain, api });
+
+export default app;
+export const { DB, BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;
+```
+
+Application routes receive the typed binding as `c.env.DB`. The local `client` wrapper keeps function objects inside the Worker and sends only stable refs and bounded JSON over RPC. It requires a Better Auth JWT and the exact issuing origin. The binding verifies the token, resolves current Catalog membership and roles, derives placement from server-owned intent, and executes through the same Cdb mutation or query path used by live traffic.
+
+```ts
+import { client } from "chardb";
+import { postMessage } from "./api.ts";
+import { listMessages } from "./queries.ts";
+
+app.get("/messages", async c => {
+  const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
+  if (!jwt) return c.text("unauthorized", 401);
+
+  const db = client(c.env.DB, {
+    jwt,
+    authOrigin: new URL(c.req.url).origin,
+  });
+  return c.json(await db.query(listMessages, {
+    organizationId: "org-1",
+    channelId: "general",
+    limit: 50,
+  }));
+});
+
+await client(c.env.DB, { jwt, authOrigin }).mutate(postMessage, args, {
+  mutId: requestId,
+});
+```
+
+Pass a stable `mutId` when an outer request may be retried. If omitted, `client` creates a UUID for that invocation. Binding failures throw `CdbError` with the same locked code and retryability contract as the WebSocket client. The current binding accepts registered organization-scoped handles. It does not expose raw Drizzle builders, caller-supplied authority, scatter queries, or cross-partition work.
+
 ## Repository development
 
 Install Bun, then run:
@@ -230,6 +271,8 @@ bun run bench:live -- --profile throughput --samples 5 --output-dir .chardb/benc
 
 The profiles fix the accepted workload and test budgets. `ci-smoke` uses one client per tenant, four mutations per tenant, four selective subscriptions, and two refresh rounds. `client-max-accepted` uses one client per tenant, 32 mutations per tenant in a batch of 32, 64 selective subscriptions, and two rounds. `throughput` uses eight clients per tenant, 1,024 mutations per tenant, 32 subscriptions, and eight rounds. The fanout case commits half its writes, converges every client, closes and recreates half the clients, rematerializes their tenant rows, then finishes the workload. It then drops up to one mutation batch of committed SDK responses. For each lost response, the test holds the replacement connection before `hello`, checks that the first attempt added one domain row, op-log row, and clock step, releases reconnect, and requires the same `mutId` and stored result without another counter change. Every selective-refresh sample reconstructs Cdb with all subscriptions active, verifies the exact registration identities and unchanged Gateway state, closes and recreates the SDK connection, proves that every new Gateway head has the same new identity as its active Cdb registration, then performs the measured writes and materializations. Both scenarios require every successful mutation to add exactly one domain row, one op-log row, and one change-clock step. Connection churn, reconstruction, and mutation replay must leave those counters unchanged. The CLI parses 1 to 20 samples but rejects any profile and sample combination that exceeds the conservative workflow allowance. The output directory must be absent or empty. `run.json` is written before the first sample and keeps structured running, completed, or failed state. Each sample keeps stdout and stderr and writes two `chardb.scale.sample.v1` NDJSON records. The `chardb.scale.report.v1` report records exact workload, Git revision, Bun, OS, CPU, and runner metadata, then summarizes timing and rate fields with min, p50, p95, max, and mean. The manual `Live scale benchmark` workflow accepts a profile and sample count and uploads the full result directory for 14 days.
 
+The clean-tarball chat smoke also runs a frozen `env.DB` query workload after proving binding mutation replay and two-client live convergence. `CDB_BINDING_BENCH_PROFILE=ci-smoke` runs 32 exact two-row queries at concurrency eight; `throughput` runs 256 at concurrency 32. It emits a `chardb-binding-benchmark` JSON record with elapsed time, queries per second, and min, p50, p95, and max call latency. These are Miniflare regression measurements, not service targets.
+
 A three-sample clean-HEAD local `throughput` run at `2c936fe` on Bun 1.2.22 and an Apple M4 Pro executed 6,144 fanout mutations, 96 response-loss mutations, and 768 selective mutations. The 7,008 first commits produced exact deltas of 7,008 domain rows, 7,008 op-log rows, and 7,008 change-clock steps. All 96 lost responses replayed with the same mutation id and exact stored result while those counters stayed fixed and no duplicate row appeared. The run replaced 24 live clients midway, verified 86,016 logical row deliveries, reconstructed 96 live Cdb registrations across three evictions, and replaced them with 96 exact new SDK/Gateway registrations. Per-sample fanout throughput ranged from 158.65 to 163.89 mutations/s, client churn took 176.87 to 184.77 ms for eight clients, logical delivery throughput ranged from 29,880.85 to 32,929.17 rows/s, response-loss recovery ranged from 3.61 to 3.68 replays/s, selective recovery took 253.94 to 263.18 ms for 32 registrations, writes ranged from 291.60 to 303.20/s, and materializations from 270.62 to 281.68/s. This Miniflare run is regression telemetry, not a benchmark baseline, capacity claim, or performance target. The repository still requires repeated runs on a declared platform before setting targets.
 
 The landing page is a separate workspace:
@@ -249,7 +292,7 @@ bun run build
 - `example/chat` is a concept application. It does not yet prove the complete runtime path.
 - `landing` contains the project site.
 
-The npm tarball contains built `dist` files and the public documents. It does not contain `src`. CI runs `chardb init` from that tarball in a temporary project, installs its pinned dependencies without workspace aliases, verifies the TOML migration set has no internal Durable Object bindings, typechecks it, and runs a Wrangler dry-run build. It then starts Wrangler locally and reaches Catalog through the migration-provisioned `ctx.exports` namespace. CI also runs the packed chat smoke, which installs version 0.1.0 into another clean temporary consumer, provisions Miniflare by exported class name, applies the packaged schema with the packed CLI, and proves sign-in, organization membership lookup, mutation, live delivery, persistent restart, session reconstruction, op-log replay, one-row readback, organization isolation, and logout. Down migrations and online traffic during migration remain unfinished.
+The npm tarball contains built `dist` files and the public documents. It does not contain `src`. CI runs `chardb init` from that tarball in a temporary project, installs its pinned dependencies without workspace aliases, verifies the TOML migration set has no internal Durable Object bindings, typechecks it, and runs a Wrangler dry-run build. It then starts Wrangler locally and reaches Catalog through the migration-provisioned `ctx.exports` namespace. CI also runs the packed chat smoke, which installs version 0.1.0 into another clean temporary consumer, provisions Miniflare by exported class name, applies the packaged schema with the packed CLI, and proves sign-in, native `env.DB` query and mutation RPC, binding mutation replay, two-client live convergence, persistent restart, session reconstruction, WebSocket op-log replay, two-row readback, organization isolation, and logout. Down migrations and online traffic during migration remain unfinished.
 
 Repository tooling and the `chardb` CLI support Bun 1.2.22. The package does not claim Node runtime support. CI also fetches complete Git history and runs `bun run security:history`, which scans every reachable text blob for high-confidence private-key and provider-token formats without printing matched secret values.
 

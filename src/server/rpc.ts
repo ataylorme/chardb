@@ -161,6 +161,13 @@ export interface CdbQueryRpc {
     query(request: CdbQueryRequest): Promise<CdbQueryResponse>;
 }
 
+/** Authenticated input for one server-routed query outside the live socket path. */
+export interface TrustedQueryDispatchRequest {
+    readonly principalId: PrincipalId;
+    readonly ref: string;
+    readonly args: RawJson;
+}
+
 /** Re-run one persisted live-query generation with freshly authorized context. */
 export interface CdbRegisteredQueryRequest {
     readonly subscription: LiveSubscriptionId;

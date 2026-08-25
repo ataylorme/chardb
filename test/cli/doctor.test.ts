@@ -138,6 +138,7 @@ describe("chardb init + doctor end-to-end", () => {
         expect(JSON.parse(files.get("/tmp/proj/tsconfig.json") ?? "").compilerOptions).not.toHaveProperty("paths");
         // Worker template must be specialised to the app name.
         expect(files.get("/tmp/proj/src/worker.ts")).toContain('appName: "myapp"');
+        expect(files.get("/tmp/proj/src/worker.ts")).toContain("{ DB, BlobMeta, Catalog, Cdb, Gateway");
         expect(files.get("/tmp/proj/src/worker.ts")).not.toContain("ChardbWorker");
         expect(files.get("/tmp/proj/wrangler.toml")).not.toContain("CDB_WORKER");
         expect(files.get("/tmp/proj/src/schema.ts")).toContain("const { cdbTable } = forOrg()");

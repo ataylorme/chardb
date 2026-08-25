@@ -21,6 +21,19 @@ function callableNamespace(label: string): DurableObjectNamespace {
 }
 
 describe("native loopback binding resolution", () => {
+    test("maps the native DB service entrypoint onto the application environment", () => {
+        const db = { async executeQuery() {}, async executeMutation() {} };
+        const resolved = withChardbLoopbacks({}, { exports: { DB: db } });
+        expect((resolved as { readonly DB?: unknown }).DB).toBe(db);
+    });
+
+    test("keeps an explicit split-Worker DB service binding", () => {
+        const explicit = { async executeQuery() {}, async executeMutation() {} };
+        const loopback = { async executeQuery() {}, async executeMutation() {} };
+        const resolved = withChardbLoopbacks({ DB: explicit }, { exports: { DB: loopback } });
+        expect(resolved.DB).toBe(explicit);
+    });
+
     test("maps exported class names onto Chardb's internal environment", () => {
         const rawEnv = { APP_SETTING: "kept" };
         const catalog = namespace("catalog");

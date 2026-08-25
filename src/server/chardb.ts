@@ -2,7 +2,7 @@
  * `chardb({ … })` — the single Worker-entry factory.
  *
  * Returns the wrangler-ready module: a Hono app you can mount your own
- * routes on, with `.fetch`, `.scheduled`, the six chardb Durable Object
+ * routes on, with `.fetch`, `.scheduled`, the native `DB` entrypoint, the six chardb Durable Object
  * classes, the synthesized better-auth schema, and the chardb-managed
  * `auth` value all hanging off the same object. One call replaces
  * `defineAuth` + `defineChardb` + `new Hono()` + `mountChardb` + the DO
@@ -20,7 +20,7 @@
  *   });
  *   app.get("/health", (c) => c.text("ok"));
  *   export default app;
- *   export const { Cdb, Catalog, Gateway, BlobMeta, Resharder, GsiShard } = app;
+ *   export const { DB, Cdb, Catalog, Gateway, BlobMeta, Resharder, GsiShard } = app;
  *
  * Schema authors reach the synthesized auth tables via the live ESM
  * binding (`import { app } from "./worker.ts"`) — Drizzle's
@@ -45,6 +45,8 @@ import {
     type SynthesizedAuthSchema,
     defineAuth,
 } from "../auth/synthesize.ts";
+import type { ChardbBinding } from "../binding.ts";
+import { type DB, configureDbBindingRuntime } from "./binding.ts";
 import { buildAccessControl } from "./cdb-access.ts";
 import { BlobMeta } from "./do/blobmeta.ts";
 import { type Catalog, configureCatalogRuntime } from "./do/catalog.ts";
@@ -101,7 +103,7 @@ export interface ChardbFactoryInput<
     /** Deprecated alias for `api` — supported for one minor cycle. */
     readonly refs?: DefineChardbInput<TSchema>["refs"];
     /** Inline-route hook so the whole config can read top-to-bottom. */
-    readonly routes?: (app: Hono<{ Bindings: ChardbEnv }>) => void;
+    readonly routes?: (app: Hono<{ Bindings: ChardbAppEnv }>) => void;
     /** Better-auth fetch handler from `betterAuth(options).handler`; auto-mounted at `/api/auth/*`. */
     readonly authHandler?: MountChardbOptions["authHandler"];
     readonly authBasePath?: MountChardbOptions["authBasePath"];
@@ -122,12 +124,15 @@ export interface ChardbFactoryInput<
  *   - DO classes are direct fields so `export const { Cdb, … } = app`
  *     drops the DO re-export ceremony to a single destructure line.
  */
+export type ChardbAppEnv = ChardbEnv & { readonly DB: ChardbBinding };
+
 export type ChardbApp<TPlugins extends readonly BetterAuthPlugin[], TSchema extends Record<string, unknown>> = Hono<{
-    Bindings: ChardbEnv;
+    Bindings: ChardbAppEnv;
 }> & {
     readonly fetch: (request: Request, env: ChardbEnv, ctx: ExecutionContext) => Promise<Response>;
     readonly auth: ChardbAuth<TPlugins>;
     readonly schema: TSchema & SynthesizedAuthSchema<InferPluginTables<TPlugins>>;
+    readonly DB: typeof DB;
     readonly Cdb: typeof Cdb;
     readonly Catalog: typeof Catalog;
     readonly Gateway: typeof Gateway;
@@ -191,13 +196,19 @@ export function chardb<
     });
     const ConfiguredCatalog = configureCatalogRuntime({ migrations: () => migrationJournal });
     const authBasePath = input.authBasePath ?? auth.options.basePath ?? "/api/auth";
+    const jwtConfig = gatewayJwtConfigFromAuthOptions(auth.options, authBasePath);
     const ConfiguredGateway = configureGatewayRuntime({
         schema: () => runtimeEntrypoint.schema,
         manifest: () => runtimeEntrypoint.chardbManifest,
-        auth: gatewayJwtConfigFromAuthOptions(auth.options, authBasePath),
+        auth: jwtConfig,
+    });
+    const ConfiguredDB = configureDbBindingRuntime({
+        schema: () => runtimeEntrypoint.schema,
+        manifest: () => runtimeEntrypoint.chardbManifest,
+        auth: jwtConfig,
     });
 
-    const hono = new Hono<{ Bindings: ChardbEnv }>();
+    const hono = new Hono<{ Bindings: ChardbAppEnv }>();
     if (input.routes) input.routes(hono);
 
     // Snapshot Hono's own `.fetch` BEFORE handing the instance to
@@ -252,6 +263,7 @@ export function chardb<
     const merged = Object.assign(hono, {
         fetch: mounted.fetch,
         auth,
+        DB: ConfiguredDB,
         Cdb: ConfiguredCdb,
         Catalog: ConfiguredCatalog,
         Gateway: ConfiguredGateway,

@@ -106,7 +106,8 @@ export {
     type DefineChardbInput,
     type MountChardbOptions,
 } from "./entrypoint.ts";
-export { chardb, type ChardbApp, type ChardbFactoryInput } from "./chardb.ts";
+export { chardb, type ChardbApp, type ChardbAppEnv, type ChardbFactoryInput } from "./chardb.ts";
+export { DB, configureDbBindingRuntime, type DbBindingEnv, type DbBindingRuntimeConfig } from "./binding.ts";
 export {
     defineMigrations,
     defineSchemaBaseline,
@@ -138,6 +139,7 @@ export type {
     MutationRouteResponse,
     TrustedMutationAuth,
     TrustedMutationDispatchRequest,
+    TrustedQueryDispatchRequest,
 } from "./rpc.ts";
 export {
     defineAuth,

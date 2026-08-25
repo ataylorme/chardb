@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-08-25
 
-The narrow organization-tenanted runtime is the current supported path. The packages below are not implemented. They may appear on the landing page only when clearly labeled as the destination or target interface. Pick one package before starting another.
+The narrow organization-tenanted runtime is the current supported path. The one-binding package below is complete for that path. The remaining packages are not implemented and may appear on the landing page only when clearly labeled as the destination or target interface. Pick one package before starting another.
 
 ## Product contract
 
@@ -21,13 +21,15 @@ Capacity numbers, automatic behavior, and production-readiness claims require me
 
 A package is complete only when its public API, failure contract, resource bounds, and cleanup behavior are implemented and documented. It also needs a configured Workerd end-to-end case, a clean-tarball consumer case where packaging matters, and a frozen benchmark profile when scale or latency is part of the claim. Update `STATUS.md`, the capability matrix, and the landing page in the same change.
 
-## One-binding developer surface
+## One-binding developer surface: completed 2026-08-25
 
-The target interface is one schema entry and one typed `env.DB` handle. Generated same-Worker apps now provision Chardb's exported classes through standard Wrangler migrations and resolve them through native `ctx.exports`; consumers do not declare the six internal Durable Object bindings. `wrangler.toml` is the scaffold default, and doctor also accepts `wrangler.jsonc`. The remaining product work is the public typed database handle and a shared application-facing path for local development, migration, and production.
+Same-Worker apps expose one typed `env.DB` handle and resolve Chardb's internal classes through native `ctx.exports`; consumers do not declare the six internal Durable Object bindings. `wrangler.toml` is the scaffold default, and doctor also accepts `wrangler.jsonc`. The handle accepts registered query and mutation functions through `client(env.DB, { jwt, authOrigin })`, converts them to stable refs before RPC, verifies the JWT, re-derives current organization authority in Catalog, and uses the same manifest, migration epoch, policy, and Cdb execution paths as live traffic.
 
-- Make `chardb init`, local development, deployment, migration, and production use share the same application-facing handle.
-- Preserve explicit stable refs, server-owned query intent, tenancy enforcement, and migration epochs behind that handle.
-- Prove a clean package can scaffold, typecheck, build, migrate, and run the chat end to end without the consumer wiring Chardb internals.
+- `chardb init`, local Miniflare, Wrangler deployment, migration, and production share the same exported `DB` entrypoint.
+- Explicit stable refs, server-owned query intent, current Catalog authority, policy checks, and migration epochs remain behind the handle.
+- The clean-tarball chat proof executes both binding methods, checks idempotent mutation replay and two-client live invalidation, restarts Miniflare over persisted storage, and runs a frozen concurrent binding-query telemetry profile.
+
+Raw Drizzle builders over RPC remain outside this package. Adding them would require a bounded serializable query representation that preserves the same server-owned intent and authorization guarantees.
 
 ## Query shapes
 

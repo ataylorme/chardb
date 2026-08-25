@@ -9,7 +9,11 @@ const LOOPBACK_BINDINGS = {
     CDB_GSI: "GsiShard",
 } as const;
 
-type LoopbackExportName = (typeof LOOPBACK_BINDINGS)[keyof typeof LOOPBACK_BINDINGS];
+const PUBLIC_BINDINGS = { DB: "DB" } as const;
+
+type LoopbackExportName =
+    | (typeof LOOPBACK_BINDINGS)[keyof typeof LOOPBACK_BINDINGS]
+    | (typeof PUBLIC_BINDINGS)[keyof typeof PUBLIC_BINDINGS];
 type ChardbBindingName = keyof typeof LOOPBACK_BINDINGS;
 
 interface ContextWithExports {
@@ -30,6 +34,12 @@ function isDurableObjectNamespace(value: unknown): value is DurableObjectNamespa
     );
 }
 
+function isDbBinding(value: unknown): boolean {
+    if ((typeof value !== "object" && typeof value !== "function") || value === null) return false;
+    const binding = value as { readonly executeQuery?: unknown; readonly executeMutation?: unknown };
+    return typeof binding.executeQuery === "function" && typeof binding.executeMutation === "function";
+}
+
 /**
  * Add same-Worker Durable Object namespaces from Cloudflare's native
  * `ctx.exports` collection. Miniflare's programmatic API provisions the same
@@ -39,7 +49,7 @@ function isDurableObjectNamespace(value: unknown): value is DurableObjectNamespa
 export function withChardbLoopbacks<TEnv extends object>(env: TEnv, context: unknown): TEnv {
     const exports = (context as ContextWithExports | null | undefined)?.exports ?? {};
 
-    const additions: Partial<Record<ChardbBindingName, DurableObjectNamespace>> = {};
+    const additions: Record<string, unknown> = {};
     for (const [bindingName, exportName] of Object.entries(LOOPBACK_BINDINGS) as [
         ChardbBindingName,
         LoopbackExportName,
@@ -50,6 +60,10 @@ export function withChardbLoopbacks<TEnv extends object>(env: TEnv, context: unk
             ? exportedNamespace
             : (env as Record<string, unknown>)[exportName];
         if (isDurableObjectNamespace(namespace)) additions[bindingName] = namespace;
+    }
+    if (!isDbBinding((env as Record<string, unknown>).DB)) {
+        const db = exports.DB ?? (env as Record<string, unknown>).DB;
+        if (isDbBinding(db)) additions.DB = db;
     }
     if (Object.keys(additions).length === 0) return env;
 

@@ -67,3 +67,16 @@ export {
 } from "./intervals_wire.ts";
 export { canonicalConcat, VSHARD_COUNT, VshardMap, vshardOf, type VshardRange } from "./vshard.ts";
 export { createChardbClient, type ChardbClient, type ChardbClientOptions } from "./client/index.ts";
+export {
+    CHARDB_BINDING_MAX_IN_FLIGHT,
+    client,
+    type ChardbBinding,
+    type ChardbBindingAuth,
+    type ChardbBindingClient,
+    type ChardbBindingFailure,
+    type ChardbBindingMutationOptions,
+    type ChardbBindingMutationRequest,
+    type ChardbBindingMutationResponse,
+    type ChardbBindingQueryRequest,
+    type ChardbBindingQueryResponse,
+} from "./binding.ts";
