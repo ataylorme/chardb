@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -32,6 +34,9 @@ jobs:
 
       - name: Lint
         run: bun run lint
+
+      - name: Scan Git history for high-confidence secrets
+        run: bun run security:history
 
       - name: Test correctness suite
         run: bun run test:correctness
