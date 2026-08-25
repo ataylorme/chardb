@@ -359,6 +359,112 @@ async function createSdkClient(clientId: string, subject: string): Promise<Chard
     });
 }
 
+async function createSdkClientWithTrackedClose(
+    clientId: string,
+    subject: string
+): Promise<{ readonly client: ChardbClient; readonly socketClosed: Promise<void> }> {
+    const NativeWebSocket = globalThis.WebSocket;
+    const jwt = await signed(subject);
+    let settleCreated: (() => void) | undefined;
+    let settleClosed: (() => void) | undefined;
+    const socketCreated = new Promise<void>(resolve => {
+        settleCreated = resolve;
+    });
+    const socketClosed = new Promise<void>(resolve => {
+        settleClosed = resolve;
+    });
+
+    class CloseTrackingWebSocket {
+        static readonly CONNECTING = NativeWebSocket.CONNECTING;
+        static readonly OPEN = NativeWebSocket.OPEN;
+        static readonly CLOSING = NativeWebSocket.CLOSING;
+        static readonly CLOSED = NativeWebSocket.CLOSED;
+        private readonly inner: WebSocket;
+
+        constructor(url: string | URL) {
+            this.inner = new NativeWebSocket(url);
+            this.inner.addEventListener("close", () => settleClosed?.(), { once: true });
+            settleCreated?.();
+        }
+
+        get readyState(): number {
+            return this.inner.readyState;
+        }
+
+        get onopen(): WebSocket["onopen"] {
+            return this.inner.onopen;
+        }
+
+        set onopen(listener: WebSocket["onopen"]) {
+            this.inner.onopen = listener;
+        }
+
+        get onmessage(): WebSocket["onmessage"] {
+            return this.inner.onmessage;
+        }
+
+        set onmessage(listener: WebSocket["onmessage"]) {
+            this.inner.onmessage = listener;
+        }
+
+        get onclose(): WebSocket["onclose"] {
+            return this.inner.onclose;
+        }
+
+        set onclose(listener: WebSocket["onclose"]) {
+            this.inner.onclose = listener;
+        }
+
+        get onerror(): WebSocket["onerror"] {
+            return this.inner.onerror;
+        }
+
+        set onerror(listener: WebSocket["onerror"]) {
+            this.inner.onerror = listener;
+        }
+
+        send(data: Parameters<WebSocket["send"]>[0]): void {
+            this.inner.send(data);
+        }
+
+        close(code?: number, reason?: string): void {
+            this.inner.close(code, reason);
+        }
+    }
+
+    let client: ChardbClient | undefined;
+    let creationTimer: ReturnType<typeof setTimeout> | undefined;
+    let created = false;
+    try {
+        globalThis.WebSocket = CloseTrackingWebSocket as unknown as typeof WebSocket;
+        client = createChardbClient({
+            endpoint: sdkEndpoint(),
+            clientId,
+            getJwt: async () => jwt,
+            crossTab: false,
+            mutationTimeoutMs: SCALE_WAIT_MS,
+        });
+        await Promise.race([
+            socketCreated,
+            new Promise<never>((_, reject) => {
+                creationTimer = setTimeout(
+                    () => reject(new Error(`timed out constructing SDK WebSocket for ${clientId}`)),
+                    SCALE_WAIT_MS
+                );
+            }),
+        ]);
+        created = true;
+        return { client, socketClosed };
+    } finally {
+        if (creationTimer) clearTimeout(creationTimer);
+        globalThis.WebSocket = NativeWebSocket;
+        if (!created) {
+            client?.close();
+            settleClosed?.();
+        }
+    }
+}
+
 async function drainUntilSettled(clientId: string, subIds: readonly number[]): Promise<GatewayLiveState> {
     const deadline = Date.now() + SCALE_WAIT_MS;
     let latest: GatewayLiveState | null = null;
@@ -1262,7 +1368,8 @@ describe("public durable live queries in real workerd", () => {
             const writeRef = mutationRef;
             const readRef = queryRef;
             const clientId = "bench-select-0001";
-            let client = await createSdkClient(clientId, "workerd-user");
+            const initialClient = await createSdkClientWithTrackedClose(clientId, "workerd-user");
+            let client = initialClient.client;
             let subscriptions: Array<{ unsubscribe: () => void }> = [];
             let observers = Array.from({ length: SCALE_SUBSCRIPTIONS }, () => createQueryObserver());
             const bodies = observers.map((_, index) => `sdk-scale-filter-${index.toString().padStart(3, "0")}`);
@@ -1316,6 +1423,7 @@ describe("public durable live queries in real workerd", () => {
                 expect(await gatewayState(clientId)).toEqual(gatewayBeforeReconstruction);
 
                 await cleanupSdkClient(clientId, client, subscriptions);
+                await initialClient.socketClosed;
                 subscriptions = [];
                 await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", {
                     name: clientId.slice(0, 12),
