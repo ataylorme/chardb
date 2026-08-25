@@ -6,6 +6,7 @@ import {
     AUTH_BULK_PRELOAD_MAX_ROWS,
     AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES,
     AUTH_BULK_REPLACEMENT_MAX_BYTES,
+    AUTH_READ_IN_MAX_VALUES,
 } from "../../src/auth/sql.ts";
 import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import { chardb } from "../../src/server/chardb.ts";
@@ -349,9 +350,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("routes adapter counts to countAuth without falling back to queryAuth", async () => {
-        const requests: Array<{ model: string; where: Record<string, unknown> }> = [];
+        const requests: unknown[] = [];
         const catalog = {
-            async countAuth(request: { model: string; where: Record<string, unknown> }) {
+            async countAuth(request: unknown) {
                 requests.push(request);
                 return 7;
             },
@@ -366,7 +367,52 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespace } })(auth.options);
 
         await expect(adapter.count({ model: "user", where: eq("name", "Counted") })).resolves.toBe(7);
-        expect(requests).toEqual([{ model: "user", where: { name: "Counted" } }]);
+        expect(requests).toEqual([{ model: "user", where: [{ field: "name", operator: "eq", value: "Counted" }] }]);
+    });
+
+    test("routes bounded in filters through Catalog reads", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const now = new Date("2026-08-24T00:00:00Z");
+        for (const id of ["in-user-a", "in-user-b", "in-user-c"]) {
+            await adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id,
+                    name: id,
+                    email: `${id}@example.com`,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+        }
+
+        await expect(
+            adapter.findMany<Record<string, unknown>>({
+                model: "user",
+                where: [{ field: "id", operator: "in", value: ["in-user-c", "in-user-a"] }],
+                sortBy: { field: "id", direction: "asc" },
+            })
+        ).resolves.toEqual([
+            expect.objectContaining({ id: "in-user-a" }),
+            expect.objectContaining({ id: "in-user-c" }),
+        ]);
+        await expect(
+            adapter.count({ model: "user", where: [{ field: "id", operator: "in", value: [] }] })
+        ).resolves.toBe(0);
+        await expect(
+            adapter.findMany({
+                model: "user",
+                where: [
+                    {
+                        field: "id",
+                        operator: "in",
+                        value: Array.from({ length: AUTH_READ_IN_MAX_VALUES + 1 }, (_, index) => `u-${index}`),
+                    },
+                ],
+            })
+        ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS" });
     });
 
     test("routes incrementOne through the native Catalog RPC without fallback reads or writes", async () => {
@@ -448,7 +494,11 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             })
         ).resolves.toMatchObject({ id: "rate-swapped", key: "swapped", count: 2, lastRequest: 200 });
         await expect(
-            harness.catalog.queryAuth({ model: "rateLimit", where: { id: "rate-swapped" }, limit: 1 })
+            harness.catalog.queryAuth({
+                model: "rateLimit",
+                where: [{ field: "id", operator: "eq", value: "rate-swapped" }],
+                limit: 1,
+            })
         ).resolves.toEqual([
             expect.objectContaining({ id: "rate-swapped", key: "swapped", count: 2, lastRequest: 200 }),
         ]);

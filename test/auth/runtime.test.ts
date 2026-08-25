@@ -20,6 +20,7 @@ import {
     AUTH_BULK_PRELOAD_MAX_ROWS,
     AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES,
     AUTH_BULK_REPLACEMENT_MAX_BYTES,
+    AUTH_READ_IN_MAX_VALUES,
     assertAuthIncrementInput,
     authCount,
     authCreate,
@@ -149,8 +150,39 @@ describe("auth/sql — render path against bun:sqlite", () => {
         const colDDL = [...cfg.entries()].map(([_, n]) => `"${n}" TEXT`).join(", ");
         sql.exec(`CREATE TABLE "user" (${colDDL})`);
         for (let i = 0; i < 5; i++) authCreate(sql, t, { id: `u${i}`, name: "x" });
-        expect(authFindMany(sql, t, { name: "x" }).length).toBe(5);
-        expect(authCount(sql, t, { name: "x" })).toBe(5);
+        expect(authFindMany(sql, t, [{ field: "name", operator: "eq", value: "x" }]).length).toBe(5);
+        expect(authCount(sql, t, [{ field: "name", operator: "eq", value: "x" }])).toBe(5);
+    });
+
+    test("findMany and count bind bounded in filters", () => {
+        resetAuthRuntime();
+        bindAuthRuntime({ schema: defineAuth({ plugins: [] }) as never, options: {} });
+        const db = new BunSqlite(":memory:");
+        const statements: string[] = [];
+        const sql = bunSyncSql(db, statements);
+        const t = tableFor("user");
+        const cfg = authTableColumns(t);
+        const colDDL = [...cfg.entries()].map(([_, n]) => `"${n}" TEXT`).join(", ");
+        sql.exec(`CREATE TABLE "user" (${colDDL})`);
+        for (const id of ["u1", "u2", "u3"]) authCreate(sql, t, { id, name: `name-${id}` });
+        statements.length = 0;
+
+        const where = [{ field: "id", operator: "in" as const, value: ["u3", "u1"] }];
+        expect(authFindMany(sql, t, where, 100).map(row => row.id)).toEqual(["u1", "u3"]);
+        expect(authCount(sql, t, where)).toBe(2);
+        expect(statements).toHaveLength(2);
+        expect(statements.every(statement => statement.includes('"id" IN (?, ?)'))).toBe(true);
+        expect(authFindMany(sql, t, [{ field: "id", operator: "in", value: [] }])).toEqual([]);
+        expect(() =>
+            authFindMany(sql, t, [
+                {
+                    field: "id",
+                    operator: "in",
+                    value: Array.from({ length: AUTH_READ_IN_MAX_VALUES + 1 }, (_, index) => `u${index}`),
+                },
+            ])
+        ).toThrow(/in filter exceeds 256 values/);
+        db.close();
     });
 
     test("findMany maps sort fields to renamed SQL columns", () => {
@@ -170,10 +202,10 @@ describe("auth/sql — render path against bun:sqlite", () => {
         }
 
         expect(
-            authFindMany(sql, renamed, {}, 2, 1, { field: "displayName", direction: "asc" }).map(row => row.displayName)
+            authFindMany(sql, renamed, [], 2, 1, { field: "displayName", direction: "asc" }).map(row => row.displayName)
         ).toEqual(["Bravo", "Charlie"]);
         expect(
-            authFindMany(sql, renamed, {}, 2, 1, { field: "displayName", direction: "desc" }).map(
+            authFindMany(sql, renamed, [], 2, 1, { field: "displayName", direction: "desc" }).map(
                 row => row.displayName
             )
         ).toEqual(["Charlie", "Bravo"]);
@@ -276,13 +308,13 @@ describe("auth/sql — render path against bun:sqlite", () => {
         const colDDL = [...cfg.entries()].map(([_, n]) => `"${n}" TEXT`).join(", ");
         sql.exec(`CREATE TABLE "user" (${colDDL})`);
 
-        expect(() => authFindMany(sql, t, {}, -1)).toThrow(/limit must be a non-negative safe integer/);
-        expect(() => authFindMany(sql, t, {}, 1.5)).toThrow(/limit must be a non-negative safe integer/);
-        expect(() => authFindMany(sql, t, {}, 1, -1)).toThrow(/offset must be a non-negative safe integer/);
-        expect(() => authFindMany(sql, t, {}, 1, 0, { field: "missing", direction: "asc" })).toThrow(
+        expect(() => authFindMany(sql, t, [], -1)).toThrow(/limit must be a non-negative safe integer/);
+        expect(() => authFindMany(sql, t, [], 1.5)).toThrow(/limit must be a non-negative safe integer/);
+        expect(() => authFindMany(sql, t, [], 1, -1)).toThrow(/offset must be a non-negative safe integer/);
+        expect(() => authFindMany(sql, t, [], 1, 0, { field: "missing", direction: "asc" })).toThrow(
             /sort field "missing" is not a column/
         );
-        expect(() => authFindMany(sql, t, {}, 1, 0, { field: "name", direction: "sideways" } as never)).toThrow(
+        expect(() => authFindMany(sql, t, [], 1, 0, { field: "name", direction: "sideways" } as never)).toThrow(
             /invalid sort direction/
         );
     });

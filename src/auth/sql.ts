@@ -18,10 +18,8 @@
  *   - findOne → `SELECT * FROM t WHERE ... LIMIT 1`.
  *   - findMany → `SELECT * FROM t WHERE ... ORDER BY ... LIMIT ? OFFSET ?`.
  *
- * Where-clauses are restricted to a flat AND of equalities. Better-auth's
- * own query surface only emits these for the model-store path; richer
- * filters land on hand-rolled queries against the synthesized schema
- * directly.
+ * Read predicates support a flat AND of equality and bounded `in`
+ * filters. Mutation predicates remain equality-only.
  */
 
 import { type Column, getTableColumns, getTableName } from "drizzle-orm";
@@ -34,6 +32,7 @@ const ALLOWED_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export const AUTH_BULK_PRELOAD_MAX_ROWS = 4_096;
 export const AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES = 512 * 1_024;
 export const AUTH_BULK_REPLACEMENT_MAX_BYTES = 512 * 1_024;
+export const AUTH_READ_IN_MAX_VALUES = 256;
 const AUTH_BULK_PRELOAD_RETRY_MS = 1_000;
 
 function quoteIdent(raw: string): string {
@@ -57,6 +56,18 @@ export interface AuthIncrementWhere {
     readonly operator: AuthIncrementWhereOperator;
     readonly value: RawJson;
 }
+
+export type AuthReadWhere =
+    | {
+          readonly field: string;
+          readonly operator: "eq";
+          readonly value: RawJson;
+      }
+    | {
+          readonly field: string;
+          readonly operator: "in";
+          readonly value: readonly RawJson[];
+      };
 
 const tableInfoCache = new WeakMap<AnySQLiteTable, TableInfo>();
 
@@ -123,6 +134,47 @@ function bindWhere(info: TableInfo, where: { readonly [k: string]: RawJson }): {
         }
         parts.push(`${quoteIdent(sqlName)} = ?`);
         params.push(toSqlValue(where[key] as RawJson));
+    }
+    return { sql: parts.join(" AND "), params };
+}
+
+function bindReadWhere(
+    info: TableInfo,
+    where: readonly AuthReadWhere[]
+): { readonly sql: string; readonly params: SqlValue[] } {
+    if (where.length === 0) return { sql: "1=1", params: [] };
+    const parts: string[] = [];
+    const params: SqlValue[] = [];
+    for (const condition of where) {
+        const sqlName = info.columns.get(condition.field);
+        if (!sqlName) {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: `auth/sql: where field "${condition.field}" is not a column on table ${info.name}`,
+            });
+        }
+        const quoted = quoteIdent(sqlName);
+        if (condition.operator === "eq") {
+            if (condition.value === null) {
+                parts.push(`${quoted} IS NULL`);
+            } else {
+                parts.push(`${quoted} = ?`);
+                params.push(toSqlValue(condition.value));
+            }
+            continue;
+        }
+        if (condition.value.length > AUTH_READ_IN_MAX_VALUES) {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: `auth/sql: in filter exceeds ${AUTH_READ_IN_MAX_VALUES} values`,
+            });
+        }
+        if (condition.value.length === 0) {
+            parts.push("0=1");
+            continue;
+        }
+        parts.push(`${quoted} IN (${condition.value.map(() => "?").join(", ")})`);
+        for (const value of condition.value) params.push(toSqlValue(value));
     }
     return { sql: parts.join(" AND "), params };
 }
@@ -570,13 +622,13 @@ export function authFindFirstId(
 export function authFindMany(
     sql: SyncSql,
     table: AnySQLiteTable,
-    where: { readonly [k: string]: RawJson },
+    where: readonly AuthReadWhere[],
     limit?: number,
     offset?: number,
     sortBy?: { readonly field: string; readonly direction: "asc" | "desc" }
 ): Record<string, RawJson>[] {
     const info = infoOf(table);
-    const w = bindWhere(info, where);
+    const w = bindReadWhere(info, where);
     const params = [...w.params];
 
     let orderClause = "";
@@ -626,9 +678,9 @@ export function authFindMany(
     return rows.map(r => projectRow(info, r));
 }
 
-export function authCount(sql: SyncSql, table: AnySQLiteTable, where: { readonly [k: string]: RawJson }): number {
+export function authCount(sql: SyncSql, table: AnySQLiteTable, where: readonly AuthReadWhere[]): number {
     const info = infoOf(table);
-    const w = bindWhere(info, where);
+    const w = bindReadWhere(info, where);
     const row = sql.one<{ c: number }>(
         `SELECT COUNT(*) AS c FROM ${quoteIdent(info.name)} WHERE ${w.sql}`,
         ...w.params

@@ -33,6 +33,7 @@ import {
 import { getAuthRuntime, placementFor, tableFor } from "../../auth/runtime.ts";
 import {
     type AuthIncrementWhere,
+    type AuthReadWhere,
     assertAuthIncrementInput,
     authCount,
     authCreate,
@@ -499,7 +500,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
     /** Read Better Auth rows from Catalog-owned storage. */
     async queryAuth(args: {
         readonly model: string;
-        readonly where: { readonly [k: string]: RawJson };
+        readonly where: readonly AuthReadWhere[];
         readonly limit?: number;
         readonly offset?: number;
         readonly sortBy?: { readonly field: string; readonly direction: "asc" | "desc" };
@@ -514,7 +515,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
     /** Count Better Auth rows without materializing them across the Catalog RPC. */
     async countAuth(args: {
         readonly model: string;
-        readonly where: { readonly [k: string]: RawJson };
+        readonly where: readonly AuthReadWhere[];
     }): Promise<number> {
         await this.bootstrap();
         this.ensureAuthTables();

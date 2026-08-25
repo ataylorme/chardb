@@ -14,11 +14,9 @@
  * one SQLite transaction. The adapter does not issue a second invalidation
  * RPC after the row has committed.
  *
- * Where-clause translation: the only operator currently supported is
- * `eq` joined by AND. Better-auth's standard model-store operations
- * never emit anything richer for the four core models or the shipping
- * plugins; if a user-provided plugin needs `in`/`contains`/etc.,
- * support is straightforward to add by extending `whereToFlat`.
+ * Reads support `eq` and bounded `in` filters joined by AND. Writes use
+ * equality predicates. The organization plugin uses `in` to load users
+ * for a page of membership rows.
  */
 
 import type { AdapterFactory, CleanedWhere } from "@better-auth/core/db/adapter";
@@ -26,7 +24,7 @@ import type { BetterAuthOptions } from "better-auth";
 import { createAdapterFactory } from "better-auth/adapters";
 import { CdbError } from "../errors.ts";
 import type { RawJson } from "../types.ts";
-import type { AuthIncrementWhere } from "./sql.ts";
+import { AUTH_READ_IN_MAX_VALUES, type AuthIncrementWhere, type AuthReadWhere } from "./sql.ts";
 
 /**
  * Bindings the adapter needs at runtime. Provided by `mountChardb` /
@@ -47,12 +45,12 @@ interface CatalogRpc {
     }): Promise<{ ok: true; row?: Record<string, RawJson> | null; affected?: number }>;
     queryAuth(args: {
         model: string;
-        where: { [k: string]: RawJson };
+        where: readonly AuthReadWhere[];
         limit?: number;
         offset?: number;
         sortBy?: { field: string; direction: "asc" | "desc" };
     }): Promise<readonly Record<string, RawJson>[]>;
-    countAuth(args: { model: string; where: { [k: string]: RawJson } }): Promise<number>;
+    countAuth(args: { model: string; where: readonly AuthReadWhere[] }): Promise<number>;
     incrementAuth(args: {
         model: string;
         where: readonly AuthIncrementWhere[];
@@ -136,16 +134,16 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                 },
 
                 async findOne({ model, where }) {
-                    const flat = whereToFlat(where);
-                    const rows = await catalog().queryAuth({ model, where: flat, limit: 1 });
+                    const filters = whereToReadFilters(where);
+                    const rows = await catalog().queryAuth({ model, where: filters, limit: 1 });
                     return (rows[0] ?? null) as never;
                 },
 
                 async findMany({ model, where, limit, offset, sortBy }) {
-                    const flat = where ? whereToFlat(where) : {};
+                    const filters = where ? whereToReadFilters(where) : [];
                     const rows = await catalog().queryAuth({
                         model,
-                        where: flat,
+                        where: filters,
                         limit: limit ?? 100,
                         ...(offset === undefined ? {} : { offset }),
                         ...(sortBy === undefined ? {} : { sortBy }),
@@ -154,8 +152,8 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                 },
 
                 async count({ model, where }) {
-                    const flat = where ? whereToFlat(where) : {};
-                    return catalog().countAuth({ model, where: flat });
+                    const filters = where ? whereToReadFilters(where) : [];
+                    return catalog().countAuth({ model, where: filters });
                 },
 
                 async update({ model, where, update }) {
@@ -267,6 +265,53 @@ function whereToFlat(where: CleanedWhere[]): { [k: string]: RawJson } {
     return out;
 }
 
+function whereToReadFilters(where: CleanedWhere[]): AuthReadWhere[] {
+    const out: AuthReadWhere[] = [];
+    for (const condition of where) {
+        if (condition.connector === "OR") {
+            throw new CdbError({
+                code: "CDB_UNSUPPORTED_FEATURE",
+                message: "chardb auth adapter: OR connectors are not supported in where clauses",
+            });
+        }
+        if (condition.mode !== "sensitive") {
+            throw new CdbError({
+                code: "CDB_UNSUPPORTED_FEATURE",
+                message: "chardb auth adapter: case-insensitive where clauses are not supported",
+            });
+        }
+        if (condition.operator === "eq") {
+            out.push({ field: condition.field, operator: "eq", value: normalize(condition.value) });
+            continue;
+        }
+        if (condition.operator === "in") {
+            if (!Array.isArray(condition.value)) {
+                throw new CdbError({
+                    code: "CDB_INVALID_ARGS",
+                    message: "chardb auth adapter: in filter value must be an array",
+                });
+            }
+            if (condition.value.length > AUTH_READ_IN_MAX_VALUES) {
+                throw new CdbError({
+                    code: "CDB_INVALID_ARGS",
+                    message: `chardb auth adapter: in filter exceeds ${AUTH_READ_IN_MAX_VALUES} values`,
+                });
+            }
+            out.push({
+                field: condition.field,
+                operator: "in",
+                value: condition.value.map(value => normalize(value)),
+            });
+            continue;
+        }
+        throw new CdbError({
+            code: "CDB_UNSUPPORTED_FEATURE",
+            message: `chardb auth adapter: where operator "${condition.operator}" not supported`,
+        });
+    }
+    return out;
+}
+
 function whereToIncrementGuards(where: CleanedWhere[], defaultField: (field: string) => string): AuthIncrementWhere[] {
     const out: AuthIncrementWhere[] = [];
     for (const condition of where) {
@@ -321,9 +366,6 @@ function whereToIncrementGuards(where: CleanedWhere[], defaultField: (field: str
 function normalize(v: CleanedWhere["value"]): RawJson {
     if (v instanceof Date) return v.getTime();
     if (Array.isArray(v)) {
-        // Caller used `in` operator — handled above. This branch
-        // exists only so `string[]` / `number[]` from edge cases
-        // don't crash; they'll surface as JSON-encoded blobs.
         return v as unknown as RawJson;
     }
     return v as RawJson;
