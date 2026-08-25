@@ -6,7 +6,7 @@ Last reviewed: 2026-08-24
 
 Chardb should do one thing well: a developer marks an organization boundary in a Drizzle schema, and chardb routes that organization's data to a SQLite Durable Object with tenant isolation, atomic mutations, idempotent retries, initial queries, and live updates.
 
-The repository now proves that narrow path under workerd. A declared organization mutation crosses Gateway, Catalog, and Cdb. An explicit stable-ref query with `authority: "organization"` can register against one exact partition, receive an initial snapshot, rerun after a matching commit, and receive a replacement snapshot. The clients acknowledge delivery, and the Cdb invalidation outbox drains. One reconstruction test stages a snapshot before send, evicts Gateway and Cdb, then completes delivery after both objects restart. A second test sends a snapshot without receiving its acknowledgement, reconstructs both objects around the same hibernated socket, redelivers the exact cookie and rows, accepts one acknowledgement, and delivers a later mutation normally. The clean-tarball smoke persists Durable Object storage through a full Miniflare restart. It reconstructs the existing Better Auth session, issues a fresh JWT for the restarted origin, replays the exact prior mutation with an identical result and one stored row, then continues cross-organization denial. Resume cookies still do not replay missed changes after a transport disconnect.
+The repository now proves that narrow path under workerd. A declared organization mutation crosses Gateway, Catalog, and Cdb. An explicit stable-ref query with `authority: "organization"` can register against one exact partition, receive an initial snapshot, rerun after a matching commit, and receive a replacement snapshot. The clients acknowledge delivery, and the Cdb invalidation outbox drains. One reconstruction test stages a snapshot before send, evicts Gateway and Cdb, then completes delivery after both objects restart. A second test reconstructs both objects around the same hibernated socket and redelivers an unacknowledged snapshot with the exact cookie and rows. A third loses the socket after delivery but before acknowledgement, retires that generation, and rematerializes the SDK subscription on a replacement connection through explicit `mustRefetch`. The clean-tarball smoke also proves live replacement reaches two independent same-organization browser connections before its persistent restart and isolation checks. Exact resume-cookie replay remains open.
 
 Finish the organization-tenanted SQL path first. Stop presenting files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding as working product features. Keep that code as experimental work until the database path works.
 
@@ -164,7 +164,7 @@ The database proxy now applies one explicit rule to registered-table inserts, up
 
 ## 7. Implement narrow organization queries
 
-Protocol v3 subscription requests send a query reference and raw arguments. Query arguments use strict owned snapshots through raw Gateway admission, validator output, routed output, `Cdb.subscribe`, and direct or registered Cdb execution. For an explicit organization query with a stable ref, partition key, developer-declared server-side intent, and `authority: "organization"`, Gateway requires the partition and intent to resolve to the same exact organization and one virtual shard. It derives current authority from Catalog, installs a durable generation before `Cdb.subscribe`, reruns the exact registered query, and sends snapshots. For supported full-row queries, Cdb conservatively records `cdbTable` dependencies and compares them with declared `intent.tables` before returning rows. Each terminal query execution also records its typed predicate after the row-policy floor is applied. Each declared interval bundle's union must contain every observed range for its table and index. Raw or untracked predicates, embedded subqueries, and callback predicates or ordering remain blocked. General query shapes remain closed. Resume cookies do not replay missed changes.
+Protocol v3 subscription requests send a query reference and raw arguments. Query arguments use strict owned snapshots through raw Gateway admission, validator output, routed output, `Cdb.subscribe`, and direct or registered Cdb execution. For an explicit organization query with a stable ref, partition key, developer-declared server-side intent, and `authority: "organization"`, Gateway requires the partition and intent to resolve to the same exact organization and one virtual shard. It derives current authority from Catalog, installs a durable generation before `Cdb.subscribe`, reruns the exact registered query, and sends snapshots. For supported full-row queries, Cdb conservatively records `cdbTable` dependencies and compares them with declared `intent.tables` before returning rows. Each terminal query execution also records its typed predicate after the row-policy floor is applied. Each declared interval bundle's union must contain every observed range for its table and index. Raw or untracked predicates, embedded subqueries, and callback predicates or ordering remain blocked. General query shapes remain closed. Resume cookies trigger fresh rematerialization after transport loss; they do not replay an exact missed snapshot.
 
 - [x] Change the wire protocol so `sub` carries the query reference and raw arguments.
 - [x] Increment the protocol version and enforce it during `hello` and `welcome`.
@@ -227,11 +227,11 @@ Do not start with incremental row patches. Re-run the affected query after a com
 
 ## 9. Define reconnect, retry, and failure behavior
 
-The current cookie is a generated string, not a replay coordinate. Resume does not replay missed changes. Admitted mutation dispatch failures settle as typed results, but socket loss and shutdown behavior still need an explicit rule.
+The current cookie is a generated string, not a replay coordinate. A replacement connection can carry it, but recovery rematerializes subscriptions instead of replaying the exact missed snapshot. Admitted mutation dispatch failures settle as typed results, while broader shutdown behavior remains open.
 
 - [ ] Define what a cookie identifies and where its replay data lives.
-- [ ] Either implement replay from a valid cookie or always issue `mustRefetch` after reconnect.
-- [ ] Do not claim read-your-writes resume until missed updates can actually be recovered.
+- [x] On a replacement SDK connection that carries a resume cookie, require one per-subscription `mustRefetch{lagged}` round trip before Catalog, Cdb, or installation. Clear the client state to `refetching`, resend the owned subscription, install a fresh generation, accept authoritative rows under a fresh cookie, acknowledge it, and continue later delivery.
+- [x] Start one independent 30-second expiry for retained pre-disconnect query state. Do not reset it across a held JWT or repeated pre-welcome failures. Expire only subscriptions that have not recovered, preserve cookie progress from recovered siblings, and notify each expired record once before its later resend.
 - [ ] Connect replacement snapshots to a durable cookie coordinate and prove cookie replay after missed invalidations.
 - [x] Bound pending mutation settlement with `mutationTimeoutMs`, defaulting to 60 seconds and returning nonretryable `CDB_MUTATION_OUTCOME_UNKNOWN` when the server may already have committed.
 - [x] Reuse the original `mutId` when reconnect resends a mutation that remains pending, without resetting its deadline.
@@ -271,8 +271,9 @@ The current cookie is a generated string, not a replay coordinate. Resume does n
 - [x] Use one correctness command that runs ordinary tests together and every workerd harness serially, with process-tree cleanup on timeout or cancellation.
 - [x] Add a manual scale workflow with frozen `ci-smoke`, `client-max-accepted`, and `throughput` profiles and 1 to 20 sequential samples. Preserve per-sample output, write `chardb.scale.sample.v1` NDJSON records and a `chardb.scale.report.v1` aggregate with min, p50, p95, max, and mean, and record exact workload, Git, Bun, OS, and CPU metadata. Keep timing out of correctness decisions.
 - [x] Prove through configured workerd that an already delivered but unacknowledged snapshot redelivers with the exact cookie and rows after Gateway and Cdb reconstruct around the same hibernated socket, then accepts one acknowledgement and delivers a later mutation.
-- [ ] Prove through configured workerd that a socket lost after snapshot delivery but before acknowledgement reconnects, receives the same staged cookie, acknowledges once, and continues.
-- [ ] Add configured workerd proofs for stale schema epochs and protocol mismatch. Keep focused fake-runtime coverage, but do not count it as configured-runtime evidence.
+- [x] Prove through configured workerd that socket loss after delivery but before acknowledgement retires the lost generation, performs explicit lagged refetch on the replacement SDK connection, receives and acknowledges authoritative rows under a fresh cookie, and delivers a later mutation.
+- [x] Prove through the configured workerd Gateway that an unsupported protocol returns `mustRefetch{protocolMismatch}` and closes with 1002 before JWT or JWKS verification.
+- [ ] Add configured workerd proof for stale shard schema epochs as part of the migration work.
 - [ ] Add remaining Worker RPC failure and shard-eviction cases that are not already covered by Gateway and Cdb reconstruction tests.
 - [ ] Establish performance targets only after repeated benchmark runs on a declared platform. Do not turn local Miniflare timing into a product claim.
 
@@ -290,7 +291,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Add an idempotent auth hook that reuses the demo organization and user membership, tolerates confirmed concurrent creation, then sets the active organization.
 - [x] Give `postMessage` an explicit stable ref and organization authority, and call it through the public mutation hook.
 - [x] Make opening a channel in the clean packed chat consumer return and acknowledge an empty initial query result under workerd.
-- [ ] Make a second browser receive the live replacement result.
+- [x] Make a second same-organization browser receive and acknowledge the packed live replacement before the later restart and isolation checks.
 - [x] Add a second packed principal, move its session from `demo-org` to another organization, deny its `demo-org` query, and prove its own organization starts empty.
 - [x] Install, typecheck, and build the example against the packed package instead of TypeScript aliases or source imports.
 - [x] Add a clean-tarball workerd smoke that crosses the real WebSocket, Gateway, Worker, Catalog, Cdb, Better Auth, policy, mutation, query, and live-update paths.
@@ -310,7 +311,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Remove placeholder React hooks from public exports until implemented.
 - [x] Remove placeholder file and vector APIs from the main product description.
 - [x] Run each workerd harness in a separate sequential CI process to avoid shared Miniflare ports.
-- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 7/7 including the aggregate registration boundary and two default-small scale scenarios, `gateway-jwt` 21/21, and `gateway-snapshot` 2/2. Give both snapshot durability cases 15-second test budgets. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
+- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 7/7 including the aggregate registration boundary and two default-small scale scenarios, `gateway-jwt` 22/22, and `gateway-snapshot` 3/3. Give the snapshot recovery cases 15-second test budgets. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
 - [ ] Add one command that starts the example locally with migrations applied.
 
 ## 12. Fix package and repository hygiene
