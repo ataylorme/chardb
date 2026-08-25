@@ -19,7 +19,16 @@
     "bin": {
         "chardb": "./dist/cli/bin.mjs"
     },
-    "files": ["dist", "README.md", "STATUS.md", "ARCHITECTURE.md", "SECURITY.md", "CONTRIBUTING.md"],
+    "files": [
+        "dist",
+        "README.md",
+        "STATUS.md",
+        "ARCHITECTURE.md",
+        "PLAN.md",
+        "NEXT_SCOPE.md",
+        "SECURITY.md",
+        "CONTRIBUTING.md"
+    ],
     "workspaces": ["landing"],
     "scripts": {
         "build": "unbuild",

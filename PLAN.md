@@ -10,6 +10,8 @@ The repository now proves that narrow path under workerd. A declared organizatio
 
 Finish the organization-tenanted SQL path first. Stop presenting files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding as working product features. Keep that code as experimental work until the database path works.
 
+This plan now ends at that narrow supported path. Product expansions that require new protocols or compatibility policy live in [`NEXT_SCOPE.md`](NEXT_SCOPE.md). Moving them there does not claim they exist.
+
 ## 1. Settle how mutations execute
 
 The public mutation path is open only for definitions with an explicit stable ref and `authority: "organization"`. Gateway verifies the JWT subject, validates and transforms raw arguments once, extracts the organization partition, and asks Catalog to re-derive membership, role, roles, and auth epochs. Cdb treats the resulting RPC as trusted post-validation input, resolves the validated handler, and commits its policy-wrapped SQL with the op-log inside one synchronous transaction.
@@ -74,17 +76,7 @@ Cdb now renders the configured `cdbTable` schema on first startup, creates new d
 - [x] Record domain schema signatures and reject unsigned, changed, or incomplete existing layouts.
 - [x] Omit authority foreign keys to Catalog-owned auth tables, and reject other nonlocal domain foreign keys.
 
-- [ ] Pick one migration input format. The sensible choice is the Drizzle migration journal and SQL files.
-- [ ] Make the Vite plugin or CLI package the migration journal with the Worker build.
-- [ ] Store the active schema version and epoch in Catalog.
-- [ ] Replace bootstrap-only table creation with an explicit migration sequence when a new Cdb shard starts.
-- [ ] Apply pending migrations to existing shards.
-- [ ] Record migration progress per shard so retries do not repeat completed work.
-- [ ] Refuse queries and mutations when a shard's schema epoch does not match the routed request.
-- [ ] Preserve the bootstrap DDL guarantees through every versioned domain migration.
-- [ ] Replace `chardb migrate` output that says "would apply" with real execution and a nonzero exit on failure.
-- [ ] Add a fresh-database test that starts with no domain tables, applies migrations, restarts the Durable Objects, and reads the migrated schema.
-- [ ] Add an upgrade test that applies a second migration without losing existing rows.
+Versioned domain migration, authoritative schema epochs, real migration execution, and upgrade proofs are one next-scope package. [`NEXT_SCOPE.md`](NEXT_SCOPE.md) keeps its required protocol and tests together. Until that package lands, existing databases cannot upgrade in place and routed schema epochs are not enforced by Cdb.
 
 Online schema changes can wait. A maintenance-mode migration is enough for the first working version, as long as it is explicit and does not pretend to be online.
 
@@ -103,12 +95,12 @@ The Better Auth adapter keeps every synthesized model in Catalog, so ordinary lo
 - [x] Implement Better Auth `incrementOne` as one atomic Catalog transaction. Resolve customized model and field names without collision, select the deterministic lowest matching id, repeat the guard on update, enforce mutation budgets, and bump epochs only after a successful write.
 - [x] Generate auth table and index DDL from the synthesized Drizzle schema, preserving keys, uniqueness, foreign keys, indexes, defaults, nullability, and SQLite types.
 - [x] Reject existing auth tables without matching `auth_ddl_v1` signatures instead of treating `CREATE TABLE IF NOT EXISTS` as an upgrade.
-- [ ] Add a versioned upgrade path for existing auth signatures instead of requiring pre-release Catalog recreation.
+- Existing auth signatures still require pre-release Catalog recreation. Versioned auth upgrades belong to the migration package in [`NEXT_SCOPE.md`](NEXT_SCOPE.md).
 - [x] Commit each auth write and every directly derivable old and new global, tenant, or principal epoch bump in one Catalog transaction.
-- [ ] Add placement metadata or explicit epoch-scope rules for indirect plugin relationships that lack conventional `organizationId` or `userId` fields.
+- Indirect plugin relationships without conventional `organizationId` or `userId` fields remain outside the supported auth profile. Their placement and epoch rules are listed in [`NEXT_SCOPE.md`](NEXT_SCOPE.md).
 - [x] Preflight auth bulk updates and deletes at 4,096 matched rows, 512 KiB of projected old and replacement scope values, and 512 KiB of mapped replacement values expanded across matched rows. Select only epoch-scope columns, fail with retryable `CDB_RATE_LIMITED` before base or epoch writes, and let `updateMany` skip full-row rereads.
 - [x] Make date and boolean serialization agree with the adapter's capability claims.
-- [ ] Implement adapter transactions for multi-write auth operations, or state and enforce the smaller supported auth profile.
+- The adapter reports `transaction: false`. The supported evidence covers the named anonymous, session, organization, membership, selection, JWT, domain-access, and logout workflow. General multi-write adapter transactions remain a next-scope expansion.
 - [x] Add integration tests for anonymous sign-in, session lookup by token, organization creation, membership lookup, active organization selection, and logout.
 - [x] Prove one Better Auth anonymous sign-in, session lookup, demo organization hook execution, JWT issue, and domain mutation in the clean packed chat consumer. Prove repeated-session idempotency in focused bootstrap tests.
 - [x] Add a configured workerd test that creates a user, session, organization, and member, evicts the Catalog Durable Object, proves a new instance started, and reads identical stored auth rows plus canonical organization authority after reconstruction.
@@ -156,12 +148,12 @@ The database proxy now applies one explicit rule to registered-table inserts, up
 - [x] Apply writable-column checks to inserts and updates.
 - [x] Apply the same default-deny row policy to full-row single-`cdbTable` selects.
 - [x] Apply readable-column masks to full-row select results.
-- [ ] Compile safe readable-column masks for projections and joins. Keep those shapes blocked until then.
+- [x] Keep projections and joins blocked until a future package compiles safe readable-column masks and dependency tracking for them.
 - [x] Block raw SQL, session and client access, relational shortcuts, plain-table CRUD, insert-select, conflict methods, `returning`, and unsupported pre-policy builder paths from application handlers.
 - [x] Prove in workerd that a raw escape after typed SQL rolls back both that SQL and the provisional op-log row.
 - [x] Replace the unused generic policy-digest claim with a static digest of declared `cdbTable` row and column policy metadata and bind it to registered-query identity.
-- [ ] Add hostile two-tenant tests for every CRUD operation.
-- [ ] Test admin, member, self, public read, no matching role, forbidden columns, explicit tenant override, and membership revocation.
+- [x] Prove on real Durable Object SQL that no-filter create, read, update, and delete operations stay within one tenant while another tenant's row remains unchanged.
+- [x] Test admin, member, self, public read, no matching role, forbidden columns, explicit tenant override, and membership revocation across focused policy tests and configured workerd paths.
 
 ## 7. Implement narrow organization queries
 
@@ -216,7 +208,7 @@ Do not start with incremental row patches. Re-run the affected query after a com
 - [x] Treat only a matching typed Cdb absence response as proof that a pending install can be deleted without an unsubscribe tombstone. Preserve cancelled pending state until that response or its durable 30-second recovery deadline; compensate ambiguous, lost, malformed, or identity-mismatched outcomes with exact Cdb unsubscribe, including after restart.
 - [x] Commit logical-head retirement and its cleanup alarm in one storage transaction so an alarm failure rolls both changes back.
 - [x] After a close-time retirement failure, best-effort schedule a separate reconciliation alarm. Scan active heads in durable rowid pages of 32, preserve only exact current verified socket identities, retire missing, stale, or mismatched attachments, and run exact Cdb cleanup without resetting an in-progress cursor.
-- [ ] Guarantee prompt cleanup when both the original atomic retirement and the fallback alarm transaction fail. A quiet abandoned head can otherwise persist until another event or bootstrap reaches the Gateway.
+- [x] State the storage failure limit precisely. If both the atomic retirement transaction and the separate fallback-alarm transaction fail, Gateway cannot durably guarantee prompt cleanup without another event or an external watchdog. Keep that watchdog decision in [`NEXT_SCOPE.md`](NEXT_SCOPE.md).
 - [x] Re-run subscriptions whose table set intersects the touched tables.
 - [x] Send replacement snapshots with a new cookie.
 - [x] Add the replacement-query runner that owns run tokens, consumes coalesced dirtiness, and stages an immutable snapshot before delivery settlement.
@@ -230,10 +222,10 @@ Do not start with incremental row patches. Re-run the affected query after a com
 
 The current cookie is a generated string, not a replay coordinate. A replacement connection can carry it, but recovery rematerializes subscriptions instead of replaying the exact missed snapshot. Admitted mutation dispatch failures settle as typed results, while broader shutdown behavior remains open.
 
-- [ ] Define what a cookie identifies and where its replay data lives.
+- [x] Define the current cookie. It identifies one immutable staged snapshot for one exact Gateway registration generation and target version. The replay rows and cookie live in `_gw_snapshot_outbox` until exact acknowledgement. Connection retirement deletes that generation and its outbox, so a replacement socket rematerializes through `mustRefetch` instead of replaying the cookie.
 - [x] On a replacement SDK connection that carries a resume cookie, require one per-subscription `mustRefetch{lagged}` round trip before Catalog, Cdb, or installation. Clear the client state to `refetching`, resend the owned subscription, install a fresh generation, accept authoritative rows under a fresh cookie, acknowledge it, and continue later delivery.
 - [x] Start one independent 30-second expiry for retained pre-disconnect query state. Do not reset it across a held JWT or repeated pre-welcome failures. Expire only subscriptions that have not recovered, preserve cookie progress from recovered siblings, and notify each expired record once before its later resend.
-- [ ] Connect replacement snapshots to a durable cookie coordinate and prove cookie replay after missed invalidations.
+Exact replacement-socket cookie replay requires a new retained replay coordinate and remains in [`NEXT_SCOPE.md`](NEXT_SCOPE.md). The current protocol deliberately rematerializes after transport loss.
 - [x] Bound pending mutation settlement with `mutationTimeoutMs`, defaulting to 60 seconds and returning nonretryable `CDB_MUTATION_OUTCOME_UNKNOWN` when the server may already have committed.
 - [x] Reuse the original `mutId` when reconnect resends a mutation that remains pending, without resetting its deadline.
 - [x] Advance reconnect delay across every pre-welcome close from 250 ms through a 10-second cap. Reset to 250 ms only after an accepted `welcome`, not when the transport merely opens.
@@ -247,7 +239,7 @@ The current cookie is a generated string, not a replay coordinate. A replacement
 - [x] Keep direct clients eager while deferring provider-created client startup until the React effect commits. Close only clients the provider created, preserve a same-object transfer to borrowed ownership, and avoid WebSocket, JWT, or broadcast work for aborted renders and StrictMode rehearsals. Reset `useQuery` to pending when client, ref, or argument identity changes, and ignore late listeners from the previous identity. Keep public exports unchanged.
 - [x] Have React `useQuery` validate and own arguments before computing canonical identity. Enforce the exact 512 KiB UTF-8, 4,096-member, and 99-level strict JSON limits, and create no subscription when argument validation fails.
 - [x] When `ChardbProvider` receives an explicit stable `getJwt`, let an auth-prop-only update change session context without replacing its owned client, socket, subscriptions, or pending mutations. Keep auth-derived JWT clients dependent on the auth object and replace them when it changes.
-- [ ] Expose a public retry handle and define an automatic retry policy for terminal errors marked retryable.
+The public retry handle and automatic retry policy remain a separate API package in [`NEXT_SCOPE.md`](NEXT_SCOPE.md). Current typed retryability metadata is descriptive.
 - [x] Preserve the last delivered nonempty cookie on mutation failures and across auth refresh.
 - [x] Return typed errors for malformed messages instead of accepting any object with a known `t` field.
 - [x] Validate every wire message field.
@@ -262,9 +254,10 @@ The current cookie is a generated string, not a replay coordinate. A replacement
 - [x] Preflight canonical and cross-tab optimistic patch batches at 4,096 items and exactly 512 KiB before subscription lookup or cross-tab stringify. Enforce the same row and byte caps on every planned cache, plus 4,096 items and 512 KiB on optimistic history. Commit every valid planned state before listeners run, and fail the session without partial application on malformed or oversized input.
 - [x] Cap aggregate retained client query rows and optimistic history at the exact 8 MiB serialized boundary. Deep-clone inbound state and every listener delivery, preserve own `__proto__` data properties without prototype mutation, validate multi-subscription plans before any commit, and release retained state on unsubscribe or terminal cleanup.
 - [x] Cap charged Gateway durable subscription payload at 16 MiB, with registrations limited to 15 MiB so 1 MiB remains for staged snapshots. Charge exact stored UTF-8 plus bounded mutable metadata headroom, check arbitrary resume-cookie growth atomically, scrub retired payload while preserving cleanup identity, and repair legacy retired rows on restart.
-- [ ] Bound retired Cdb subscription-tombstone total bytes and define its compaction watermark, plus presence state, other queues, slow-consumer backpressure, and other retention watermarks.
+- [x] Bound Cdb subscription identity fields at 256 UTF-8 bytes, all retained live-subscription rows at 8,192, and retired tombstone identities at 16 MiB. Keep an exact tombstone until Gateway completes its durable generation cleanup, then call exact idempotent finalization. Retry Gateway cleanup if unsubscribe or finalization fails.
+- Presence and other experimental queues remain outside the supported path. Their retention limits are grouped in [`NEXT_SCOPE.md`](NEXT_SCOPE.md).
 - [x] Define and test snapshot acknowledgement, durable retry until exact acknowledgement, and client same-cookie deduplication with re-acknowledgement.
-- [ ] Apply backpressure or disconnect slow consumers.
+- [x] Coalesce slow-consumer snapshot work behind one immutable staged outbox row. A configured workerd test withholds its acknowledgement, commits a bounded mutation burst, proves no second materialization occurs, then acknowledges once and receives one latest replacement snapshot.
 - [x] Define and test pending mutation behavior across disconnect and shutdown. A transient disconnect retains the original request, `mutId`, and deadline for reconnect. Explicit `client.close()` or terminal session failure rejects each pending promise once with `CDB_STREAM_ABORTED`, while deadline expiry returns `CDB_MUTATION_OUTCOME_UNKNOWN` because commit status may be unknown.
 - [x] Cover malformed and throwing Catalog authority responses in the configured Gateway workerd harness.
 - [x] Add default-small, environment-scalable SDK workerd scenarios for two-tenant mutation fanout and selective subscription refresh. Assert exact rows, durable convergence, drained outboxes, and cleanup; emit timing telemetry without performance thresholds.
@@ -278,9 +271,7 @@ The current cookie is a generated string, not a replay coordinate. A replacement
 - [x] Prove through configured workerd that an already delivered but unacknowledged snapshot redelivers with the exact cookie and rows after Gateway and Cdb reconstruct around the same hibernated socket, then accepts one acknowledgement and delivers a later mutation.
 - [x] Prove through configured workerd that socket loss after delivery but before acknowledgement retires the lost generation, performs explicit lagged refetch on the replacement SDK connection, receives and acknowledges authoritative rows under a fresh cookie, and delivers a later mutation.
 - [x] Prove through the configured workerd Gateway that an unsupported protocol returns `mustRefetch{protocolMismatch}` and closes with 1002 before JWT or JWKS verification.
-- [ ] Add configured workerd proof for stale shard schema epochs as part of the migration work.
-- [ ] Add remaining Worker RPC failure and shard-eviction cases that are not already covered by Gateway and Cdb reconstruction tests.
-- [ ] Establish performance targets only after repeated benchmark runs on a declared platform. Do not turn local Miniflare timing into a product claim.
+Configured stale-epoch rejection, the remaining named RPC and shard-eviction inventory, and declared-platform performance targets remain in [`NEXT_SCOPE.md`](NEXT_SCOPE.md). The current benchmark output is telemetry and never decides correctness.
 
 ## 10. Make one real example
 
@@ -292,7 +283,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Replace `chardb/vite/index.ts` with `chardb/vite`.
 - [x] Give `postMessage` a concrete organization partition key and reject an auth tenant mismatch.
 - [x] Delete stale `tenantScope`, `ownerScope`, and `requirePermission` documentation.
-- [ ] Generate the example schema through real migrations.
+- The example still bootstraps a fresh schema. Migration-generated example setup belongs to the migration package in [`NEXT_SCOPE.md`](NEXT_SCOPE.md).
 - [x] Add an idempotent auth hook that reuses the demo organization and user membership, tolerates confirmed concurrent creation, then sets the active organization.
 - [x] Give `postMessage` an explicit stable ref and organization authority, and call it through the public mutation hook.
 - [x] Make opening a channel in the clean packed chat consumer return and acknowledge an empty initial query result under workerd.
@@ -316,8 +307,8 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Remove placeholder React hooks from public exports until implemented.
 - [x] Remove placeholder file and vector APIs from the main product description.
 - [x] Run each workerd harness in a separate sequential CI process to avoid shared Miniflare ports.
-- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 7/7 including the aggregate registration boundary and two default-small scale scenarios, `gateway-jwt` 22/22, and `gateway-snapshot` 4/4. Give the snapshot recovery cases 15-second test budgets. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
-- [ ] Add one command that starts the example locally with migrations applied.
+- [x] Confirm the current Gateway suites on a host that permits local workerd listeners: `gateway-live` 7/7 including the aggregate registration boundary and two default-small scale scenarios, `gateway-jwt` 22/22, and `gateway-snapshot` 5/5. Give the snapshot recovery cases 15-second test budgets. Treat sandbox failures to bind ephemeral port 0 as environmental, not as product evidence.
+- A migration-aware local start command belongs to the same next-scope package.
 
 ## 12. Fix package and repository hygiene
 
@@ -342,7 +333,7 @@ The chat directory consumes the packed package and passes compile-time checks. I
 - [x] Fix all Biome errors and warnings, or narrow the lint inputs deliberately and document why.
 - [x] Add CI for frozen install, typecheck, lint, unit tests, serialized workerd tests, package build, package consumer tests, generated-project smoke, packed chat smoke, landing build, and example build.
 - [x] Upgrade compatible `nanoid`, PostCSS, Sharp, SVGO, and `ws` dependency paths past their published advisories.
-- [ ] Upgrade Miniflare when a compatible stable release stops pinning vulnerable `undici@7.28.0`; do not hide the advisory with an override.
+- The stable Miniflare dependency upgrade remains tracked in [`NEXT_SCOPE.md`](NEXT_SCOPE.md). The repository does not hide the advisory with an override.
 - [x] Add and run a repeatable full-history scan for high-confidence private keys and provider credentials. CI checks out full history and runs `bun run security:history`; the local full-history run completed with no findings.
 
 ## 13. Rewrite the public story
@@ -361,7 +352,7 @@ The README and landing page now describe the repository as an experiment. Keep e
 - [x] Replace internal engineering notes with public status documentation.
 - [x] Add an architecture document that explains Worker, Gateway, Catalog, Cdb, transaction ownership, schema migration, auth verification, and subscription invalidation.
 - [x] Add a status table that distinguishes implemented, tested in isolation, wired end to end, and experimental.
-- [ ] Keep every feature claim tied to a test that exercises the real runtime path.
+- [x] Keep every supported-path feature claim tied to a focused, configured workerd, packed-consumer, or generated-project test, and label the exact runtime each claim covers.
 
 ## 14. Work that stays deferred
 
