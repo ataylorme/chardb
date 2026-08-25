@@ -12,7 +12,7 @@ export function Footer() {
                     GitHub
                 </a>
                 <span aria-hidden="true">·</span>
-                <span>experimental prototype</span>
+                <span>working core · unfinished product</span>
             </div>
         </footer>
     );

@@ -1,4 +1,3 @@
-import { GITHUB_URL } from "../lib/constants";
 import { CoalShader } from "./CoalShader";
 
 export function Hero() {
@@ -10,29 +9,28 @@ export function Hero() {
                         className="font-sans font-semibold tracking-tight text-fg"
                         style={{ fontSize: "clamp(40px, 6vw, 72px)", lineHeight: 1.05, letterSpacing: "-0.02em" }}
                     >
-                        A database experiment for tenant-shaped apps.
+                        A real database inside your Worker.
                     </h1>
                     <p
                         className="mt-6 text-fg-muted max-w-2xl"
                         style={{ fontSize: "clamp(16px, 1.4vw, 18px)", lineHeight: 1.6 }}
                     >
-                        Declare an organization boundary in Drizzle. A narrow workerd path now carries declared
-                        mutations and exact-partition live queries through verified identity, Catalog authority, tenant
-                        routing, policy enforcement, durable invalidation, and acknowledged replacement snapshots.
+                        One binding and one typed query layer for tenant-shaped SQL, auth, files, vectors, and live
+                        queries. That is the destination. The organization-scoped SQL and live-query core works today;
+                        the rest is an explicit roadmap.
                     </p>
 
                     <div className="mt-8 flex flex-col sm:flex-row sm:items-center gap-4">
                         <a
-                            href={GITHUB_URL}
-                            rel="noopener"
+                            href="#today"
                             className="inline-flex items-center gap-1 text-sm text-fg-muted hover:text-fg transition-colors"
                         >
-                            Read the code and current plan <span aria-hidden="true">→</span>
+                            See what works today <span aria-hidden="true">→</span>
                         </a>
                     </div>
 
                     <p className="mt-8 text-xs text-fg-dim font-mono lowercase">
-                        <span>experimental</span>
+                        <span>working core</span>
                         <span className="px-2 text-fg-dim/70" aria-hidden="true">
                             ·
                         </span>
@@ -40,7 +38,7 @@ export function Hero() {
                         <span className="px-2 text-fg-dim/70" aria-hidden="true">
                             ·
                         </span>
-                        <span>Drizzle-native</span>
+                        <span>unfinished product</span>
                     </p>
                 </div>
 

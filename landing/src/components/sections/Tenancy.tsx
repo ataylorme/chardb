@@ -4,13 +4,13 @@ import { Cmt, Fn, Id, Kw, P, Str } from "../syn";
 
 export function Tenancy() {
     return (
-        <Section id="tenancy" num="03" label="tenancy">
-            <SectionHeading>Put the tenant boundary in the schema.</SectionHeading>
+        <Section id="tenancy" num="04" label="tenancy">
+            <SectionHeading>Sharded the way your app already works.</SectionHeading>
             <SectionLead>
-                For declared organization mutations, <InlineCode>forOrg()</InlineCode> supplies the colocation, routing,
-                and policy boundary for one shard-local transaction. <InlineCode>forUser()</InlineCode> and{" "}
-                <InlineCode>globalScope()</InlineCode> are available schema primitives, but they do not have equally
-                complete public runtime paths.
+                <InlineCode>forOrg()</InlineCode>, <InlineCode>forUser()</InlineCode>, and{" "}
+                <InlineCode>globalScope()</InlineCode> should declare placement, transaction, and policy boundaries
+                once. The organization path works end to end today. User and global paths still need the same public
+                runtime proof.
             </SectionLead>
 
             <div className="mt-10">
@@ -65,7 +65,7 @@ export function Tenancy() {
                 </CodeCard>
             </div>
 
-            <PullQuote>organization mutations use the schema as the boundary.</PullQuote>
+            <PullQuote>the schema is the boundary.</PullQuote>
         </Section>
     );
 }

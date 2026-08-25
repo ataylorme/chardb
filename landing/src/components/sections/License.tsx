@@ -2,14 +2,14 @@ import { BulletList, InlineCode, PullQuote, Section, SectionHeading, SectionLead
 
 export function License() {
     return (
-        <Section id="license" num="06" label="license">
-            <SectionHeading>Open for inspection.</SectionHeading>
+        <Section id="license" num="07" label="license">
+            <SectionHeading>Yours to inspect and run.</SectionHeading>
             <SectionLead>
                 The code is MIT-licensed. It targets <InlineCode>wrangler</InlineCode> and Cloudflare Durable Objects,
                 but it is not ready for production data.
             </SectionLead>
             <BulletList items={["read the implementation", "run the tests", "challenge the tenant-boundary model"]} />
-            <PullQuote>publish the experiment. earn the product claims later.</PullQuote>
+            <PullQuote>your account. your data. your code.</PullQuote>
         </Section>
     );
 }

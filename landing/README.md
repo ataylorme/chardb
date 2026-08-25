@@ -55,7 +55,7 @@ Requires Google Chrome installed at `/Applications/Google Chrome.app` (the scrip
 ## Structure
 
 - `src/components/` — UI components
-- `src/components/sections/` — site sections (Binding, Scale, Tenancy, Auth, License, Closing)
+- `src/components/sections/` — current proof and destination sections
 - `src/components/CoalShader.tsx` — WebGL coal/ember shader for the hero
 - `src/lib/constants.ts` — site URL, GitHub URL, repository setup command
 - `tailwind.config.ts` — design tokens (ink, accent, syntax colors, fonts)

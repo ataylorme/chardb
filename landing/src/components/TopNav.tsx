@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { GITHUB_URL } from "../lib/constants";
 
-const SECTIONS = ["binding", "scale", "tenancy", "auth"] as const;
+const SECTIONS = ["today", "binding", "scale", "tenancy", "auth", "files"] as const;
 
 export function TopNav() {
     const [scrolled, setScrolled] = useState(false);
@@ -41,8 +41,8 @@ export function TopNav() {
                     chardb
                 </a>
 
-                <nav aria-label="Primary" className="flex items-center gap-6">
-                    <ul className="hidden md:flex items-center gap-6 text-sm text-fg-muted">
+                <nav aria-label="Primary" className="flex items-center gap-5">
+                    <ul className="hidden lg:flex items-center gap-5 text-sm text-fg-muted">
                         {SECTIONS.map(id => (
                             <li key={id}>
                                 <a

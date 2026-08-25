@@ -13,7 +13,7 @@ export function Closing() {
                         maxWidth: "18ch",
                     }}
                 >
-                    Does a schema-declared organization boundary fit your app?
+                    One database model. Inside your Worker.
                 </h2>
 
                 <div className="mt-10 flex flex-col sm:flex-row items-center justify-center gap-5">
@@ -22,7 +22,7 @@ export function Closing() {
                         rel="noopener"
                         className="inline-flex items-center gap-1 text-sm text-fg-muted hover:text-fg transition-colors"
                     >
-                        Read the code and tell us where it breaks <span aria-hidden="true">→</span>
+                        Read the proof and the remaining work <span aria-hidden="true">→</span>
                     </a>
                 </div>
             </div>

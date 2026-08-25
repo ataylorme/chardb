@@ -4,27 +4,20 @@ import { Cmt, Fn, Id, Kw, P, Str } from "../syn";
 
 export function Auth() {
     return (
-        <Section id="auth" num="04" label="auth">
-            <SectionHeading>Declare access beside the table.</SectionHeading>
+        <Section id="auth" num="05" label="auth">
+            <SectionHeading>Auth and data, one schema.</SectionHeading>
             <SectionLead>
-                Better Auth models live in Catalog. For each declared organization mutation or exact-partition query,
-                Gateway re-derives membership, roles, and auth epochs from Catalog. Cdb then enforces schema-declared
-                write and select rules. The query path persists an exact generation and sends replacement snapshots
-                after matching commits.
+                Better Auth identities, tenant membership, roles, row rules, and column masks belong in the same typed
+                model as application data. The organization path enforces that boundary today. The destination is one
+                transaction and query layer across the full supported Better Auth workflow.
             </SectionLead>
 
             <BulletList
                 items={[
-                    "Catalog-backed Better Auth models and signed Gateway identity",
-                    "declared organization writes use current membership, roles, auth epochs, row predicates, and column rules",
-                    "publicRead still requires JWT identity, organization membership, and tenant isolation",
-                    "dirty live reruns re-read membership and roles on long-lived sockets",
-                    "tracked query tables must appear in the declared live intent",
-                    "registered queries bind to a static digest of declared table policy metadata",
-                    "durable delivery retries until an exact client acknowledgement",
-                    "Better Auth anonymous accounts become JWT-authenticated principals",
-                    "Catalog-owned JWKS refresh with URL-scoped cache, leases, bounds, and cooldowns",
-                    "exact resume replay and online migrations remain unfinished",
+                    "today: Catalog-backed Better Auth identity, membership, roles, and auth epochs",
+                    "today: row predicates and readable or writable column rules enforced inside Cdb",
+                    "today: live reruns re-check authority before replacing client state",
+                    "target: supported Better Auth workflows can make atomic multi-write changes",
                 ]}
             />
 
@@ -181,11 +174,11 @@ export function Auth() {
             </div>
 
             <p className="mt-6 text-sm text-fg-muted">
-                Declared organization mutations and exact-partition live queries execute through the policy wrapper in
-                focused workerd tests. The package remains experimental; do not use production data.
+                The tested organization slice includes anonymous sign-in, membership lookup, mutation, readback,
+                cross-organization denial, role revocation, reconnect, and restart. Do not use production data yet.
             </p>
 
-            <PullQuote>one narrow live path works. it is not production ready.</PullQuote>
+            <PullQuote>users should not require a second data system.</PullQuote>
         </Section>
     );
 }

@@ -15,16 +15,16 @@ export function OgImage() {
                         className="mt-8 font-sans font-semibold tracking-tight text-fg"
                         style={{ fontSize: 70, lineHeight: 1.05, letterSpacing: "-0.02em" }}
                     >
-                        Tenant-sharded SQLite experiments on Cloudflare.
+                        A real database inside your Worker.
                     </h1>
 
                     <p className="mt-7 text-fg-muted" style={{ fontSize: 24, lineHeight: 1.5, maxWidth: 640 }}>
-                        Tested organization mutations and acknowledged live snapshots derived from Drizzle. Resume
-                        replay and online migrations remain unfinished.
+                        One typed query layer for tenant-shaped SQL, auth, files, vectors, and live data. The core
+                        works; the destination is explicit.
                     </p>
 
                     <div className="mt-8 inline-flex items-center rounded-full border border-line2 bg-ink-850 px-6 py-2.5 font-mono">
-                        <span className="text-fg text-[20px]">experimental prototype</span>
+                        <span className="text-fg text-[20px]">working core · unfinished product</span>
                     </div>
 
                     <div className="mt-4 font-mono text-[16px] text-fg-dim lowercase flex items-center gap-3">

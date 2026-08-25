@@ -6,22 +6,22 @@ export function Scale() {
             <div className="mx-auto max-w-page px-5 sm:px-8 py-16 lg:py-28 grid grid-cols-1 lg:grid-cols-12 gap-10 lg:gap-16 items-start">
                 <div className="lg:col-span-7">
                     <p className="eyebrow">
-                        <span className="num">02</span> / scale
+                        <span className="num">03</span> / scale
                     </p>
-                    <SectionHeading>Separate tenant placement from physical shards.</SectionHeading>
+                    <SectionHeading>Scale should not become an app migration.</SectionHeading>
                     <SectionLead>
-                        Organization keys map deterministically into 16,384 virtual shards, and Catalog stores the
-                        current physical range map. Split, copy, tail, and phase logic are tested in isolation;
-                        automatic end-to-end resharding and recovery are not.
+                        Application code should keep addressing a tenant while Chardb moves physical ranges underneath
+                        it. Deterministic placement and the split machinery exist today. Automatic online coordination
+                        and recovery are still destination work.
                     </SectionLead>
                     <BulletList
                         items={[
-                            "16,384 virtual shards with deterministic organization routing",
-                            "Catalog stores current physical range ownership",
-                            "reshard copy, tail, and phase logic are isolated, not an automated production path",
+                            "today: 16,384 virtual shards with deterministic organization routing",
+                            "today: Catalog stores current physical range ownership",
+                            "target: split, copy, tail, cut over, and recover without changing application code",
                         ]}
                     />
-                    <PullQuote>routing is implemented. live resharding is not.</PullQuote>
+                    <PullQuote>scale should be an operational event, not a rewrite.</PullQuote>
                 </div>
 
                 <div className="lg:col-span-5">
@@ -121,7 +121,7 @@ export function Scale() {
                                 fontSize="10"
                                 fill="#5A5A5A"
                             >
-                                design target: split a range and move ownership
+                                target: split a range and move ownership online
                             </text>
                         </svg>
                     </div>
