@@ -89,6 +89,71 @@ describe("trusted one-shot query dispatch", () => {
         });
     });
 
+    test("binds user queries to the verified subject", async () => {
+        const deps: TrustedQueryDispatchDeps = {
+            routeQuery: async input => ({
+                ok: true,
+                args: input.args,
+                intent: {
+                    kind: "select",
+                    tables: ["preferences"],
+                    partitionKey: { table: "preferences", column: "user_id", values: ["user-1"] },
+                },
+                policyDigest: "user-policy",
+                queryHash: "user-query",
+                authority: "user",
+                partitionKey: "user-1",
+            }),
+            catalog: {
+                resolveOrganizationAuthority: async () => null,
+                resolveUserAuthority: async input => ({
+                    principalId: input.principalId,
+                    role: "user",
+                    roles: ["user"],
+                    authEpochs: { global: 2, tenant: 0, principal: 7 },
+                }),
+                route: async () => ({ shardId: ShardId("user-shard"), schemaEpoch: 3, domainSchemaEpoch: 4 }),
+            },
+            cdb: () => ({
+                query: async input => {
+                    expect(input.auth).toEqual({
+                        userId: "user-1",
+                        role: "user",
+                        roles: ["user"],
+                        authEpochs: { global: 2, tenant: 0, principal: 7 },
+                        claims: {},
+                    });
+                    return { ok: true, result: [{ theme: "dark" }] };
+                },
+            }),
+        };
+
+        await expect(dispatchTrustedQuery(deps, request)).resolves.toEqual({
+            ok: true,
+            result: [{ theme: "dark" }],
+        });
+        const forgedDeps: TrustedQueryDispatchDeps = {
+            ...deps,
+            routeQuery: async input => ({
+                ok: true,
+                args: input.args,
+                intent: {
+                    kind: "select",
+                    tables: ["preferences"],
+                    partitionKey: { table: "preferences", column: "user_id", values: ["user-2"] },
+                },
+                policyDigest: "user-policy",
+                queryHash: "forged-user-query",
+                authority: "user",
+                partitionKey: "user-2",
+            }),
+        };
+        await expect(dispatchTrustedQuery(forgedDeps, request)).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_FORBIDDEN" },
+        });
+    });
+
     test("rejects caller-controlled or cross-partition intent before Catalog", async () => {
         let catalogCalls = 0;
         for (const routed of [

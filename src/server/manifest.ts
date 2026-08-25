@@ -270,10 +270,10 @@ export function routeValidatedQuery(
         { maxAggregateMembers: CDB_JSON_MAX_AGGREGATE_MEMBERS, maxDepth: CDB_QUERY_ARGS_MAX_DEPTH }
     ) as unknown as CdbIntent;
     const policyDigest = policyDigestForTables(intent.tables);
-    if (descriptor.authority === "organization" && (typeof key !== "string" || key.length === 0)) {
+    if (descriptor.authority !== undefined && (typeof key !== "string" || key.length === 0)) {
         throw new CdbError({
             code: "CDB_INVALID_ARGS",
-            message: `organization query ${input.ref} requires a nonempty string partition key`,
+            message: `${descriptor.authority} query ${input.ref} requires a nonempty string partition key`,
         });
     }
     return {
@@ -343,10 +343,10 @@ export function routeMutation(
         let key: string | number | bigint | undefined;
         if (desc.extractPartitionKey) key = desc.extractPartitionKey(snapshotCdbMutationArgs(validatedArgs));
         const args = snapshotCdbMutationArgs(validatedArgs);
-        if (desc.authority === "organization" && (typeof key !== "string" || key.length === 0)) {
+        if (desc.authority !== undefined && (typeof key !== "string" || key.length === 0)) {
             throw new CdbError({
                 code: "CDB_INVALID_ARGS",
-                message: `organization mutation ${input.ref} requires a nonempty string partition key`,
+                message: `${desc.authority} mutation ${input.ref} requires a nonempty string partition key`,
             });
         }
         if (key === undefined && desc.singlePartition) {

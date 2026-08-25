@@ -2,7 +2,13 @@ import type { CdbError } from "../errors.ts";
 import type { ChardbRef, ClientId, PrincipalId, RawJson, ShardId, SubId, TenantId } from "../types.ts";
 import type { WireInterval } from "../wire.ts";
 import type { AuthCtx, MutationAuthority } from "./define.ts";
-import type { OrganizationAuthority, OrganizationAuthorityRequest, RouteResult } from "./do/catalog.ts";
+import type {
+    OrganizationAuthority,
+    OrganizationAuthorityRequest,
+    RouteResult,
+    UserAuthority,
+    UserAuthorityRequest,
+} from "./do/catalog.ts";
 
 /** Structured-cloneable error envelope shared by every mutation RPC hop. */
 export type CdbErrorWire = ReturnType<CdbError["toJSON"]>;
@@ -38,6 +44,11 @@ export interface CatalogRoutingRpc extends CatalogMutationRpc {
 /** Catalog boundary for deriving tenant authority from persisted membership. */
 export interface CatalogOrganizationAuthorityRpc {
     resolveOrganizationAuthority(request: OrganizationAuthorityRequest): Promise<OrganizationAuthority | null>;
+}
+
+/** Catalog boundary for deriving authority from the persisted Better Auth user row. */
+export interface CatalogUserAuthorityRpc {
+    resolveUserAuthority(request: UserAuthorityRequest): Promise<UserAuthority | null>;
 }
 
 /** Globally unique identity for one live subscription registration. */

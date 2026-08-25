@@ -20,7 +20,13 @@ import {
 } from "./do/gateway.ts";
 import { withChardbLoopbacks } from "./loopback.ts";
 import { type ChardbManifest, emptyManifest, routeMutation, routeQuery } from "./manifest.ts";
-import type { CatalogMutationRpc, CatalogOrganizationAuthorityRpc, CdbMutationRpc, CdbQueryRpc } from "./rpc.ts";
+import type {
+    CatalogMutationRpc,
+    CatalogOrganizationAuthorityRpc,
+    CatalogUserAuthorityRpc,
+    CdbMutationRpc,
+    CdbQueryRpc,
+} from "./rpc.ts";
 
 export interface DbBindingEnv {
     readonly CDB_CATALOG: DurableObjectNamespace;
@@ -164,10 +170,12 @@ export class DB extends WorkerEntrypoint<DbBindingEnv> {
 
     private catalog(): CatalogMutationRpc &
         CatalogOrganizationAuthorityRpc &
+        CatalogUserAuthorityRpc &
         Parameters<typeof verifyGatewayJwt>[0]["catalog"] {
         const id = this.env.CDB_CATALOG.idFromName("global");
         return this.env.CDB_CATALOG.get(id) as unknown as CatalogMutationRpc &
             CatalogOrganizationAuthorityRpc &
+            CatalogUserAuthorityRpc &
             Parameters<typeof verifyGatewayJwt>[0]["catalog"];
     }
 

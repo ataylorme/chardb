@@ -104,6 +104,31 @@ describe("defineXxx — function-ref identity", () => {
         expect(fn.__chardbRef).toBe(ChardbRef("api/messages#post"));
     });
 
+    test("user authority is explicit query and mutation metadata", () => {
+        const mutation = defineMutation({
+            ref: "api/preferences#save",
+            args: z.object({ userId: z.string() }),
+            authority: "user",
+            partitionKey: "userId",
+            handler: () => null,
+        });
+        const query = defineQuery({
+            ref: "api/preferences#list",
+            authority: "user",
+            partitionKey: "userId",
+            intent: (args: { userId: string }) => ({
+                kind: "select",
+                tables: ["preferences"],
+                partitionKey: { table: "preferences", column: "user_id", values: [args.userId] },
+            }),
+            handler: async () => [],
+        });
+
+        expect((mutation as unknown as { __chardbAuthority?: string }).__chardbAuthority).toBe("user");
+        expect(query.__chardbAuthority).toBe("user");
+        expect(query.__chardbPartitionKey?.({ userId: "user-7" })).toBe("user-7");
+    });
+
     test("config mutation and query refs are stable and validated", () => {
         const mutation = defineMutation({ ref: "api/items#create", handler: () => null });
         const query = defineQuery({ ref: "api/items#list", handler: async () => [] });

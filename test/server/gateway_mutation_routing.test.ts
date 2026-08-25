@@ -9,6 +9,7 @@ import {
     gatewayErrorEnvelope,
     projectCdbMutationResponse,
     projectOrganizationMutationAuth,
+    projectUserMutationAuth,
 } from "../../src/server/do/gateway.ts";
 import { manifestFromExports, routeMutation } from "../../src/server/manifest.ts";
 import { CDB_JSON_MAX_AGGREGATE_MEMBERS, CDB_MUTATION_ARGS_MAX_DEPTH } from "../../src/server/result_limits.ts";
@@ -158,6 +159,87 @@ describe("trusted Gateway mutation dispatch", () => {
             result: { id: "post-1" },
             rowsAffected: 1,
         });
+    });
+
+    test("binds user mutations to the verified subject and current Catalog user", async () => {
+        const userRequest: TrustedMutationDispatchRequest = {
+            principalId: PrincipalId("user-1"),
+            mutId: "user-mut-1",
+            ref: "api/preferences#save",
+            args: { userId: "user-1", theme: "dark" },
+        };
+        const deps: TrustedMutationDispatchDeps = {
+            routeMutation: input => ({
+                ok: true,
+                vshard: Number(vshardOf(["user-1"])),
+                authority: "user",
+                partitionKey: "user-1",
+                args: input.args,
+            }),
+            catalog: {
+                resolveOrganizationAuthority: async () => null,
+                resolveUserAuthority: async input => ({
+                    principalId: input.principalId,
+                    role: "admin,user",
+                    roles: ["admin", "user"],
+                    authEpochs: { global: 5, tenant: 0, principal: 8 },
+                }),
+                route: async () => ({ shardId: ShardId("user-shard"), schemaEpoch: 2, domainSchemaEpoch: 3 }),
+            },
+            cdb: () => ({
+                mutate: async input => {
+                    expect(input.auth).toEqual({
+                        userId: "user-1",
+                        role: "admin,user",
+                        roles: ["admin", "user"],
+                        authEpochs: { global: 5, tenant: 0, principal: 8 },
+                        claims: {},
+                    });
+                    return { ok: true, cookie: "user-cookie", ran: true, result: null, rowsAffected: 1 };
+                },
+            }),
+        };
+
+        await expect(dispatchTrustedMutation(deps, userRequest)).resolves.toMatchObject({ ok: true, ran: true });
+        const forgedDeps: TrustedMutationDispatchDeps = {
+            ...deps,
+            routeMutation: input => ({
+                ok: true,
+                vshard: Number(vshardOf(["user-2"])),
+                authority: "user",
+                partitionKey: "user-2",
+                args: input.args,
+            }),
+        };
+        await expect(dispatchTrustedMutation(forgedDeps, userRequest)).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_FORBIDDEN" },
+        });
+    });
+
+    test("validates user authority envelopes before shard dispatch", () => {
+        expect(
+            projectUserMutationAuth(
+                {
+                    principalId: PrincipalId("user-1"),
+                    role: "user",
+                    roles: ["user"],
+                    authEpochs: { global: 1, tenant: 0, principal: 2 },
+                },
+                { principalId: PrincipalId("user-1") }
+            )
+        ).toMatchObject({ ok: true, auth: { userId: "user-1" } });
+        expect(
+            projectUserMutationAuth(
+                {
+                    principalId: PrincipalId("user-2"),
+                    role: "user",
+                    roles: ["user"],
+                    authEpochs: { global: 1, tenant: 0, principal: 2 },
+                },
+                { principalId: PrincipalId("user-1") }
+            )
+        ).toMatchObject({ ok: false, code: "CDB_FORBIDDEN" });
     });
 
     test("forwards the exact transformed args and makes no RPC for invalid raw args", async () => {

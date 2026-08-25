@@ -342,6 +342,25 @@ export interface OrganizationAuthority {
     };
 }
 
+export interface UserAuthorityRequest {
+    /** Subject from a successfully signature-verified JWT. */
+    readonly principalId: PrincipalId;
+}
+
+export interface UserAuthority {
+    readonly principalId: PrincipalId;
+    /** Canonical comma-separated Better Auth user role. */
+    readonly role: string;
+    /** Sorted, deduplicated user roles. */
+    readonly roles: readonly string[];
+    readonly authEpochs: {
+        readonly global: number;
+        /** User scope has no organization epoch. */
+        readonly tenant: 0;
+        readonly principal: number;
+    };
+}
+
 export class Catalog extends DurableObject<CatalogEnv> {
     private bootstrapped = false;
     private authTablesBootstrapped = false;
@@ -795,6 +814,44 @@ export class Catalog extends DurableObject<CatalogEnv> {
                 authEpochs: {
                     global: this.readEpoch("auth_global", "global"),
                     tenant: this.readEpoch("auth_tenant", args.organizationId),
+                    principal: this.readEpoch("auth_principal", args.principalId),
+                },
+            };
+        });
+        return authority;
+    }
+
+    /** Resolve user authority from the Catalog-owned Better Auth user row. */
+    async resolveUserAuthority(args: UserAuthorityRequest): Promise<UserAuthority | null> {
+        await this.bootstrap();
+        if (!args.principalId) return null;
+
+        let runtime: ReturnType<typeof getAuthRuntime>;
+        try {
+            runtime = getAuthRuntime();
+        } catch (error) {
+            if (error instanceof CdbError && error.code === "CDB_AUTH_NOT_BOUND") return null;
+            throw error;
+        }
+        const authSchema = runtime.schema as unknown as Record<string, unknown>;
+        if (!authSchema.user) return null;
+
+        this.ensureAuthTables();
+        const userTable = tableFor("user");
+        let authority: UserAuthority | null = null;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const user = authFindOne(sql, userTable, { id: args.principalId });
+            if (!user) return;
+            const roles = canonicalMembershipRoles(user.role);
+            if (roles.length === 0) return;
+            authority = {
+                principalId: args.principalId,
+                role: roles.join(","),
+                roles,
+                authEpochs: {
+                    global: this.readEpoch("auth_global", "global"),
+                    tenant: 0,
                     principal: this.readEpoch("auth_principal", args.principalId),
                 },
             };

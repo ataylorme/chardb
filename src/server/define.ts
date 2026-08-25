@@ -85,7 +85,7 @@ export interface AuthCtx {
  * ergonomics, not a knob that weakens the per-shard op-log floor.
  */
 export type IdempotencyTtl = "24h";
-export type MutationAuthority = "organization";
+export type MutationAuthority = "organization" | "user";
 export type IdempotentMutation<F, _Ttl extends IdempotencyTtl> = F & {
     readonly __chardbIdempotencyTtl: _Ttl;
 };
@@ -113,6 +113,12 @@ export type MutationOptions<TArgs = unknown> =
           /** Opens dispatch only after Catalog confirms membership in the extracted organization partition. */
           readonly authority: "organization";
           readonly ref: string;
+      })
+    | (MutationOptionsBase<TArgs> & {
+          /** Opens dispatch only when the extracted partition is the verified JWT subject. */
+          readonly authority: "user";
+          readonly ref: string;
+          readonly partitionKey: (args: TArgs) => string | number | bigint | undefined;
       })
     | (MutationOptionsBase<TArgs> & { readonly authority?: undefined });
 
@@ -208,6 +214,12 @@ export type MutationConfig<TDb, TArgs extends Record<string, unknown>, TResult> 
           readonly authority: "organization";
           readonly ref: string;
       })
+    | (MutationConfigBase<TDb, TArgs, TResult> & {
+          /** The extracted partition must equal the verified JWT subject. */
+          readonly authority: "user";
+          readonly ref: string;
+          readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
+      })
     | (MutationConfigBase<TDb, TArgs, TResult> & { readonly authority?: undefined });
 
 /**
@@ -254,8 +266,8 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
         throw new TypeError("chardb: mutation ref must be a nonempty string containing #");
     }
     const authority = isConfig ? configOrHandler.authority : optionsArg?.authority;
-    if (authority === "organization" && explicitRef === undefined) {
-        throw new TypeError("chardb: organization mutations require an explicit ref");
+    if (authority !== undefined && explicitRef === undefined) {
+        throw new TypeError(`chardb: ${authority} mutations require an explicit ref`);
     }
     const partitionKey = isConfig ? configOrHandler.partitionKey : optionsArg?.partitionKey;
     const partitionKeyFn: ((args: TArgs) => string | number | bigint | undefined) | undefined =
@@ -385,6 +397,12 @@ export type QueryConfig<TDb, TArgs extends Record<string, unknown>, TResult> =
           readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
           readonly intent: (args: TArgs) => CdbIntent;
       })
+    | (QueryConfigBase<TDb, TArgs, TResult> & {
+          readonly authority: "user";
+          readonly ref: string;
+          readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
+          readonly intent: (args: TArgs) => CdbIntent;
+      })
     | (QueryConfigBase<TDb, TArgs, TResult> & { readonly authority?: undefined });
 
 /**
@@ -421,8 +439,8 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
     if (explicitRef !== undefined && (explicitRef.length === 0 || !explicitRef.includes("#"))) {
         throw new TypeError("chardb: query ref must be a nonempty string containing #");
     }
-    if (authority === "organization" && explicitRef === undefined) {
-        throw new TypeError("chardb: organization queries require an explicit ref");
+    if (authority !== undefined && explicitRef === undefined) {
+        throw new TypeError(`chardb: ${authority} queries require an explicit ref`);
     }
     const invokeValidated = async (ctx: QueryCtx<TDb>, args: TArgs): Promise<TResult> => {
         const wrappedCtx = wrapCtxDb(ctx) as QueryCtx<TDb>;

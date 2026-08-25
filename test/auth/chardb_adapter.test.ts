@@ -1489,6 +1489,44 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         });
     });
 
+    test("derives user authority from the current Catalog user row", async () => {
+        const nowMs = Date.parse("2026-08-23T00:00:00Z");
+        await harness.catalog.mutateAuth({
+            model: "user",
+            op: "create",
+            payload: {
+                id: "user-authority-subject",
+                name: "User Authority",
+                email: "user-authority@example.com",
+                emailVerified: true,
+                role: " user,admin,user ",
+                createdAt: nowMs,
+                updatedAt: nowMs,
+            },
+        });
+
+        expect(
+            await harness.catalog.resolveUserAuthority({ principalId: PrincipalId("user-authority-subject") })
+        ).toEqual({
+            principalId: PrincipalId("user-authority-subject"),
+            role: "admin,user",
+            roles: ["admin", "user"],
+            authEpochs: { global: 1, tenant: 0, principal: 1 },
+        });
+        expect(
+            await harness.catalog.resolveUserAuthority({ principalId: PrincipalId("missing-user-authority") })
+        ).toBeNull();
+
+        await harness.catalog.mutateAuth({
+            model: "user",
+            op: "delete",
+            where: { id: "user-authority-subject" },
+        });
+        expect(
+            await harness.catalog.resolveUserAuthority({ principalId: PrincipalId("user-authority-subject") })
+        ).toBeNull();
+    });
+
     test("isolates organizations and returns null for missing or revoked membership", async () => {
         const nowMs = Date.parse("2026-08-23T00:00:00Z");
         for (const organizationId of ["isolation-org-a", "isolation-org-b"]) {

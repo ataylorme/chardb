@@ -61,6 +61,7 @@ import type {
     CatalogMutationRpc,
     CatalogOrganizationAuthorityRpc,
     CatalogRoutingRpc,
+    CatalogUserAuthorityRpc,
     CdbErrorWire,
     CdbMutationResponse,
     CdbMutationRpc,
@@ -495,13 +496,13 @@ type CdbRpc = CdbSubscriptionRpc & CdbQueryRpc;
 
 export interface TrustedMutationDispatchDeps {
     readonly routeMutation: MutationRouteResolver;
-    readonly catalog: CatalogMutationRpc & CatalogOrganizationAuthorityRpc;
+    readonly catalog: CatalogMutationRpc & CatalogOrganizationAuthorityRpc & Partial<CatalogUserAuthorityRpc>;
     readonly cdb: (shardId: string) => CdbMutationRpc;
 }
 
 export interface TrustedQueryDispatchDeps {
     readonly routeQuery: (request: { readonly ref: string; readonly args: RawJson }) => Promise<QueryRouteResponse>;
-    readonly catalog: CatalogMutationRpc & CatalogOrganizationAuthorityRpc;
+    readonly catalog: CatalogMutationRpc & CatalogOrganizationAuthorityRpc & Partial<CatalogUserAuthorityRpc>;
     readonly cdb: (shardId: string) => CdbQueryRpc;
 }
 
@@ -660,6 +661,64 @@ type OrganizationAuthProjection =
           readonly code: "CDB_FORBIDDEN" | "CDB_CATALOG_UNAVAILABLE";
           readonly message: string;
       };
+
+type UserAuthProjection = OrganizationAuthProjection;
+
+/** Validate the Catalog user envelope before it becomes runtime auth. */
+export function projectUserMutationAuth(
+    value: unknown,
+    expected: { readonly principalId: PrincipalId }
+): UserAuthProjection {
+    if (value === null) {
+        return { ok: false, code: "CDB_FORBIDDEN", message: "user is missing or revoked" };
+    }
+    if (typeof value !== "object" || Array.isArray(value)) {
+        return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog returned malformed user authority" };
+    }
+    const authority = value as Record<string, unknown>;
+    const roles = authority.roles;
+    const epochs = authority.authEpochs;
+    if (
+        typeof authority.principalId !== "string" ||
+        typeof authority.role !== "string" ||
+        !Array.isArray(roles) ||
+        !roles.every(role => typeof role === "string") ||
+        typeof epochs !== "object" ||
+        epochs === null ||
+        Array.isArray(epochs)
+    ) {
+        return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog returned malformed user authority" };
+    }
+    const epochRecord = epochs as Record<string, unknown>;
+    if (
+        ![epochRecord.global, epochRecord.tenant, epochRecord.principal].every(
+            epoch => typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch >= 0
+        ) ||
+        epochRecord.tenant !== 0
+    ) {
+        return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog returned malformed auth epochs" };
+    }
+    if (authority.principalId !== expected.principalId || authority.role.length === 0 || roles.length === 0) {
+        return { ok: false, code: "CDB_FORBIDDEN", message: "user is missing or revoked" };
+    }
+    if (roles.some(role => role.length === 0) || authority.role !== roles.join(",")) {
+        return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog returned inconsistent user roles" };
+    }
+    return {
+        ok: true,
+        auth: {
+            userId: authority.principalId,
+            role: authority.role,
+            roles: [...roles],
+            authEpochs: {
+                global: epochRecord.global as number,
+                tenant: 0,
+                principal: epochRecord.principal as number,
+            },
+            claims: {},
+        },
+    };
+}
 
 /** Validate the Catalog authority envelope before it becomes mutation auth. */
 export function projectOrganizationMutationAuth(
@@ -2929,26 +2988,44 @@ export async function dispatchTrustedMutation(
     if (!Number.isSafeInteger(vshard) || vshard < 0 || vshard >= VSHARD_COUNT) {
         return mutationFailure("CDB_INVARIANT", "local mutation routing returned an invalid vshard");
     }
-    if (routeAuthority !== "organization") {
-        return mutationFailure("CDB_AUTH_NOT_BOUND", "mutation has no declared organization authority");
+    if (routeAuthority !== "organization" && routeAuthority !== "user") {
+        return mutationFailure("CDB_AUTH_NOT_BOUND", "mutation has no declared authority");
     }
     if (typeof partitionKey !== "string" || partitionKey.length === 0) {
-        return mutationFailure("CDB_INVALID_ARGS", "organization mutation has no organization partition key");
+        return mutationFailure("CDB_INVALID_ARGS", `${routeAuthority} mutation has no partition key`);
     }
 
-    let authority: Awaited<ReturnType<CatalogOrganizationAuthorityRpc["resolveOrganizationAuthority"]>>;
-    try {
-        authority = await deps.catalog.resolveOrganizationAuthority({
+    if (routeAuthority === "user" && partitionKey !== principalId) {
+        return mutationFailure("CDB_FORBIDDEN", "user mutation partition does not match the verified subject");
+    }
+
+    let projected: OrganizationAuthProjection;
+    if (routeAuthority === "organization") {
+        let authority: Awaited<ReturnType<CatalogOrganizationAuthorityRpc["resolveOrganizationAuthority"]>>;
+        try {
+            authority = await deps.catalog.resolveOrganizationAuthority({
+                principalId,
+                organizationId: TenantId(partitionKey),
+            });
+        } catch {
+            return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog organization authority RPC failed");
+        }
+        projected = projectOrganizationMutationAuth(authority, {
             principalId,
             organizationId: TenantId(partitionKey),
         });
-    } catch {
-        return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog organization authority RPC failed");
+    } else {
+        if (!deps.catalog.resolveUserAuthority) {
+            return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog user authority RPC is unavailable");
+        }
+        let authority: Awaited<ReturnType<CatalogUserAuthorityRpc["resolveUserAuthority"]>>;
+        try {
+            authority = await deps.catalog.resolveUserAuthority({ principalId });
+        } catch {
+            return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog user authority RPC failed");
+        }
+        projected = projectUserMutationAuth(authority, { principalId });
     }
-    const projected = projectOrganizationMutationAuth(authority, {
-        principalId,
-        organizationId: TenantId(partitionKey),
-    });
     if (!projected.ok) return mutationFailure(projected.code, projected.message);
     // This Catalog read is the authorization linearization point. A later
     // revocation blocks the next dispatch but does not cancel this in-flight
@@ -3023,19 +3100,22 @@ export async function dispatchTrustedQuery(
             error instanceof Error ? error.message : "routed query argument sizing failed"
         );
     }
-    if (routed.authority !== "organization") {
-        return mutationFailure("CDB_AUTH_NOT_BOUND", "query has no declared organization authority");
+    if (routed.authority !== "organization" && routed.authority !== "user") {
+        return mutationFailure("CDB_AUTH_NOT_BOUND", "query has no declared authority");
     }
-    const organizationId = routed.partitionKey;
+    const partitionKey = routed.partitionKey;
     const partition = routed.intent.partitionKey;
     if (
-        !organizationId ||
+        !partitionKey ||
         !partition ||
         partition.values.length === 0 ||
         routed.intent.joinShape === "cross-partition" ||
-        !partition.values.every(value => typeof value === "string" && value === organizationId)
+        !partition.values.every(value => typeof value === "string" && value === partitionKey)
     ) {
-        return mutationFailure("CDB_CROSS_PARTITION", "query intent is not bound to one organization partition");
+        return mutationFailure("CDB_CROSS_PARTITION", "query intent is not bound to one declared partition");
+    }
+    if (routed.authority === "user" && partitionKey !== request.principalId) {
+        return mutationFailure("CDB_FORBIDDEN", "user query partition does not match the verified subject");
     }
     const vshards = new Set(partition.values.map(value => Number(vshardOf([value as string]))));
     if (vshards.size !== 1) {
@@ -3046,19 +3126,33 @@ export async function dispatchTrustedQuery(
         return mutationFailure("CDB_CROSS_PARTITION", "query intent has no routable virtual shard");
     }
 
-    let authority: Awaited<ReturnType<CatalogOrganizationAuthorityRpc["resolveOrganizationAuthority"]>>;
-    try {
-        authority = await deps.catalog.resolveOrganizationAuthority({
+    let projected: OrganizationAuthProjection;
+    if (routed.authority === "organization") {
+        let authority: Awaited<ReturnType<CatalogOrganizationAuthorityRpc["resolveOrganizationAuthority"]>>;
+        try {
+            authority = await deps.catalog.resolveOrganizationAuthority({
+                principalId: request.principalId,
+                organizationId: TenantId(partitionKey),
+            });
+        } catch {
+            return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog organization authority RPC failed");
+        }
+        projected = projectOrganizationMutationAuth(authority, {
             principalId: request.principalId,
-            organizationId: TenantId(organizationId),
+            organizationId: TenantId(partitionKey),
         });
-    } catch {
-        return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog organization authority RPC failed");
+    } else {
+        if (!deps.catalog.resolveUserAuthority) {
+            return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog user authority RPC is unavailable");
+        }
+        let authority: Awaited<ReturnType<CatalogUserAuthorityRpc["resolveUserAuthority"]>>;
+        try {
+            authority = await deps.catalog.resolveUserAuthority({ principalId: request.principalId });
+        } catch {
+            return mutationFailure("CDB_CATALOG_UNAVAILABLE", "Catalog user authority RPC failed");
+        }
+        projected = projectUserMutationAuth(authority, { principalId: request.principalId });
     }
-    const projected = projectOrganizationMutationAuth(authority, {
-        principalId: request.principalId,
-        organizationId: TenantId(organizationId),
-    });
     if (!projected.ok) return mutationFailure(projected.code, projected.message);
 
     let location: Awaited<ReturnType<CatalogMutationRpc["route"]>>;
