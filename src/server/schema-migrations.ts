@@ -124,3 +124,16 @@ export function pendingMigrations(journal: ChardbMigrationJournal, activeVersion
     }
     return journal.migrations.slice(activeVersion);
 }
+
+/** Content digest for the exact journal prefix active on a Catalog or Cdb. */
+export function migrationDigestAt(journal: ChardbMigrationJournal, version: number): string {
+    if (!Number.isSafeInteger(version) || version < 0 || version > journal.version) {
+        throw new CdbError({
+            code: "CDB_PARTITION_CONTRACT_CHANGED",
+            message: `schema version ${String(version)} is incompatible with packaged version ${journal.version}`,
+        });
+    }
+    return stableHashHex(
+        journal.migrations.slice(0, version).map(migration => [migration.version, migration.name, migration.digest])
+    );
+}

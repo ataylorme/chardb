@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { defineMigrations, pendingMigrations } from "../../src/server/schema-migrations.ts";
+import { defineMigrations, migrationDigestAt, pendingMigrations } from "../../src/server/schema-migrations.ts";
 
 describe("packaged schema migration journal", () => {
     test("owns, freezes, hashes, and selects a contiguous migration suffix", () => {
@@ -25,6 +25,12 @@ describe("packaged schema migration journal", () => {
         expect(pendingMigrations(journal, 0).map(migration => migration.version)).toEqual([1, 2]);
         expect(pendingMigrations(journal, 1).map(migration => migration.version)).toEqual([2]);
         expect(pendingMigrations(journal, 2)).toEqual([]);
+        expect(migrationDigestAt(journal, 2)).toBe(journal.digest);
+        expect(migrationDigestAt(journal, 1)).toBe(
+            defineMigrations([
+                { version: 1, name: "create_projects", statements: ["CREATE TABLE projects (id TEXT PRIMARY KEY)"] },
+            ]).digest
+        );
         expect(
             defineMigrations([
                 { version: 1, name: "create_projects", statements: ["CREATE TABLE projects (id TEXT PRIMARY KEY)"] },

@@ -47,7 +47,7 @@ import {
 } from "../auth/synthesize.ts";
 import { buildAccessControl } from "./cdb-access.ts";
 import { BlobMeta } from "./do/blobmeta.ts";
-import { Catalog } from "./do/catalog.ts";
+import { type Catalog, configureCatalogRuntime } from "./do/catalog.ts";
 import { type Cdb, configureCdbRuntime } from "./do/cdb.ts";
 import { type Gateway, type GatewayJwtConfig, configureGatewayRuntime } from "./do/gateway.ts";
 import { GsiShard } from "./do/gsishard.ts";
@@ -59,6 +59,7 @@ import {
     defineChardb,
     mountChardb,
 } from "./entrypoint.ts";
+import { type ChardbMigrationJournal, defineMigrations } from "./schema-migrations.ts";
 
 /**
  * Input shape. Two equivalent ways to provide the auth profile:
@@ -103,6 +104,8 @@ export interface ChardbFactoryInput<
     /** Better-auth fetch handler from `betterAuth(options).handler`; auto-mounted at `/api/auth/*`. */
     readonly authHandler?: MountChardbOptions["authHandler"];
     readonly authBasePath?: MountChardbOptions["authBasePath"];
+    /** Immutable migration journal packaged with every Worker and Durable Object class. */
+    readonly migrations?: ChardbMigrationJournal;
 }
 
 /**
@@ -183,6 +186,8 @@ export function chardb<
         schema: () => runtimeEntrypoint.schema,
         manifest: () => runtimeEntrypoint.chardbManifest,
     });
+    const migrationJournal = input.migrations ?? defineMigrations([]);
+    const ConfiguredCatalog = configureCatalogRuntime({ migrations: () => migrationJournal });
     const authBasePath = input.authBasePath ?? auth.options.basePath ?? "/api/auth";
     const ConfiguredGateway = configureGatewayRuntime({
         schema: () => runtimeEntrypoint.schema,
@@ -246,7 +251,7 @@ export function chardb<
         fetch: mounted.fetch,
         auth,
         Cdb: ConfiguredCdb,
-        Catalog,
+        Catalog: ConfiguredCatalog,
         Gateway: ConfiguredGateway,
         BlobMeta,
         Resharder,

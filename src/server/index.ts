@@ -109,6 +109,7 @@ export {
 export { chardb, type ChardbApp, type ChardbFactoryInput } from "./chardb.ts";
 export {
     defineMigrations,
+    migrationDigestAt,
     pendingMigrations,
     type ChardbMigration,
     type ChardbMigrationInput,
@@ -172,6 +173,9 @@ export {
 } from "../vector.ts";
 export {
     Catalog,
+    configureCatalogRuntime,
+    type CatalogRuntimeConfig,
+    type CatalogSchemaState,
     type OrganizationAuthority,
     type OrganizationAuthorityRequest,
 } from "./do/catalog.ts";
