@@ -424,7 +424,7 @@ describe("Cdb live subscription identity", () => {
         await expect(bootstrap).rejects.toMatchObject({ code: "CDB_INVARIANT" });
     });
 
-    test("unsubscribe-before-subscribe leaves an irreversible tombstone", async () => {
+    test("unsubscribe-before-subscribe stays fenced until exact Gateway finalization", async () => {
         const identity = subscription("gateway-do-1", "client-1", "registration-retired");
 
         await cdb.unsubscribe(identity);
@@ -456,6 +456,61 @@ describe("Cdb live subscription identity", () => {
             tables: [],
             invalidations: [],
         });
+
+        await expect(cdb.finalizeUnsubscribe({ ...identity, connectionId: "connection-forged" })).rejects.toMatchObject(
+            {
+                code: "CDB_INVARIANT",
+            }
+        );
+        await cdb.finalizeUnsubscribe(identity);
+        await cdb.finalizeUnsubscribe(identity);
+        expect(durableLiveState(db)).toEqual({ registrations: [], tables: [], invalidations: [] });
+        await expect(cdb.subscribe(request(identity))).resolves.toEqual({
+            ok: true,
+            subscription: identity,
+            changeSeq: 0,
+        });
+        await expect(cdb.finalizeUnsubscribe(identity)).rejects.toMatchObject({ code: "CDB_INVARIANT" });
+    });
+
+    test("bounds retained subscription rows and identity bytes before tombstone insertion", async () => {
+        const exactIdentity = subscription("g".repeat(256), "c".repeat(256), "r".repeat(256), "n".repeat(256));
+        await cdb.unsubscribe(exactIdentity);
+        await cdb.finalizeUnsubscribe(exactIdentity);
+        const oversized = subscription("g".repeat(257), "client", "registration", "connection");
+        await expect(cdb.unsubscribe(oversized)).rejects.toMatchObject({ code: "CDB_INVALID_ARGS" });
+
+        const insert = db.prepare(
+            `INSERT INTO _chardb_live_subscriptions
+             (gateway_id, registration_id, connection_id, client_id, sub_id, state)
+             VALUES (?, ?, ?, ?, ?, 'retired')`
+        );
+        db.transaction(() => {
+            for (let index = 0; index < 8_192; index++) {
+                insert.run("gateway-cap", `retired-${index}`, `connection-${index}`, `client-${index}`, index);
+            }
+        })();
+        const excess = subscription("gateway-cap", "client-excess", "retired-excess", "connection-excess");
+        await expect(cdb.unsubscribe(excess)).rejects.toMatchObject({
+            code: "CDB_RATE_LIMITED",
+            retryable: true,
+        });
+        expect(
+            db
+                .prepare("SELECT 1 AS present FROM _chardb_live_subscriptions WHERE registration_id = ?")
+                .get(excess.registrationId)
+        ).toBeNull();
+
+        const released: LiveSubscriptionId = {
+            gatewayId: "gateway-cap",
+            registrationId: "retired-0",
+            connectionId: "connection-0",
+            clientId: ClientId("client-0"),
+            subId: SubId(0),
+        };
+        await cdb.finalizeUnsubscribe(released);
+        await expect(cdb.unsubscribe(excess)).resolves.toBeUndefined();
+        expect(db.prepare("SELECT COUNT(*) AS count FROM _chardb_live_subscriptions").get()).toEqual({ count: 8_192 });
     });
 
     test("a retired active registration stays absent after reconstruction", async () => {

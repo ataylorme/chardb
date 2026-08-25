@@ -200,6 +200,9 @@ const INVALIDATION_MAX_ATTEMPTS = 8;
 const INVALIDATION_BASE_RETRY_MS = 1_000;
 const INVALIDATION_MAX_RETRY_MS = 60_000;
 const CDB_MAX_ACTIVE_LIVE_REGISTRATIONS = 4_096;
+const CDB_MAX_LIVE_REGISTRATION_ROWS = 8_192;
+const CDB_MAX_RETIRED_TOMBSTONE_BYTES = 16 * 1_024 * 1_024;
+const CDB_MAX_SUBSCRIPTION_IDENTITY_FIELD_BYTES = 256;
 const CDB_MAX_INVALIDATION_OUTBOX_ROWS = 4_096;
 const CDB_MAX_INVALIDATIONS_PER_MUTATION = 4_096;
 
@@ -221,6 +224,54 @@ function snapshotCdbQueryResultLimits(result: unknown, subject: string): RawJson
 
 function subscriptionKey(subscription: LiveSubscriptionId): string {
     return JSON.stringify([subscription.gatewayId, subscription.registrationId]);
+}
+
+function assertLiveSubscriptionIdentity(subscription: LiveSubscriptionId): void {
+    for (const [name, value] of [
+        ["gatewayId", subscription.gatewayId],
+        ["registrationId", subscription.registrationId],
+        ["connectionId", subscription.connectionId],
+        ["clientId", subscription.clientId],
+    ] as const) {
+        if (typeof value !== "string" || value.length === 0) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: `live subscription ${name} must be nonempty` });
+        }
+        if (new TextEncoder().encode(value).byteLength > CDB_MAX_SUBSCRIPTION_IDENTITY_FIELD_BYTES) {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: `live subscription ${name} exceeds ${CDB_MAX_SUBSCRIPTION_IDENTITY_FIELD_BYTES} UTF-8 bytes`,
+            });
+        }
+    }
+    if (!Number.isSafeInteger(subscription.subId) || subscription.subId < 0) {
+        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "live subscription subId must be non-negative" });
+    }
+}
+
+function subscriptionIdentityBytes(subscription: LiveSubscriptionId): number {
+    const encoder = new TextEncoder();
+    return (
+        encoder.encode(subscription.gatewayId).byteLength +
+        encoder.encode(subscription.registrationId).byteLength +
+        encoder.encode(subscription.connectionId).byteLength +
+        encoder.encode(subscription.clientId).byteLength +
+        8
+    );
+}
+
+function retiredTombstoneBytes(sql: SyncSql): number {
+    return durableRowCount(
+        sql,
+        `SELECT COALESCE(SUM(
+             length(CAST(gateway_id AS BLOB)) +
+             length(CAST(registration_id AS BLOB)) +
+             length(CAST(connection_id AS BLOB)) +
+             length(CAST(client_id AS BLOB)) + 8
+         ), 0) AS count
+         FROM _chardb_live_subscriptions
+         WHERE state = 'retired'`,
+        "retired live subscription tombstone bytes"
+    );
 }
 
 function subscriptionPayloadHash(args: CdbSubscriptionRequest, policyDigest: string): string {
@@ -1045,6 +1096,7 @@ export class Cdb extends DurableObject<CdbEnv> {
      * Register a live-query subscription on this shard. Caller is the Gateway DO.
      */
     async subscribe(input: SubscribeArgs): Promise<CdbSubscriptionResponse> {
+        assertLiveSubscriptionIdentity(input.subscription);
         const args = { ...input, args: snapshotCdbQueryArgs(input.args) };
         const intervals = this.prepareIntervals(args);
         const policyDigest = cdbPolicyDigest(this.mutationSchema(), args.tables);
@@ -1074,6 +1126,23 @@ export class Cdb extends DurableObject<CdbEnv> {
                 }
                 assertSubscriptionTables(sql, args.subscription, tableNames);
             } else {
+                const registrationRows = durableRowCount(
+                    sql,
+                    "SELECT COUNT(*) AS count FROM _chardb_live_subscriptions",
+                    "live registration row"
+                );
+                if (registrationRows >= CDB_MAX_LIVE_REGISTRATION_ROWS) {
+                    response = {
+                        ok: false,
+                        registrationState: "absent",
+                        subscription: args.subscription,
+                        error: subscriptionCapacityExceeded(
+                            "live registration row",
+                            CDB_MAX_LIVE_REGISTRATION_ROWS
+                        ).toJSON(),
+                    };
+                    return;
+                }
                 const activeRegistrations = durableRowCount(
                     sql,
                     "SELECT COUNT(*) AS count FROM _chardb_live_subscriptions WHERE state = 'active'",
@@ -1132,6 +1201,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     async unsubscribe(subscription: LiveSubscriptionId): Promise<void> {
+        assertLiveSubscriptionIdentity(subscription);
         const key = subscriptionKey(subscription);
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -1146,6 +1216,23 @@ export class Cdb extends DurableObject<CdbEnv> {
             );
             if (existing && !sameSubscriptionIdentity(existing, subscription)) {
                 throw subscriptionInvariant("live subscription unregister identity does not match its registration");
+            }
+            if (!existing || existing.state === "active") {
+                const rows = durableRowCount(
+                    sql,
+                    "SELECT COUNT(*) AS count FROM _chardb_live_subscriptions",
+                    "live registration row"
+                );
+                if (!existing && rows >= CDB_MAX_LIVE_REGISTRATION_ROWS) {
+                    throw subscriptionCapacityExceeded("live registration row", CDB_MAX_LIVE_REGISTRATION_ROWS);
+                }
+                const projectedBytes = retiredTombstoneBytes(sql) + subscriptionIdentityBytes(subscription);
+                if (projectedBytes > CDB_MAX_RETIRED_TOMBSTONE_BYTES) {
+                    throw subscriptionCapacityExceeded(
+                        "retired live subscription tombstone bytes",
+                        CDB_MAX_RETIRED_TOMBSTONE_BYTES
+                    );
+                }
             }
             sql.exec(
                 `INSERT INTO _chardb_live_subscriptions
@@ -1183,6 +1270,41 @@ export class Cdb extends DurableObject<CdbEnv> {
         });
         this.intervalMap.unregister(key);
         this.subscriptions.delete(key);
+    }
+
+    /** Delete one exact tombstone after Gateway has finished every pending install and cleanup retry for it. */
+    async finalizeUnsubscribe(subscription: LiveSubscriptionId): Promise<void> {
+        assertLiveSubscriptionIdentity(subscription);
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const existing = sql.one<StoredSubscriptionRow>(
+                `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+                        principal_id, organization_id, ref, args_json, policy_digest, query_hash,
+                        tables_json, intervals_json
+                 FROM _chardb_live_subscriptions
+                 WHERE gateway_id = ? AND registration_id = ?`,
+                subscription.gatewayId,
+                subscription.registrationId
+            );
+            if (!existing) return;
+            if (!sameSubscriptionIdentity(existing, subscription)) {
+                throw subscriptionInvariant("live subscription finalize identity does not match its tombstone");
+            }
+            if (existing.state !== "retired") {
+                throw subscriptionInvariant("active live subscription cannot be finalized");
+            }
+            sql.exec(
+                `DELETE FROM _chardb_live_subscriptions
+                 WHERE gateway_id = ? AND registration_id = ? AND connection_id = ?
+                   AND client_id = ? AND sub_id = ? AND state = 'retired'`,
+                subscription.gatewayId,
+                subscription.registrationId,
+                subscription.connectionId,
+                subscription.clientId,
+                subscription.subId
+            );
+            if (sql.changes() !== 1) throw subscriptionInvariant("live subscription tombstone changed before finalize");
+        });
     }
 
     /** Resolve and run a registered mutation entirely inside this shard isolate. */

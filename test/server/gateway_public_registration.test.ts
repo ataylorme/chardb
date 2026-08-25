@@ -76,6 +76,7 @@ describe("Gateway public durable registration", () => {
     let socketConnected: boolean;
     let subscribeCalls: CdbSubscriptionRequest[];
     let unsubscribeCalls: LiveSubscriptionId[];
+    let finalizeCalls: LiveSubscriptionId[];
     let registeredQueryCalls: unknown[];
     let routeCalls: number;
     let routeBehavior: () => QueryRouteResponse | Promise<QueryRouteResponse>;
@@ -106,6 +107,7 @@ describe("Gateway public durable registration", () => {
         socketConnected = true;
         subscribeCalls = [];
         unsubscribeCalls = [];
+        finalizeCalls = [];
         registeredQueryCalls = [];
         routeCalls = 0;
         routeBehavior = () => route;
@@ -144,6 +146,9 @@ describe("Gateway public durable registration", () => {
             },
             async unsubscribe(subscription: LiveSubscriptionId) {
                 unsubscribeCalls.push(subscription);
+            },
+            async finalizeUnsubscribe(subscription: LiveSubscriptionId) {
+                finalizeCalls.push(subscription);
             },
             async queryRegistered(request: unknown) {
                 registeredQueryCalls.push(request);
@@ -521,6 +526,7 @@ describe("Gateway public durable registration", () => {
         currentAlarm = null;
         await gateway.alarm();
         expect(unsubscribeCalls).toEqual([subscription]);
+        expect(finalizeCalls).toEqual([subscription]);
         expect(generation()).toBeNull();
     });
 

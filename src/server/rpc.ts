@@ -83,6 +83,7 @@ export type CdbSubscriptionResponse =
 export interface CdbSubscriptionRpc {
     subscribe(args: CdbSubscriptionRequest): Promise<CdbSubscriptionResponse>;
     unsubscribe(subscription: LiveSubscriptionId): Promise<void>;
+    finalizeUnsubscribe(subscription: LiveSubscriptionId): Promise<void>;
 }
 
 export interface GatewayInvalidation {

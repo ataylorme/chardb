@@ -96,6 +96,7 @@ describe("Gateway retired-generation cleanup", () => {
     let stringLookups: string[];
     let nameLookups: string[];
     let unsubscribeCalls: LiveSubscriptionId[];
+    let finalizeCalls: LiveSubscriptionId[];
     let unsubscribeBehavior: (subscription: LiveSubscriptionId) => unknown | Promise<unknown>;
     let sockets: { deserializeAttachment: () => VerifiedGwAttachment }[];
     let state: DurableObjectState;
@@ -121,12 +122,16 @@ describe("Gateway retired-generation cleanup", () => {
         stringLookups = [];
         nameLookups = [];
         unsubscribeCalls = [];
+        finalizeCalls = [];
         unsubscribeBehavior = () => undefined;
         sockets = [];
         const cdb = {
             async unsubscribe(subscription: LiveSubscriptionId): Promise<unknown> {
                 unsubscribeCalls.push(subscription);
                 return await unsubscribeBehavior(subscription);
+            },
+            async finalizeUnsubscribe(subscription: LiveSubscriptionId): Promise<void> {
+                finalizeCalls.push(subscription);
             },
         };
         const shardNamespace = {
@@ -249,6 +254,7 @@ describe("Gateway retired-generation cleanup", () => {
                 subId: SubId(1),
             },
         ]);
+        expect(finalizeCalls).toEqual(unsubscribeCalls);
         expect(cleanupState(current.registrationId)).toBeNull();
         expect(alarms).toEqual([]);
     });
@@ -263,6 +269,7 @@ describe("Gateway retired-generation cleanup", () => {
         };
 
         await fireCleanupAlarm();
+        expect(finalizeCalls).toEqual([]);
         expect(cleanupState(current.registrationId)).toEqual({
             lifecycle: "retiring",
             cdb_state: "retiring",

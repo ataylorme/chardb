@@ -3277,14 +3277,17 @@ export class Gateway extends DurableObject<GatewayEnv> {
             }
             const id = this.env.CDB_SHARD.idFromString(row.source_cdb_id);
             const cdb = this.env.CDB_SHARD.get(id) as unknown as CdbSubscriptionRpc;
-            const outcome: unknown = await cdb.unsubscribe({
+            const subscription = {
                 gatewayId: this.ctx.id.toString(),
                 registrationId: row.registration_id,
                 connectionId: row.connection_id,
                 clientId: ClientId(row.client_id),
                 subId: SubId(row.sub_id),
-            });
+            };
+            const outcome: unknown = await cdb.unsubscribe(subscription);
             if (outcome !== undefined) throw new Error("Cdb returned a malformed unsubscribe outcome");
+            const finalized: unknown = await cdb.finalizeUnsubscribe(subscription);
+            if (finalized !== undefined) throw new Error("Cdb returned a malformed unsubscribe finalization outcome");
             this.completeGatewayCleanup(row);
         } catch (error) {
             this.recordGatewayCleanupFailure(row, nowMs, error);
@@ -4835,7 +4838,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
                     clientId,
                     subId
                 );
-                await this.cdb(shardId).unsubscribe(subscription);
+                const cdb = this.cdb(shardId);
+                await cdb.unsubscribe(subscription);
+                await cdb.finalizeUnsubscribe(subscription);
             })
         );
     }

@@ -115,6 +115,7 @@ describe("Gateway active snapshot runner", () => {
     let sockets: FakeSocket[];
     let queryCalls: unknown[];
     let unsubscribeCalls: LiveSubscriptionId[];
+    let finalizeCalls: LiveSubscriptionId[];
     let queryBehavior: () => unknown | Promise<unknown>;
     let authorityBehavior: () => unknown | Promise<unknown>;
     let routePhysicalId: string;
@@ -133,6 +134,7 @@ describe("Gateway active snapshot runner", () => {
         sockets = [];
         queryCalls = [];
         unsubscribeCalls = [];
+        finalizeCalls = [];
         queryBehavior = () => ({ ok: true, result: [{ id: 1, body: "hello" }] });
         authorityBehavior = () => ({
             principalId: PrincipalId("principal-1"),
@@ -167,6 +169,9 @@ describe("Gateway active snapshot runner", () => {
             },
             async unsubscribe(subscription: LiveSubscriptionId) {
                 unsubscribeCalls.push(subscription);
+            },
+            async finalizeUnsubscribe(subscription: LiveSubscriptionId) {
+                finalizeCalls.push(subscription);
             },
         };
         const catalogNamespace = {
@@ -713,6 +718,7 @@ describe("Gateway active snapshot runner", () => {
                 subId: input.subId,
             },
         ]);
+        expect(finalizeCalls).toEqual(unsubscribeCalls);
         expect(currentAlarm).toBeNull();
     });
 
