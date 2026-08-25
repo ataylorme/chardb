@@ -98,6 +98,7 @@ describe("Gateway retired-generation cleanup", () => {
     let unsubscribeCalls: LiveSubscriptionId[];
     let finalizeCalls: LiveSubscriptionId[];
     let unsubscribeBehavior: (subscription: LiveSubscriptionId) => unknown | Promise<unknown>;
+    let finalizeBehavior: (subscription: LiveSubscriptionId) => unknown | Promise<unknown>;
     let sockets: { deserializeAttachment: () => VerifiedGwAttachment }[];
     let state: DurableObjectState;
     let env: GatewayEnv;
@@ -124,14 +125,16 @@ describe("Gateway retired-generation cleanup", () => {
         unsubscribeCalls = [];
         finalizeCalls = [];
         unsubscribeBehavior = () => undefined;
+        finalizeBehavior = () => undefined;
         sockets = [];
         const cdb = {
             async unsubscribe(subscription: LiveSubscriptionId): Promise<unknown> {
                 unsubscribeCalls.push(subscription);
                 return await unsubscribeBehavior(subscription);
             },
-            async finalizeUnsubscribe(subscription: LiveSubscriptionId): Promise<void> {
+            async finalizeUnsubscribe(subscription: LiveSubscriptionId): Promise<unknown> {
                 finalizeCalls.push(subscription);
+                return await finalizeBehavior(subscription);
             },
         };
         const shardNamespace = {
@@ -304,6 +307,33 @@ describe("Gateway retired-generation cleanup", () => {
             retry_at: clock + GATEWAY_CLEANUP_MAX_RETRY_MS,
         });
         expect((capped?.retry_error as string).length).toBe(GATEWAY_CLEANUP_MAX_ERROR_LENGTH);
+    });
+
+    test("keeps Gateway cleanup durable until Cdb tombstone finalization succeeds", async () => {
+        const current = registration("registration-finalize-retry");
+        install(current);
+        activate(current);
+        retire(current);
+        finalizeBehavior = () => {
+            throw new Error("finalize unavailable");
+        };
+
+        await fireCleanupAlarm();
+        expect(unsubscribeCalls).toHaveLength(1);
+        expect(finalizeCalls).toEqual(unsubscribeCalls);
+        expect(cleanupState(current.registrationId)).toMatchObject({
+            lifecycle: "retiring",
+            cdb_state: "retiring",
+            retry_count: 1,
+            retry_error: "finalize unavailable",
+        });
+
+        clock = 1_100;
+        finalizeBehavior = () => undefined;
+        await fireCleanupAlarm();
+        expect(unsubscribeCalls).toHaveLength(2);
+        expect(finalizeCalls).toEqual(unsubscribeCalls);
+        expect(cleanupState(current.registrationId)).toBeNull();
     });
 
     test("cleans a superseded generation without deleting its replacement", async () => {
