@@ -8,9 +8,12 @@ export function Tenancy() {
             <SectionHeading>Sharded the way your app already works.</SectionHeading>
             <SectionLead>
                 <InlineCode>forOrg()</InlineCode>, <InlineCode>forUser()</InlineCode>, and{" "}
-                <InlineCode>globalScope()</InlineCode> should declare placement, transaction, and policy boundaries
-                once. Organization and user paths work through the binding, WebSocket live queries, Catalog authority,
-                and Cdb policy enforcement today. Global placement and cross-boundary transactions remain closed.
+                <InlineCode>globalScope()</InlineCode> declare placement, transaction, and policy boundaries once.
+                Organization, user, and narrow global paths run through the binding, WebSocket live queries, Catalog
+                authority, and Cdb policy enforcement. A global operation names one exact application partition and runs
+                on one physical Cdb. Workerd and clean-tarball Miniflare tests prove cross-principal sharing,
+                neighboring-partition isolation, reconstruction, replay, and restart. Composite, replicated, and
+                cross-boundary operations remain closed.
             </SectionLead>
 
             <div className="mt-10">

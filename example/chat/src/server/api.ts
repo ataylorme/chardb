@@ -5,7 +5,7 @@
 import { api } from "chardb/server";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { channels, messages, userPreferences } from "./schema.ts";
+import { channels, globalNotices, messages, userPreferences } from "./schema.ts";
 
 export const postMessage = api.mutation({
     ref: "src/server/api.ts#postMessage",
@@ -50,6 +50,17 @@ export const createUserPreference = api.mutation({
     handler: (ctx, args) => {
         ctx.db.insert(userPreferences).values({ id: args.id, theme: args.theme }).run();
         return { id: args.id, userId: ctx.auth.userId, theme: args.theme };
+    },
+});
+
+export const createGlobalNotice = api.mutation({
+    ref: "src/server/api.ts#createGlobalNotice",
+    authority: "global",
+    args: z.object({ id: z.string(), namespace: z.string(), body: z.string() }),
+    partitionKey: "namespace",
+    handler: (ctx, args) => {
+        ctx.db.insert(globalNotices).values(args).run();
+        return args;
     },
 });
 

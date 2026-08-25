@@ -5,8 +5,8 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
-import { forOrg } from "../../src/server/index.ts";
-import { manifestFromExports, resolveQuery } from "../../src/server/manifest.ts";
+import { forOrg, globalScope } from "../../src/server/index.ts";
+import { manifestFromExports, resolveQuery, routeValidatedQuery } from "../../src/server/manifest.ts";
 import { CDB_RESULT_MAX_BYTES } from "../../src/server/result_limits.ts";
 import type {
     CdbQueryRequest,
@@ -102,6 +102,16 @@ const publicRecords = cdbTable(
     },
     { publicRead: true }
 );
+const { cdbTable: globalTable } = globalScope();
+const globalSettings = globalTable(
+    "query_global_settings",
+    {
+        id: text("id").primaryKey(),
+        scope: text("scope").notNull(),
+        value: text("value").notNull(),
+    },
+    { partitionBy: "scope", roles: { admin: { read: "*" } } }
+);
 const policyDriftRecords = cdbTable(
     "query_records",
     {
@@ -119,7 +129,7 @@ const policyDriftRecords = cdbTable(
     { selfBy: "ownerId", roles: { member: { read: "*" }, self: { read: "*" } } }
 );
 const joinTarget = sqliteTable("query_join_target", { id: text("id").primaryKey() });
-const schema = { organization, user, records, privateRecords, publicRecords };
+const schema = { organization, user, records, privateRecords, publicRecords, globalSettings };
 const api = createApi(schema);
 
 const listRecords = api.query(async function listRecordsHandler(ctx, args: { groupId: string }) {
@@ -176,6 +186,29 @@ const registeredGetRecord = api.query({
     }),
     handler: async function registeredGetRecordHandler(ctx, args: { organizationId: string; id: string }) {
         return ctx.db.select().from(records).where(eq(records.id, args.id)).get();
+    },
+});
+const registeredGlobalSettings = api.query({
+    ref: "queries.ts#registeredGlobalSettings",
+    authority: "global",
+    partitionKey: "scope",
+    intent: (args: { scope: string }) => ({
+        kind: "select" as const,
+        tables: ["query_global_settings"],
+        partitionKey: {
+            table: "query_global_settings",
+            column: "scope",
+            values: [args.scope],
+        },
+        intervals: [{ table: "query_global_settings", indexName: "by_scope", intervals: [{ kind: "full" as const }] }],
+    }),
+    handler: async function registeredGlobalSettingsHandler(ctx, args: { scope: string }) {
+        return ctx.db
+            .select()
+            .from(globalSettings)
+            .where(eq(globalSettings.scope, args.scope))
+            .orderBy(globalSettings.id)
+            .all();
     },
 });
 const registeredNonJsonResult = api.query({
@@ -509,6 +542,7 @@ const manifest = manifestFromExports({
     awaitRecords,
     registeredListRecords,
     registeredGetRecord,
+    registeredGlobalSettings,
     registeredNonJsonResult,
     registeredSizedResult,
     registeredHostileResult,
@@ -677,6 +711,9 @@ describe("Cdb registered query execution", () => {
         db.run(
             "INSERT INTO query_public_records (id, organization_id, display_name) VALUES ('public-a', 'org-a', 'Alpha'), ('public-b', 'org-b', 'Beta')"
         );
+        db.run(
+            "INSERT INTO query_global_settings (id, scope, value) VALUES ('setting-a', 'settings-v1', 'on'), ('setting-b', 'settings-v2', 'off')"
+        );
         return { db, cdb: configured.cdb };
     }
 
@@ -707,6 +744,63 @@ describe("Cdb registered query execution", () => {
             ],
         });
         expect(registeredProbeRuns).toBe(1);
+    });
+
+    test("reruns a persisted global query with its exact partition and fresh user role", async () => {
+        const { cdb } = await setup();
+        const subscription = liveIdentity({ registrationId: "global-registration" });
+        const args = { scope: "settings-v1" };
+        const routed = routeValidatedQuery(manifest, { ref: registeredGlobalSettings.__chardbRef, args }, tables =>
+            cdbPolicyDigest(schema, tables)
+        );
+        const intent = routed.intent;
+        const placement = { authority: "global" as const, partitionKey: "settings-v1" };
+        await cdb.subscribe({
+            subscription,
+            principalId: PrincipalId("user-2"),
+            organizationId: TenantId("settings-v1"),
+            placement,
+            domainSchemaEpoch: 1,
+            ref: registeredGlobalSettings.__chardbRef,
+            args,
+            queryHash: routed.queryHash,
+            tables: intent.tables,
+            intervals: intent.intervals ?? [],
+        });
+
+        await expect(
+            cdb.queryRegistered({
+                subscription,
+                placement,
+                auth: {
+                    userId: "user-2",
+                    role: "admin",
+                    roles: ["admin"],
+                    authEpochs: { global: 4, tenant: 0, principal: 7 },
+                    claims: {},
+                },
+                domainSchemaEpoch: 1,
+            })
+        ).resolves.toEqual({
+            ok: true,
+            result: [{ id: "setting-a", scope: "settings-v1", value: "on" }],
+        });
+        await expect(
+            cdb.queryRegistered({
+                subscription,
+                placement: { authority: "global", partitionKey: "settings-v2" },
+                auth: { userId: "user-2", role: "admin", roles: ["admin"], claims: {} },
+                domainSchemaEpoch: 1,
+            })
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVARIANT" } });
+        await expect(
+            cdb.queryRegistered({
+                subscription,
+                placement: { authority: "user", partitionKey: "settings-v1" },
+                auth: { userId: "settings-v1", role: "admin", roles: ["admin"], claims: {} },
+                domainSchemaEpoch: 1,
+            })
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVARIANT" } });
     });
 
     test("caps direct query arguments before descriptor lookup or handler invocation", async () => {

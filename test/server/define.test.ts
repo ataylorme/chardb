@@ -129,6 +129,57 @@ describe("defineXxx — function-ref identity", () => {
         expect(query.__chardbPartitionKey?.({ userId: "user-7" })).toBe("user-7");
     });
 
+    test("global authority requires and preserves placement metadata", () => {
+        const mutation = defineMutation({
+            ref: "api/settings#save",
+            authority: "global",
+            partitionKey: (args: { partition: string }) => args.partition,
+            handler: () => null,
+        });
+        const query = defineQuery({
+            ref: "api/settings#read",
+            authority: "global",
+            partitionKey: (args: { partition: string }) => args.partition,
+            intent: (args: { partition: string }) => ({
+                kind: "select",
+                tables: ["settings"],
+                partitionKey: { table: "settings", column: "partition", values: [args.partition] },
+            }),
+            handler: async () => [],
+        });
+
+        expect((mutation as unknown as { __chardbAuthority?: string }).__chardbAuthority).toBe("global");
+        expect(query.__chardbAuthority).toBe("global");
+        expect(query.__chardbPartitionKey?.({ partition: "app" })).toBe("app");
+        expect(query.__chardbIntent?.({ partition: "app" }).tables).toEqual(["settings"]);
+    });
+
+    test("global declarations reject missing placement metadata at runtime", () => {
+        expect(() =>
+            defineMutation({
+                ref: "api/settings#missingPartition",
+                authority: "global",
+                handler: () => null,
+            } as never)
+        ).toThrow("global mutations require an explicit partitionKey extractor");
+        expect(() =>
+            defineQuery({
+                ref: "api/settings#missingQueryPartition",
+                authority: "global",
+                intent: () => ({ kind: "select", tables: [] }),
+                handler: async () => [],
+            } as never)
+        ).toThrow("global queries require an explicit partitionKey extractor");
+        expect(() =>
+            defineQuery({
+                ref: "api/settings#missingIntent",
+                authority: "global",
+                partitionKey: () => "app",
+                handler: async () => [],
+            } as never)
+        ).toThrow("global queries require an explicit intent extractor");
+    });
+
     test("config mutation and query refs are stable and validated", () => {
         const mutation = defineMutation({ ref: "api/items#create", handler: () => null });
         const query = defineQuery({ ref: "api/items#list", handler: async () => [] });

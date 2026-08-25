@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
   payload_hash TEXT,
   principal_id TEXT,
   organization_id TEXT,
+  authority TEXT CHECK (authority IS NULL OR authority IN ('organization', 'user', 'global')),
   domain_schema_epoch INTEGER CHECK (domain_schema_epoch IS NULL OR domain_schema_epoch > 0),
   ref TEXT,
   args_json TEXT,
@@ -227,6 +228,7 @@ interface StoredSubscriptionRow {
     readonly payload_hash: string | null;
     readonly principal_id: string | null;
     readonly organization_id: string | null;
+    readonly authority: string | null;
     readonly domain_schema_epoch: number | null;
     readonly ref: string | null;
     readonly args_json: string | null;
@@ -342,6 +344,7 @@ function subscriptionPayloadHash(args: CdbSubscriptionRequest, policyDigest: str
         subId: args.subscription.subId,
         principalId: args.principalId,
         organizationId: args.organizationId,
+        ...(args.placement === undefined ? {} : { placement: args.placement }),
         domainSchemaEpoch: args.domainSchemaEpoch,
         ref: args.ref,
         args: args.args,
@@ -434,6 +437,11 @@ function ensureLiveSubscriptionAuthorityColumns(sql: SyncSql): void {
     if (!columns.has("organization_id")) {
         sql.exec("ALTER TABLE _chardb_live_subscriptions ADD COLUMN organization_id TEXT");
     }
+    if (!columns.has("authority")) {
+        sql.exec(
+            "ALTER TABLE _chardb_live_subscriptions ADD COLUMN authority TEXT CHECK (authority IS NULL OR authority IN ('organization', 'user', 'global'))"
+        );
+    }
     if (!columns.has("query_hash")) {
         sql.exec("ALTER TABLE _chardb_live_subscriptions ADD COLUMN query_hash TEXT");
     }
@@ -454,6 +462,7 @@ function retireLegacyLiveSubscriptions(sql: SyncSql): void {
              payload_hash = NULL,
              principal_id = NULL,
              organization_id = NULL,
+             authority = NULL,
              domain_schema_epoch = NULL,
              ref = NULL,
              args_json = NULL,
@@ -569,6 +578,9 @@ function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionReq
         },
         principalId: PrincipalId(row.principal_id),
         organizationId: TenantId(row.organization_id),
+        ...(row.authority === "organization" || row.authority === "user" || row.authority === "global"
+            ? { placement: { authority: row.authority, partitionKey: row.organization_id } }
+            : {}),
         domainSchemaEpoch: row.domain_schema_epoch,
         ref: ChardbRef(row.ref),
         args,
@@ -934,7 +946,7 @@ export class Cdb extends DurableObject<CdbEnv> {
         }
         const cursor = this.ctx.storage.sql.exec<StoredSubscriptionRow>(
             `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                    principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+                    principal_id, organization_id, authority, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                     tables_json, intervals_json
              FROM _chardb_live_subscriptions
              WHERE state = 'active'
@@ -1577,6 +1589,18 @@ export class Cdb extends DurableObject<CdbEnv> {
         assertLiveSubscriptionIdentity(input.subscription);
         const args = { ...input, args: snapshotCdbQueryArgs(input.args) };
         this.assertActiveSchemaEpoch(args.domainSchemaEpoch);
+        if (args.placement) {
+            const routed = routeValidatedQuery(this.mutationManifest(), { ref: args.ref, args: args.args }, tables =>
+                cdbPolicyDigest(this.mutationSchema(), tables)
+            );
+            if (
+                routed.authority !== args.placement.authority ||
+                routed.partitionKey !== args.placement.partitionKey ||
+                args.organizationId !== args.placement.partitionKey
+            ) {
+                throw subscriptionInvariant("live subscription placement does not match its server manifest route");
+            }
+        }
         const intervals = this.prepareIntervals(args);
         const policyDigest = cdbPolicyDigest(this.mutationSchema(), args.tables);
         const payloadHash = subscriptionPayloadHash(args, policyDigest);
@@ -1587,7 +1611,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             this.assertActiveSchemaEpoch(args.domainSchemaEpoch, sql);
             const existing = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+                        principal_id, organization_id, authority, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
@@ -1643,9 +1667,9 @@ export class Cdb extends DurableObject<CdbEnv> {
                 sql.exec(
                     `INSERT INTO _chardb_live_subscriptions
                      (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                      principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+                      principal_id, organization_id, authority, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                       tables_json, intervals_json)
-                     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                     args.subscription.gatewayId,
                     args.subscription.registrationId,
                     args.subscription.connectionId,
@@ -1654,6 +1678,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                     payloadHash,
                     args.principalId,
                     args.organizationId,
+                    args.placement?.authority ?? null,
                     args.domainSchemaEpoch,
                     args.ref,
                     JSON.stringify(args.args),
@@ -1724,6 +1749,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                    payload_hash = NULL,
                    principal_id = NULL,
                    organization_id = NULL,
+                   authority = NULL,
                    domain_schema_epoch = NULL,
                    ref = NULL,
                    args_json = NULL,
@@ -1805,12 +1831,22 @@ export class Cdb extends DurableObject<CdbEnv> {
                 mutId,
                 ref,
                 args,
+                ...(input.placement === undefined ? {} : { placement: input.placement }),
                 auth,
                 schemaEpoch,
                 domainSchemaEpoch,
             };
             this.assertActiveSchemaEpoch(request.domainSchemaEpoch);
             const descriptor = resolveMutation(this.mutationManifest(), request.ref as ChardbRef);
+            const declaredPartition = descriptor.extractPartitionKey?.(request.args);
+            if (
+                request.placement &&
+                (descriptor.authority !== request.placement.authority ||
+                    declaredPartition === undefined ||
+                    String(declaredPartition) !== request.placement.partitionKey)
+            ) {
+                throw subscriptionInvariant("mutation placement does not match its server manifest route");
+            }
             try {
                 await this.ctx.storage.setAlarm(this.invalidationNowMs() + 1);
             } catch (error) {
@@ -1824,6 +1860,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 storage: this.ctx.storage,
                 schema: this.mutationSchema(),
                 request,
+                ...(request.placement === undefined ? {} : { placement: request.placement }),
                 // This is an internal post-validation RPC. The configured
                 // Gateway validates raw wire args and forwards this exact value.
                 handler: (ctx, args) => descriptor.invokeValidated(ctx, args),
@@ -1858,6 +1895,19 @@ export class Cdb extends DurableObject<CdbEnv> {
             const request = { ...input, args: snapshotCdbQueryArgs(input.args) };
             this.assertActiveSchemaEpoch(request.domainSchemaEpoch);
             const descriptor = resolveQuery(this.mutationManifest(), request.ref);
+            if (request.placement) {
+                const routed = routeValidatedQuery(
+                    this.mutationManifest(),
+                    { ref: request.ref, args: request.args },
+                    tables => cdbPolicyDigest(this.mutationSchema(), tables)
+                );
+                if (
+                    routed.authority !== request.placement.authority ||
+                    routed.partitionKey !== request.placement.partitionKey
+                ) {
+                    throw subscriptionInvariant("query placement does not match its server manifest route");
+                }
+            }
             const declaredIntent = descriptor.extractIntent ? descriptor.extractIntent(request.args) : undefined;
             const readTables = new Set<string>();
             const readRanges = new Map<object, QueryReadRangeObservation>();
@@ -1865,7 +1915,8 @@ export class Cdb extends DurableObject<CdbEnv> {
                 drizzle(this.ctx.storage, { schema: this.mutationSchema() }),
                 request.auth,
                 tableName => readTables.add(tableName),
-                observation => readRanges.set(observation.token, observation)
+                observation => readRanges.set(observation.token, observation),
+                request.placement
             );
             const result = snapshotCdbQueryResultLimits(
                 await descriptor.invokeValidated({ db: readOnlyQueryDb(database), auth: request.auth }, request.args),
@@ -1889,7 +1940,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             this.assertActiveSchemaEpoch(request.domainSchemaEpoch, sql);
             const row = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+                        principal_id, organization_id, authority, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
@@ -1919,16 +1970,31 @@ export class Cdb extends DurableObject<CdbEnv> {
                 { ref: subscription.ref, args: subscription.args },
                 tables => cdbPolicyDigest(this.mutationSchema(), tables)
             );
-            if (routed.authority !== "organization" && routed.authority !== "user") {
+            if (routed.authority !== "organization" && routed.authority !== "user" && routed.authority !== "global") {
                 throw subscriptionInvariant("registered query no longer has declared authority");
             }
-            const authorizedPartition =
-                routed.authority === "organization" ? request.auth.tenantId : request.auth.userId;
-            if (row.organization_id !== authorizedPartition) {
+            const placement = request.placement;
+            if (row.authority !== null && row.authority !== routed.authority) {
+                throw subscriptionInvariant("registered query authority changed after registration");
+            }
+            if (row.authority === "global" && !placement) {
+                throw subscriptionInvariant("registered global query omitted fresh placement");
+            }
+            if (placement && placement.authority !== routed.authority) {
+                throw subscriptionInvariant("registered query authority changed after registration");
+            }
+            const reroutedPartition = placement?.partitionKey ?? subscription.organizationId;
+            if (reroutedPartition !== row.organization_id) {
                 throw subscriptionInvariant("registered query partition does not match fresh authorization");
             }
+            if (routed.authority === "organization" && reroutedPartition !== request.auth.tenantId) {
+                throw subscriptionInvariant("registered query organization does not match fresh authorization");
+            }
+            if (routed.authority === "user" && reroutedPartition !== request.auth.userId) {
+                throw subscriptionInvariant("registered query user does not match fresh authorization");
+            }
             if (routed.partitionKey !== subscription.organizationId) {
-                throw subscriptionInvariant("registered query organization partition changed after registration");
+                throw subscriptionInvariant("registered query partition changed after registration");
             }
             if (routed.policyDigest !== row.policy_digest) {
                 throw subscriptionInvariant("registered query policy changed after registration");
@@ -1944,7 +2010,8 @@ export class Cdb extends DurableObject<CdbEnv> {
                 drizzle(this.ctx.storage, { schema: this.mutationSchema() }),
                 request.auth,
                 tableName => readTables.add(tableName),
-                observation => readRanges.set(observation.token, observation)
+                observation => readRanges.set(observation.token, observation),
+                { authority: routed.authority, partitionKey: reroutedPartition }
             );
             const result = snapshotCdbQueryResultLimits(
                 await descriptor.invokeValidated(
@@ -1961,7 +2028,7 @@ export class Cdb extends DurableObject<CdbEnv> {
 
             const current = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+                        principal_id, organization_id, authority, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
@@ -1974,6 +2041,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 !sameSubscriptionIdentity(current, request.subscription) ||
                 current.principal_id !== row.principal_id ||
                 current.organization_id !== row.organization_id ||
+                current.authority !== row.authority ||
                 current.payload_hash !== row.payload_hash ||
                 current.policy_digest !== row.policy_digest ||
                 current.query_hash !== row.query_hash ||

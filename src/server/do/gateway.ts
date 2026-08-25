@@ -788,8 +788,8 @@ async function resolvePartitionAuth(
     principalId: PrincipalId,
     partitionKey: string
 ): Promise<OrganizationAuthProjection> {
-    if (authority === "user") {
-        if (partitionKey !== principalId) {
+    if (authority === "user" || authority === "global") {
+        if (authority === "user" && partitionKey !== principalId) {
             return { ok: false, code: "CDB_FORBIDDEN", message: "user partition does not match the verified subject" };
         }
         if (!catalog.resolveUserAuthority) {
@@ -852,6 +852,7 @@ export function cdbSubscriptionRequest(input: {
     readonly subId: SubId;
     readonly principalId: PrincipalId;
     readonly organizationId: TenantId;
+    readonly authority?: MutationAuthority;
     readonly domainSchemaEpoch: number;
     readonly ref: ChardbRef;
     readonly args: RawJson;
@@ -868,6 +869,9 @@ export function cdbSubscriptionRequest(input: {
         ),
         principalId: input.principalId,
         organizationId: input.organizationId,
+        ...(input.authority === undefined
+            ? {}
+            : { placement: { authority: input.authority, partitionKey: input.organizationId } }),
         domainSchemaEpoch: input.domainSchemaEpoch,
         ref: input.ref,
         args: input.args,
@@ -3029,7 +3033,7 @@ export async function dispatchTrustedMutation(
     if (!Number.isSafeInteger(vshard) || vshard < 0 || vshard >= VSHARD_COUNT) {
         return mutationFailure("CDB_INVARIANT", "local mutation routing returned an invalid vshard");
     }
-    if (routeAuthority !== "organization" && routeAuthority !== "user") {
+    if (routeAuthority !== "organization" && routeAuthority !== "user" && routeAuthority !== "global") {
         return mutationFailure("CDB_AUTH_NOT_BOUND", "mutation has no declared authority");
     }
     if (typeof partitionKey !== "string" || partitionKey.length === 0) {
@@ -3095,6 +3099,7 @@ export async function dispatchTrustedMutation(
             mutId,
             ref,
             args: routedArgs,
+            placement: { authority: routeAuthority, partitionKey },
             auth: projected.auth,
             schemaEpoch: location.schemaEpoch,
             domainSchemaEpoch: location.domainSchemaEpoch,
@@ -3141,7 +3146,7 @@ export async function dispatchTrustedQuery(
             error instanceof Error ? error.message : "routed query argument sizing failed"
         );
     }
-    if (routed.authority !== "organization" && routed.authority !== "user") {
+    if (routed.authority !== "organization" && routed.authority !== "user" && routed.authority !== "global") {
         return mutationFailure("CDB_AUTH_NOT_BOUND", "query has no declared authority");
     }
     const partitionKey = routed.partitionKey;
@@ -3218,6 +3223,7 @@ export async function dispatchTrustedQuery(
             await deps.cdb(location.shardId).query({
                 ref: request.ref as ChardbRef,
                 args: routed.args,
+                placement: { authority: routed.authority, partitionKey },
                 auth: projected.auth,
                 domainSchemaEpoch: location.domainSchemaEpoch,
             })
@@ -3532,7 +3538,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
             const rerouted = await this.routeQuery({ ref: run.ref, args: run.args });
             if (
                 !rerouted.ok ||
-                (rerouted.authority !== "organization" && rerouted.authority !== "user") ||
+                (rerouted.authority !== "organization" &&
+                    rerouted.authority !== "user" &&
+                    rerouted.authority !== "global") ||
                 rerouted.partitionKey !== run.organizationId
             ) {
                 const retiredAt = this.gatewayNowMs();
@@ -3596,6 +3604,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                         clientId: identity.clientId,
                         subId: identity.subId,
                     },
+                    placement: { authority: rerouted.authority, partitionKey: run.organizationId },
                     auth: projected.auth,
                     domainSchemaEpoch: route.domainSchemaEpoch,
                 })
@@ -4836,7 +4845,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             this.sendError(ws, error instanceof CdbError ? error.code : "CDB_INVARIANT", msg.subId);
             return;
         }
-        if (routed.authority !== "organization" && routed.authority !== "user") {
+        if (routed.authority !== "organization" && routed.authority !== "user" && routed.authority !== "global") {
             this.sendError(ws, "CDB_AUTH_NOT_BOUND", msg.subId);
             return;
         }
@@ -5075,6 +5084,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             gatewayId: this.ctx.id.toString(),
             ...identity,
             organizationId: TenantId(organizationId),
+            authority: routed.authority,
             domainSchemaEpoch,
             ref: msg.ref,
             args: routed.args,

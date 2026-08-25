@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-08-25
 
-The narrow organization- and user-tenanted runtimes are the current supported paths. The one-binding package works for both. The remaining packages are not implemented and may appear on the landing page only when clearly labeled as the destination or target interface. Pick one package before starting another.
+The narrow organization-, user-, and global-scoped runtimes are the current proven paths. The remaining packages are not implemented and may appear on the landing page only when clearly labeled as the destination or target interface. Pick one package before starting another.
 
 ## Product contract
 
@@ -23,11 +23,11 @@ A package is complete only when its public API, failure contract, resource bound
 
 ## One-binding developer surface: completed 2026-08-25
 
-Same-Worker apps expose one typed `env.DB` handle and resolve Chardb's internal classes through native `ctx.exports`; consumers do not declare the six internal Durable Object bindings. `wrangler.toml` is the scaffold default, and doctor also accepts `wrangler.jsonc`. The handle accepts registered query and mutation functions through `client(env.DB, { jwt, authOrigin })`, converts them to stable refs before RPC, verifies the JWT, re-derives current organization or user authority in Catalog, and uses the same manifest, migration epoch, policy, and Cdb execution paths as live traffic.
+Same-Worker apps expose one typed `env.DB` handle and resolve Chardb's internal classes through native `ctx.exports`; consumers do not declare the six internal Durable Object bindings. `wrangler.toml` is the scaffold default, and doctor also accepts `wrangler.jsonc`. The handle accepts registered query and mutation functions through `client(env.DB, { jwt, authOrigin })`, converts them to stable refs before RPC, verifies the JWT, re-derives current organization membership or user system authority in Catalog, and uses the same manifest, migration epoch, policy, and Cdb execution paths as live traffic. Narrow global handles use that user authority with one exact application partition.
 
 - `chardb init`, local Miniflare, Wrangler deployment, migration, and production share the same exported `DB` entrypoint.
 - Explicit stable refs, server-owned query intent, current Catalog authority, policy checks, and migration epochs remain behind the handle.
-- The clean-tarball chat proof executes both binding methods, checks idempotent mutation replay and two-client live invalidation, restarts Miniflare over persisted storage, and runs a frozen concurrent binding-query telemetry profile.
+- The clean-tarball chat proof executes both binding methods across organization, user, and global authority, checks idempotent mutation replay and two-client live invalidation, restarts Miniflare over persisted storage, and runs frozen concurrent binding-query telemetry profiles.
 
 Raw Drizzle builders over RPC remain outside this package. Adding them would require a bounded serializable query representation that preserves the same server-owned intent and authorization guarantees.
 
@@ -41,12 +41,16 @@ Full-row single-table queries are the only supported shape.
 
 ## Complete tenancy axes
 
-`forOrg()`, `forUser()`, and `globalScope()` exist as schema primitives. Organization and user scopes have public mutation, query, auth, binding, and live-update proofs. Global scope still lacks a public runtime contract.
+`forOrg()`, `forUser()`, and `globalScope()` have recorded public mutation, query, auth, binding, and live-update proofs for their supported shapes.
 
 - User scope completed 2026-08-25. Gateway binds its declared partition to the verified JWT subject, Catalog re-derives the current user row, system role, and principal epoch, and Cdb applies the `forUser()` policy floor. Workerd proves forged-subject denial, two-user isolation, invalidation, Gateway hibernation, Cdb reconstruction, and concurrent principal fanout. The exact-tarball chat proves native `env.DB` query, mutation replay, isolation, restart, and a frozen two-principal query profile.
-- Give global tables an explicit placement and transaction contract instead of silently treating them as tenant data.
+- Global mutations and queries require JWT authentication, an explicit stable ref, and one exact nonempty application partition. Queries also declare server-owned intent.
+- Catalog re-derives the current user system role and global and principal epochs. The application partition is routing data, not a token claim or user identity.
+- Cdb accepts one-column colocated global tables only. It requires the routed key on insert, forbids changing it, and applies it as the select, update, and delete floor. Each operation is one physical Cdb transaction.
+- Global scope completed 2026-08-25. The configured Workerd suite passes 11 of 11 cases. Its global case covers two principals sharing one partition, wrong-key denial, neighbor isolation, Gateway hibernation, Cdb reconstruction, and deleted-user rerun retirement. The frozen profile uses one principal, eight partitions, eight registrations, eight writes, and eight exact snapshots.
+- The clean-tarball proof covers native `env.DB` cross-principal shared reads, neighbor isolation, stable mutation replay, and restart persistence. Its frozen global profile runs 32 queries at concurrency eight. The local Miniflare run measured 375.15 queries per second, which is regression telemetry rather than a target.
 - Define and reject cross-boundary joins and transactions until a bounded, atomic contract exists.
-- Run the same isolation, reconnect, revocation, migration, and reconstruction matrix for global scope if it becomes public.
+- Keep composite and replicated global operations closed until they have explicit placement, consistency, and failure contracts.
 
 ## Auth profile expansion
 

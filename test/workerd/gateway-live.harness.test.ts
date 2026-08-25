@@ -24,6 +24,7 @@ const SCALE_REFRESH_ROUNDS = boundedIntegerEnv("CHARDB_WORKERD_REFRESH_ROUNDS", 
 const SCALE_WAIT_MS = boundedIntegerEnv("CHARDB_WORKERD_WAIT_MS", 5_000, 1_000, 60_000);
 const SCALE_TEST_TIMEOUT_MS = boundedIntegerEnv("CHARDB_WORKERD_TEST_TIMEOUT_MS", 30_000, 5_000, 300_000);
 const USER_AXIS_BENCH_USERS = boundedIntegerEnv("CHARDB_WORKERD_USER_AXIS_USERS", 8, 2, 32);
+const GLOBAL_AXIS_BENCH_PARTITIONS = boundedIntegerEnv("CHARDB_WORKERD_GLOBAL_AXIS_PARTITIONS", 8, 2, 32);
 
 function boundedIntegerEnv(name: string, fallback: number, minimum: number, maximum: number): number {
     const raw = process.env[name];
@@ -91,6 +92,8 @@ let queryRef: ChardbRef | undefined;
 let publicQueryRef: ChardbRef | undefined;
 let userMutationRef: ChardbRef | undefined;
 let userQueryRef: ChardbRef | undefined;
+let globalMutationRef: ChardbRef | undefined;
+let globalQueryRef: ChardbRef | undefined;
 let shardId = "";
 let signToken: ((subject: string) => Promise<string>) | undefined;
 
@@ -225,6 +228,16 @@ async function createFixtureUser(userId: string): Promise<void> {
     if (!response.ok) throw new Error(`user creation failed: ${response.status} ${await response.text()}`);
 }
 
+async function deleteFixtureUser(userId: string): Promise<void> {
+    if (!mf) throw new Error("Miniflare is not initialized");
+    const response = await mf.dispatchFetch("http://example.com/live-user", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: userId, action: "delete" }),
+    });
+    if (!response.ok) throw new Error(`user deletion failed: ${response.status} ${await response.text()}`);
+}
+
 async function gatewayState(clientId: string): Promise<GatewayLiveState> {
     return fixtureFetch("/live-gateway-state", { clientId });
 }
@@ -251,6 +264,16 @@ async function currentRegistration(
     throw new Error(`timed out waiting for active registration ${clientId}:${subId}`);
 }
 
+async function waitForNoRegistration(clientId: string, subId: number): Promise<void> {
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+        const state = await gatewayState(clientId);
+        if (!state.registrations.some(row => row.subId === subId && row.currentHead)) return;
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw new Error(`timed out waiting for registration retirement ${clientId}:${subId}`);
+}
+
 async function subscribe(
     opened: OpenedSocket,
     clientId: string,
@@ -273,6 +296,47 @@ async function subscribe(
     const message = await snapshot;
     if (message.t !== "snapshot") throw new Error(`expected snapshot, received ${message.t}`);
     return message;
+}
+
+async function subscribeGlobal(
+    opened: OpenedSocket,
+    clientId: string,
+    subId: number,
+    namespace: string
+): Promise<Extract<Down, { t: "snapshot" }>> {
+    if (!globalQueryRef) throw new Error("global query ref was not seeded");
+    const snapshot = nextDown(opened.socket);
+    opened.socket.send(
+        encodeWire({
+            t: "sub",
+            subId: SubId(subId),
+            ref: globalQueryRef,
+            args: { namespace },
+        })
+    );
+    await currentRegistration(clientId, subId);
+    await drainGateway(clientId);
+    const message = await snapshot;
+    if (message.t !== "snapshot") throw new Error(`expected global snapshot, received ${message.t}`);
+    return message;
+}
+
+async function mutateGlobal(
+    opened: OpenedSocket,
+    mutId: string,
+    input: { readonly id: string; readonly namespace: string; readonly storedNamespace: string; readonly value: string }
+): Promise<Down> {
+    if (!globalMutationRef) throw new Error("global mutation ref was not seeded");
+    const result = nextDown(opened.socket);
+    opened.socket.send(
+        encodeWire({
+            t: "mut",
+            mutId: MutId(mutId),
+            ref: globalMutationRef,
+            args: input,
+        })
+    );
+    return result;
 }
 
 function acknowledge(socket: WebSocket, snapshot: Extract<Down, { t: "snapshot" }>): void {
@@ -795,6 +859,8 @@ beforeAll(async () => {
         readonly publicQueryRef: ChardbRef;
         readonly userMutationRef: ChardbRef;
         readonly userQueryRef: ChardbRef;
+        readonly globalMutationRef: ChardbRef;
+        readonly globalQueryRef: ChardbRef;
         readonly shardA: string;
         readonly shardB: string;
     };
@@ -803,6 +869,8 @@ beforeAll(async () => {
     publicQueryRef = seed.publicQueryRef;
     userMutationRef = seed.userMutationRef;
     userQueryRef = seed.userQueryRef;
+    globalMutationRef = seed.globalMutationRef;
+    globalQueryRef = seed.globalQueryRef;
     shardId = seed.shardA;
     expect(seed.shardA).toBe(seed.shardB);
     await fixtureFetch("/live-public-seed", { shardId });
@@ -1038,6 +1106,229 @@ describe("public durable live queries in real workerd", () => {
         openedB.socket.close();
         await Promise.all([openedA.closed, openedB.closed]);
         await Promise.all([drainGateway(clientA), drainGateway(clientB)]);
+    });
+
+    test("global authority shares one exact application partition and fences neighboring rows", async () => {
+        if (!mf || !globalMutationRef || !globalQueryRef) throw new Error("global authority refs were not seeded");
+        const clientA = "global-axis-a";
+        const clientB = "global-axis-b";
+        const namespace = "global-shared";
+        const openedA = await openSocket(clientA, await signed("workerd-user"));
+        const openedB = await openSocket(clientB, await signed("workerd-user-2"));
+        expect(openedA.welcome.t).toBe("welcome");
+        expect(openedB.welcome.t).toBe("welcome");
+
+        const [initialA, initialB] = await Promise.all([
+            subscribeGlobal(openedA, clientA, 50, namespace),
+            subscribeGlobal(openedB, clientB, 50, namespace),
+        ]);
+        expect(initialA.rows).toEqual([]);
+        expect(initialB.rows).toEqual([]);
+        acknowledge(openedA.socket, initialA);
+        acknowledge(openedB.socket, initialB);
+
+        await expect(
+            mutateGlobal(openedA, "global-axis-write-a", {
+                id: "global-row-a",
+                namespace,
+                storedNamespace: namespace,
+                value: "alpha",
+            })
+        ).resolves.toMatchObject({
+            t: "poke",
+            mutResults: [{ mutId: "global-axis-write-a", ok: true }],
+        });
+        const replacementA = nextDown(openedA.socket);
+        const replacementB = nextDown(openedB.socket);
+        await Promise.all([drainGateway(clientA), drainGateway(clientB)]);
+        const [messageA, messageB] = await Promise.all([replacementA, replacementB]);
+        const sharedRows = [{ id: "global-row-a", namespace, value: "alpha" }];
+        expect(messageA).toMatchObject({ t: "snapshot", subId: 50, rows: sharedRows });
+        expect(messageB).toMatchObject({ t: "snapshot", subId: 50, rows: sharedRows });
+        if (messageA.t !== "snapshot" || messageB.t !== "snapshot") {
+            throw new Error("expected shared global replacement snapshots");
+        }
+        acknowledge(openedA.socket, messageA);
+        acknowledge(openedB.socket, messageB);
+
+        await expect(
+            mutateGlobal(openedA, "global-axis-misplaced-write", {
+                id: "global-row-misplaced",
+                namespace,
+                storedNamespace: "global-neighbor",
+                value: "misplaced",
+            })
+        ).resolves.toMatchObject({
+            t: "poke",
+            mutResults: [
+                {
+                    mutId: "global-axis-misplaced-write",
+                    ok: false,
+                    error: { code: "CDB_FORBIDDEN", retryable: false },
+                },
+            ],
+        });
+
+        const neighborInitial = await subscribeGlobal(openedA, clientA, 51, "global-neighbor");
+        expect(neighborInitial.rows).toEqual([]);
+        acknowledge(openedA.socket, neighborInitial);
+        openedA.socket.send(encodeWire({ t: "unsub", subId: SubId(51) }));
+        await waitForNoRegistration(clientA, 51);
+
+        const gatewayBeforeEviction = await gatewayState(clientA);
+        const cdbBeforeEviction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+        await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", {
+            name: clientA.slice(0, 12),
+            webSockets: "hibernate",
+        });
+        await mf.unsafeEvictDurableObject(WORKER_NAME, "Cdb", { name: shardId });
+        const gatewayAfterEviction = await gatewayState(clientA);
+        const cdbAfterEviction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+        expect(gatewayAfterEviction.instanceId).not.toBe(gatewayBeforeEviction.instanceId);
+        expect(cdbAfterEviction.instanceId).not.toBe(cdbBeforeEviction.instanceId);
+        expect(gatewayAfterEviction.registrations).toEqual(gatewayBeforeEviction.registrations);
+
+        await expect(
+            mutateGlobal(openedB, "global-axis-write-after-eviction", {
+                id: "global-row-b",
+                namespace,
+                storedNamespace: namespace,
+                value: "after-eviction",
+            })
+        ).resolves.toMatchObject({
+            t: "poke",
+            mutResults: [{ mutId: "global-axis-write-after-eviction", ok: true }],
+        });
+        const afterEvictionA = nextDown(openedA.socket);
+        const afterEvictionB = nextDown(openedB.socket);
+        await Promise.all([drainGateway(clientA), drainGateway(clientB)]);
+        const [afterEvictionMessageA, afterEvictionMessageB] = await Promise.all([afterEvictionA, afterEvictionB]);
+        const reconstructedRows = [
+            { id: "global-row-a", namespace, value: "alpha" },
+            { id: "global-row-b", namespace, value: "after-eviction" },
+        ];
+        expect(afterEvictionMessageA).toMatchObject({ t: "snapshot", subId: 50, rows: reconstructedRows });
+        expect(afterEvictionMessageB).toMatchObject({ t: "snapshot", subId: 50, rows: reconstructedRows });
+        if (afterEvictionMessageA.t === "snapshot") acknowledge(openedA.socket, afterEvictionMessageA);
+        if (afterEvictionMessageB.t === "snapshot") acknowledge(openedB.socket, afterEvictionMessageB);
+
+        const revokedUser = "global-revoked-user";
+        await createFixtureUser(revokedUser);
+        const revokedClient = "global-revoked";
+        const revoked = await openSocket(revokedClient, await signed(revokedUser));
+        const revokedInitial = await subscribeGlobal(revoked, revokedClient, 52, "global-revoked-partition");
+        expect(revokedInitial.rows).toEqual([]);
+        acknowledge(revoked.socket, revokedInitial);
+        await deleteFixtureUser(revokedUser);
+
+        await expect(
+            mutateGlobal(openedB, "global-axis-revocation-trigger", {
+                id: "global-revocation-row",
+                namespace: "global-revoked-partition",
+                storedNamespace: "global-revoked-partition",
+                value: "trigger",
+            })
+        ).resolves.toMatchObject({
+            t: "poke",
+            mutResults: [{ mutId: "global-axis-revocation-trigger", ok: true }],
+        });
+        const revokedFailure = nextDown(revoked.socket);
+        await drainGateway(revokedClient);
+        await expect(revokedFailure).resolves.toMatchObject({
+            t: "error",
+            subId: 52,
+            code: "CDB_FORBIDDEN",
+            retryable: false,
+        });
+        expect((await gatewayState(revokedClient)).registrations.some(row => row.subId === 52 && row.currentHead)).toBe(
+            false
+        );
+
+        openedA.socket.close();
+        openedB.socket.close();
+        revoked.socket.close();
+        await Promise.all([openedA.closed, openedB.closed, revoked.closed]);
+        await Promise.all([drainGateway(clientA), drainGateway(clientB), drainGateway(revokedClient)]);
+    });
+
+    test("global-axis fanout stays exact across concurrent application partitions", async () => {
+        if (!globalMutationRef || !globalQueryRef) throw new Error("global authority refs were not seeded");
+        const partitions = Array.from(
+            { length: GLOBAL_AXIS_BENCH_PARTITIONS },
+            (_, index) => `global-bench-${index.toString().padStart(2, "0")}`
+        );
+        const clientIds = partitions.map((_, index) => `global-bench-client-${index.toString().padStart(2, "0")}`);
+
+        const registrationStartedAt = performance.now();
+        const opened = await Promise.all(
+            clientIds.map(async clientId => openSocket(clientId, await signed("workerd-user")))
+        );
+        const initialSnapshots = await Promise.all(
+            opened.map((connection, index) =>
+                subscribeGlobal(connection, clientIds[index] as string, 53, partitions[index] as string)
+            )
+        );
+        initialSnapshots.forEach((message, index) => {
+            expect(message.rows).toEqual([]);
+            acknowledge((opened[index] as OpenedSocket).socket, message);
+        });
+        const registrationMs = performance.now() - registrationStartedAt;
+
+        const writeStartedAt = performance.now();
+        const mutationMessages = await Promise.all(
+            opened.map((connection, index) =>
+                mutateGlobal(connection, `global-bench-mut-${index}`, {
+                    id: `global-bench-row-${index}`,
+                    namespace: partitions[index] as string,
+                    storedNamespace: partitions[index] as string,
+                    value: `value-${index}`,
+                })
+            )
+        );
+        mutationMessages.forEach((message, index) => {
+            expect(message).toMatchObject({
+                t: "poke",
+                mutResults: [{ mutId: `global-bench-mut-${index}`, ok: true }],
+            });
+        });
+        const replacements = opened.map(connection => nextDown(connection.socket));
+        await Promise.all(clientIds.map(drainGateway));
+        const replacementMessages = await Promise.all(replacements);
+        replacementMessages.forEach((message, index) => {
+            expect(message).toMatchObject({
+                t: "snapshot",
+                subId: 53,
+                rows: [
+                    {
+                        id: `global-bench-row-${index}`,
+                        namespace: partitions[index],
+                        value: `value-${index}`,
+                    },
+                ],
+            });
+            if (message.t === "snapshot") acknowledge((opened[index] as OpenedSocket).socket, message);
+        });
+        const writeAndConvergenceMs = performance.now() - writeStartedAt;
+
+        console.log(
+            JSON.stringify({
+                type: "chardb-workerd-benchmark",
+                scenario: "global-axis-concurrent-application-partitions",
+                principals: 1,
+                partitions: partitions.length,
+                registrations: partitions.length,
+                registrationMs: Number(registrationMs.toFixed(2)),
+                registrationsPerSecond: rate(partitions.length, registrationMs),
+                writes: partitions.length,
+                writeAndConvergenceMs: Number(writeAndConvergenceMs.toFixed(2)),
+                writesPerSecond: rate(partitions.length, writeAndConvergenceMs),
+                exactIsolatedSnapshots: replacementMessages.length,
+            })
+        );
+
+        for (const connection of opened) connection.socket.close();
+        await Promise.all(opened.map(connection => connection.closed));
+        await Promise.all(clientIds.map(drainGateway));
     });
 
     test("user-axis fanout stays exact across concurrent principals", async () => {

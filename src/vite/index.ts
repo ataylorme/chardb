@@ -350,7 +350,7 @@ function collectExports(code: string, id: string): FoundExport[] {
             );
         const refProperty = namedProperty("ref");
         const authorityProperty = namedProperty("authority");
-        let organizationAuthority = false;
+        let declaredAuthority: string | undefined;
         if (authorityProperty) {
             if (
                 !ts.isPropertyAssignment(authorityProperty) ||
@@ -359,12 +359,19 @@ function collectExports(code: string, id: string): FoundExport[] {
             ) {
                 throw new Error(`[chardb/vite] Authority for ${exportName} must be a string literal`);
             }
-            organizationAuthority = authorityProperty.initializer.text === "organization";
+            declaredAuthority = authorityProperty.initializer.text;
         }
+        const stableAuthority =
+            declaredAuthority === "organization" || declaredAuthority === "user" || declaredAuthority === "global"
+                ? declaredAuthority
+                : undefined;
+        const authorityLabel = stableAuthority
+            ? `${stableAuthority[0]?.toUpperCase()}${stableAuthority.slice(1)}`
+            : undefined;
         if (!refProperty) {
-            if (organizationAuthority) {
+            if (authorityLabel) {
                 throw new Error(
-                    `[chardb/vite] Organization ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires a literal ref`
+                    `[chardb/vite] ${authorityLabel} ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires a literal ref`
                 );
             }
             return undefined;
@@ -383,7 +390,16 @@ function collectExports(code: string, id: string): FoundExport[] {
         if (!ts.isStringLiteralLike(property.initializer)) {
             throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a string literal`);
         }
-        return validExplicitRef(property.initializer.text, exportName);
+        const explicitRef = validExplicitRef(property.initializer.text, exportName);
+        if (stableAuthority === "global" && !namedProperty("partitionKey")) {
+            throw new Error(
+                `[chardb/vite] Global ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires an explicit partitionKey extractor`
+            );
+        }
+        if (stableAuthority === "global" && kind === "defineQuery" && !namedProperty("intent")) {
+            throw new Error(`[chardb/vite] Global query ${exportName} requires an explicit intent extractor`);
+        }
+        return explicitRef;
     };
 
     const out: FoundExport[] = [];
@@ -510,22 +526,38 @@ function regexExplicitConfigRef(
         throw new Error(`[chardb/vite] ${exportName} config cannot spread ref metadata`);
     }
     const hasAuthority = /\bauthority\s*:/.test(config);
-    const organizationAuthority = /\bauthority\s*:\s*(["'])organization\1/.test(config);
-    if (hasAuthority && !organizationAuthority) {
-        const literalAuthority = /\bauthority\s*:\s*(["'])[^"'\\]*\1/.test(config);
-        if (!literalAuthority) throw new Error(`[chardb/vite] Authority for ${exportName} must be a string literal`);
+    const literalAuthority = /\bauthority\s*:\s*(["'])([^"'\\]*)\1/.exec(config);
+    if (hasAuthority && !literalAuthority) {
+        throw new Error(`[chardb/vite] Authority for ${exportName} must be a string literal`);
     }
+    const declaredAuthority = literalAuthority?.[2];
+    const stableAuthority =
+        declaredAuthority === "organization" || declaredAuthority === "user" || declaredAuthority === "global"
+            ? declaredAuthority
+            : undefined;
+    const authorityLabel = stableAuthority
+        ? `${stableAuthority[0]?.toUpperCase()}${stableAuthority.slice(1)}`
+        : undefined;
     if (!/\bref\s*:/.test(config)) {
-        if (organizationAuthority) {
+        if (authorityLabel) {
             throw new Error(
-                `[chardb/vite] Organization ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires a literal ref`
+                `[chardb/vite] ${authorityLabel} ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires a literal ref`
             );
         }
         return undefined;
     }
     const literal = /\bref\s*:\s*(["'])([^"'\\]*)\1/.exec(config);
     if (!literal?.[2]) throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a string literal`);
-    return validExplicitRef(literal[2], exportName);
+    const explicitRef = validExplicitRef(literal[2], exportName);
+    if (stableAuthority === "global" && !/\bpartitionKey\s*:/.test(config)) {
+        throw new Error(
+            `[chardb/vite] Global ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires an explicit partitionKey extractor`
+        );
+    }
+    if (stableAuthority === "global" && kind === "defineQuery" && !/\bintent\s*:/.test(config)) {
+        throw new Error(`[chardb/vite] Global query ${exportName} requires an explicit intent extractor`);
+    }
+    return explicitRef;
 }
 
 function cleanModuleId(id: string): string {

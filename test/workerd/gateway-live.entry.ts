@@ -3,12 +3,14 @@ import { text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
-import { type ChardbManifest, api, forOrg, forUser, manifestFromExports } from "../../src/server/index.ts";
+import { type ChardbManifest, api, forOrg, forUser, globalScope, manifestFromExports } from "../../src/server/index.ts";
 import baseWorker, { Catalog, Cdb as ProductionCdb, Gateway as ProductionGateway } from "./gateway-jwt.entry.ts";
 
 const PUBLIC_QUERY_REF = "test/workerd/gateway-live.entry.ts#listPublicOrganizationRows";
 const USER_MUTATION_REF = "test/workerd/gateway-live.entry.ts#writeUserRow";
 const USER_QUERY_REF = "test/workerd/gateway-live.entry.ts#listUserRows";
+const GLOBAL_MUTATION_REF = "test/workerd/gateway-live.entry.ts#writeGlobalRow";
+const GLOBAL_QUERY_REF = "test/workerd/gateway-live.entry.ts#listGlobalRows";
 
 const { cdbTable } = forOrg();
 const publicOrganizationRows = cdbTable(
@@ -40,6 +42,20 @@ const userRows = userTable(
     }
 );
 
+const { cdbTable: globalTable } = globalScope();
+const globalRows = globalTable(
+    "gateway_global_rows",
+    {
+        id: text("id").primaryKey(),
+        namespace: text("namespace").notNull(),
+        value: text("value").notNull(),
+    },
+    {
+        partitionBy: "namespace",
+        roles: { user: { create: "*", read: "*" }, admin: "*" },
+    }
+);
+
 const writeUserRow = api.mutation({
     ref: USER_MUTATION_REF,
     args: z.object({ id: z.string(), userId: z.string(), value: z.string() }),
@@ -65,6 +81,46 @@ const listUserRows = api.query({
     }),
     handler: async (ctx, args) =>
         ctx.db.select().from(userRows).where(eq(userRows.userId, args.userId)).orderBy(userRows.id).all(),
+});
+
+const writeGlobalRow = api.mutation({
+    ref: GLOBAL_MUTATION_REF,
+    args: z.object({ id: z.string(), namespace: z.string(), storedNamespace: z.string(), value: z.string() }),
+    authority: "global",
+    partitionKey: "namespace",
+    handler: (ctx, args) => {
+        ctx.db.insert(globalRows).values({ id: args.id, namespace: args.storedNamespace, value: args.value }).run();
+        return { id: args.id, namespace: args.namespace, storedNamespace: args.storedNamespace };
+    },
+});
+
+const listGlobalRows = api.query({
+    ref: GLOBAL_QUERY_REF,
+    args: z.object({ namespace: z.string() }),
+    authority: "global",
+    partitionKey: "namespace",
+    intent: args => ({
+        kind: "select",
+        tables: ["gateway_global_rows"],
+        partitionKey: { table: "gateway_global_rows", column: "namespace", values: [args.namespace] },
+        joinShape: "colocated",
+        intervals: [
+            {
+                table: "gateway_global_rows",
+                indexName: "namespace",
+                intervals: [
+                    {
+                        kind: "range",
+                        lo: { kind: "value", value: [args.namespace], inclusive: true },
+                        hi: { kind: "value", value: [args.namespace], inclusive: true },
+                    },
+                ],
+            },
+        ],
+    }),
+    // Deliberately omit a caller predicate. The request-scoped global
+    // placement floor must keep neighboring partitions out of the result.
+    handler: async ctx => ctx.db.select().from(globalRows).orderBy(globalRows.id).all(),
 });
 
 const listPublicOrganizationRows = api.query({
@@ -94,7 +150,13 @@ const listPublicOrganizationRows = api.query({
     handler: async ctx => ctx.db.select().from(publicOrganizationRows).orderBy(publicOrganizationRows.id).all(),
 });
 
-const publicManifest = manifestFromExports({ listPublicOrganizationRows, writeUserRow, listUserRows });
+const publicManifest = manifestFromExports({
+    listPublicOrganizationRows,
+    writeUserRow,
+    listUserRows,
+    writeGlobalRow,
+    listGlobalRows,
+});
 
 function withPublicQuery(base: ChardbManifest): ChardbManifest {
     return {
@@ -164,8 +226,13 @@ export class Gateway extends ProductionGateway {
     }
 
     protected override runtimePolicyDigest(tableNames: readonly string[]): string | null {
-        if (tableNames.every(table => table === "gateway_public_rows" || table === "gateway_user_rows")) {
-            return cdbPolicyDigest({ publicOrganizationRows, userRows }, tableNames);
+        if (
+            tableNames.every(
+                table =>
+                    table === "gateway_public_rows" || table === "gateway_user_rows" || table === "gateway_global_rows"
+            )
+        ) {
+            return cdbPolicyDigest({ publicOrganizationRows, userRows, globalRows }, tableNames);
         }
         return super.runtimePolicyDigest(tableNames);
     }
@@ -251,7 +318,7 @@ export class Cdb extends ProductionCdb {
     private readonly fixtureInstanceId = crypto.randomUUID();
 
     protected override mutationSchema(): Record<string, unknown> {
-        return { ...super.mutationSchema(), publicOrganizationRows, userRows };
+        return { ...super.mutationSchema(), publicOrganizationRows, userRows, globalRows };
     }
 
     protected override mutationManifest(): ChardbManifest {
@@ -362,6 +429,8 @@ export default {
                 publicQueryRef: listPublicOrganizationRows.__chardbRef,
                 userMutationRef: writeUserRow.__chardbRef,
                 userQueryRef: listUserRows.__chardbRef,
+                globalMutationRef: writeGlobalRow.__chardbRef,
+                globalQueryRef: listGlobalRows.__chardbRef,
             });
         }
         if (url.pathname === "/live-public-seed") {
@@ -404,9 +473,26 @@ export default {
             );
         }
         if (url.pathname === "/live-user") {
-            const user = (await request.json()) as { readonly id: string };
+            const user = (await request.json()) as {
+                readonly id: string;
+                readonly action?: "create" | "delete" | "role";
+                readonly role?: string;
+            };
             const id = env.CDB_CATALOG.idFromName("global");
             const catalog = env.CDB_CATALOG.get(id) as unknown as CatalogFixtureRpc;
+            if (user.action === "delete") {
+                return Response.json(await catalog.mutateAuth({ model: "user", op: "delete", where: { id: user.id } }));
+            }
+            if (user.action === "role") {
+                return Response.json(
+                    await catalog.mutateAuth({
+                        model: "user",
+                        op: "update",
+                        where: { id: user.id },
+                        payload: { role: user.role ?? "user" },
+                    })
+                );
+            }
             return Response.json(
                 await catalog.mutateAuth({
                     model: "user",

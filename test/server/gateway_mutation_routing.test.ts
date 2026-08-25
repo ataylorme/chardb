@@ -77,6 +77,7 @@ function workingDeps(): TrustedMutationDispatchDeps {
                         mutId: "mut-1",
                         ref: "api.ts#createPost",
                         args: request.args,
+                        placement: { authority: "organization", partitionKey: "org-1" },
                         auth: {
                             userId: "user-1",
                             tenantId: "org-1",
@@ -215,6 +216,50 @@ describe("trusted Gateway mutation dispatch", () => {
             ok: false,
             error: { code: "CDB_FORBIDDEN" },
         });
+    });
+
+    test("routes a global partition with fresh user authority", async () => {
+        const deps: TrustedMutationDispatchDeps = {
+            routeMutation: input => ({
+                ok: true,
+                vshard: Number(vshardOf(["settings-v1"])),
+                authority: "global",
+                partitionKey: "settings-v1",
+                args: input.args,
+            }),
+            catalog: {
+                resolveOrganizationAuthority: async () => null,
+                resolveUserAuthority: async input => ({
+                    principalId: input.principalId,
+                    role: "admin",
+                    roles: ["admin"],
+                    authEpochs: { global: 9, tenant: 0, principal: 4 },
+                }),
+                route: async () => ({ shardId: ShardId("global-shard"), schemaEpoch: 3, domainSchemaEpoch: 2 }),
+            },
+            cdb: () => ({
+                mutate: async input => {
+                    expect(input.placement).toEqual({ authority: "global", partitionKey: "settings-v1" });
+                    expect(input.auth).toEqual({
+                        userId: "user-1",
+                        role: "admin",
+                        roles: ["admin"],
+                        authEpochs: { global: 9, tenant: 0, principal: 4 },
+                        claims: {},
+                    });
+                    return { ok: true, cookie: "global-cookie", ran: true, result: null, rowsAffected: 1 };
+                },
+            }),
+        };
+
+        await expect(
+            dispatchTrustedMutation(deps, {
+                principalId: PrincipalId("user-1"),
+                mutId: "global-mut-1",
+                ref: "api/settings#save",
+                args: { partition: "settings-v1", value: "on" },
+            })
+        ).resolves.toMatchObject({ ok: true, ran: true });
     });
 
     test("validates user authority envelopes before shard dispatch", () => {

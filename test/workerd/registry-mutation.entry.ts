@@ -72,16 +72,16 @@ const rawAfterTyped = api.mutation({
 let registeredQueryRuns = 0;
 const registryEntries = api.query({
     ref: "queries.ts#registryEntries",
-    args: z.object({ organizationId: z.string(), minimum: z.number().int() }),
-    authority: "organization",
-    partitionKey: "organizationId",
-    intent: (args: { organizationId: string; minimum: number }) => ({
+    args: z.object({ ownerId: z.string(), minimum: z.number().int() }),
+    authority: "global",
+    partitionKey: "ownerId",
+    intent: (args: { ownerId: string; minimum: number }) => ({
         kind: "select" as const,
         tables: ["registry_entries"],
         partitionKey: {
             table: "registry_entries",
-            column: "organization_id",
-            values: [args.organizationId],
+            column: "owner_id",
+            values: [args.ownerId],
         },
     }),
     handler: async function registryEntries(ctx, args) {
@@ -248,7 +248,7 @@ function subscriptionRequest(gatewayId: string): CdbSubscriptionRequest {
 }
 
 function registeredSubscriptionRequest(gatewayId: string, registrationId: string): CdbSubscriptionRequest {
-    const args = { organizationId: AUTH.tenantId, minimum: 60 };
+    const args = { ownerId: AUTH.userId, minimum: 60 };
     const routed = routeValidatedQuery(manifest, { ref: registryEntries.__chardbRef, args }, tables =>
         cdbPolicyDigest(schema, tables)
     );
@@ -261,7 +261,8 @@ function registeredSubscriptionRequest(gatewayId: string, registrationId: string
             subId: SubId(2),
         },
         principalId: PrincipalId(AUTH.userId),
-        organizationId: TenantId(AUTH.tenantId),
+        organizationId: TenantId(AUTH.userId),
+        placement: { authority: "global", partitionKey: AUTH.userId },
         domainSchemaEpoch: 1,
         ref: registryEntries.__chardbRef,
         args: routed.args,
@@ -311,7 +312,8 @@ export default {
                 readonly registrationId: string;
                 readonly forgedIdentity?: boolean;
                 readonly forgedPrincipal?: boolean;
-                readonly forgedOrganization?: boolean;
+                readonly forgedPartition?: boolean;
+                readonly forgedAuthority?: boolean;
                 readonly corruption?: "malformed" | "mismatch" | "mapping";
             };
             const registered = registeredSubscriptionRequest(gatewayId.toString(), body.registrationId);
@@ -339,10 +341,13 @@ export default {
                         auth: {
                             ...AUTH,
                             userId: body.forgedPrincipal ? "forged-principal" : AUTH.userId,
-                            tenantId: body.forgedOrganization ? "forged-organization" : AUTH.tenantId,
                             claims: { probe: "fresh-query-auth" },
                         },
                         domainSchemaEpoch: 1,
+                        placement: {
+                            authority: body.forgedAuthority ? "organization" : "global",
+                            partitionKey: body.forgedPartition ? "forged-partition" : AUTH.userId,
+                        },
                     })
                 );
             }

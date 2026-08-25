@@ -25,7 +25,7 @@ import { CdbError } from "../../src/errors.ts";
 import { type QueryReadRangeObservation, wrapMutationDb, wrapQueryDb } from "../../src/server/cdb-db-proxy.ts";
 import type { RoleValue } from "../../src/server/cdb-table-types.ts";
 import type { AuthCtx } from "../../src/server/define.ts";
-import { forOrg, forUser, wrapDb } from "../../src/server/index.ts";
+import { forOrg, forUser, globalScope, wrapDb } from "../../src/server/index.ts";
 
 /**
  * The stub satisfies the surface chardb's proxy actually inspects
@@ -56,6 +56,11 @@ interface CapturedDelete {
     where: unknown;
 }
 
+interface CapturedSelect {
+    readonly table: SQLiteTable;
+    where: unknown;
+}
+
 /**
  * Minimal stub for the surface the proxy actually inspects: an
  * `insert(table)` method that returns a builder whose `.values(rows)`
@@ -66,11 +71,34 @@ function makeStubDb(): {
     captured: CapturedInsert[];
     capturedUpdates: CapturedUpdate[];
     capturedDeletes: CapturedDelete[];
+    capturedSelects: CapturedSelect[];
 } {
     const captured: CapturedInsert[] = [];
     const capturedUpdates: CapturedUpdate[] = [];
     const capturedDeletes: CapturedDelete[] = [];
+    const capturedSelects: CapturedSelect[] = [];
     const db: unknown = {
+        select() {
+            return {
+                from(table: SQLiteTable) {
+                    const entry: CapturedSelect = { table, where: undefined };
+                    capturedSelects.push(entry);
+                    const builder = {
+                        where(where: unknown) {
+                            entry.where = where;
+                            return builder;
+                        },
+                        all() {
+                            return [];
+                        },
+                        toSQL() {
+                            return { sql: "select", params: [] };
+                        },
+                    };
+                    return builder;
+                },
+            };
+        },
         insert(table: SQLiteTable) {
             const entry: CapturedInsert = { table, rows: undefined };
             captured.push(entry);
@@ -145,7 +173,7 @@ function makeStubDb(): {
             return builder;
         },
     };
-    return { db: db as StubDb, captured, capturedUpdates, capturedDeletes };
+    return { db: db as StubDb, captured, capturedUpdates, capturedDeletes, capturedSelects };
 }
 
 const baseAuth: AuthCtx = Object.freeze({
@@ -1166,5 +1194,205 @@ describe("wrapDb / select bypass guards", () => {
         const error = forbiddenFeature(() => selectRoot.from(rawTable));
         expect(error.message).toContain("only from cdbTable");
         expect(selected).toBe(false);
+    });
+});
+
+describe("wrapDb / request placement fence", () => {
+    const { cdbTable: orgCdbTable } = forOrg();
+    const orgRows = orgCdbTable(
+        "placement_org_rows",
+        {
+            id: text("id").primaryKey(),
+            organizationId: text("organization_id")
+                .notNull()
+                .references(() => orgTable.id),
+            value: text("value").notNull(),
+        },
+        { roles: { member: "*" } }
+    );
+    const { cdbTable: userCdbTable } = forUser();
+    const userRows = userCdbTable(
+        "placement_user_rows",
+        {
+            id: text("id").primaryKey(),
+            userId: text("user_id")
+                .notNull()
+                .references(() => userTable.id),
+            value: text("value").notNull(),
+        },
+        { roles: { member: "*" } }
+    );
+    const { cdbTable: globalCdbTable } = globalScope();
+    const globalRows = globalCdbTable(
+        "placement_global_rows",
+        {
+            id: text("id").primaryKey(),
+            rootId: text("root_id").notNull(),
+            value: text("value").notNull(),
+        },
+        { partitionBy: "rootId", roles: { member: "*" } }
+    );
+
+    test("allows only tables on the routed authority axis", () => {
+        const orgDb = makeStubDb();
+        wrapDb(orgDb.db, baseAuth, { authority: "organization", partitionKey: "org-acme" })
+            .insert(orgRows)
+            .values({ id: "org-row", value: "allowed" })
+            .run();
+        expectForbidden(() =>
+            wrapDb(orgDb.db, baseAuth, { authority: "organization", partitionKey: "org-acme" }).insert(userRows)
+        );
+        expectForbidden(() =>
+            wrapDb(orgDb.db, baseAuth, { authority: "organization", partitionKey: "org-acme" })
+                .select()
+                .from(globalRows)
+        );
+        expect(orgDb.capturedSelects).toEqual([]);
+
+        const userDb = makeStubDb();
+        wrapDb(userDb.db, baseAuth, { authority: "user", partitionKey: "u-alice" })
+            .insert(userRows)
+            .values({ id: "user-row", value: "allowed" })
+            .run();
+        expectForbidden(() =>
+            wrapDb(userDb.db, baseAuth, { authority: "user", partitionKey: "u-alice" }).update(orgRows)
+        );
+        expectForbidden(() =>
+            wrapDb(userDb.db, baseAuth, { authority: "user", partitionKey: "u-alice" }).delete(globalRows)
+        );
+
+        const globalDb = makeStubDb();
+        wrapDb(globalDb.db, baseAuth, { authority: "global", partitionKey: "root-a" })
+            .insert(globalRows)
+            .values({ id: "global-row", rootId: "root-a", value: "allowed" })
+            .run();
+        expectForbidden(() =>
+            wrapDb(globalDb.db, baseAuth, { authority: "global", partitionKey: "root-a" }).insert(orgRows)
+        );
+        expectForbidden(() =>
+            wrapDb(globalDb.db, baseAuth, { authority: "global", partitionKey: "root-a" }).select().from(userRows)
+        );
+        expect(globalDb.capturedSelects).toEqual([]);
+    });
+
+    test("requires every global insert row to carry the routed partition", () => {
+        const exact = makeStubDb();
+        wrapDb(exact.db, baseAuth, { authority: "global", partitionKey: "root-a" })
+            .insert(globalRows)
+            .values({ id: "exact", rootId: "root-a", value: "allowed" })
+            .run();
+        expect(exact.captured[0]?.rows).toEqual({ id: "exact", rootId: "root-a", value: "allowed" });
+
+        const missing = makeStubDb();
+        expectForbidden(() =>
+            wrapDb(missing.db, baseAuth, { authority: "global", partitionKey: "root-a" })
+                .insert(globalRows)
+                .values({ id: "missing", value: "denied" } as never)
+        );
+        expect(missing.captured[0]?.rows).toBeUndefined();
+
+        const mixed = makeStubDb();
+        expectForbidden(() =>
+            wrapDb(mixed.db, baseAuth, { authority: "global", partitionKey: "root-a" })
+                .insert(globalRows)
+                .values([
+                    { id: "exact", rootId: "root-a", value: "allowed" },
+                    { id: "wrong", rootId: "root-b", value: "denied" },
+                ])
+        );
+        expect(mixed.captured[0]?.rows).toBeUndefined();
+    });
+
+    test("scopes global select, update, and delete and blocks partition updates", () => {
+        const blocked = makeStubDb();
+        expectForbidden(() =>
+            wrapDb(blocked.db, baseAuth, { authority: "global", partitionKey: "root-a" })
+                .update(globalRows)
+                .set({ rootId: "root-b" })
+        );
+        expect(blocked.capturedUpdates[0]?.values).toBeUndefined();
+
+        const noWhere = makeStubDb();
+        const noWhereWrapped = wrapDb(noWhere.db, baseAuth, {
+            authority: "global",
+            partitionKey: "root-a",
+        });
+        noWhereWrapped.update(globalRows).set({ value: "updated" }).run();
+        noWhereWrapped.delete(globalRows).run();
+        noWhereWrapped.select().from(globalRows);
+        for (const predicate of [
+            noWhere.capturedUpdates[0]?.where,
+            noWhere.capturedDeletes[0]?.where,
+            noWhere.capturedSelects[0]?.where,
+        ]) {
+            const rendered = renderSql(predicate);
+            expect(rendered.sql).toContain('"root_id"');
+            expect(rendered.params).toContain("root-a");
+        }
+
+        const scoped = makeStubDb();
+        const wrapped = wrapDb(scoped.db, baseAuth, { authority: "global", partitionKey: "root-a" });
+        wrapped.update(globalRows).set({ value: "updated" }).where(eq(globalRows.id, "row-1")).run();
+        wrapped.delete(globalRows).where(eq(globalRows.id, "row-1")).run();
+        wrapped.select().from(globalRows).where(eq(globalRows.id, "row-1"));
+
+        for (const predicate of [
+            scoped.capturedUpdates[0]?.where,
+            scoped.capturedDeletes[0]?.where,
+            scoped.capturedSelects[0]?.where,
+        ]) {
+            const rendered = renderSql(predicate);
+            expect(rendered.sql).toContain('"root_id"');
+            expect(rendered.params).toContain("root-a");
+            expect(rendered.params).toContain("row-1");
+        }
+    });
+
+    test("reports the global partition fence as part of the observed query range", () => {
+        const { db } = makeStubDb();
+        const observations: QueryReadRangeObservation[] = [];
+        wrapQueryDb(db, baseAuth, undefined, observation => observations.push(observation), {
+            authority: "global",
+            partitionKey: "root-a",
+        })
+            .select()
+            .from(globalRows)
+            .all();
+
+        expect(observations).toHaveLength(1);
+        const rendered = renderSql(observations[0]?.predicate);
+        expect(rendered.sql).toContain('"root_id"');
+        expect(rendered.params).toContain("root-a");
+    });
+
+    test("rejects composite and replicated global placement", () => {
+        const composite = globalCdbTable(
+            "placement_global_composite",
+            { id: text("id").primaryKey(), rootId: text("root_id").notNull() },
+            { partitionBy: ["rootId", "id"], roles: { member: "*" } }
+        );
+        const replicated = globalCdbTable(
+            "placement_global_replicated",
+            { id: text("id").primaryKey() },
+            { partitionBy: "replicated", roles: { member: "*" } }
+        );
+        const { db } = makeStubDb();
+        const compositeError = forbiddenFeature(() =>
+            wrapDb(db, baseAuth, { authority: "global", partitionKey: "root-a" }).insert(composite)
+        );
+        expect(compositeError.message).toContain("one colocated partition column");
+        const replicatedError = forbiddenFeature(() =>
+            wrapDb(db, baseAuth, { authority: "global", partitionKey: "root-a" }).select().from(replicated)
+        );
+        expect(replicatedError.message).toContain("one colocated partition column");
+    });
+
+    test("preserves direct wrapper behavior when placement is absent", () => {
+        const { db, captured } = makeStubDb();
+        wrapDb(db, baseAuth)
+            .insert(globalRows)
+            .values({ id: "direct", rootId: "any-partition", value: "allowed" })
+            .run();
+        expect(captured[0]?.rows).toEqual({ id: "direct", rootId: "any-partition", value: "allowed" });
     });
 });

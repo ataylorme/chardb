@@ -1,4 +1,4 @@
-import { forOrg, forUser } from "chardb/server";
+import { forOrg, forUser, globalScope } from "chardb/server";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { auth } from "./worker.ts";
 
@@ -6,6 +6,7 @@ import { auth } from "./worker.ts";
 // auto-discovered from the `.references(() => auth.organization.id)`
 const { cdbTable } = forOrg();
 const { cdbTable: userTable } = forUser();
+const { cdbTable: globalTable } = globalScope();
 
 export const channels = cdbTable(
     "channels",
@@ -73,6 +74,22 @@ export const userPreferences = userTable(
     {
         roles: {
             user: { create: ["id", "theme"], read: "*", update: ["theme"] },
+            admin: "*",
+        },
+    }
+);
+
+export const globalNotices = globalTable(
+    "global_notices",
+    {
+        id: text("id").primaryKey(),
+        namespace: text("namespace").notNull(),
+        body: text("body").notNull(),
+    },
+    {
+        partitionBy: "namespace",
+        roles: {
+            user: { create: "*", read: "*" },
             admin: "*",
         },
     }

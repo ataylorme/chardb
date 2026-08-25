@@ -9,7 +9,7 @@
 import { api } from "chardb/server";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
-import { messages, userPreferences } from "./schema.ts";
+import { globalNotices, messages, userPreferences } from "./schema.ts";
 
 const listMessagesArgs = z.object({
     organizationId: z.string(),
@@ -69,4 +69,31 @@ export const listUserPreferences = api.query({
     }),
     handler: async (ctx, args) =>
         ctx.db.select().from(userPreferences).where(eq(userPreferences.userId, args.userId)).all(),
+});
+
+export const listGlobalNotices = api.query({
+    ref: "src/server/queries.ts#listGlobalNotices",
+    args: z.object({ namespace: z.string() }),
+    authority: "global",
+    partitionKey: "namespace",
+    intent: args => ({
+        kind: "select",
+        tables: ["global_notices"],
+        partitionKey: { table: "global_notices", column: "namespace", values: [args.namespace] },
+        joinShape: "colocated",
+        intervals: [
+            {
+                table: "global_notices",
+                indexName: "namespace",
+                intervals: [
+                    {
+                        kind: "range",
+                        lo: { kind: "value", value: [args.namespace], inclusive: true },
+                        hi: { kind: "value", value: [args.namespace], inclusive: true },
+                    },
+                ],
+            },
+        ],
+    }),
+    handler: async ctx => ctx.db.select().from(globalNotices).orderBy(globalNotices.id).all(),
 });

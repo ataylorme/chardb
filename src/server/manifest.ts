@@ -242,6 +242,20 @@ export function resolveQuery(manifest: ChardbManifest, ref: ChardbRef): QueryDes
     return descriptor;
 }
 
+function requireAuthorityPartition(
+    authority: MutationAuthority | undefined,
+    kind: "mutation" | "query",
+    ref: string,
+    key: string | number | bigint | undefined
+): asserts key is string {
+    if (authority === undefined) return;
+    if (typeof key === "string" && key.length > 0) return;
+    throw new CdbError({
+        code: "CDB_INVALID_ARGS",
+        message: `${authority} ${kind} ${ref} requires a nonempty string partition key`,
+    });
+}
+
 /** Re-derive query placement from arguments that Gateway already validated. */
 export function routeValidatedQuery(
     manifest: ChardbManifest,
@@ -270,12 +284,7 @@ export function routeValidatedQuery(
         { maxAggregateMembers: CDB_JSON_MAX_AGGREGATE_MEMBERS, maxDepth: CDB_QUERY_ARGS_MAX_DEPTH }
     ) as unknown as CdbIntent;
     const policyDigest = policyDigestForTables(intent.tables);
-    if (descriptor.authority !== undefined && (typeof key !== "string" || key.length === 0)) {
-        throw new CdbError({
-            code: "CDB_INVALID_ARGS",
-            message: `${descriptor.authority} query ${input.ref} requires a nonempty string partition key`,
-        });
-    }
+    requireAuthorityPartition(descriptor.authority, "query", input.ref, key);
     return {
         ok: true,
         args,
@@ -343,12 +352,7 @@ export function routeMutation(
         let key: string | number | bigint | undefined;
         if (desc.extractPartitionKey) key = desc.extractPartitionKey(snapshotCdbMutationArgs(validatedArgs));
         const args = snapshotCdbMutationArgs(validatedArgs);
-        if (desc.authority !== undefined && (typeof key !== "string" || key.length === 0)) {
-            throw new CdbError({
-                code: "CDB_INVALID_ARGS",
-                message: `${desc.authority} mutation ${input.ref} requires a nonempty string partition key`,
-            });
-        }
+        requireAuthorityPartition(desc.authority, "mutation", input.ref, key);
         if (key === undefined && desc.singlePartition) {
             throw new CdbError({
                 code: "CDB_CROSS_PARTITION",

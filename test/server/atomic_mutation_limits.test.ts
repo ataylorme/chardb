@@ -92,6 +92,7 @@ describe("atomic mutation limits", () => {
         readonly mutId: string;
         readonly id: string;
         readonly result: RawJson;
+        readonly placement?: { readonly authority: "global"; readonly partitionKey: string };
         throwError?: boolean;
         mutateResultInMicrotask?: boolean;
     }) {
@@ -108,6 +109,7 @@ describe("atomic mutation limits", () => {
             },
             cookie: `cookie:${args.mutId}`,
             nowMs: 1_700_000_000_000,
+            ...(args.placement ? { placement: args.placement } : {}),
             handler: ({ db: mutationDb }, request) => {
                 handlerRuns++;
                 mutationDb.insert(entries).values({ id: request.id, value: "written", ordinal: 0 }).run();
@@ -124,6 +126,32 @@ describe("atomic mutation limits", () => {
             },
         });
     }
+
+    test("threads global placement into the transaction database fence", () => {
+        const allowed = execute({
+            mutId: "global-placement-exact",
+            id: "partition-a",
+            result: null,
+            placement: { authority: "global", partitionKey: "partition-a" },
+        });
+        expect(allowed).toMatchObject({ ran: true, touchedTables: ["mutation_limit_entries"] });
+        expect(durableCounts()).toEqual({ domain: 1, opLog: 1 });
+
+        let caught: unknown;
+        try {
+            execute({
+                mutId: "global-placement-mismatch",
+                id: "partition-b",
+                result: null,
+                placement: { authority: "global", partitionKey: "partition-a" },
+            });
+        } catch (error) {
+            caught = error;
+        }
+        expect(caught).toBeInstanceOf(CdbError);
+        expect(caught).toMatchObject({ code: "CDB_FORBIDDEN" });
+        expect(durableCounts()).toEqual({ domain: 1, opLog: 1 });
+    });
 
     function durableCounts(): { readonly domain: number; readonly opLog: number } {
         const domain = db.query("SELECT COUNT(*) AS count FROM mutation_limit_entries").get() as { count: number };

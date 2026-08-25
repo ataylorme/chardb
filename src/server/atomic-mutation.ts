@@ -2,7 +2,7 @@ import { type DrizzleSqliteDODatabase, drizzle } from "drizzle-orm/durable-sqlit
 import { CdbError } from "../errors.ts";
 import { type MutationOutcome, type SyncSql, canonicalRequest, runWrappedMutation } from "../oplog/wrapper.ts";
 import { Cookie, MutId, PrincipalId, type RawJson } from "../types.ts";
-import { type MutationDbTransactionGuard, wrapMutationDb } from "./cdb-db-proxy.ts";
+import { type CdbDbPlacement, type MutationDbTransactionGuard, wrapMutationDb } from "./cdb-db-proxy.ts";
 import type { AuthCtx, MutationCtx } from "./define.ts";
 import { adaptSqlStorage } from "./do/sql_adapter.ts";
 import { assertCdbResultByteLimit, snapshotCdbResultByteLimit } from "./result_limits.ts";
@@ -46,6 +46,8 @@ export interface ExecuteAtomicMutationInput<TSchema extends Record<string, unkno
     readonly schema: TSchema;
     readonly request: AtomicMutationRequest<TArgs>;
     readonly handler: AtomicMutationHandler<TSchema, TArgs, TResult>;
+    /** Trusted shard placement for this request. Omitted by direct internal callers. */
+    readonly placement?: CdbDbPlacement;
     readonly cookie: string;
     readonly nowMs?: number;
     /** Internal synchronous fence evaluated inside the mutation transaction before op-log lookup or handler SQL. */
@@ -89,7 +91,8 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
         input.request.auth,
         tableName => writeVolume.record(tableName),
         () => writeVolume.beforeWrite(),
-        transactionGuard
+        transactionGuard,
+        input.placement
     );
     let wrappedResult: ReturnType<typeof runWrappedMutation<TResult>> | undefined;
     let committedTouchedTables: readonly string[] = [];

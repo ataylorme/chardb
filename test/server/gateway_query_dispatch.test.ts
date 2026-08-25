@@ -64,6 +64,7 @@ function workingDeps(): TrustedQueryDispatchDeps {
                     expect(input).toEqual<CdbQueryRequest>({
                         ref: ChardbRef("queries.ts#listMessages"),
                         args,
+                        placement: { authority: "organization", partitionKey: "org-1" },
                         auth: {
                             userId: "user-1",
                             tenantId: "org-1",
@@ -151,6 +152,47 @@ describe("trusted one-shot query dispatch", () => {
         await expect(dispatchTrustedQuery(forgedDeps, request)).resolves.toMatchObject({
             ok: false,
             error: { code: "CDB_FORBIDDEN" },
+        });
+    });
+
+    test("routes a global partition without binding it to the JWT subject", async () => {
+        const deps: TrustedQueryDispatchDeps = {
+            routeQuery: async input => ({
+                ok: true,
+                args: input.args,
+                intent: {
+                    kind: "select",
+                    tables: ["settings"],
+                    partitionKey: { table: "settings", column: "scope", values: ["settings-v1"] },
+                },
+                policyDigest: "global-policy",
+                queryHash: "global-query",
+                authority: "global",
+                partitionKey: "settings-v1",
+            }),
+            catalog: {
+                resolveOrganizationAuthority: async () => null,
+                resolveUserAuthority: async input => ({
+                    principalId: input.principalId,
+                    role: "admin",
+                    roles: ["admin"],
+                    authEpochs: { global: 6, tenant: 0, principal: 8 },
+                }),
+                route: async () => ({ shardId: ShardId("global-shard"), schemaEpoch: 4, domainSchemaEpoch: 5 }),
+            },
+            cdb: () => ({
+                query: async input => {
+                    expect(input.placement).toEqual({ authority: "global", partitionKey: "settings-v1" });
+                    expect(input.auth.userId).toBe("user-1");
+                    expect(input.auth.tenantId).toBeUndefined();
+                    return { ok: true, result: [{ enabled: true }] };
+                },
+            }),
+        };
+
+        await expect(dispatchTrustedQuery(deps, request)).resolves.toEqual({
+            ok: true,
+            result: [{ enabled: true }],
         });
     });
 

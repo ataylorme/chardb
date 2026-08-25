@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { isCdbError } from "../../src/errors.ts";
 import { defineCron, defineMutation, defineQuery } from "../../src/server/define.ts";
-import { manifestFromExports, resolveMutation, resolveQuery } from "../../src/server/manifest.ts";
+import {
+    manifestFromExports,
+    resolveMutation,
+    resolveQuery,
+    routeMutation,
+    routeValidatedQuery,
+} from "../../src/server/manifest.ts";
 import type { ChardbRef } from "../../src/types.ts";
 
 const createPost = defineMutation<unknown, { authorId: string; body: string }, { id: string }>(
@@ -69,5 +75,72 @@ describe("manifestFromExports", () => {
         const descriptor = resolveQuery(manifest, listOrganizationPosts.__chardbRef);
         expect(descriptor.authority).toBe("organization");
         expect(descriptor.extractPartitionKey?.({ organizationId: "org-1" })).toBe("org-1");
+    });
+
+    test("preserves and routes global mutation and query placement", () => {
+        const mutation = defineMutation({
+            ref: "api/settings#save",
+            authority: "global",
+            partitionKey: (args: { partition: string }) => args.partition,
+            handler: () => null,
+        });
+        const query = defineQuery({
+            ref: "api/settings#read",
+            authority: "global",
+            partitionKey: (args: { partition: string }) => args.partition,
+            intent: (args: { partition: string }) => ({
+                kind: "select",
+                tables: ["settings"],
+                partitionKey: { table: "settings", column: "partition", values: [args.partition] },
+            }),
+            handler: async () => [],
+        });
+        const manifest = manifestFromExports({ mutation, query });
+
+        const mutationRoute = routeMutation(
+            manifest,
+            { ref: mutation.__chardbRef, args: { partition: "app" } },
+            parts => (parts[0] === "app" ? 7 : 0)
+        );
+        expect(mutationRoute).toMatchObject({
+            ok: true,
+            authority: "global",
+            partitionKey: "app",
+            vshard: 7,
+        });
+        const queryRoute = routeValidatedQuery(
+            manifest,
+            { ref: query.__chardbRef, args: { partition: "app" } },
+            tables => tables.join(",")
+        );
+        expect(queryRoute.authority).toBe("global");
+        expect(queryRoute.partitionKey).toBe("app");
+        expect(queryRoute.policyDigest).toBe("settings");
+    });
+
+    test("rejects empty and non-string global partition results", () => {
+        const mutation = defineMutation({
+            ref: "api/settings#invalidSave",
+            authority: "global",
+            partitionKey: (args: { partition: string | number }) => args.partition,
+            handler: () => null,
+        });
+        const query = defineQuery({
+            ref: "api/settings#invalidRead",
+            authority: "global",
+            partitionKey: (args: { partition: string | number }) => args.partition,
+            intent: () => ({ kind: "select", tables: ["settings"] }),
+            handler: async () => [],
+        });
+        const manifest = manifestFromExports({ mutation, query });
+
+        const emptyMutation = routeMutation(manifest, { ref: mutation.__chardbRef, args: { partition: "" } }, () => 0);
+        expect(emptyMutation).toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVALID_ARGS", message: expect.stringContaining("nonempty string partition key") },
+        });
+        expect(() =>
+            routeValidatedQuery(manifest, { ref: query.__chardbRef, args: { partition: 1 } }, () => "policy")
+        ).toThrow("global query api/settings#invalidRead requires a nonempty string partition key");
     });
 });

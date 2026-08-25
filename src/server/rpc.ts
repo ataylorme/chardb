@@ -51,6 +51,12 @@ export interface CatalogUserAuthorityRpc {
     resolveUserAuthority(request: UserAuthorityRequest): Promise<UserAuthority | null>;
 }
 
+/** Gateway-owned logical placement forwarded across each Cdb RPC boundary. */
+export interface CdbPlacement {
+    readonly authority: MutationAuthority;
+    readonly partitionKey: string;
+}
+
 /** Globally unique identity for one live subscription registration. */
 export interface LiveSubscriptionId {
     readonly gatewayId: string;
@@ -66,6 +72,7 @@ export interface CdbSubscriptionRequest {
     readonly subscription: LiveSubscriptionId;
     readonly principalId: PrincipalId;
     readonly organizationId: TenantId;
+    readonly placement?: CdbPlacement;
     readonly domainSchemaEpoch: number;
     readonly ref: ChardbRef;
     readonly args: RawJson;
@@ -129,6 +136,7 @@ export interface CdbMutationRequest {
     readonly mutId: string;
     readonly ref: string;
     readonly args: RawJson;
+    readonly placement?: CdbPlacement;
     readonly auth: AuthCtx;
     readonly schemaEpoch: number;
     readonly domainSchemaEpoch: number;
@@ -160,6 +168,7 @@ export interface CdbMutationRpc {
 export interface CdbQueryRequest {
     readonly ref: ChardbRef;
     readonly args: RawJson;
+    readonly placement?: CdbPlacement;
     readonly auth: AuthCtx;
     readonly domainSchemaEpoch: number;
 }
@@ -182,6 +191,7 @@ export interface TrustedQueryDispatchRequest {
 /** Re-run one persisted live-query generation with freshly authorized context. */
 export interface CdbRegisteredQueryRequest {
     readonly subscription: LiveSubscriptionId;
+    readonly placement?: CdbPlacement;
     readonly auth: AuthCtx;
     readonly domainSchemaEpoch: number;
 }

@@ -41,6 +41,8 @@ import {
     SQL,
     StringChunk,
     Table,
+    and,
+    eq,
     getTableColumns,
     is,
     isSQLWrapper,
@@ -54,6 +56,18 @@ import type { CdbTableMeta } from "./cdb-table-types.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
 import type { AuthCtx } from "./define.ts";
 import { applyPoliciesToWhere, applyRowPolicies } from "./policy.ts";
+
+/** Trusted request placement derived before a handler receives its database. */
+export interface CdbDbPlacement {
+    readonly authority: "organization" | "user" | "global";
+    readonly partitionKey: string;
+}
+
+interface GlobalTablePlacement {
+    readonly jsColumn: string;
+    readonly sqlColumn: string;
+    readonly partitionKey: string;
+}
 
 /**
  * Cache of (sqlColumnName → jsColumnKey) for each cdbTable. The map is
@@ -92,6 +106,7 @@ interface AutoFillPlan {
     readonly onWrite: ((tableName: string) => void) | undefined;
     readonly beforeWrite: (() => undefined | (() => void)) | undefined;
     readonly transactionGuard: MutationDbTransactionGuard | undefined;
+    readonly globalPlacement: GlobalTablePlacement | undefined;
     readonly bindings: ReadonlyArray<{
         readonly jsKey: string;
         readonly value: string;
@@ -108,6 +123,7 @@ interface SelectPlan {
     readonly rangeObserver: QueryReadRangeObserver | undefined;
     readonly rangeState: QueryReadRangeState;
     readonly transactionGuard: MutationDbTransactionGuard | undefined;
+    readonly globalPlacement: GlobalTablePlacement | undefined;
 }
 
 interface SelectRootPlan {
@@ -117,6 +133,7 @@ interface SelectRootPlan {
     readonly onRead: ((tableName: string) => void) | undefined;
     readonly transactionGuard: MutationDbTransactionGuard | undefined;
     readonly rangeObserver: QueryReadRangeObserver | undefined;
+    readonly placement: CdbDbPlacement | undefined;
 }
 
 export interface QueryReadRangeObservation {
@@ -171,7 +188,8 @@ function buildPlan(
     operation: "insert" | "update" | "delete" = "insert",
     onWrite?: (tableName: string) => void,
     beforeWrite?: () => undefined | (() => void),
-    transactionGuard?: MutationDbTransactionGuard
+    transactionGuard?: MutationDbTransactionGuard,
+    globalPlacement?: GlobalTablePlacement
 ): AutoFillPlan {
     const bindings: Array<{ jsKey: string; value: string; authority: "tenant" | "self" }> = [];
     const sqlToJs = sqlToJsMap(table);
@@ -216,6 +234,7 @@ function buildPlan(
         onWrite,
         beforeWrite,
         transactionGuard,
+        globalPlacement,
         bindings,
     };
 }
@@ -232,8 +251,23 @@ function applyPlan<T extends Record<string, unknown>>(plan: AutoFillPlan, row: T
         next[jsKey] = value;
     }
     const filled = (next ?? row) as T;
+    assertGlobalInsertPlacement(plan, filled);
     assertCreateAuthorized(plan, filled);
     return filled;
+}
+
+function assertGlobalInsertPlacement(plan: AutoFillPlan, row: Readonly<Record<string, unknown>>): void {
+    const placement = plan.globalPlacement;
+    if (!placement) return;
+    if (
+        !Object.prototype.hasOwnProperty.call(row, placement.jsColumn) ||
+        row[placement.jsColumn] !== placement.partitionKey
+    ) {
+        throw new CdbError({
+            code: "CDB_FORBIDDEN",
+            message: `${plan.tableName}: insert must carry routed partition ${placement.jsColumn}`,
+        });
+    }
 }
 
 /**
@@ -289,12 +323,14 @@ function assertCreateAuthorized(plan: AutoFillPlan, row: Readonly<Record<string,
     }
 
     try {
+        const autoFilled = new Set(plan.bindings.map(binding => jsToSql.get(binding.jsKey) ?? binding.jsKey));
+        if (plan.globalPlacement) autoFilled.add(plan.globalPlacement.sqlColumn);
         assertColumnsWritable({
             values: policyRow,
             table: plan.table,
             auth: plan.auth,
             verb: "create",
-            autoFilled: new Set(plan.bindings.map(binding => jsToSql.get(binding.jsKey) ?? binding.jsKey)),
+            autoFilled,
         });
     } catch (error) {
         rethrowForbiddenColumn(error);
@@ -308,9 +344,10 @@ function buildWritePlan(
     operation: "update" | "delete",
     onWrite?: (tableName: string) => void,
     beforeWrite?: () => undefined | (() => void),
-    transactionGuard?: MutationDbTransactionGuard
+    transactionGuard?: MutationDbTransactionGuard,
+    globalPlacement?: GlobalTablePlacement
 ): AutoFillPlan {
-    const plan = buildPlan(table, meta, auth, operation, onWrite, beforeWrite, transactionGuard);
+    const plan = buildPlan(table, meta, auth, operation, onWrite, beforeWrite, transactionGuard, globalPlacement);
     const authorityRow: Record<string, unknown> = {};
     const jsToSql = jsToSqlMap(table);
     for (const binding of plan.bindings) authorityRow[jsToSql.get(binding.jsKey) ?? binding.jsKey] = binding.value;
@@ -337,6 +374,12 @@ function assertUpdateAuthorized(plan: AutoFillPlan, values: Readonly<Record<stri
                 message: `cannot update managed ${binding.authority} column "${binding.jsKey}"`,
             });
         }
+    }
+    if (plan.globalPlacement && Object.prototype.hasOwnProperty.call(values, plan.globalPlacement.jsColumn)) {
+        throw new CdbError({
+            code: "CDB_FORBIDDEN",
+            message: `cannot update routed partition column "${plan.globalPlacement.jsColumn}"`,
+        });
     }
 
     const policyValues = toSqlColumnNames(values, jsToSqlMap(plan.table));
@@ -386,6 +429,7 @@ function wrapSelectFromBuilder(builder: unknown, root: SelectRootPlan): unknown 
                 if (!root.fullRow) {
                     throw unsupportedSelect("cdbTable projections are unavailable until projected masks are compiled");
                 }
+                const globalPlacement = resolveTablePlacement(table, meta, root.placement);
                 const selected = (value as (table: SQLiteTable) => unknown).call(target, table);
                 // Observe at FROM construction, not execution. Drizzle can embed a
                 // builder through exists(inner), in which case the inner proxy only
@@ -404,6 +448,7 @@ function wrapSelectFromBuilder(builder: unknown, root: SelectRootPlan): unknown 
                     rangeObserver: root.rangeObserver,
                     rangeState: undefined,
                     transactionGuard: root.transactionGuard,
+                    globalPlacement,
                 });
             };
         },
@@ -416,12 +461,7 @@ function scopeSelectBuilder(
 ): unknown {
     const where = Reflect.get(builder as object, "where");
     if (typeof where !== "function") throw unsupportedSelect("select builder does not expose a WHERE stage");
-    const predicate = applyPoliciesToWhere({
-        op: "select",
-        auth: plan.auth,
-        table: plan.table,
-        policies: plan.policies,
-    });
+    const predicate = applyScopedPoliciesToWhere(plan, "select");
     if (!predicate) throw unsupportedSelect("select policy did not produce a predicate");
     const scoped = where.call(builder, predicate);
     return wrapScopedSelectBuilder(scoped, { ...plan, rangeState: { predicate } });
@@ -446,13 +486,7 @@ function wrapScopedSelectBuilder(builder: unknown, plan: SelectPlan): unknown {
                         throw unsupportedSelect("live query WHERE callbacks and empty predicates are unavailable");
                     }
                     if (plan.queryBoundary) assertTrackedSql(userWhere, plan.onRead);
-                    const combined = applyPoliciesToWhere({
-                        op: "select",
-                        auth: plan.auth,
-                        table: plan.table,
-                        userWhere,
-                        policies: plan.policies,
-                    });
+                    const combined = applyScopedPoliciesToWhere(plan, "select", userWhere);
                     if (!combined) throw unsupportedSelect("select policy did not produce a predicate");
                     const next = (value as (where: unknown) => unknown).call(target, combined);
                     const rangeState = next === target ? plan.rangeState : { predicate: combined };
@@ -639,18 +673,71 @@ function unsupportedWrite(operation: "insert" | "update" | "delete", property: P
     });
 }
 
+function resolveTablePlacement(
+    table: SQLiteTable,
+    meta: CdbTableMeta,
+    placement: CdbDbPlacement | undefined
+): GlobalTablePlacement | undefined {
+    if (!placement) return undefined;
+    const expectedTenantKind =
+        placement.authority === "organization" ? "org" : placement.authority === "user" ? "user" : "none";
+    if (meta.tenantKind !== expectedTenantKind) {
+        throw new CdbError({
+            code: "CDB_FORBIDDEN",
+            message: `${placement.authority} placement cannot access ${meta.tenantKind} table ${meta.name}`,
+        });
+    }
+    if (placement.authority !== "global") return undefined;
+    if (meta.partitionBy.kind !== "colocate" || meta.partitionBy.via.length !== 1) {
+        throw new CdbError({
+            code: "CDB_UNSUPPORTED_FEATURE",
+            message: `${meta.name}: global placement requires one colocated partition column`,
+        });
+    }
+    const sqlColumn = meta.partitionBy.via[0];
+    const jsColumn = sqlColumn ? sqlToJsMap(table).get(sqlColumn) : undefined;
+    if (!sqlColumn || !jsColumn) {
+        throw new CdbError({
+            code: "CDB_INVARIANT",
+            message: `${meta.name}: global placement partition column is missing from the table`,
+        });
+    }
+    return { jsColumn, sqlColumn, partitionKey: placement.partitionKey };
+}
+
+function globalPlacementPredicate(table: SQLiteTable, placement: GlobalTablePlacement | undefined): SQL | undefined {
+    if (!placement) return undefined;
+    const column = (getTableColumns(table) as Record<string, unknown>)[placement.jsColumn];
+    if (!column) {
+        throw new CdbError({
+            code: "CDB_INVARIANT",
+            message: `global placement column ${placement.sqlColumn} is missing from the table`,
+        });
+    }
+    return eq(column as never, placement.partitionKey);
+}
+
+function applyScopedPoliciesToWhere(
+    plan: Pick<AutoFillPlan | SelectPlan, "auth" | "table" | "policies" | "globalPlacement">,
+    op: "select" | "update" | "delete",
+    userWhere?: SQL
+): SQL | undefined {
+    const placementWhere = globalPlacementPredicate(plan.table, plan.globalPlacement);
+    const scopedUserWhere =
+        placementWhere && userWhere ? and(userWhere, placementWhere) : (placementWhere ?? userWhere);
+    return applyPoliciesToWhere({
+        op,
+        auth: plan.auth,
+        table: plan.table,
+        userWhere: scopedUserWhere,
+        policies: plan.policies,
+    });
+}
+
 function scopePolicyBuilder(builder: unknown, plan: AutoFillPlan, operation: "update" | "delete"): unknown {
     const where = Reflect.get(builder as object, "where");
     if (typeof where !== "function") throw unsupportedWrite(operation, "where");
-    const scoped = where.call(
-        builder,
-        applyPoliciesToWhere({
-            op: operation,
-            auth: plan.auth,
-            table: plan.table,
-            policies: plan.policies,
-        })
-    );
+    const scoped = where.call(builder, applyScopedPoliciesToWhere(plan, operation));
     return wrapScopedPolicyBuilder(scoped, plan, operation);
 }
 
@@ -662,13 +749,7 @@ function wrapScopedPolicyBuilder(builder: unknown, plan: AutoFillPlan, operation
                 const value = Reflect.get(target, prop, receiver);
                 if (typeof value !== "function") throw unsupportedWrite(operation, prop);
                 return (userWhere: import("drizzle-orm").SQL) => {
-                    const combined = applyPoliciesToWhere({
-                        op: operation,
-                        auth: plan.auth,
-                        table: plan.table,
-                        userWhere,
-                        policies: plan.policies,
-                    });
+                    const combined = applyScopedPoliciesToWhere(plan, operation, userWhere);
                     return wrapScopedPolicyBuilder(
                         (value as (where: unknown) => unknown).call(target, combined),
                         plan,
@@ -771,17 +852,18 @@ function conflictingAuthority(authority: "tenant" | "self", column: string): Cdb
  * transaction. Raw execution shortcuts and Drizzle's client/session objects
  * fail closed. Transactions receive the same wrapper recursively.
  */
-export function wrapDb<TDb extends object>(db: TDb, auth: AuthCtx): TDb {
-    return wrapDbInternal(db, auth, false, undefined, undefined);
+export function wrapDb<TDb extends object>(db: TDb, auth: AuthCtx, placement?: CdbDbPlacement): TDb {
+    return wrapDbInternal(db, auth, false, undefined, undefined, undefined, undefined, undefined, placement);
 }
 
 export function wrapQueryDb<TDb extends object>(
     db: TDb,
     auth: AuthCtx,
     onRead?: (tableName: string) => void,
-    rangeObserver?: QueryReadRangeObserver
+    rangeObserver?: QueryReadRangeObserver,
+    placement?: CdbDbPlacement
 ): TDb {
-    return wrapDbInternal(db, auth, true, undefined, onRead, rangeObserver);
+    return wrapDbInternal(db, auth, true, undefined, onRead, rangeObserver, undefined, undefined, placement);
 }
 
 /** Internal mutation wrapper used by the atomic executor to observe guarded writes. */
@@ -790,9 +872,10 @@ export function wrapMutationDb<TDb extends object>(
     auth: AuthCtx,
     onWrite?: (tableName: string) => void,
     beforeWrite?: () => undefined | (() => void),
-    transactionGuard?: MutationDbTransactionGuard
+    transactionGuard?: MutationDbTransactionGuard,
+    placement?: CdbDbPlacement
 ): TDb {
-    return wrapDbInternal(db, auth, false, onWrite, undefined, undefined, beforeWrite, transactionGuard);
+    return wrapDbInternal(db, auth, false, onWrite, undefined, undefined, beforeWrite, transactionGuard, placement);
 }
 
 export interface MutationDbTransactionGuard {
@@ -816,7 +899,8 @@ function wrapDbInternal<TDb extends object>(
     onRead: ((tableName: string) => void) | undefined,
     rangeObserver?: QueryReadRangeObserver,
     beforeWrite?: () => undefined | (() => void),
-    transactionGuard?: MutationDbTransactionGuard
+    transactionGuard?: MutationDbTransactionGuard,
+    placement?: CdbDbPlacement
 ): TDb {
     return new Proxy(db, {
         get(target, prop, receiver) {
@@ -844,6 +928,7 @@ function wrapDbInternal<TDb extends object>(
                         onRead,
                         rangeObserver,
                         transactionGuard,
+                        placement,
                     });
                 };
             }
@@ -851,7 +936,17 @@ function wrapDbInternal<TDb extends object>(
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
                     if (!meta) throw unsupportedWrite("insert", "plain table");
-                    const plan = buildPlan(table, meta, auth, "insert", onWrite, beforeWrite, transactionGuard);
+                    const globalPlacement = resolveTablePlacement(table, meta, placement);
+                    const plan = buildPlan(
+                        table,
+                        meta,
+                        auth,
+                        "insert",
+                        onWrite,
+                        beforeWrite,
+                        transactionGuard,
+                        globalPlacement
+                    );
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
                     return wrapInsertBuilder(builder, plan);
                 };
@@ -860,7 +955,17 @@ function wrapDbInternal<TDb extends object>(
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
                     if (!meta) throw unsupportedWrite("update", "plain table");
-                    const plan = buildWritePlan(table, meta, auth, "update", onWrite, beforeWrite, transactionGuard);
+                    const globalPlacement = resolveTablePlacement(table, meta, placement);
+                    const plan = buildWritePlan(
+                        table,
+                        meta,
+                        auth,
+                        "update",
+                        onWrite,
+                        beforeWrite,
+                        transactionGuard,
+                        globalPlacement
+                    );
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
                     return wrapUpdateBuilder(builder, plan);
                 };
@@ -869,7 +974,17 @@ function wrapDbInternal<TDb extends object>(
                 return (table: SQLiteTable) => {
                     const meta = getCdbMeta(table);
                     if (!meta) throw unsupportedWrite("delete", "plain table");
-                    const plan = buildWritePlan(table, meta, auth, "delete", onWrite, beforeWrite, transactionGuard);
+                    const globalPlacement = resolveTablePlacement(table, meta, placement);
+                    const plan = buildWritePlan(
+                        table,
+                        meta,
+                        auth,
+                        "delete",
+                        onWrite,
+                        beforeWrite,
+                        transactionGuard,
+                        globalPlacement
+                    );
                     const builder = (v as (t: SQLiteTable) => unknown).call(target, table);
                     return scopePolicyBuilder(builder, plan, "delete");
                 };
@@ -887,7 +1002,8 @@ function wrapDbInternal<TDb extends object>(
                                 onRead,
                                 rangeObserver,
                                 beforeWrite,
-                                transactionGuard
+                                transactionGuard,
+                                placement
                             )
                         );
                     return (v as (cb: (tx: TDb) => Promise<unknown>, ...r: readonly unknown[]) => unknown).call(

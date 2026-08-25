@@ -148,6 +148,61 @@ describe("@chardb/vite-plugin", () => {
         ).toThrow("Organization query list requires a literal ref");
     });
 
+    test("preserves global query and mutation refs", () => {
+        const p = makePlugin();
+        const out = transform(
+            p,
+            `
+      import { api } from "chardb/server";
+      export const save = api.mutation({
+        ref: "api/settings#save",
+        authority: "global",
+        partitionKey: () => "app",
+        handler: () => null,
+      });
+      export const read = api.query({
+        ref: "api/settings#read",
+        authority: "global",
+        partitionKey: () => "app",
+        intent: () => ({ kind: "select", tables: ["settings"] }),
+        handler: async () => [],
+      });
+    `,
+            "/abs/proj/src/global.ts"
+        );
+        expect(out.code).toContain('value: "api/settings#save"');
+        expect(out.code).toContain('value: "api/settings#read"');
+        expect(out.code).not.toContain("src/global.ts#save");
+        expect(out.code).not.toContain("src/global.ts#read");
+    });
+
+    test("rejects incomplete global placement metadata", () => {
+        const cases = [
+            {
+                source: `export const save = api.mutation({ authority: "global", partitionKey: () => "app", handler: () => null });`,
+                message: "Global mutation save requires a literal ref",
+            },
+            {
+                source: `export const save = api.mutation({ ref: "api/settings#save", authority: "global", handler: () => null });`,
+                message: "Global mutation save requires an explicit partitionKey extractor",
+            },
+            {
+                source: `export const read = api.query({ ref: "api/settings#read", authority: "global", intent: () => ({ kind: "select", tables: [] }), handler: async () => [] });`,
+                message: "Global query read requires an explicit partitionKey extractor",
+            },
+            {
+                source: `export const read = api.query({ ref: "api/settings#read", authority: "global", partitionKey: () => "app", handler: async () => [] });`,
+                message: "Global query read requires an explicit intent extractor",
+            },
+        ];
+        for (const testCase of cases) {
+            const p = makePlugin();
+            expect(() =>
+                p.transform(`import { api } from "chardb/server"; ${testCase.source}`, "/abs/proj/src/global.ts")
+            ).toThrow(testCase.message);
+        }
+    });
+
     test("rejects duplicate and nonliteral explicit refs", () => {
         const duplicate = makePlugin();
         expect(() =>

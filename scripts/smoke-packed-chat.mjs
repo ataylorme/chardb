@@ -246,6 +246,8 @@ async function main() {
         assert(built.includes("src/server/queries.ts#listMessages"), "Vite output lost the stable query ref");
         assert(built.includes("src/server/api.ts#createUserPreference"), "Vite output lost the user mutation ref");
         assert(built.includes("src/server/queries.ts#listUserPreferences"), "Vite output lost the user query ref");
+        assert(built.includes("src/server/api.ts#createGlobalNotice"), "Vite output lost the global mutation ref");
+        assert(built.includes("src/server/queries.ts#listGlobalNotices"), "Vite output lost the global query ref");
 
         const bundlePath = join(scratch, "chat-worker.mjs");
         const worker = await bundleWorker(consumer, bundlePath);
@@ -450,6 +452,125 @@ async function main() {
                     exactPrimaryRowsPerQuery: 1,
                     exactSecondUserRowsPerQuery: 0,
                     forgedPartitionDenied: true,
+                    mutationReplayStable: true,
+                },
+            })
+        );
+
+        const globalNoticeMutationRequest = {
+            id: "packed-global-notice",
+            namespace: "packed-global-shared",
+            body: "shared across principals",
+            mutId: "packed-global-notice-mut",
+        };
+        const globalNoticeMutation = await mf.dispatchFetch(new URL("/api/db/notices", origin), {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${tokenBody.token}`,
+                "content-type": "application/json",
+            },
+            body: JSON.stringify(globalNoticeMutationRequest),
+        });
+        const globalNoticeMutationBody = await globalNoticeMutation.json();
+        assert(
+            globalNoticeMutation.ok &&
+                globalNoticeMutationBody?.id === "packed-global-notice" &&
+                globalNoticeMutationBody?.namespace === "packed-global-shared",
+            `native env.DB global mutation failed: ${JSON.stringify(globalNoticeMutationBody)}`
+        );
+        const sharedGlobalNoticeUrl = new URL("/api/db/notices", origin);
+        sharedGlobalNoticeUrl.searchParams.set("namespace", "packed-global-shared");
+        const neighboringGlobalNoticeUrl = new URL("/api/db/notices", origin);
+        neighboringGlobalNoticeUrl.searchParams.set("namespace", "packed-global-neighbor");
+        const [sharedGlobalNoticeResponse, neighboringGlobalNoticeResponse] = await Promise.all([
+            mf.dispatchFetch(sharedGlobalNoticeUrl, {
+                headers: { authorization: `Bearer ${secondTokenBody.token}` },
+            }),
+            mf.dispatchFetch(neighboringGlobalNoticeUrl, {
+                headers: { authorization: `Bearer ${tokenBody.token}` },
+            }),
+        ]);
+        const [sharedGlobalNotices, neighboringGlobalNotices] = await Promise.all([
+            sharedGlobalNoticeResponse.json(),
+            neighboringGlobalNoticeResponse.json(),
+        ]);
+        assert(
+            sharedGlobalNoticeResponse.ok &&
+                Array.isArray(sharedGlobalNotices) &&
+                sharedGlobalNotices.length === 1 &&
+                sharedGlobalNotices[0]?.id === "packed-global-notice",
+            `native env.DB global cross-principal read failed: ${JSON.stringify(sharedGlobalNotices)}`
+        );
+        assert(
+            neighboringGlobalNoticeResponse.ok &&
+                Array.isArray(neighboringGlobalNotices) &&
+                neighboringGlobalNotices.length === 0,
+            `native env.DB global partition floor failed: ${JSON.stringify(neighboringGlobalNotices)}`
+        );
+
+        const globalNoticeReplay = await mf.dispatchFetch(new URL("/api/db/notices", origin), {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${tokenBody.token}`,
+                "content-type": "application/json",
+            },
+            body: JSON.stringify(globalNoticeMutationRequest),
+        });
+        const globalNoticeReplayBody = await globalNoticeReplay.json();
+        assert(
+            globalNoticeReplay.ok &&
+                JSON.stringify(globalNoticeReplayBody) === JSON.stringify(globalNoticeMutationBody),
+            `native env.DB global mutation replay changed its result: ${JSON.stringify(globalNoticeReplayBody)}`
+        );
+
+        const globalQueryLatenciesMs = [];
+        const globalBenchmarkStartedAt = performance.now();
+        for (let offset = 0; offset < bindingBenchmarkProfile.queries; offset += bindingBenchmarkProfile.concurrency) {
+            const batchSize = Math.min(bindingBenchmarkProfile.concurrency, bindingBenchmarkProfile.queries - offset);
+            await Promise.all(
+                Array.from({ length: batchSize }, async (_, batchIndex) => {
+                    const shared = (offset + batchIndex) % 2 === 0;
+                    const startedAt = performance.now();
+                    const response = await mf.dispatchFetch(
+                        shared ? sharedGlobalNoticeUrl : neighboringGlobalNoticeUrl,
+                        {
+                            headers: {
+                                authorization: `Bearer ${shared ? secondTokenBody.token : tokenBody.token}`,
+                            },
+                        }
+                    );
+                    const rows = await response.json();
+                    globalQueryLatenciesMs.push(performance.now() - startedAt);
+                    assert(
+                        response.ok && Array.isArray(rows) && rows.length === (shared ? 1 : 0),
+                        `native env.DB global benchmark diverged: ${JSON.stringify(rows)}`
+                    );
+                })
+            );
+        }
+        const globalBenchmarkElapsedMs = performance.now() - globalBenchmarkStartedAt;
+        const sortedGlobalQueryLatenciesMs = [...globalQueryLatenciesMs].sort((left, right) => left - right);
+        console.log(
+            JSON.stringify({
+                type: "chardb-global-binding-benchmark",
+                version: 1,
+                profile: bindingBenchmarkProfileName,
+                principals: 2,
+                partitions: 2,
+                queries: bindingBenchmarkProfile.queries,
+                concurrency: bindingBenchmarkProfile.concurrency,
+                elapsedMs: globalBenchmarkElapsedMs,
+                queriesPerSecond: (bindingBenchmarkProfile.queries * 1_000) / globalBenchmarkElapsedMs,
+                latencyMs: {
+                    min: sortedGlobalQueryLatenciesMs[0],
+                    p50: percentile(sortedGlobalQueryLatenciesMs, 0.5),
+                    p95: percentile(sortedGlobalQueryLatenciesMs, 0.95),
+                    max: sortedGlobalQueryLatenciesMs.at(-1),
+                },
+                invariants: {
+                    exactSharedRowsPerQuery: 1,
+                    exactNeighborRowsPerQuery: 0,
+                    crossPrincipalRead: true,
                     mutationReplayStable: true,
                 },
             })
@@ -702,6 +823,35 @@ async function main() {
                 Array.isArray(reconstructedSecondRows) &&
                 reconstructedSecondRows.length === 0,
             `user isolation changed after Miniflare restart: ${JSON.stringify(reconstructedSecondRows)}`
+        );
+        const reconstructedSharedGlobalNoticeUrl = new URL("/api/db/notices", origin);
+        reconstructedSharedGlobalNoticeUrl.searchParams.set("namespace", "packed-global-shared");
+        const reconstructedNeighboringGlobalNoticeUrl = new URL("/api/db/notices", origin);
+        reconstructedNeighboringGlobalNoticeUrl.searchParams.set("namespace", "packed-global-neighbor");
+        const [reconstructedSharedGlobalNotice, reconstructedNeighboringGlobalNotice] = await Promise.all([
+            mf.dispatchFetch(reconstructedSharedGlobalNoticeUrl, {
+                headers: { authorization: `Bearer ${reconstructedSecondTokenBody.token}` },
+            }),
+            mf.dispatchFetch(reconstructedNeighboringGlobalNoticeUrl, {
+                headers: { authorization: `Bearer ${reconstructedTokenBody.token}` },
+            }),
+        ]);
+        const [reconstructedSharedGlobalRows, reconstructedNeighboringGlobalRows] = await Promise.all([
+            reconstructedSharedGlobalNotice.json(),
+            reconstructedNeighboringGlobalNotice.json(),
+        ]);
+        assert(
+            reconstructedSharedGlobalNotice.ok &&
+                Array.isArray(reconstructedSharedGlobalRows) &&
+                reconstructedSharedGlobalRows.length === 1 &&
+                reconstructedSharedGlobalRows[0]?.id === "packed-global-notice",
+            `global notice did not survive Miniflare restart: ${JSON.stringify(reconstructedSharedGlobalRows)}`
+        );
+        assert(
+            reconstructedNeighboringGlobalNotice.ok &&
+                Array.isArray(reconstructedNeighboringGlobalRows) &&
+                reconstructedNeighboringGlobalRows.length === 0,
+            `global partition isolation changed after restart: ${JSON.stringify(reconstructedNeighboringGlobalRows)}`
         );
 
         primary = await connectGateway(origin, "packed-chat-client", reconstructedTokenBody.token);

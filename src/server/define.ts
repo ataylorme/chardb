@@ -85,7 +85,7 @@ export interface AuthCtx {
  * ergonomics, not a knob that weakens the per-shard op-log floor.
  */
 export type IdempotencyTtl = "24h";
-export type MutationAuthority = "organization" | "user";
+export type MutationAuthority = "organization" | "user" | "global";
 export type IdempotentMutation<F, _Ttl extends IdempotencyTtl> = F & {
     readonly __chardbIdempotencyTtl: _Ttl;
 };
@@ -117,6 +117,12 @@ export type MutationOptions<TArgs = unknown> =
     | (MutationOptionsBase<TArgs> & {
           /** Opens dispatch only when the extracted partition is the verified JWT subject. */
           readonly authority: "user";
+          readonly ref: string;
+          readonly partitionKey: (args: TArgs) => string | number | bigint | undefined;
+      })
+    | (MutationOptionsBase<TArgs> & {
+          /** Places the mutation in an explicit application-wide partition. */
+          readonly authority: "global";
           readonly ref: string;
           readonly partitionKey: (args: TArgs) => string | number | bigint | undefined;
       })
@@ -220,6 +226,12 @@ export type MutationConfig<TDb, TArgs extends Record<string, unknown>, TResult> 
           readonly ref: string;
           readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
       })
+    | (MutationConfigBase<TDb, TArgs, TResult> & {
+          /** Places the mutation in an explicit application-wide partition. */
+          readonly authority: "global";
+          readonly ref: string;
+          readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
+      })
     | (MutationConfigBase<TDb, TArgs, TResult> & { readonly authority?: undefined });
 
 /**
@@ -277,6 +289,9 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
                   return typeof v === "string" || typeof v === "number" || typeof v === "bigint" ? v : undefined;
               }
             : partitionKey;
+    if (authority === "global" && partitionKeyFn === undefined) {
+        throw new TypeError("chardb: global mutations require an explicit partitionKey extractor");
+    }
     const invokeValidated = (ctx: MutationCtx<TDb>, args: TArgs): TResult => {
         const wrappedCtx = wrapCtxDb(ctx) as MutationCtx<TDb>;
         return handler(wrappedCtx, args);
@@ -403,6 +418,12 @@ export type QueryConfig<TDb, TArgs extends Record<string, unknown>, TResult> =
           readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
           readonly intent: (args: TArgs) => CdbIntent;
       })
+    | (QueryConfigBase<TDb, TArgs, TResult> & {
+          readonly authority: "global";
+          readonly ref: string;
+          readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
+          readonly intent: (args: TArgs) => CdbIntent;
+      })
     | (QueryConfigBase<TDb, TArgs, TResult> & { readonly authority?: undefined });
 
 /**
@@ -441,6 +462,12 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
     }
     if (authority !== undefined && explicitRef === undefined) {
         throw new TypeError(`chardb: ${authority} queries require an explicit ref`);
+    }
+    if (authority === "global" && partitionKeyFn === undefined) {
+        throw new TypeError("chardb: global queries require an explicit partitionKey extractor");
+    }
+    if (authority === "global" && intent === undefined) {
+        throw new TypeError("chardb: global queries require an explicit intent extractor");
     }
     const invokeValidated = async (ctx: QueryCtx<TDb>, args: TArgs): Promise<TResult> => {
         const wrappedCtx = wrapCtxDb(ctx) as QueryCtx<TDb>;
