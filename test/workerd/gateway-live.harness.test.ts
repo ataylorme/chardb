@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { Miniflare } from "miniflare";
 import { type ChardbClient, createChardbClient } from "../../src/client/index.ts";
-import { type ChardbRef, ClientId, MutId, SubId } from "../../src/types.ts";
+import { type ChardbRef, ClientId, MutId, type RawJson, SubId } from "../../src/types.ts";
 import { type Down, PROTOCOL_V, type Up, decodeWire, encodeWire } from "../../src/wire.ts";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
@@ -466,6 +466,201 @@ async function createSdkClientWithTrackedClose(
             settleClosed?.();
         }
     }
+}
+
+interface DroppedMutationResult {
+    readonly mutId: MutId;
+    readonly result: RawJson;
+    readonly raw: string;
+}
+
+interface ArmedMutationResponseLoss {
+    readonly dropped: Promise<DroppedMutationResult>;
+    readonly replacementHeld: Promise<void>;
+    releaseReplacement(): void;
+}
+
+interface MutationResponseLossClient {
+    readonly client: ChardbClient;
+    armNextSuccessfulResult(): ArmedMutationResponseLoss;
+    successfulResultCount(mutId: MutId): number;
+    restoreWebSocket(): void;
+}
+
+interface ActiveMutationResponseLoss {
+    dropPending: boolean;
+    readonly settleDropped: (result: DroppedMutationResult) => void;
+    readonly settleReplacementHeld: () => void;
+    releaseReplacement?: () => void;
+}
+
+async function createSdkClientWithMutationResponseLoss(
+    clientId: string,
+    subject: string
+): Promise<MutationResponseLossClient> {
+    const NativeWebSocket = globalThis.WebSocket;
+    const jwt = await signed(subject);
+    const successfulResults = new Map<MutId, number>();
+    let armed: ActiveMutationResponseLoss | undefined;
+    let holdReplacementOpen = false;
+
+    class MutationResponseDroppingWebSocket {
+        static readonly CONNECTING = NativeWebSocket.CONNECTING;
+        static readonly OPEN = NativeWebSocket.OPEN;
+        static readonly CLOSING = NativeWebSocket.CLOSING;
+        static readonly CLOSED = NativeWebSocket.CLOSED;
+        private readonly inner: WebSocket;
+        private readonly owned: boolean;
+
+        constructor(url: string | URL) {
+            this.owned = new URL(url).searchParams.get("clientId") === clientId;
+            this.inner = new NativeWebSocket(url);
+        }
+
+        get readyState(): number {
+            return this.inner.readyState;
+        }
+
+        get onopen(): WebSocket["onopen"] {
+            return this.inner.onopen;
+        }
+
+        set onopen(listener: WebSocket["onopen"]) {
+            if (listener === null) {
+                this.inner.onopen = null;
+                return;
+            }
+            this.inner.onopen = event => {
+                if (!this.owned || !holdReplacementOpen) {
+                    listener.call(this.inner, event);
+                    return;
+                }
+                holdReplacementOpen = false;
+                const current = armed;
+                if (!current) throw new Error("replacement socket opened without an armed response loss");
+                current.releaseReplacement = () => listener.call(this.inner, event);
+                current.settleReplacementHeld();
+            };
+        }
+
+        get onmessage(): WebSocket["onmessage"] {
+            return this.inner.onmessage;
+        }
+
+        set onmessage(listener: WebSocket["onmessage"]) {
+            if (listener === null) {
+                this.inner.onmessage = null;
+                return;
+            }
+            this.inner.onmessage = event => {
+                if (this.owned && typeof event.data === "string") {
+                    const message = decodeWire(event.data) as Down;
+                    if (message.t === "poke") {
+                        const result = message.mutResults?.find(candidate => candidate.ok);
+                        if (result?.ok) {
+                            successfulResults.set(result.mutId, (successfulResults.get(result.mutId) ?? 0) + 1);
+                            const current = armed;
+                            if (current?.dropPending) {
+                                current.dropPending = false;
+                                holdReplacementOpen = true;
+                                current.settleDropped({
+                                    mutId: result.mutId,
+                                    result: result.result,
+                                    raw: event.data,
+                                });
+                                this.inner.close();
+                                return;
+                            }
+                        }
+                    }
+                }
+                listener.call(this.inner, event);
+            };
+        }
+
+        get onclose(): WebSocket["onclose"] {
+            return this.inner.onclose;
+        }
+
+        set onclose(listener: WebSocket["onclose"]) {
+            this.inner.onclose = listener;
+        }
+
+        get onerror(): WebSocket["onerror"] {
+            return this.inner.onerror;
+        }
+
+        set onerror(listener: WebSocket["onerror"]) {
+            this.inner.onerror = listener;
+        }
+
+        send(data: Parameters<WebSocket["send"]>[0]): void {
+            this.inner.send(data);
+        }
+
+        close(code?: number, reason?: string): void {
+            this.inner.close(code, reason);
+        }
+    }
+
+    let restored = false;
+    const restoreWebSocket = () => {
+        if (restored) return;
+        restored = true;
+        if (globalThis.WebSocket === (MutationResponseDroppingWebSocket as unknown as typeof WebSocket)) {
+            globalThis.WebSocket = NativeWebSocket;
+        }
+    };
+    let client: ChardbClient;
+    try {
+        globalThis.WebSocket = MutationResponseDroppingWebSocket as unknown as typeof WebSocket;
+        client = createChardbClient({
+            endpoint: sdkEndpoint(),
+            clientId,
+            getJwt: async () => jwt,
+            crossTab: false,
+            mutationTimeoutMs: SCALE_WAIT_MS,
+        });
+    } catch (error) {
+        restoreWebSocket();
+        throw error;
+    }
+    return {
+        client,
+        armNextSuccessfulResult() {
+            if (armed || holdReplacementOpen) throw new Error("a mutation response loss is already armed");
+            let settleDropped: ((result: DroppedMutationResult) => void) | undefined;
+            let settleReplacementHeld: (() => void) | undefined;
+            const dropped = new Promise<DroppedMutationResult>(resolve => {
+                settleDropped = resolve;
+            });
+            const replacementHeld = new Promise<void>(resolve => {
+                settleReplacementHeld = resolve;
+            });
+            const session: ActiveMutationResponseLoss = {
+                dropPending: true,
+                settleDropped: result => settleDropped?.(result),
+                settleReplacementHeld: () => settleReplacementHeld?.(),
+            };
+            armed = session;
+            return {
+                dropped,
+                replacementHeld,
+                releaseReplacement() {
+                    if (armed !== session || !session.releaseReplacement) {
+                        throw new Error("replacement socket has not reached its open event");
+                    }
+                    const release = session.releaseReplacement;
+                    armed = undefined;
+                    release();
+                },
+            };
+        },
+        successfulResultCount(mutId) {
+            return successfulResults.get(mutId) ?? 0;
+        },
+        restoreWebSocket,
+    };
 }
 
 async function drainUntilSettled(clientId: string, subIds: readonly number[]): Promise<GatewayLiveState> {
@@ -1234,6 +1429,10 @@ describe("public durable live queries in real workerd", () => {
                 observer: QueryObserver;
                 readonly subscriptions: Array<{ unsubscribe: () => void }>;
             }> = [];
+            const responseLossClientId = "bench-response-loss-0001";
+            const responseLossBody = "sdk-scale-response-loss-v1";
+            let responseLossClient: MutationResponseLossClient | undefined;
+            const responseLossSubscriptions: Array<{ unsubscribe: () => void }> = [];
             const startedAt = performance.now();
             try {
                 for (const tenant of tenants) {
@@ -1426,8 +1625,91 @@ describe("public durable live queries in real workerd", () => {
                     expect(registration?.dirtyVersion).toBe(registration?.deliveredVersion);
                 }
                 const mutationCount = tenants.length * SCALE_MUTATIONS_PER_TENANT;
+                const cdbAfterFanout = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                expectCdbMutationDelta(cdbBeforeMutations, cdbAfterFanout, mutationCount);
+                expect(cdbAfterFanout.invalidations).toEqual([]);
+
+                responseLossClient = await createSdkClientWithMutationResponseLoss(
+                    responseLossClientId,
+                    "workerd-user"
+                );
+                const responseLossObserver = createQueryObserver();
+                responseLossSubscriptions.push(
+                    responseLossClient.client.subscribe<ScaleRow>(
+                        readRef,
+                        { organizationId: ORGANIZATION_A, body: responseLossBody },
+                        responseLossObserver.listener
+                    )
+                );
+                await drainUntilSettled(responseLossClientId, [1]);
+                await responseLossObserver.waitFor(
+                    observation => observation.state === "live" && observation.rows.length === 0,
+                    "response-loss initial snapshot"
+                );
+
+                const responseLossCount = Math.min(SCALE_MUTATIONS_PER_TENANT, SCALE_MUTATION_BATCH);
+                const responseLossIds: string[] = [];
+                const responseLossStartedAt = performance.now();
+                let responseLossBefore = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                for (let index = 0; index < responseLossCount; index++) {
+                    const id = `sdk-response-loss-${index.toString().padStart(5, "0")}`;
+                    responseLossIds.push(id);
+                    const loss = responseLossClient.armNextSuccessfulResult();
+                    const replayedMutation = responseLossClient.client.mutate<{
+                        readonly id: string;
+                        readonly userId: string;
+                        readonly tenantId: string | null;
+                    }>(writeRef, {
+                        id,
+                        organizationId: ORGANIZATION_A,
+                        body: responseLossBody,
+                        createdAt: 30_000 + index,
+                    });
+                    const dropped = await loss.dropped;
+                    await loss.replacementHeld;
+                    const firstCommit = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                    expectCdbMutationDelta(responseLossBefore, firstCommit, 1);
+                    expect(dropped.result).toMatchObject({
+                        id,
+                        userId: "workerd-user",
+                        tenantId: ORGANIZATION_A,
+                    });
+                    const droppedWire = decodeWire(dropped.raw) as Down;
+                    expect(droppedWire).toMatchObject({
+                        t: "poke",
+                        mutResults: [{ mutId: dropped.mutId, ok: true, result: dropped.result }],
+                    });
+
+                    loss.releaseReplacement();
+                    const replayedResult = await replayedMutation;
+                    expect(JSON.stringify(replayedResult)).toBe(JSON.stringify(dropped.result));
+                    expect(responseLossClient.successfulResultCount(dropped.mutId)).toBe(2);
+                    const afterReplay = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+                    expect(afterReplay.domainRows).toBe(firstCommit.domainRows);
+                    expect(afterReplay.opLogRows).toBe(firstCommit.opLogRows);
+                    expect(afterReplay.changeSeq).toBe(firstCommit.changeSeq);
+                    responseLossBefore = afterReplay;
+                }
+                const responseLossReplayMs = performance.now() - responseLossStartedAt;
+                await drainUntilSettled(responseLossClientId, [1]);
+                const responseLossObservation = await responseLossObserver.waitFor(
+                    observation => observation.state === "live" && observation.rows.length === responseLossCount,
+                    "response-loss exact rows"
+                );
+                expect(responseLossObservation.rows.map(row => row.id)).toEqual(responseLossIds);
+                expect(new Set(responseLossObservation.rows.map(row => row.id)).size).toBe(responseLossCount);
+                expect(
+                    responseLossObservation.rows.every(
+                        row =>
+                            row.organizationId === ORGANIZATION_A &&
+                            row.body === responseLossBody &&
+                            row.viewerId === "workerd-user"
+                    )
+                ).toBe(true);
+
                 const finalCdb = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
-                expectCdbMutationDelta(cdbBeforeMutations, finalCdb, mutationCount);
+                const committedMutationCount = mutationCount + responseLossCount;
+                expectCdbMutationDelta(cdbBeforeMutations, finalCdb, committedMutationCount);
                 expect(finalCdb.invalidations).toEqual([]);
                 const finalDeliveryRows =
                     SCALE_MUTATIONS_PER_TENANT > firstMutationCount ? clients.length * SCALE_MUTATIONS_PER_TENANT : 0;
@@ -1447,9 +1729,14 @@ describe("public durable live queries in real workerd", () => {
                         churnMs: Number(churnMs.toFixed(2)),
                         reconnectedClients: churnTargets.length,
                         reconnectedClientsPerSecond: rate(churnTargets.length, churnMs),
-                        committedRows: mutationCount,
-                        opLogEntries: mutationCount,
-                        changeSeqAdvance: mutationCount,
+                        responseLossMutations: responseLossCount,
+                        responseLossReplayMs: Number(responseLossReplayMs.toFixed(2)),
+                        responseLossReplaysPerSecond: rate(responseLossCount, responseLossReplayMs),
+                        exactReplayResults: responseLossCount,
+                        replayDuplicateRows: 0,
+                        committedRows: committedMutationCount,
+                        opLogEntries: committedMutationCount,
+                        changeSeqAdvance: committedMutationCount,
                         convergenceMs: Number(convergenceMs.toFixed(2)),
                         deliveryMs: Number(deliveryMs.toFixed(2)),
                         logicalRowDeliveries,
@@ -1457,9 +1744,25 @@ describe("public durable live queries in real workerd", () => {
                     })
                 );
             } finally {
-                await Promise.all(
-                    clients.map(entry => cleanupSdkClient(entry.clientId, entry.client, entry.subscriptions))
+                const cleanup = clients.map(entry =>
+                    cleanupSdkClient(entry.clientId, entry.client, entry.subscriptions)
                 );
+                if (responseLossClient) {
+                    cleanup.push(
+                        (async () => {
+                            try {
+                                await cleanupSdkClient(
+                                    responseLossClientId,
+                                    responseLossClient.client,
+                                    responseLossSubscriptions
+                                );
+                            } finally {
+                                responseLossClient.restoreWebSocket();
+                            }
+                        })()
+                    );
+                }
+                await Promise.all(cleanup);
             }
         },
         SCALE_TEST_TIMEOUT_MS
