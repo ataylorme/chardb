@@ -267,6 +267,7 @@ The current cookie is a generated string, not a replay coordinate. A replacement
 - [ ] Make disconnect and shutdown reject or retain pending mutations according to a documented rule.
 - [x] Cover malformed and throwing Catalog authority responses in the configured Gateway workerd harness.
 - [x] Add default-small, environment-scalable SDK workerd scenarios for two-tenant mutation fanout and selective subscription refresh. Assert exact rows, durable convergence, drained outboxes, and cleanup; emit timing telemetry without performance thresholds.
+- [x] Split scaled two-tenant fanout into two write phases, replace half the clients after the first convergence point, rematerialize exact tenant rows, then complete the workload without duplicates or cross-tenant rows.
 - [x] Reconstruct Cdb during every selective-refresh scale sample with all registrations active, prove exact registration identity and unchanged Gateway state, then recreate the SDK connection, prove exact new Gateway-to-Cdb registration matching, and complete the measured writes and materializations through the recovered topology.
 - [x] Drive one configured Gateway to 256 active registrations with four real SDK clients, reject the 257th with retryable `CDB_RATE_LIMITED` before Cdb installation, release one exact slot, readmit one replacement, and drain Gateway and Cdb back to zero.
 - [x] Use one correctness command that runs ordinary tests together and every workerd harness serially, with process-tree cleanup on timeout or cancellation.
