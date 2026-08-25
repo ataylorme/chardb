@@ -23,6 +23,7 @@ const SCALE_SUBSCRIPTIONS = boundedIntegerEnv("CHARDB_WORKERD_SUBSCRIPTIONS", 4,
 const SCALE_REFRESH_ROUNDS = boundedIntegerEnv("CHARDB_WORKERD_REFRESH_ROUNDS", 2, 1, 64);
 const SCALE_WAIT_MS = boundedIntegerEnv("CHARDB_WORKERD_WAIT_MS", 5_000, 1_000, 60_000);
 const SCALE_TEST_TIMEOUT_MS = boundedIntegerEnv("CHARDB_WORKERD_TEST_TIMEOUT_MS", 30_000, 5_000, 300_000);
+const USER_AXIS_BENCH_USERS = boundedIntegerEnv("CHARDB_WORKERD_USER_AXIS_USERS", 8, 2, 32);
 
 function boundedIntegerEnv(name: string, fallback: number, minimum: number, maximum: number): number {
     const raw = process.env[name];
@@ -53,6 +54,7 @@ interface GatewayLiveState {
         readonly currentHead: boolean;
         readonly outboxCookie: string | null;
         readonly outboxTargetVersion: number | null;
+        readonly retryError: string | null;
     }[];
 }
 
@@ -87,6 +89,8 @@ let workerdUrl: URL | undefined;
 let mutationRef: ChardbRef | undefined;
 let queryRef: ChardbRef | undefined;
 let publicQueryRef: ChardbRef | undefined;
+let userMutationRef: ChardbRef | undefined;
+let userQueryRef: ChardbRef | undefined;
 let shardId = "";
 let signToken: ((subject: string) => Promise<string>) | undefined;
 
@@ -209,6 +213,16 @@ async function mutateMembership(action: "delete" | "upsert", role?: string): Pro
     });
     if (!response.ok) throw new Error(`membership mutation failed: ${response.status} ${await response.text()}`);
     return (await response.json()) as { readonly affected?: number };
+}
+
+async function createFixtureUser(userId: string): Promise<void> {
+    if (!mf) throw new Error("Miniflare is not initialized");
+    const response = await mf.dispatchFetch("http://example.com/live-user", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: userId }),
+    });
+    if (!response.ok) throw new Error(`user creation failed: ${response.status} ${await response.text()}`);
 }
 
 async function gatewayState(clientId: string): Promise<GatewayLiveState> {
@@ -779,12 +793,16 @@ beforeAll(async () => {
         readonly mutationRef: ChardbRef;
         readonly queryRef: ChardbRef;
         readonly publicQueryRef: ChardbRef;
+        readonly userMutationRef: ChardbRef;
+        readonly userQueryRef: ChardbRef;
         readonly shardA: string;
         readonly shardB: string;
     };
     mutationRef = seed.mutationRef;
     queryRef = seed.queryRef;
     publicQueryRef = seed.publicQueryRef;
+    userMutationRef = seed.userMutationRef;
+    userQueryRef = seed.userQueryRef;
     shardId = seed.shardA;
     expect(seed.shardA).toBe(seed.shardB);
     await fixtureFetch("/live-public-seed", { shardId });
@@ -860,6 +878,274 @@ describe("public durable live queries in real workerd", () => {
             await rejected.closed;
             expect((await gatewayState(rejectedClientId)).registrations.some(row => row.currentHead)).toBe(false);
         }
+    });
+
+    test("user authority isolates live queries and mutations by verified subject", async () => {
+        if (!mf || !userMutationRef || !userQueryRef) throw new Error("user authority refs were not seeded");
+        const clientA = "user-axis-a";
+        const clientB = "user-axis-b";
+        const openedA = await openSocket(clientA, await signed("workerd-user"));
+        const openedB = await openSocket(clientB, await signed("workerd-user-2"));
+        expect(openedA.welcome.t).toBe("welcome");
+        expect(openedB.welcome.t).toBe("welcome");
+
+        const initialA = nextDown(openedA.socket);
+        openedA.socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(30),
+                ref: userQueryRef,
+                args: { userId: "workerd-user" },
+            })
+        );
+        await currentRegistration(clientA, 30);
+        await drainGateway(clientA);
+        const initialMessageA = await initialA;
+        expect(initialMessageA).toMatchObject({ t: "snapshot", subId: 30, rows: [] });
+        if (initialMessageA.t !== "snapshot") throw new Error("expected initial user snapshot");
+        acknowledge(openedA.socket, initialMessageA);
+
+        const forged = nextDown(openedA.socket);
+        openedA.socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(31),
+                ref: userQueryRef,
+                args: { userId: "workerd-user-2" },
+            })
+        );
+        await expect(forged).resolves.toMatchObject({
+            t: "error",
+            subId: 31,
+            code: "CDB_FORBIDDEN",
+            retryable: false,
+        });
+        expect((await gatewayState(clientA)).registrations.some(row => row.subId === 31 && row.currentHead)).toBe(
+            false
+        );
+
+        const mutationA = nextDown(openedA.socket);
+        openedA.socket.send(
+            encodeWire({
+                t: "mut",
+                mutId: MutId("user-axis-write-a"),
+                ref: userMutationRef,
+                args: { id: "user-row-a", userId: "workerd-user", value: "alpha" },
+            })
+        );
+        await expect(mutationA).resolves.toMatchObject({
+            t: "poke",
+            mutResults: [{ mutId: "user-axis-write-a", ok: true }],
+        });
+        const dirtyA = await currentRegistration(clientA, 30);
+        if (dirtyA.dirtyVersion <= dirtyA.deliveredVersion) {
+            throw new Error(`user authority subscription was not invalidated: ${JSON.stringify(dirtyA)}`);
+        }
+        const replacementA = nextDown(openedA.socket);
+        await drainGateway(clientA);
+        const afterDrainA = await currentRegistration(clientA, 30);
+        if (afterDrainA.retryError) throw new Error(`user authority rerun failed: ${afterDrainA.retryError}`);
+        const replacementMessageA = await replacementA;
+        expect(replacementMessageA).toMatchObject({
+            t: "snapshot",
+            subId: 30,
+            rows: [{ id: "user-row-a", userId: "workerd-user", value: "alpha" }],
+        });
+        if (replacementMessageA.t !== "snapshot") throw new Error("expected replacement user snapshot");
+        acknowledge(openedA.socket, replacementMessageA);
+
+        const gatewayBeforeEviction = await gatewayState(clientA);
+        const cdbBeforeEviction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+        await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", {
+            name: clientA.slice(0, 12),
+            webSockets: "hibernate",
+        });
+        await mf.unsafeEvictDurableObject(WORKER_NAME, "Cdb", { name: shardId });
+        const gatewayAfterEviction = await gatewayState(clientA);
+        const cdbAfterEviction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+        expect(gatewayAfterEviction.instanceId).not.toBe(gatewayBeforeEviction.instanceId);
+        expect(cdbAfterEviction.instanceId).not.toBe(cdbBeforeEviction.instanceId);
+        expect(gatewayAfterEviction.registrations).toEqual(gatewayBeforeEviction.registrations);
+
+        const mutationAfterEviction = nextDown(openedA.socket);
+        openedA.socket.send(
+            encodeWire({
+                t: "mut",
+                mutId: MutId("user-axis-write-after-eviction"),
+                ref: userMutationRef,
+                args: { id: "user-row-a-2", userId: "workerd-user", value: "after-eviction" },
+            })
+        );
+        await expect(mutationAfterEviction).resolves.toMatchObject({
+            t: "poke",
+            mutResults: [{ mutId: "user-axis-write-after-eviction", ok: true }],
+        });
+        const dirtyAfterEviction = await currentRegistration(clientA, 30);
+        expect(dirtyAfterEviction.dirtyVersion).toBeGreaterThan(dirtyAfterEviction.deliveredVersion);
+        const replacementAfterEviction = nextDown(openedA.socket);
+        await drainGateway(clientA);
+        const replacementAfterEvictionMessage = await replacementAfterEviction;
+        expect(replacementAfterEvictionMessage).toMatchObject({
+            t: "snapshot",
+            subId: 30,
+            rows: [
+                { id: "user-row-a", userId: "workerd-user", value: "alpha" },
+                { id: "user-row-a-2", userId: "workerd-user", value: "after-eviction" },
+            ],
+        });
+        if (replacementAfterEvictionMessage.t !== "snapshot") {
+            throw new Error("expected user snapshot after Durable Object reconstruction");
+        }
+        acknowledge(openedA.socket, replacementAfterEvictionMessage);
+
+        const initialB = nextDown(openedB.socket);
+        openedB.socket.send(
+            encodeWire({
+                t: "sub",
+                subId: SubId(30),
+                ref: userQueryRef,
+                args: { userId: "workerd-user-2" },
+            })
+        );
+        await currentRegistration(clientB, 30);
+        await drainGateway(clientB);
+        const initialMessageB = await initialB;
+        expect(initialMessageB).toMatchObject({ t: "snapshot", subId: 30, rows: [] });
+        if (initialMessageB.t !== "snapshot") throw new Error("expected isolated user snapshot");
+        acknowledge(openedB.socket, initialMessageB);
+
+        const forgedMutation = nextDown(openedA.socket);
+        openedA.socket.send(
+            encodeWire({
+                t: "mut",
+                mutId: MutId("user-axis-forged-write"),
+                ref: userMutationRef,
+                args: { id: "forged-user-row", userId: "workerd-user-2", value: "forged" },
+            })
+        );
+        await expect(forgedMutation).resolves.toMatchObject({
+            t: "poke",
+            mutResults: [
+                {
+                    mutId: "user-axis-forged-write",
+                    ok: false,
+                    error: { code: "CDB_FORBIDDEN", retryable: false },
+                },
+            ],
+        });
+
+        openedA.socket.close();
+        openedB.socket.close();
+        await Promise.all([openedA.closed, openedB.closed]);
+        await Promise.all([drainGateway(clientA), drainGateway(clientB)]);
+    });
+
+    test("user-axis fanout stays exact across concurrent principals", async () => {
+        if (!userMutationRef || !userQueryRef) throw new Error("user authority refs were not seeded");
+        const writeRef = userMutationRef;
+        const readRef = userQueryRef;
+        const subjects = Array.from(
+            { length: USER_AXIS_BENCH_USERS },
+            (_, index) => `user-bench-${index.toString().padStart(2, "0")}`
+        );
+        await Promise.all(subjects.map(createFixtureUser));
+
+        const registrationStartedAt = performance.now();
+        const opened = await Promise.all(
+            subjects.map(async (subject, index) =>
+                openSocket(`user-bench-client-${index.toString().padStart(2, "0")}`, await signed(subject))
+            )
+        );
+        const initialSnapshots = opened.map((connection, index) => {
+            const snapshot = nextDown(connection.socket);
+            connection.socket.send(
+                encodeWire({
+                    t: "sub",
+                    subId: SubId(40),
+                    ref: readRef,
+                    args: { userId: subjects[index] as string },
+                })
+            );
+            return snapshot;
+        });
+        await Promise.all(
+            opened.map((_, index) => currentRegistration(`user-bench-client-${index.toString().padStart(2, "0")}`, 40))
+        );
+        await Promise.all(
+            opened.map((_, index) => drainGateway(`user-bench-client-${index.toString().padStart(2, "0")}`))
+        );
+        const initialMessages = await Promise.all(initialSnapshots);
+        initialMessages.forEach((message, index) => {
+            expect(message).toMatchObject({ t: "snapshot", subId: 40, rows: [] });
+            if (message.t === "snapshot") acknowledge((opened[index] as OpenedSocket).socket, message);
+        });
+        const registrationMs = performance.now() - registrationStartedAt;
+
+        const writeStartedAt = performance.now();
+        const mutationResults = opened.map((connection, index) => {
+            const result = nextDown(connection.socket);
+            connection.socket.send(
+                encodeWire({
+                    t: "mut",
+                    mutId: MutId(`user-bench-mut-${index}`),
+                    ref: writeRef,
+                    args: {
+                        id: `user-bench-row-${index}`,
+                        userId: subjects[index] as string,
+                        value: `value-${index}`,
+                    },
+                })
+            );
+            return result;
+        });
+        const mutationMessages = await Promise.all(mutationResults);
+        mutationMessages.forEach((message, index) => {
+            expect(message).toMatchObject({
+                t: "poke",
+                mutResults: [{ mutId: `user-bench-mut-${index}`, ok: true }],
+            });
+        });
+        const replacements = opened.map(connection => nextDown(connection.socket));
+        await Promise.all(
+            opened.map((_, index) => drainGateway(`user-bench-client-${index.toString().padStart(2, "0")}`))
+        );
+        const replacementMessages = await Promise.all(replacements);
+        replacementMessages.forEach((message, index) => {
+            expect(message).toMatchObject({
+                t: "snapshot",
+                subId: 40,
+                rows: [
+                    {
+                        id: `user-bench-row-${index}`,
+                        userId: subjects[index],
+                        value: `value-${index}`,
+                    },
+                ],
+            });
+            if (message.t === "snapshot") acknowledge((opened[index] as OpenedSocket).socket, message);
+        });
+        const writeAndConvergenceMs = performance.now() - writeStartedAt;
+
+        console.log(
+            JSON.stringify({
+                type: "chardb-workerd-benchmark",
+                scenario: "user-axis-concurrent-principal-fanout",
+                principals: subjects.length,
+                registrations: subjects.length,
+                registrationMs: Number(registrationMs.toFixed(2)),
+                registrationsPerSecond: rate(subjects.length, registrationMs),
+                writes: subjects.length,
+                writeAndConvergenceMs: Number(writeAndConvergenceMs.toFixed(2)),
+                writesPerSecond: rate(subjects.length, writeAndConvergenceMs),
+                exactIsolatedSnapshots: replacementMessages.length,
+            })
+        );
+
+        for (const connection of opened) connection.socket.close();
+        await Promise.all(opened.map(connection => connection.closed));
+        await Promise.all(
+            opened.map((_, index) => drainGateway(`user-bench-client-${index.toString().padStart(2, "0")}`))
+        );
     });
 
     test("two clients receive a committed replacement while another organization stays isolated", async () => {

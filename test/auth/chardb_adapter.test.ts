@@ -1516,6 +1516,25 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(
             await harness.catalog.resolveUserAuthority({ principalId: PrincipalId("missing-user-authority") })
         ).toBeNull();
+        await harness.catalog.mutateAuth({
+            model: "user",
+            op: "create",
+            payload: {
+                id: "default-role-user",
+                name: "Default Role User",
+                email: "default-role@example.com",
+                emailVerified: true,
+                createdAt: nowMs,
+                updatedAt: nowMs,
+            },
+        });
+        expect(
+            await harness.catalog.resolveUserAuthority({ principalId: PrincipalId("default-role-user") })
+        ).toMatchObject({
+            role: "user",
+            roles: ["user"],
+            authEpochs: { tenant: 0 },
+        });
 
         await harness.catalog.mutateAuth({
             model: "user",

@@ -1,11 +1,14 @@
+import { eq } from "drizzle-orm";
 import { text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
-import { type ChardbManifest, api, forOrg, manifestFromExports } from "../../src/server/index.ts";
+import { type ChardbManifest, api, forOrg, forUser, manifestFromExports } from "../../src/server/index.ts";
 import baseWorker, { Catalog, Cdb as ProductionCdb, Gateway as ProductionGateway } from "./gateway-jwt.entry.ts";
 
 const PUBLIC_QUERY_REF = "test/workerd/gateway-live.entry.ts#listPublicOrganizationRows";
+const USER_MUTATION_REF = "test/workerd/gateway-live.entry.ts#writeUserRow";
+const USER_QUERY_REF = "test/workerd/gateway-live.entry.ts#listUserRows";
 
 const { cdbTable } = forOrg();
 const publicOrganizationRows = cdbTable(
@@ -21,6 +24,48 @@ const publicOrganizationRows = cdbTable(
         publicRead: true,
     }
 );
+
+const { cdbTable: userTable } = forUser();
+const userRows = userTable(
+    "gateway_user_rows",
+    {
+        id: text("id").primaryKey(),
+        userId: text("user_id").notNull(),
+        value: text("value").notNull(),
+    },
+    {
+        tenantBy: "userId",
+        partitionBy: "userId",
+        roles: { user: { create: ["id", "value"], read: "*" } },
+    }
+);
+
+const writeUserRow = api.mutation({
+    ref: USER_MUTATION_REF,
+    args: z.object({ id: z.string(), userId: z.string(), value: z.string() }),
+    authority: "user",
+    partitionKey: "userId",
+    handler: (ctx, args) => {
+        ctx.db.insert(userRows).values({ id: args.id, value: args.value }).run();
+        return { id: args.id, userId: ctx.auth.userId, tenantId: ctx.auth.tenantId ?? null };
+    },
+});
+
+const listUserRows = api.query({
+    ref: USER_QUERY_REF,
+    args: z.object({ userId: z.string() }),
+    authority: "user",
+    partitionKey: "userId",
+    intent: args => ({
+        kind: "select",
+        tables: ["gateway_user_rows"],
+        partitionKey: { table: "gateway_user_rows", column: "user_id", values: [args.userId] },
+        joinShape: "colocated",
+        intervals: [{ table: "gateway_user_rows", indexName: "user_id", intervals: [{ kind: "full" }] }],
+    }),
+    handler: async (ctx, args) =>
+        ctx.db.select().from(userRows).where(eq(userRows.userId, args.userId)).orderBy(userRows.id).all(),
+});
 
 const listPublicOrganizationRows = api.query({
     ref: PUBLIC_QUERY_REF,
@@ -49,11 +94,11 @@ const listPublicOrganizationRows = api.query({
     handler: async ctx => ctx.db.select().from(publicOrganizationRows).orderBy(publicOrganizationRows.id).all(),
 });
 
-const publicManifest = manifestFromExports({ listPublicOrganizationRows });
+const publicManifest = manifestFromExports({ listPublicOrganizationRows, writeUserRow, listUserRows });
 
 function withPublicQuery(base: ChardbManifest): ChardbManifest {
     return {
-        mutations: base.mutations,
+        mutations: new Map([...base.mutations, ...publicManifest.mutations]),
         queries: new Map([...base.queries, ...publicManifest.queries]),
         crons: base.crons,
         ledgers: base.ledgers,
@@ -84,6 +129,7 @@ interface GatewayLiveState {
         readonly currentHead: boolean;
         readonly outboxCookie: string | null;
         readonly outboxTargetVersion: number | null;
+        readonly retryError: string | null;
     }[];
 }
 
@@ -118,8 +164,8 @@ export class Gateway extends ProductionGateway {
     }
 
     protected override runtimePolicyDigest(tableNames: readonly string[]): string | null {
-        if (tableNames.every(table => table === "gateway_public_rows")) {
-            return cdbPolicyDigest({ publicOrganizationRows }, tableNames);
+        if (tableNames.every(table => table === "gateway_public_rows" || table === "gateway_user_rows")) {
+            return cdbPolicyDigest({ publicOrganizationRows, userRows }, tableNames);
         }
         return super.runtimePolicyDigest(tableNames);
     }
@@ -164,12 +210,14 @@ export class Gateway extends ProductionGateway {
             current_head: number;
             outbox_cookie: string | null;
             outbox_target_version: number | null;
+            retry_error: string | null;
         }>(
             `SELECT g.registration_id, g.connection_id, g.client_id, g.sub_id, g.organization_id,
                     g.lifecycle, g.cdb_state, g.dirty_version, g.delivered_version,
                     g.initial_snapshot_pending, g.last_cookie, g.last_snapshot_cookie,
                     CASE WHEN h.registration_id IS NULL THEN 0 ELSE 1 END AS current_head,
-                    o.cookie AS outbox_cookie, o.target_version AS outbox_target_version
+                    o.cookie AS outbox_cookie, o.target_version AS outbox_target_version,
+                    g.retry_error
              FROM _gw_registration_generations AS g
              LEFT JOIN _gw_registration_heads AS h ON h.registration_id = g.registration_id
              LEFT JOIN _gw_snapshot_outbox AS o ON o.registration_id = g.registration_id
@@ -193,6 +241,7 @@ export class Gateway extends ProductionGateway {
                 currentHead: row.current_head === 1,
                 outboxCookie: row.outbox_cookie,
                 outboxTargetVersion: row.outbox_target_version,
+                retryError: row.retry_error,
             })),
         };
     }
@@ -202,7 +251,7 @@ export class Cdb extends ProductionCdb {
     private readonly fixtureInstanceId = crypto.randomUUID();
 
     protected override mutationSchema(): Record<string, unknown> {
-        return { ...super.mutationSchema(), publicOrganizationRows };
+        return { ...super.mutationSchema(), publicOrganizationRows, userRows };
     }
 
     protected override mutationManifest(): ChardbManifest {
@@ -298,7 +347,7 @@ interface CatalogFixtureRpc {
         readonly model: string;
         readonly op: "create" | "update" | "delete";
         readonly where?: { readonly [key: string]: string };
-        readonly payload?: { readonly [key: string]: string | number };
+        readonly payload?: { readonly [key: string]: string | number | boolean };
     }): Promise<{ readonly affected?: number }>;
 }
 
@@ -311,6 +360,8 @@ export default {
             return Response.json({
                 ...((await response.json()) as Record<string, unknown>),
                 publicQueryRef: listPublicOrganizationRows.__chardbRef,
+                userMutationRef: writeUserRow.__chardbRef,
+                userQueryRef: listUserRows.__chardbRef,
             });
         }
         if (url.pathname === "/live-public-seed") {
@@ -348,6 +399,26 @@ export default {
                         ...where,
                         role: mutation.role,
                         createdAt: Date.parse("2026-08-23T00:00:00Z"),
+                    },
+                })
+            );
+        }
+        if (url.pathname === "/live-user") {
+            const user = (await request.json()) as { readonly id: string };
+            const id = env.CDB_CATALOG.idFromName("global");
+            const catalog = env.CDB_CATALOG.get(id) as unknown as CatalogFixtureRpc;
+            return Response.json(
+                await catalog.mutateAuth({
+                    model: "user",
+                    op: "create",
+                    payload: {
+                        id: user.id,
+                        name: user.id,
+                        email: `${user.id}@example.com`,
+                        emailVerified: true,
+                        role: "user",
+                        createdAt: Date.parse("2026-08-25T00:00:00Z"),
+                        updatedAt: Date.parse("2026-08-25T00:00:00Z"),
                     },
                 })
             );

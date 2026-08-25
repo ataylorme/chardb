@@ -1904,10 +1904,6 @@ export class Cdb extends DurableObject<CdbEnv> {
             if (row.principal_id !== request.auth.userId) {
                 throw subscriptionInvariant("registered query principal does not match fresh authorization");
             }
-            if (row.organization_id !== request.auth.tenantId) {
-                throw subscriptionInvariant("registered query organization does not match fresh authorization");
-            }
-
             const subscription = parseStoredSubscription(row);
             if (subscription.domainSchemaEpoch !== request.domainSchemaEpoch) {
                 throw new CdbError({
@@ -1923,8 +1919,13 @@ export class Cdb extends DurableObject<CdbEnv> {
                 { ref: subscription.ref, args: subscription.args },
                 tables => cdbPolicyDigest(this.mutationSchema(), tables)
             );
-            if (routed.authority !== "organization") {
-                throw subscriptionInvariant("registered query no longer has organization authority");
+            if (routed.authority !== "organization" && routed.authority !== "user") {
+                throw subscriptionInvariant("registered query no longer has declared authority");
+            }
+            const authorizedPartition =
+                routed.authority === "organization" ? request.auth.tenantId : request.auth.userId;
+            if (row.organization_id !== authorizedPartition) {
+                throw subscriptionInvariant("registered query partition does not match fresh authorization");
             }
             if (routed.partitionKey !== subscription.organizationId) {
                 throw subscriptionInvariant("registered query organization partition changed after registration");

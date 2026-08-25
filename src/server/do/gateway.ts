@@ -47,7 +47,7 @@ import {
     encodeWire,
 } from "../../wire.ts";
 import { cdbPolicyDigest } from "../cdb-policy.ts";
-import type { AuthCtx } from "../define.ts";
+import type { AuthCtx, MutationAuthority } from "../define.ts";
 import { withChardbLoopbacks } from "../loopback.ts";
 import {
     type ChardbManifest,
@@ -782,6 +782,40 @@ export function projectOrganizationMutationAuth(
     };
 }
 
+async function resolvePartitionAuth(
+    catalog: CatalogOrganizationAuthorityRpc & Partial<CatalogUserAuthorityRpc>,
+    authority: MutationAuthority,
+    principalId: PrincipalId,
+    partitionKey: string
+): Promise<OrganizationAuthProjection> {
+    if (authority === "user") {
+        if (partitionKey !== principalId) {
+            return { ok: false, code: "CDB_FORBIDDEN", message: "user partition does not match the verified subject" };
+        }
+        if (!catalog.resolveUserAuthority) {
+            return {
+                ok: false,
+                code: "CDB_CATALOG_UNAVAILABLE",
+                message: "Catalog user authority RPC is unavailable",
+            };
+        }
+        try {
+            return projectUserMutationAuth(await catalog.resolveUserAuthority({ principalId }), { principalId });
+        } catch {
+            return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog user authority RPC failed" };
+        }
+    }
+    try {
+        const organizationId = TenantId(partitionKey);
+        return projectOrganizationMutationAuth(
+            await catalog.resolveOrganizationAuthority({ principalId, organizationId }),
+            { principalId, organizationId }
+        );
+    } catch {
+        return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog organization authority RPC failed" };
+    }
+}
+
 /** Build a Down.error envelope with the locked metadata for its code. */
 export function gatewayErrorEnvelope(
     code: import("../../errors.ts").CdbErrorCode,
@@ -1016,6 +1050,8 @@ export interface GatewayDirtyRun {
     readonly leaseExpiresAt: number;
     readonly reclaimed: boolean;
     readonly organizationId: TenantId;
+    readonly ref: ChardbRef;
+    readonly args: RawJson;
     readonly shardId: string;
     readonly sourceCdbId: string;
     readonly domainSchemaEpoch: number;
@@ -1610,6 +1646,8 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         run_token: string | null;
         run_version: number;
         organization_id: string;
+        ref: string;
+        args_json: string;
         shard_id: string;
         source_cdb_id: string;
         domain_schema_epoch: number;
@@ -1617,7 +1655,7 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         policy_digest: string;
     }>(
         `SELECT g.dirty_version, g.delivered_version, g.run_token, g.run_version,
-                g.organization_id, g.shard_id, g.source_cdb_id, g.domain_schema_epoch,
+                g.organization_id, g.ref, g.args_json, g.shard_id, g.source_cdb_id, g.domain_schema_epoch,
                 g.intent_json, g.policy_digest
          FROM _gw_registration_generations g
          INNER JOIN _gw_registration_heads h
@@ -1693,6 +1731,7 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         input.nowMs
     );
     if (sql.changes() !== 1) return null;
+    const args = snapshotCdbQueryArgs(JSON.parse(current.args_json) as RawJson);
     return {
         targetVersion,
         runToken,
@@ -1700,6 +1739,8 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         leaseExpiresAt: input.leaseExpiresAt,
         reclaimed: current.run_token !== null,
         organizationId: TenantId(current.organization_id),
+        ref: current.ref as ChardbRef,
+        args,
         shardId: current.shard_id,
         sourceCdbId: current.source_cdb_id,
         domainSchemaEpoch: current.domain_schema_epoch,
@@ -3488,15 +3529,29 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 return;
             }
 
-            const catalog = this.catalog() as CatalogRoutingRpc & CatalogOrganizationAuthorityRpc;
-            const authority = await catalog.resolveOrganizationAuthority({
-                principalId: identity.principalId,
-                organizationId: run.organizationId,
-            });
-            const projected = projectOrganizationMutationAuth(authority, {
-                principalId: identity.principalId,
-                organizationId: run.organizationId,
-            });
+            const rerouted = await this.routeQuery({ ref: run.ref, args: run.args });
+            if (
+                !rerouted.ok ||
+                (rerouted.authority !== "organization" && rerouted.authority !== "user") ||
+                rerouted.partitionKey !== run.organizationId
+            ) {
+                const retiredAt = this.gatewayNowMs();
+                const retired = this.retireGatewayRunnerRegistration(identity, retiredAt, run);
+                if (retired) {
+                    this.settleRetiredGatewaySubscription(identity, { kind: "error", code: "CDB_INVARIANT" });
+                    await this.scheduleGatewayWork(retiredAt).catch(() => {});
+                }
+                return;
+            }
+            const catalog = this.catalog() as CatalogRoutingRpc &
+                CatalogOrganizationAuthorityRpc &
+                Partial<CatalogUserAuthorityRpc>;
+            const projected = await resolvePartitionAuth(
+                catalog,
+                rerouted.authority,
+                identity.principalId,
+                run.organizationId
+            );
             if (!projected.ok) {
                 if (projected.code === "CDB_FORBIDDEN") {
                     const retiredAt = this.gatewayNowMs();
@@ -4781,7 +4836,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             this.sendError(ws, error instanceof CdbError ? error.code : "CDB_INVARIANT", msg.subId);
             return;
         }
-        if (routed.authority !== "organization") {
+        if (routed.authority !== "organization" && routed.authority !== "user") {
             this.sendError(ws, "CDB_AUTH_NOT_BOUND", msg.subId);
             return;
         }
@@ -4797,6 +4852,10 @@ export class Gateway extends DurableObject<GatewayEnv> {
             this.sendError(ws, "CDB_CROSS_PARTITION", msg.subId);
             return;
         }
+        if (routed.authority === "user" && organizationId !== att.principalId) {
+            this.sendError(ws, "CDB_FORBIDDEN", msg.subId);
+            return;
+        }
 
         const vshards = new Set(partition.values.map(value => Number(vshardOf([value as string]))));
         if (vshards.size !== 1) {
@@ -4809,23 +4868,11 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return;
         }
 
-        const catalog = this.catalog() as CatalogRoutingRpc & CatalogOrganizationAuthorityRpc;
-        let authority: Awaited<ReturnType<CatalogOrganizationAuthorityRpc["resolveOrganizationAuthority"]>>;
-        try {
-            authority = await catalog.resolveOrganizationAuthority({
-                principalId: att.principalId,
-                organizationId: TenantId(organizationId),
-            });
-        } catch {
-            if (pending.cancelled) return;
-            this.sendError(ws, "CDB_CATALOG_UNAVAILABLE", msg.subId);
-            return;
-        }
+        const catalog = this.catalog() as CatalogRoutingRpc &
+            CatalogOrganizationAuthorityRpc &
+            Partial<CatalogUserAuthorityRpc>;
+        const projected = await resolvePartitionAuth(catalog, routed.authority, att.principalId, organizationId);
         if (pending.cancelled) return;
-        const projected = projectOrganizationMutationAuth(authority, {
-            principalId: att.principalId,
-            organizationId: TenantId(organizationId),
-        });
         if (!projected.ok) {
             this.sendError(ws, projected.code, msg.subId);
             return;

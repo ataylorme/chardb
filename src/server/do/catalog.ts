@@ -843,8 +843,8 @@ export class Catalog extends DurableObject<CatalogEnv> {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             const user = authFindOne(sql, userTable, { id: args.principalId });
             if (!user) return;
-            const roles = canonicalMembershipRoles(user.role);
-            if (roles.length === 0) return;
+            const storedRoles = canonicalMembershipRoles(user.role);
+            const roles = storedRoles.length === 0 ? ["user"] : storedRoles;
             authority = {
                 principalId: args.principalId,
                 role: roles.join(","),
