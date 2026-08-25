@@ -16,6 +16,18 @@ const KID = "gateway-snapshot-workerd-key";
 const ISSUER = "https://issuer.example";
 const AUDIENCE = "chardb-workerd";
 const ORGANIZATION = "workerd-org";
+const SLOW_CONSUMER_MUTATIONS = boundedEnvInt("CHARDB_WORKERD_SLOW_CONSUMER_MUTATIONS", 32, 1, 256);
+
+function boundedEnvInt(name: string, fallback: number, minimum: number, maximum: number): number {
+    const raw = process.env[name];
+    if (raw === undefined) return fallback;
+    if (!/^\d+$/.test(raw)) throw new Error(`${name} must be a decimal integer`);
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+        throw new Error(`${name} must be between ${minimum} and ${maximum}`);
+    }
+    return value;
+}
 
 interface DirtyRun {
     readonly targetVersion: number;
@@ -835,6 +847,87 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
         ).toEqual([]);
         expect(cdbAfterCleanup.invalidations).toEqual([]);
     }, 15_000);
+
+    test("an unacknowledged snapshot coalesces a bounded mutation burst before one latest replacement", async () => {
+        const clientId = "snapshot-slow-01";
+        const subId = 29;
+        const body = "snapshot-slow-consumer";
+        const opened = await openSocket(clientId);
+        const initial = await subscribe(opened, clientId, subId, body);
+        acknowledge(opened.socket, initial);
+
+        await mutate(opened, "slow-consumer-first", "slow-consumer-row-0000", body);
+        await stageGateway(clientId);
+        const firstStaged = await deliveryState(clientId, subId);
+        if (!firstStaged?.cookie) throw new Error("Gateway did not stage the slow-consumer snapshot");
+        const firstMessage = nextDown(opened.socket);
+        await drainGateway(clientId);
+        const firstDelivery = await firstMessage;
+        expect(firstDelivery).toMatchObject({
+            t: "snapshot",
+            subId,
+            cookie: firstStaged.cookie,
+            rows: [expect.objectContaining({ id: "slow-consumer-row-0000" })],
+        });
+
+        const burstStartedAt = performance.now();
+        for (let index = 1; index <= SLOW_CONSUMER_MUTATIONS; index++) {
+            const suffix = String(index).padStart(4, "0");
+            await mutate(opened, `slow-consumer-${suffix}`, `slow-consumer-row-${suffix}`, body);
+        }
+        const burstMs = performance.now() - burstStartedAt;
+
+        const held = await deliveryState(clientId, subId);
+        expect(held).toMatchObject({
+            cookie: firstStaged.cookie,
+            targetVersion: firstStaged.targetVersion,
+            sendAttempts: 1,
+            dirtyVersion: (firstStaged.targetVersion ?? 0) + SLOW_CONSUMER_MUTATIONS,
+        });
+        await stageGateway(clientId);
+        expect(await deliveryState(clientId, subId)).toEqual(held);
+
+        if (firstDelivery.t !== "snapshot") throw new Error("expected the held snapshot delivery");
+        acknowledge(opened.socket, firstDelivery);
+        await stageGateway(clientId);
+        const coalesced = await deliveryState(clientId, subId);
+        expect(coalesced?.cookie).toBeString();
+        expect(coalesced?.cookie).not.toBe(firstStaged.cookie);
+        expect(coalesced).toMatchObject({
+            deliveredVersion: firstStaged.targetVersion,
+            targetVersion: held?.dirtyVersion,
+            sendAttempts: 0,
+        });
+
+        const latestMessage = nextDown(opened.socket);
+        await drainGateway(clientId);
+        const latest = await latestMessage;
+        if (latest.t !== "snapshot") throw new Error(`expected snapshot, received ${latest.t}`);
+        expect(latest.rows).toHaveLength(SLOW_CONSUMER_MUTATIONS + 1);
+        expect(new Set(latest.rows.map(row => (row as { id?: unknown }).id)).size).toBe(SLOW_CONSUMER_MUTATIONS + 1);
+        acknowledge(opened.socket, latest);
+        await drainGateway(clientId);
+        expect(await deliveryState(clientId, subId)).toMatchObject({
+            deliveredVersion: held?.dirtyVersion,
+            dirtyVersion: held?.dirtyVersion,
+            cookie: null,
+        });
+
+        console.log(
+            JSON.stringify({
+                schema: "chardb.snapshot.backpressure.v1",
+                mutations: SLOW_CONSUMER_MUTATIONS,
+                burstMs,
+                mutationsPerSecond: SLOW_CONSUMER_MUTATIONS / (burstMs / 1_000),
+                stagedSnapshotsDuringHold: 1,
+                coalescedRows: SLOW_CONSUMER_MUTATIONS + 1,
+            })
+        );
+        opened.socket.close();
+        await opened.closed;
+        await drainGateway(clientId);
+        expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
+    }, 60_000);
 
     test("a reconstructed legacy over-limit registration stays invalidatable and retires through Gateway", async () => {
         if (!mf) throw new Error("miniflare not initialized");
