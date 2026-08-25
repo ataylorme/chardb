@@ -153,6 +153,31 @@ CREATE TABLE IF NOT EXISTS _gw_snapshot_outbox (
 );
 CREATE INDEX IF NOT EXISTS _gw_snapshot_outbox_due
   ON _gw_snapshot_outbox (next_attempt_at, registration_id);
+CREATE TABLE IF NOT EXISTS _gw_snapshot_replay (
+  principal_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  sub_id INTEGER NOT NULL CHECK (sub_id >= 0),
+  cookie TEXT NOT NULL UNIQUE,
+  organization_id TEXT NOT NULL,
+  ref TEXT NOT NULL,
+  args_json TEXT NOT NULL,
+  policy_digest TEXT NOT NULL,
+  query_hash TEXT NOT NULL,
+  shard_id TEXT NOT NULL,
+  source_cdb_id TEXT NOT NULL,
+  schema_epoch INTEGER NOT NULL CHECK (schema_epoch >= 0),
+  domain_schema_epoch INTEGER NOT NULL CHECK (domain_schema_epoch > 0),
+  auth_global_epoch INTEGER NOT NULL CHECK (auth_global_epoch >= 0),
+  auth_tenant_epoch INTEGER NOT NULL CHECK (auth_tenant_epoch >= 0),
+  auth_principal_epoch INTEGER NOT NULL CHECK (auth_principal_epoch >= 0),
+  rows_json TEXT NOT NULL,
+  byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  expires_at INTEGER NOT NULL CHECK (expires_at > created_at),
+  PRIMARY KEY (principal_id, client_id, sub_id)
+);
+CREATE INDEX IF NOT EXISTS _gw_snapshot_replay_expiry
+  ON _gw_snapshot_replay (expires_at, created_at, principal_id, client_id, sub_id);
 ` as const;
 
 const GW_DDL = `
@@ -197,6 +222,8 @@ export const GATEWAY_SEND_BATCH_SIZE = 32 as const;
 export const GATEWAY_QUERY_LEASE_MS = 30_000 as const;
 export const GATEWAY_SEND_LEASE_MS = 10_000 as const;
 export const GATEWAY_SUBSCRIBE_RECOVERY_MS = 30_000 as const;
+export const GATEWAY_SNAPSHOT_REPLAY_RETENTION_MS = 30_000 as const;
+export const GATEWAY_MAX_SNAPSHOT_REPLAY_ROWS = 256 as const;
 export const GATEWAY_MAX_DURABLE_PAYLOAD_BYTES = 16 * 1024 * 1024;
 export const GATEWAY_MAX_REGISTRATION_PAYLOAD_BYTES = 15 * 1024 * 1024;
 
@@ -230,6 +257,20 @@ const GATEWAY_SNAPSHOT_PAYLOAD_COLUMNS = [
     "last_error",
 ] as const;
 
+const GATEWAY_REPLAY_PAYLOAD_COLUMNS = [
+    "principal_id",
+    "client_id",
+    "cookie",
+    "organization_id",
+    "ref",
+    "args_json",
+    "policy_digest",
+    "query_hash",
+    "shard_id",
+    "source_cdb_id",
+    "rows_json",
+] as const;
+
 const GATEWAY_UUID_TOKEN_BYTES = 36;
 // Retry text is sliced to 512 UTF-16 code units. Four bytes per unit is a
 // conservative UTF-8 bound, including malformed surrogate input.
@@ -254,6 +295,7 @@ const GATEWAY_RETIRED_PAYLOAD_ASSIGNMENTS = `
 export interface GatewayDurablePayloadUsage {
     readonly registrationBytes: number;
     readonly snapshotBytes: number;
+    readonly replayBytes: number;
     readonly totalBytes: number;
     readonly registrationReservedBytes: number;
     readonly snapshotReservedBytes: number;
@@ -273,6 +315,7 @@ export function gatewayDurablePayloadUsage(sql: SyncSql): GatewayDurablePayloadU
         "_gw_snapshot_outbox",
         GATEWAY_SNAPSHOT_PAYLOAD_COLUMNS
     );
+    const replayExpression = gatewayPayloadByteExpression(sql, "_gw_snapshot_replay", GATEWAY_REPLAY_PAYLOAD_COLUMNS);
     const generationColumns = new Set(
         sql.all<{ name: string }>("PRAGMA table_info('_gw_registration_generations')").map(column => column.name)
     );
@@ -305,6 +348,7 @@ export function gatewayDurablePayloadUsage(sql: SyncSql): GatewayDurablePayloadU
     const row = sql.one<{
         registration_bytes: number | bigint;
         snapshot_bytes: number | bigint;
+        replay_bytes: number | bigint;
         registration_reserved_bytes: number | bigint;
         snapshot_reserved_bytes: number | bigint;
     }>(
@@ -313,6 +357,8 @@ export function gatewayDurablePayloadUsage(sql: SyncSql): GatewayDurablePayloadU
                      FROM _gw_registration_generations), 0) AS registration_bytes,
            COALESCE((SELECT SUM(${snapshotExpression})
                      FROM _gw_snapshot_outbox), 0) AS snapshot_bytes,
+           COALESCE((SELECT SUM(${replayExpression})
+                     FROM _gw_snapshot_replay), 0) AS replay_bytes,
            (COALESCE((SELECT SUM(${generationRetryReservationExpression})
                       FROM _gw_registration_generations g), 0)
             + COALESCE((SELECT SUM(${currentHeadReservationExpression})
@@ -325,6 +371,7 @@ export function gatewayDurablePayloadUsage(sql: SyncSql): GatewayDurablePayloadU
     );
     const registrationBytes = Number(row?.registration_bytes ?? 0);
     const snapshotBytes = Number(row?.snapshot_bytes ?? 0);
+    const replayBytes = Number(row?.replay_bytes ?? 0);
     const registrationReservedBytes = Number(row?.registration_reserved_bytes ?? 0);
     const snapshotReservedBytes = Number(row?.snapshot_reserved_bytes ?? 0);
     if (
@@ -332,6 +379,8 @@ export function gatewayDurablePayloadUsage(sql: SyncSql): GatewayDurablePayloadU
         registrationBytes < 0 ||
         !Number.isSafeInteger(snapshotBytes) ||
         snapshotBytes < 0 ||
+        !Number.isSafeInteger(replayBytes) ||
+        replayBytes < 0 ||
         !Number.isSafeInteger(registrationReservedBytes) ||
         registrationReservedBytes < 0 ||
         !Number.isSafeInteger(snapshotReservedBytes) ||
@@ -339,7 +388,7 @@ export function gatewayDurablePayloadUsage(sql: SyncSql): GatewayDurablePayloadU
     ) {
         throw gatewayInvalidationInvariant("Gateway durable payload usage is invalid");
     }
-    const totalBytes = registrationBytes + snapshotBytes;
+    const totalBytes = registrationBytes + snapshotBytes + replayBytes;
     const chargedRegistrationBytes = registrationBytes + registrationReservedBytes;
     const chargedTotalBytes = totalBytes + registrationReservedBytes + snapshotReservedBytes;
     if (
@@ -352,6 +401,7 @@ export function gatewayDurablePayloadUsage(sql: SyncSql): GatewayDurablePayloadU
     return {
         registrationBytes,
         snapshotBytes,
+        replayBytes,
         totalBytes,
         registrationReservedBytes,
         snapshotReservedBytes,
@@ -403,6 +453,7 @@ interface PendingSubscription {
     readonly capacityKey: string;
     cancelled: boolean;
     queued: boolean;
+    readonly resumeReplayAttempt: boolean;
     task: Promise<void>;
 }
 
@@ -915,6 +966,31 @@ export interface GatewaySnapshotStage extends GatewayRegistrationKey {
     readonly nowMs: number;
 }
 
+export interface GatewaySnapshotReplayLookup extends GatewayRegistrationKey {
+    readonly cookie: Cookie;
+    readonly organizationId: TenantId;
+    readonly ref: ChardbRef;
+    readonly args: RawJson;
+    readonly policyDigest: string;
+    readonly queryHash: string;
+    readonly shardId: string;
+    readonly sourceCdbId: string;
+    readonly schemaEpoch: number;
+    readonly domainSchemaEpoch: number;
+    readonly authEpochs: {
+        readonly global: number;
+        readonly tenant: number;
+        readonly principal: number;
+    };
+    readonly nowMs: number;
+}
+
+export interface GatewaySnapshotReplay {
+    readonly subId: SubId;
+    readonly cookie: Cookie;
+    readonly rows: readonly RawJson[];
+}
+
 export interface GatewaySnapshotSendClaim {
     readonly nowMs: number;
     readonly attemptExpiresAt: number;
@@ -1054,6 +1130,7 @@ export function installGatewayRegistration(
         input.clientId,
         input.subId
     );
+    if (previous) retainCurrentGatewaySnapshotReplay(sql, input, input.nowMs, true);
     sql.exec(
         `INSERT INTO _gw_registration_generations
          (registration_id, principal_id, client_id, sub_id, connection_id, organization_id,
@@ -1107,6 +1184,7 @@ export function installGatewayRegistration(
             input.subId
         );
         sql.exec("DELETE FROM _gw_snapshot_outbox WHERE registration_id = ?", previous.registration_id);
+        pruneGatewaySnapshotReplays(sql, input.nowMs);
     }
     sql.exec(
         `INSERT INTO _gw_registration_heads
@@ -1998,8 +2076,197 @@ export function acknowledgeGatewaySnapshot(sql: SyncSql, input: GatewaySnapshotA
     if (sql.changes() !== 1) {
         throw gatewayInvalidationInvariant("staged Gateway snapshot disappeared during acknowledgement");
     }
+    sql.exec(
+        `DELETE FROM _gw_snapshot_replay
+         WHERE principal_id = ? AND client_id = ? AND sub_id = ?`,
+        input.principalId,
+        input.clientId,
+        input.subId
+    );
     assertGatewayDurablePayloadQuota(sql);
     return true;
+}
+
+/** Remove expired or oldest replay rows until both hard retention bounds hold. */
+export function pruneGatewaySnapshotReplays(sql: SyncSql, nowMs: number): number {
+    assertNonnegativeSafeInteger(nowMs, "nowMs");
+    let removed = 0;
+    sql.exec("DELETE FROM _gw_snapshot_replay WHERE expires_at <= ?", nowMs);
+    removed += sql.changes();
+    sql.exec(
+        `DELETE FROM _gw_snapshot_replay
+         WHERE rowid IN (
+           SELECT rowid FROM _gw_snapshot_replay
+           ORDER BY created_at DESC, principal_id DESC, client_id DESC, sub_id DESC
+           LIMIT -1 OFFSET ?
+         )`,
+        GATEWAY_MAX_SNAPSHOT_REPLAY_ROWS
+    );
+    removed += sql.changes();
+    while (gatewayDurablePayloadUsage(sql).chargedTotalBytes > GATEWAY_MAX_DURABLE_PAYLOAD_BYTES) {
+        sql.exec(
+            `DELETE FROM _gw_snapshot_replay
+             WHERE rowid = (
+               SELECT rowid FROM _gw_snapshot_replay
+               ORDER BY created_at, principal_id, client_id, sub_id
+               LIMIT 1
+             )`
+        );
+        const changed = sql.changes();
+        removed += changed;
+        if (changed === 0) break;
+    }
+    return removed;
+}
+
+/**
+ * Retain the latest snapshot that was handed to the transport for one logical
+ * subscription. The original send timestamp fixes the retention deadline, so
+ * repeated reconnects cannot extend it.
+ */
+export function retainCurrentGatewaySnapshotReplay(
+    sql: SyncSql,
+    key: GatewayRegistrationKey,
+    nowMs: number,
+    deferPrune = false
+): boolean {
+    assertGatewayRegistrationKey(key);
+    assertNonnegativeSafeInteger(nowMs, "nowMs");
+    sql.exec(
+        `INSERT INTO _gw_snapshot_replay
+         (principal_id, client_id, sub_id, cookie, organization_id, ref, args_json,
+          policy_digest, query_hash, shard_id, source_cdb_id, schema_epoch, domain_schema_epoch,
+          auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
+          rows_json, byte_size, created_at, expires_at)
+         SELECT g.principal_id, g.client_id, g.sub_id, o.cookie, g.organization_id, g.ref, g.args_json,
+                g.policy_digest, g.query_hash, g.shard_id, g.source_cdb_id, g.schema_epoch,
+                g.domain_schema_epoch, g.auth_global_epoch, g.auth_tenant_epoch, g.auth_principal_epoch,
+                o.rows_json, o.byte_size, o.last_sent_at, o.last_sent_at + ?
+         FROM _gw_registration_generations g
+         INNER JOIN _gw_registration_heads h
+           ON h.registration_id = g.registration_id
+          AND h.principal_id = g.principal_id
+          AND h.client_id = g.client_id
+          AND h.sub_id = g.sub_id
+         INNER JOIN _gw_snapshot_outbox o ON o.registration_id = g.registration_id
+         WHERE g.principal_id = ? AND g.client_id = ? AND g.sub_id = ?
+           AND g.lifecycle = 'active' AND g.cdb_state = 'active'
+           AND o.send_attempts > 0 AND o.last_sent_at IS NOT NULL AND o.claim_token IS NOT NULL
+           AND o.last_sent_at + ? > ?
+         ON CONFLICT (principal_id, client_id, sub_id) DO UPDATE SET
+           cookie = excluded.cookie,
+           organization_id = excluded.organization_id,
+           ref = excluded.ref,
+           args_json = excluded.args_json,
+           policy_digest = excluded.policy_digest,
+           query_hash = excluded.query_hash,
+           shard_id = excluded.shard_id,
+           source_cdb_id = excluded.source_cdb_id,
+           schema_epoch = excluded.schema_epoch,
+           domain_schema_epoch = excluded.domain_schema_epoch,
+           auth_global_epoch = excluded.auth_global_epoch,
+           auth_tenant_epoch = excluded.auth_tenant_epoch,
+           auth_principal_epoch = excluded.auth_principal_epoch,
+           rows_json = excluded.rows_json,
+           byte_size = excluded.byte_size,
+           created_at = excluded.created_at,
+           expires_at = excluded.expires_at
+         WHERE excluded.created_at >= _gw_snapshot_replay.created_at`,
+        GATEWAY_SNAPSHOT_REPLAY_RETENTION_MS,
+        key.principalId,
+        key.clientId,
+        key.subId,
+        GATEWAY_SNAPSHOT_REPLAY_RETENTION_MS,
+        nowMs
+    );
+    const retained = sql.changes() === 1;
+    if (!deferPrune) pruneGatewaySnapshotReplays(sql, nowMs);
+    return retained;
+}
+
+/** Resolve replay only when the resumed transport and current authority describe the exact old query. */
+export function resolveGatewaySnapshotReplay(
+    sql: SyncSql,
+    input: GatewaySnapshotReplayLookup
+): GatewaySnapshotReplay | null {
+    assertGatewayRegistrationKey(input);
+    if (input.cookie.length === 0) throw new TypeError("cookie must be nonempty");
+    assertNonnegativeSafeInteger(input.schemaEpoch, "schemaEpoch");
+    assertNonnegativeSafeInteger(input.domainSchemaEpoch, "domainSchemaEpoch");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    pruneGatewaySnapshotReplays(sql, input.nowMs);
+    const replay = sql.one<{ rows_json: string }>(
+        `SELECT rows_json FROM _gw_snapshot_replay
+         WHERE principal_id = ? AND client_id = ? AND sub_id = ? AND cookie = ?
+           AND organization_id = ? AND ref = ? AND args_json = ?
+           AND policy_digest = ? AND query_hash = ? AND shard_id = ? AND source_cdb_id = ?
+           AND schema_epoch = ? AND domain_schema_epoch = ?
+           AND auth_global_epoch = ? AND auth_tenant_epoch = ? AND auth_principal_epoch = ?
+           AND expires_at > ?`,
+        input.principalId,
+        input.clientId,
+        input.subId,
+        input.cookie,
+        input.organizationId,
+        input.ref,
+        stableJson(input.args),
+        input.policyDigest,
+        input.queryHash,
+        input.shardId,
+        input.sourceCdbId,
+        input.schemaEpoch,
+        input.domainSchemaEpoch,
+        input.authEpochs.global,
+        input.authEpochs.tenant,
+        input.authEpochs.principal,
+        input.nowMs
+    );
+    if (!replay) return null;
+    try {
+        const rows = rawJsonResult(JSON.parse(replay.rows_json), "Gateway replay snapshot rows");
+        if (!Array.isArray(rows)) throw new TypeError("Gateway replay snapshot rows must be an array");
+        return { subId: input.subId, cookie: input.cookie, rows };
+    } catch {
+        sql.exec(
+            `DELETE FROM _gw_snapshot_replay
+             WHERE principal_id = ? AND client_id = ? AND sub_id = ? AND cookie = ?`,
+            input.principalId,
+            input.clientId,
+            input.subId,
+            input.cookie
+        );
+        return null;
+    }
+}
+
+/** Consume one exact replay cookie after a verified replacement socket acknowledges it. */
+export function acknowledgeGatewaySnapshotReplay(
+    sql: SyncSql,
+    input: Pick<GatewaySnapshotReplayLookup, "principalId" | "clientId" | "cookie" | "nowMs">
+): SubId | null {
+    assertGatewayRegistrationKey({ principalId: input.principalId, clientId: input.clientId, subId: SubId(0) });
+    if (input.cookie.length === 0) throw new TypeError("cookie must be nonempty");
+    assertNonnegativeSafeInteger(input.nowMs, "nowMs");
+    pruneGatewaySnapshotReplays(sql, input.nowMs);
+    const replay = sql.one<{ sub_id: number }>(
+        `SELECT sub_id FROM _gw_snapshot_replay
+         WHERE principal_id = ? AND client_id = ? AND cookie = ? AND expires_at > ?
+         ORDER BY sub_id LIMIT 1`,
+        input.principalId,
+        input.clientId,
+        input.cookie,
+        input.nowMs
+    );
+    if (!replay) return null;
+    sql.exec(
+        `DELETE FROM _gw_snapshot_replay
+         WHERE principal_id = ? AND client_id = ? AND sub_id = ? AND cookie = ?`,
+        input.principalId,
+        input.clientId,
+        replay.sub_id,
+        input.cookie
+    );
+    return sql.changes() === 1 ? SubId(replay.sub_id) : null;
 }
 
 /** Return current, internally consistent generations owned by one socket generation. */
@@ -2129,11 +2396,13 @@ export function retireCurrentGatewayRegistrationsForConnection(
     assertNonnegativeSafeInteger(nowMs, "nowMs");
     const registrations = listCurrentGatewayRegistrationsForConnection(sql, connectionId);
     for (const registration of registrations) {
+        retainCurrentGatewaySnapshotReplay(sql, registration, nowMs, true);
         const retired = retireCurrentGatewayRegistration(sql, { ...registration, nowMs });
         if (!retired || retired.registrationId !== registration.registrationId) {
             throw gatewayInvalidationInvariant("current Gateway registration changed during connection retirement");
         }
     }
+    pruneGatewaySnapshotReplays(sql, nowMs);
     return registrations;
 }
 
@@ -3408,12 +3677,21 @@ export class Gateway extends DurableObject<GatewayEnv> {
         );
     }
 
+    private earliestGatewaySnapshotReplayExpiryAt(): number | null {
+        return (
+            adaptSqlStorage(this.ctx.storage.sql).one<{ expires_at: number | null }>(
+                "SELECT MIN(expires_at) AS expires_at FROM _gw_snapshot_replay"
+            )?.expires_at ?? null
+        );
+    }
+
     private async scheduleGatewayWork(nowMs: number): Promise<void> {
         const due = [
             this.earliestGatewayCleanupAt(),
             this.earliestGatewayInstallRecoveryAt(),
             this.earliestGatewayQueryAt(),
             this.earliestGatewaySnapshotSendAt(),
+            this.earliestGatewaySnapshotReplayExpiryAt(),
         ].filter((value): value is number => value !== null);
         if (due.length === 0) return;
         await this.scheduleGatewayAlarm(Math.max(nowMs + 1, Math.min(...due)));
@@ -3490,6 +3768,16 @@ export class Gateway extends DurableObject<GatewayEnv> {
         this.ctx.storage.transactionSync(() => {
             const transactionSql = adaptSqlStorage(this.ctx.storage.sql);
             for (const candidate of abandoned) {
+                retainCurrentGatewaySnapshotReplay(
+                    transactionSql,
+                    {
+                        principalId: PrincipalId(candidate.principal_id),
+                        clientId: ClientId(candidate.client_id),
+                        subId: SubId(candidate.sub_id),
+                    },
+                    nowMs,
+                    true
+                );
                 retireGatewayRegistration(
                     transactionSql,
                     {
@@ -3501,6 +3789,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                     nowMs
                 );
             }
+            pruneGatewaySnapshotReplays(transactionSql, nowMs);
             const nextCursor = hasMore ? (candidates.at(-1)?.generation_rowid ?? cursor) : 0;
             if (nextCursor !== cursor) {
                 transactionSql.exec(
@@ -3516,6 +3805,9 @@ export class Gateway extends DurableObject<GatewayEnv> {
 
     private async drainGatewayWork(): Promise<void> {
         const nowMs = this.gatewayNowMs();
+        this.ctx.storage.transactionSync(() =>
+            pruneGatewaySnapshotReplays(adaptSqlStorage(this.ctx.storage.sql), nowMs)
+        );
         for (const recovery of this.dueGatewayInstallRecoveries(nowMs)) {
             this.ctx.storage.transactionSync(() => {
                 markPendingGatewaySubscriptionAmbiguous(adaptSqlStorage(this.ctx.storage.sql), {
@@ -4085,6 +4377,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return;
         }
         const resumeRefetchPendingSubIds = attachment.resumeRefetchPendingSubIds;
+        let resumeReplayAttempt = false;
         if (resumeRefetchPendingSubIds !== undefined) {
             if (!resumeRefetchPendingSubIds.includes(msg.subId)) {
                 if (resumeRefetchPendingSubIds.length >= MAX_INITIAL_SNAPSHOTS_PER_CONNECTION) {
@@ -4097,13 +4390,13 @@ export class Gateway extends DurableObject<GatewayEnv> {
                         .sort((left, right) => left - right)
                         .map(SubId),
                 } satisfies VerifiedGwAttachment);
-                this.send(ws, { t: "mustRefetch", subIds: [msg.subId], reason: "lagged" });
-                return;
+                resumeReplayAttempt = true;
+            } else {
+                ws.serializeAttachment({
+                    ...attachment,
+                    resumeRefetchPendingSubIds: resumeRefetchPendingSubIds.filter(subId => subId !== msg.subId),
+                } satisfies VerifiedGwAttachment);
             }
-            ws.serializeAttachment({
-                ...attachment,
-                resumeRefetchPendingSubIds: resumeRefetchPendingSubIds.filter(subId => subId !== msg.subId),
-            } satisfies VerifiedGwAttachment);
         }
         const operationKey = `${attachment.connectionId}:${msg.subId}`;
         const previous = this.pendingSubscriptions.get(operationKey);
@@ -4148,6 +4441,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             capacityKey,
             cancelled: false,
             queued,
+            resumeReplayAttempt,
             task: Promise.resolve(),
         };
         this.pendingSubscriptions.set(operationKey, pending);
@@ -4372,6 +4666,57 @@ export class Gateway extends DurableObject<GatewayEnv> {
             this.sendError(ws, "CDB_SHARD_UNAVAILABLE", msg.subId);
             return;
         }
+        let replaySnapshot: GatewaySnapshotReplay | null = null;
+        if (pending.resumeReplayAttempt) {
+            const replayAt = this.gatewayNowMs();
+            replaySnapshot = this.ctx.storage.transactionSync(() => {
+                const sql = adaptSqlStorage(this.ctx.storage.sql);
+                retainCurrentGatewaySnapshotReplay(
+                    sql,
+                    { principalId: att.principalId, clientId: att.clientId, subId: msg.subId },
+                    replayAt
+                );
+                return att.lastCookie === undefined
+                    ? null
+                    : resolveGatewaySnapshotReplay(sql, {
+                          principalId: att.principalId,
+                          clientId: att.clientId,
+                          subId: msg.subId,
+                          cookie: att.lastCookie,
+                          organizationId: TenantId(organizationId),
+                          ref: msg.ref,
+                          args: routed.args,
+                          policyDigest: routed.policyDigest,
+                          queryHash: routed.queryHash,
+                          shardId,
+                          sourceCdbId,
+                          schemaEpoch,
+                          domainSchemaEpoch,
+                          authEpochs,
+                          nowMs: replayAt,
+                      });
+            });
+            if (!replaySnapshot) {
+                this.send(ws, { t: "mustRefetch", subIds: [msg.subId], reason: "lagged" });
+                return;
+            }
+            const currentAfterReplayLookup = ws.deserializeAttachment() as GwAttachment | null;
+            if (
+                !isVerifiedAttachment(currentAfterReplayLookup) ||
+                currentAfterReplayLookup.connectionId !== att.connectionId ||
+                currentAfterReplayLookup.clientId !== att.clientId ||
+                currentAfterReplayLookup.principalId !== att.principalId
+            ) {
+                return;
+            }
+            const remainingResumeSubIds = currentAfterReplayLookup.resumeRefetchPendingSubIds?.filter(
+                subId => subId !== msg.subId
+            );
+            ws.serializeAttachment({
+                ...currentAfterReplayLookup,
+                ...(remainingResumeSubIds !== undefined ? { resumeRefetchPendingSubIds: remainingResumeSubIds } : {}),
+            } satisfies VerifiedGwAttachment);
+        }
         const registrationId = crypto.randomUUID();
         const installedAt = this.gatewayNowMs();
         const identity = {
@@ -4511,6 +4856,19 @@ export class Gateway extends DurableObject<GatewayEnv> {
             .sort((left, right) => left - right)
             .map(SubId);
         ws.serializeAttachment({ ...current, snapshotSubIds } satisfies VerifiedGwAttachment);
+        if (replaySnapshot) {
+            try {
+                this.send(ws, {
+                    t: "snapshot",
+                    subId: replaySnapshot.subId,
+                    cookie: replaySnapshot.cookie,
+                    rows: replaySnapshot.rows,
+                });
+            } catch (error) {
+                this.markConnectionRejected(ws, att.connectionId);
+                this.closePreservingFailure(ws, 1011, "snapshot replay delivery failed", { value: error });
+            }
+        }
         try {
             await this.scheduleGatewayWork(activatedAt);
         } catch {
@@ -4525,13 +4883,21 @@ export class Gateway extends DurableObject<GatewayEnv> {
         if (pending) pending.cancelled = true;
         const nowMs = this.gatewayNowMs();
         await this.retireGatewayStateWithCleanupAlarm(nowMs, () => {
-            retireCurrentGatewayRegistration(adaptSqlStorage(this.ctx.storage.sql), {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            retireCurrentGatewayRegistration(sql, {
                 principalId: att.principalId,
                 clientId: att.clientId,
                 subId: msg.subId,
                 connectionId: att.connectionId,
                 nowMs,
             });
+            sql.exec(
+                `DELETE FROM _gw_snapshot_replay
+                 WHERE principal_id = ? AND client_id = ? AND sub_id = ?`,
+                att.principalId,
+                att.clientId,
+                msg.subId
+            );
         });
         const current = ws.deserializeAttachment() as GwAttachment | null;
         if (
@@ -4569,13 +4935,27 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 connectionId: attachment.connectionId,
                 cookie: msg.cookie,
             });
-            if (!identity) return null;
-            return {
-                identity,
-                acknowledged: acknowledgeGatewaySnapshot(sql, { ...identity, nowMs }),
-            };
+            if (identity) {
+                return {
+                    kind: "current" as const,
+                    identity,
+                    acknowledged: acknowledgeGatewaySnapshot(sql, { ...identity, nowMs }),
+                };
+            }
+            const replaySubId = acknowledgeGatewaySnapshotReplay(sql, {
+                principalId: attachment.principalId,
+                clientId: attachment.clientId,
+                cookie: msg.cookie,
+                nowMs,
+            });
+            return replaySubId === null ? null : { kind: "replay" as const, subId: replaySubId };
         });
-        if (!settlement?.acknowledged) return;
+        if (!settlement) return;
+        if (settlement.kind === "replay") {
+            void this.scheduleGatewayWork(nowMs);
+            return;
+        }
+        if (!settlement.acknowledged) return;
         const current = ws.deserializeAttachment() as GwAttachment | null;
         if (
             !isVerifiedAttachment(current) ||

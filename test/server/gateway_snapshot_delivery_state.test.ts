@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { SyncSql } from "../../src/oplog/wrapper.ts";
 import {
+    GATEWAY_MAX_SNAPSHOT_REPLAY_ROWS,
     GATEWAY_REGISTRATION_DDL,
     Gateway,
     type GatewayDirtyRun,
@@ -9,10 +10,14 @@ import {
     type GatewayRegistrationInstall,
     type GatewaySnapshotSendAttempt,
     acknowledgeGatewaySnapshot,
+    acknowledgeGatewaySnapshotReplay,
     claimDirtyGatewayRegistration,
     claimDueGatewaySnapshot,
     failGatewaySnapshotSend,
     installGatewayRegistration,
+    pruneGatewaySnapshotReplays,
+    resolveGatewaySnapshotReplay,
+    retainCurrentGatewaySnapshotReplay,
     retireClaimedGatewaySnapshot,
     retireGatewayRegistration,
     stageGatewaySnapshot,
@@ -484,6 +489,91 @@ describe("Gateway snapshot delivery state", () => {
                 })
             )()
         ).toBe(false);
+    });
+
+    test("retains, exactly matches, acknowledges, and expires a sent snapshot replay", () => {
+        const current = registration("registration-replay", { lastCookie: Cookie("cookie-before-replay") });
+        installActive(current);
+        expect(stage(current, claim(current) as GatewayDirtyRun)).toBe(true);
+        expect(
+            db.transaction(() => claimDueGatewaySnapshot(sql, { nowMs: 220, attemptExpiresAt: 300 }))()
+        ).not.toBeNull();
+        expect(db.transaction(() => retainCurrentGatewaySnapshotReplay(sql, current, 225))()).toBe(true);
+
+        const lookup = {
+            principalId: current.principalId,
+            clientId: current.clientId,
+            subId: current.subId,
+            cookie: Cookie("cookie-registration-replay"),
+            organizationId: current.organizationId,
+            ref: current.ref,
+            args: current.args,
+            policyDigest: current.policyDigest,
+            queryHash: current.queryHash,
+            shardId: current.shardId,
+            sourceCdbId: current.sourceCdbId,
+            schemaEpoch: current.schemaEpoch,
+            domainSchemaEpoch: current.domainSchemaEpoch,
+            authEpochs: { global: 10, tenant: 11, principal: 12 },
+            nowMs: 226,
+        } as const;
+        expect(db.transaction(() => resolveGatewaySnapshotReplay(sql, lookup))()).toEqual({
+            subId: current.subId,
+            cookie: lookup.cookie,
+            rows: [{ body: "héllo", id: 1 }],
+        });
+        expect(
+            db.transaction(() => resolveGatewaySnapshotReplay(sql, { ...lookup, policyDigest: "changed" }))()
+        ).toBeNull();
+        expect(
+            db.transaction(() =>
+                acknowledgeGatewaySnapshotReplay(sql, {
+                    principalId: current.principalId,
+                    clientId: current.clientId,
+                    cookie: lookup.cookie,
+                    nowMs: 227,
+                })
+            )()
+        ).toBe(current.subId);
+        expect(db.transaction(() => resolveGatewaySnapshotReplay(sql, lookup))()).toBeNull();
+
+        expect(db.transaction(() => retainCurrentGatewaySnapshotReplay(sql, current, 228))()).toBe(true);
+        db.query("UPDATE _gw_snapshot_replay SET rows_json = 'not-json'").run();
+        expect(db.transaction(() => resolveGatewaySnapshotReplay(sql, { ...lookup, nowMs: 229 }))()).toBeNull();
+        expect(db.query("SELECT COUNT(*) AS count FROM _gw_snapshot_replay").get()).toEqual({ count: 0 });
+
+        expect(db.transaction(() => retainCurrentGatewaySnapshotReplay(sql, current, 230))()).toBe(true);
+        expect(
+            db.transaction(() =>
+                resolveGatewaySnapshotReplay(sql, {
+                    ...lookup,
+                    nowMs: 220 + 30_000,
+                })
+            )()
+        ).toBeNull();
+        expect(db.query("SELECT COUNT(*) AS count FROM _gw_snapshot_replay").get()).toEqual({ count: 0 });
+    });
+
+    test("evicts the oldest replay identities at the hard global row bound", () => {
+        const insert = db.query(
+            `INSERT INTO _gw_snapshot_replay
+             (principal_id, client_id, sub_id, cookie, organization_id, ref, args_json,
+              policy_digest, query_hash, shard_id, source_cdb_id, schema_epoch, domain_schema_epoch,
+              auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
+              rows_json, byte_size, created_at, expires_at)
+             VALUES (?, ?, 0, ?, 'org-1', 'queries.ts#messages', '{}',
+                     'policy', 'query', 'shard', 'cdb', 1, 1, 1, 1, 1, '[]', 2, ?, ?)`
+        );
+        for (let index = 0; index <= GATEWAY_MAX_SNAPSHOT_REPLAY_ROWS; index++) {
+            insert.run("principal-1", `client-${index}`, `cookie-${index}`, index, 100_000 + index);
+        }
+
+        expect(db.transaction(() => pruneGatewaySnapshotReplays(sql, 1))()).toBe(1);
+        expect(db.query("SELECT COUNT(*) AS count FROM _gw_snapshot_replay").get()).toEqual({
+            count: GATEWAY_MAX_SNAPSHOT_REPLAY_ROWS,
+        });
+        expect(db.query("SELECT 1 FROM _gw_snapshot_replay WHERE client_id = 'client-0'").get()).toBeNull();
+        expect(db.query("SELECT 1 FROM _gw_snapshot_replay WHERE client_id = 'client-256'").get()).not.toBeNull();
     });
 
     test("retirement and supersession clear leases and discard staged snapshots", () => {

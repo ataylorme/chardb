@@ -2,16 +2,7 @@
 
 Last reviewed: 2026-08-25
 
-The narrow organization-tenanted runtime is the current supported path. This document lists product expansions that are not implemented and must not appear in capability claims. Pick one package before starting another.
-
-## Exact resume replay
-
-Current replacement sockets rematerialize every subscription through `mustRefetch{lagged}`. They do not replay a missed snapshot from the old cookie.
-
-- Define a durable cookie coordinate that survives connection retirement.
-- Bound replay rows, bytes, age, and per-client history.
-- Bind replay data to principal, client, query identity, schema epoch, and policy digest.
-- Prove transport loss after delivery and before acknowledgement, replacement-socket replay of the exact cookie and rows, one acknowledgement, restart during replay, and later normal delivery.
+The narrow organization-tenanted runtime is the current supported path. This document lists product expansions that are not implemented and must not appear in capability claims. Pick one package before starting another. Exact replacement-socket resume replay left this list on 2026-08-25 after its bounded storage, identity, acknowledgement, fallback, and configured Workerd proofs landed.
 
 ## Query shapes
 

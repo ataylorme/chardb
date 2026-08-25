@@ -270,24 +270,22 @@ describe("Gateway aggregate live-query admission", () => {
         expect(db.query("SELECT COUNT(*) AS count FROM _gw_registration_heads").get()).toEqual({ count: 256 });
     });
 
-    test("requires one bounded refetch round trip before admitting a resumed subscription", async () => {
+    test("admits one bounded replay lookup before a resumed subscription falls back", async () => {
         const held = holdSettlements();
         const socket = new FakeSocket({ ...attachment(0), resumeRefetchPendingSubIds: [] });
 
-        await subscribe(gateway, socket, 7);
-        expect(held.calls()).toBe(0);
+        const replayLookup = subscribe(gateway, socket, 7);
+        expect(held.calls()).toBe(1);
         expect(socket.attachment.resumeRefetchPendingSubIds).toEqual([SubId(7)]);
-        expect(JSON.parse(socket.sent.at(-1) as string)).toEqual({
-            t: "mustRefetch",
-            subIds: [7],
-            reason: "lagged",
-        });
+        held.releases[0]?.();
+        await replayLookup;
+        expect(socket.sent).toEqual([]);
         expect(db.query("SELECT COUNT(*) AS count FROM _gw_registration_heads").get()).toEqual({ count: 0 });
 
         const replacement = subscribe(gateway, socket, 7);
-        expect(held.calls()).toBe(1);
+        expect(held.calls()).toBe(2);
         expect(socket.attachment.resumeRefetchPendingSubIds).toEqual([]);
-        held.releases[0]?.();
+        held.releases[1]?.();
         await replacement;
 
         socket.attachment = {
@@ -297,7 +295,7 @@ describe("Gateway aggregate live-query admission", () => {
             ),
         };
         await subscribe(gateway, socket, MAX_INITIAL_SNAPSHOTS_PER_CONNECTION);
-        expect(held.calls()).toBe(1);
+        expect(held.calls()).toBe(2);
         expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
             t: "error",
             subId: MAX_INITIAL_SNAPSHOTS_PER_CONNECTION,

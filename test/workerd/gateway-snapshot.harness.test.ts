@@ -124,6 +124,7 @@ function queryObserver() {
     const waiters = new Set<() => void>();
     return {
         count: () => history.length,
+        observations: () => history.map(observation => ({ ...observation, rows: [...observation.rows] })),
         listener(rows: readonly Record<string, unknown>[], state?: string) {
             history.push({ rows: rows.map(row => ({ ...row })), state: state ?? "missing" });
             for (const wake of [...waiters]) wake();
@@ -652,13 +653,46 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
         expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
     }, 15_000);
 
-    test("socket loss before acknowledgement forces an explicit refetch on the replacement connection", async () => {
-        if (!workerdUrl || !queryRef || !mutationRef) throw new Error("snapshot SDK fixture was not initialized");
+    test("an unknown resume cookie falls back once before installing an authoritative subscription", async () => {
+        const clientId = "snapshot-fallback-01";
+        const opened = await openSocket(clientId, Cookie("snapshot-fallback-01:unknown"));
+        expect(opened.welcome).toMatchObject({
+            t: "welcome",
+            resumedFromCookie: Cookie("snapshot-fallback-01:unknown"),
+        });
+
+        const fallback = nextDown(opened.socket);
+        sendSubscription(opened.socket, 1, "snapshot-fallback-proof");
+        expect(await fallback).toEqual({ t: "mustRefetch", subIds: [SubId(1)], reason: "lagged" });
+
+        const authoritative = nextDown(opened.socket);
+        sendSubscription(opened.socket, 1, "snapshot-fallback-proof");
+        await activeRegistration(clientId, 1);
+        await drainGateway(clientId);
+        const snapshot = await authoritative;
+        expect(snapshot).toMatchObject({ t: "snapshot", subId: SubId(1), rows: [] });
+        if (snapshot.t !== "snapshot") throw new Error(`expected snapshot, received ${snapshot.t}`);
+        acknowledge(opened.socket, snapshot);
+        opened.socket.close();
+        await opened.closed;
+    });
+
+    test("socket loss before acknowledgement replays the exact snapshot before current rematerialization", async () => {
+        if (!mf || !workerdUrl || !queryRef || !mutationRef)
+            throw new Error("snapshot SDK fixture was not initialized");
         const clientId = "snapshot-reconnect-01";
         const body = "snapshot-reconnect-proof";
         const NativeWebSocket = globalThis.WebSocket;
         let dropNextAcknowledgement = false;
         let settleDroppedAcknowledgement: ((cookie: Cookie) => void) | undefined;
+        let socketOrdinal = 0;
+        const replacementSnapshotCookies: Cookie[] = [];
+        let holdReplacementHello = false;
+        let releaseReplacementHello: (() => void) | undefined;
+        let settleReplacementHelloHeld: (() => void) | undefined;
+        const replacementHelloHeld = new Promise<void>(resolve => {
+            settleReplacementHelloHeld = resolve;
+        });
         const droppedAcknowledgement = new Promise<Cookie>(resolve => {
             settleDroppedAcknowledgement = resolve;
         });
@@ -669,9 +703,11 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
             static readonly CLOSING = NativeWebSocket.CLOSING;
             static readonly CLOSED = NativeWebSocket.CLOSED;
             private readonly inner: WebSocket;
+            private readonly ordinal: number;
 
             constructor(url: string | URL) {
                 this.inner = new NativeWebSocket(url);
+                this.ordinal = ++socketOrdinal;
             }
 
             get readyState(): number {
@@ -691,7 +727,13 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
             }
 
             set onmessage(listener: WebSocket["onmessage"]) {
-                this.inner.onmessage = listener;
+                this.inner.onmessage = event => {
+                    if (this.ordinal > 1 && typeof event.data === "string") {
+                        const message = decodeWire(event.data) as Down;
+                        if (message.t === "snapshot") replacementSnapshotCookies.push(message.cookie);
+                    }
+                    listener?.call(this.inner, event);
+                };
             }
 
             get onclose(): WebSocket["onclose"] {
@@ -711,10 +753,17 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
             }
 
             send(data: Parameters<WebSocket["send"]>[0]): void {
-                if (dropNextAcknowledgement && typeof data === "string") {
+                if (typeof data === "string") {
                     const message = decodeWire(data) as Up;
-                    if (message.t === "ack") {
+                    if (this.ordinal > 1 && holdReplacementHello && message.t === "hello") {
+                        holdReplacementHello = false;
+                        releaseReplacementHello = () => this.inner.send(data);
+                        settleReplacementHelloHeld?.();
+                        return;
+                    }
+                    if (dropNextAcknowledgement && message.t === "ack") {
                         dropNextAcknowledgement = false;
+                        holdReplacementHello = true;
                         settleDroppedAcknowledgement?.(message.cookie);
                         this.inner.close();
                         return;
@@ -783,26 +832,42 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
                 "delivered snapshot before transport loss"
             );
             const afterLostDelivery = observer.count();
-            await observer.waitFor(
-                observation => observation.state === "refetching" && observation.rows.length === 0,
-                "explicit lagged refetch",
-                afterLostDelivery
-            );
+            await replacementHelloHeld;
+            const gatewayBeforeReplayReconstruction = await gatewayState(clientId);
+            await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", {
+                name: clientId.slice(0, 12),
+                webSockets: "hibernate",
+            });
+            const gatewayAfterReplayReconstruction = await gatewayState(clientId);
+            expect(gatewayAfterReplayReconstruction.instanceId).not.toBe(gatewayBeforeReplayReconstruction.instanceId);
+            if (!releaseReplacementHello) throw new Error("replacement hello was not held");
+            releaseReplacementHello();
             await activeRegistration(clientId, 1);
             await drainGateway(clientId);
             await observer.waitFor(
                 observation =>
                     observation.state === "live" &&
                     observation.rows.some(row => row.id === "snapshot-before-close-row"),
-                "authoritative snapshot after reconnect",
+                "current snapshot after exact replay",
                 afterLostDelivery
             );
+            expect(replacementSnapshotCookies[0]).toBe(Cookie(staged.cookie));
+            expect(replacementSnapshotCookies[1]).toBeString();
+            expect(replacementSnapshotCookies[1]).not.toBe(Cookie(staged.cookie));
+            expect(
+                observer
+                    .observations()
+                    .slice(afterLostDelivery)
+                    .some(observation => observation.state === "refetching")
+            ).toBe(false);
 
             await drainGateway(clientId);
             const replacement = await activeRegistration(clientId, 1);
             expect(replacement.registrationId).not.toBe(dirty.registrationId);
             expect(replacement.lastSnapshotCookie).toBeString();
-            expect(replacement.lastSnapshotCookie).not.toBe(staged.cookie);
+            const replacementCurrentCookie = replacementSnapshotCookies[1];
+            if (!replacementCurrentCookie) throw new Error("replacement did not receive its current snapshot");
+            expect(replacement.lastSnapshotCookie).toBe(replacementCurrentCookie);
 
             await client.mutate(mutationRef, {
                 id: "snapshot-after-refetch-row",
@@ -818,7 +883,7 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
                     observation.state === "live" &&
                     observation.rows.some(row => row.id === "snapshot-before-close-row") &&
                     observation.rows.some(row => row.id === "snapshot-after-refetch-row"),
-                "later delivery after explicit refetch"
+                "later delivery after exact replay"
             );
         } catch (error) {
             failure = { value: error };
