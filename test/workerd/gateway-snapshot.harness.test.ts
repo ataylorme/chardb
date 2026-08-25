@@ -835,4 +835,70 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
         ).toEqual([]);
         expect(cdbAfterCleanup.invalidations).toEqual([]);
     }, 15_000);
+
+    test("a reconstructed legacy over-limit registration stays invalidatable and retires through Gateway", async () => {
+        if (!mf) throw new Error("miniflare not initialized");
+        const clientId = "snapshot-legacy-01";
+        const subId = 41;
+        const body = "snapshot-legacy-overlimit";
+        const opened = await openSocket(clientId);
+        expect(opened.welcome).toMatchObject({ t: "welcome" });
+
+        const initial = await subscribe(opened, clientId, subId, body);
+        expect(initial.rows).toEqual([]);
+        acknowledge(opened.socket, initial);
+        const installed = await activeRegistration(clientId, subId);
+        const corrupted = await fixtureFetch<{
+            readonly registrationId: string;
+            readonly depth: number;
+            readonly tableMappings: number;
+        }>("/snapshot-cdb-legacy-overlimit", {
+            shardId,
+            clientId,
+            subId: String(subId),
+        });
+        expect(corrupted).toEqual({
+            registrationId: installed.registrationId,
+            depth: 100,
+            tableMappings: 1,
+        });
+
+        const cdbBeforeReconstruction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+        await mf.unsafeEvictDurableObject(WORKER_NAME, "Cdb", { name: shardId });
+        const cdbAfterReconstruction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
+        expect(cdbAfterReconstruction.instanceId).not.toBe(cdbBeforeReconstruction.instanceId);
+        expect(
+            cdbAfterReconstruction.subscriptions.find(row => row.registrationId === installed.registrationId)
+        ).toMatchObject({ clientId, subId, state: "active" });
+
+        await mutate(opened, "snapshot-legacy-dirty", "snapshot-legacy-dirty-row", body);
+        const dirty = await activeRegistration(clientId, subId);
+        expect(dirty.dirtyVersion).toBeGreaterThan(dirty.deliveredVersion);
+        expect((await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId })).invalidations).toEqual([]);
+
+        const terminalMessage = nextDown(opened.socket);
+        await drainGateway(clientId);
+        await expect(terminalMessage).resolves.toMatchObject({
+            t: "error",
+            code: "CDB_INVALID_ARGS",
+            retryable: false,
+            subId,
+        });
+        const retiring = await gatewayState(clientId);
+        expect(retiring.registrations.find(row => row.registrationId === installed.registrationId)).toMatchObject({
+            lifecycle: "retiring",
+            currentHead: false,
+        });
+
+        await drainGateway(clientId);
+        expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
+        expect(
+            (await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId })).subscriptions.find(
+                row => row.registrationId === installed.registrationId
+            )
+        ).toMatchObject({ state: "retired" });
+
+        opened.socket.close();
+        await opened.closed;
+    }, 15_000);
 });

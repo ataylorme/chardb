@@ -9,6 +9,7 @@ import {
 } from "../../src/server/do/gateway.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, type RawJson, SubId, TenantId } from "../../src/types.ts";
+import { stableHashHex } from "../../src/util/canonical.ts";
 import baseWorker, { Catalog, Cdb as LiveCdb, Gateway as LiveGateway } from "./gateway-live.entry.ts";
 
 const REGISTRATION: GatewayRegistrationInstall = {
@@ -296,6 +297,78 @@ export class Cdb extends LiveCdb {
     async fixtureDrain(): Promise<void> {
         await super.alarm();
     }
+
+    fixtureMakeLegacyOverlimit(
+        clientId: string,
+        subId: number
+    ): {
+        readonly registrationId: string;
+        readonly depth: number;
+        readonly tableMappings: number;
+    } {
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const row = sql.one<{
+                gateway_id: string;
+                registration_id: string;
+                connection_id: string;
+                client_id: string;
+                sub_id: number;
+                principal_id: string;
+                organization_id: string;
+                ref: string;
+                policy_digest: string;
+                query_hash: string;
+                tables_json: string;
+                intervals_json: string;
+            }>(
+                `SELECT gateway_id, registration_id, connection_id, client_id, sub_id,
+                        principal_id, organization_id, ref, policy_digest, query_hash,
+                        tables_json, intervals_json
+                 FROM _chardb_live_subscriptions
+                 WHERE client_id = ? AND sub_id = ? AND state = 'active'`,
+                clientId,
+                subId
+            );
+            if (!row) throw new Error(`missing active Cdb registration ${clientId}:${subId}`);
+            let args: RawJson = null;
+            const depth = 100;
+            for (let index = 0; index < depth; index++) args = { value: args };
+            const tables = JSON.parse(row.tables_json) as readonly string[];
+            const intervals = JSON.parse(row.intervals_json) as RawJson;
+            const payloadHash = stableHashHex({
+                connectionId: row.connection_id,
+                clientId: row.client_id,
+                subId: row.sub_id,
+                principalId: row.principal_id,
+                organizationId: row.organization_id,
+                ref: row.ref,
+                args,
+                policyDigest: row.policy_digest,
+                queryHash: row.query_hash,
+                tables,
+                intervals,
+            });
+            sql.exec(
+                `UPDATE _chardb_live_subscriptions
+                 SET args_json = ?, payload_hash = ?
+                 WHERE gateway_id = ? AND registration_id = ? AND state = 'active'`,
+                JSON.stringify(args),
+                payloadHash,
+                row.gateway_id,
+                row.registration_id
+            );
+            if (sql.changes() !== 1) throw new Error("failed to install legacy over-limit arguments");
+            const tableMappings =
+                sql.one<{ count: number }>(
+                    `SELECT COUNT(*) AS count FROM _chardb_live_subscription_tables
+                     WHERE gateway_id = ? AND registration_id = ?`,
+                    row.gateway_id,
+                    row.registration_id
+                )?.count ?? 0;
+            return { registrationId: row.registration_id, depth, tableMappings };
+        });
+    }
 }
 
 function registrationIdentity() {
@@ -328,6 +401,10 @@ interface GatewayFixtureRpc {
 
 interface CdbFixtureRpc {
     fixtureDrain(): Promise<void>;
+    fixtureMakeLegacyOverlimit(
+        clientId: string,
+        subId: number
+    ): Promise<{ readonly registrationId: string; readonly depth: number; readonly tableMappings: number }>;
 }
 
 export default {
@@ -340,6 +417,16 @@ export default {
             const cdb = env.CDB_SHARD.get(env.CDB_SHARD.idFromName(shardId)) as unknown as CdbFixtureRpc;
             await cdb.fixtureDrain();
             return Response.json({ ok: true });
+        }
+        if (url.pathname === "/snapshot-cdb-legacy-overlimit") {
+            const shardId = url.searchParams.get("shardId");
+            const clientId = url.searchParams.get("clientId");
+            const subId = Number(url.searchParams.get("subId"));
+            if (!shardId || !clientId || !Number.isSafeInteger(subId) || subId < 0) {
+                return new Response("invalid legacy registration identity", { status: 400 });
+            }
+            const cdb = env.CDB_SHARD.get(env.CDB_SHARD.idFromName(shardId)) as unknown as CdbFixtureRpc;
+            return Response.json(await cdb.fixtureMakeLegacyOverlimit(clientId, subId));
         }
         if (url.pathname === "/snapshot-gateway-drain-at") {
             const clientId = url.searchParams.get("clientId");
