@@ -1220,8 +1220,9 @@ describe("public durable live queries in real workerd", () => {
                 readonly clientId: string;
                 readonly organizationId: string;
                 readonly subject: string;
-                readonly client: ChardbClient;
-                readonly observer: QueryObserver;
+                readonly slot: number;
+                client: ChardbClient;
+                observer: QueryObserver;
                 readonly subscriptions: Array<{ unsubscribe: () => void }>;
             }> = [];
             const startedAt = performance.now();
@@ -1240,6 +1241,7 @@ describe("public durable live queries in real workerd", () => {
                             clientId,
                             organizationId: tenant.organizationId,
                             subject: tenant.subject,
+                            slot: index,
                             client,
                             observer,
                             subscriptions: [subscription],
@@ -1259,39 +1261,90 @@ describe("public durable live queries in real workerd", () => {
                 const initialMs = performance.now() - startedAt;
 
                 const expectedIds = new Map<string, string[]>();
-                const mutationStartedAt = performance.now();
+                const jobsByTenant = tenants.map(tenant => {
+                    const jobs = Array.from({ length: SCALE_MUTATIONS_PER_TENANT }, (_, index) => ({
+                        index,
+                        id: `sdk-fanout-${tenant.label}-${index.toString().padStart(5, "0")}`,
+                    }));
+                    expectedIds.set(
+                        tenant.organizationId,
+                        jobs.map(job => job.id)
+                    );
+                    return { tenant, jobs };
+                });
+                const runMutationSlice = async (start: number, end: number): Promise<number> => {
+                    const phaseStartedAt = performance.now();
+                    await Promise.all(
+                        jobsByTenant.map(async ({ tenant, jobs }) => {
+                            const mutator = clients.find(entry => entry.organizationId === tenant.organizationId);
+                            if (!mutator) throw new Error(`missing mutator for ${tenant.organizationId}`);
+                            await inBatches(jobs.slice(start, end), SCALE_MUTATION_BATCH, async job => {
+                                const result = await mutator.client.mutate<{
+                                    readonly id: string;
+                                    readonly userId: string;
+                                    readonly tenantId: string | null;
+                                }>(writeRef, {
+                                    id: job.id,
+                                    organizationId: tenant.organizationId,
+                                    body,
+                                    createdAt: 10_000 + job.index,
+                                });
+                                expect(result).toMatchObject({
+                                    id: job.id,
+                                    userId: tenant.subject,
+                                    tenantId: tenant.organizationId,
+                                });
+                            });
+                        })
+                    );
+                    return performance.now() - phaseStartedAt;
+                };
+
+                const firstMutationCount = Math.ceil(SCALE_MUTATIONS_PER_TENANT / 2);
+                let mutationMs = await runMutationSlice(0, firstMutationCount);
+                const midConvergenceStartedAt = performance.now();
+                await Promise.all(clients.map(entry => drainUntilSettled(entry.clientId, [1])));
                 await Promise.all(
-                    tenants.map(async tenant => {
-                        const mutator = clients.find(entry => entry.organizationId === tenant.organizationId);
-                        if (!mutator) throw new Error(`missing mutator for ${tenant.organizationId}`);
-                        const jobs = Array.from({ length: SCALE_MUTATIONS_PER_TENANT }, (_, index) => ({
-                            index,
-                            id: `sdk-fanout-${tenant.label}-${index.toString().padStart(5, "0")}`,
-                        }));
-                        expectedIds.set(
-                            tenant.organizationId,
-                            jobs.map(job => job.id)
+                    clients.map(entry =>
+                        entry.observer.waitFor(
+                            observation =>
+                                observation.state === "live" && observation.rows.length === firstMutationCount,
+                            `${entry.clientId} pre-churn fanout snapshot`
+                        )
+                    )
+                );
+                const midConvergenceMs = performance.now() - midConvergenceStartedAt;
+
+                const churnTargets = clients.filter(entry => entry.slot % 2 === 0);
+                const churnStartedAt = performance.now();
+                await Promise.all(
+                    churnTargets.map(async entry => {
+                        await cleanupSdkClient(entry.clientId, entry.client, entry.subscriptions);
+                        const replacement = await createSdkClient(entry.clientId, entry.subject);
+                        const observer = createQueryObserver();
+                        const subscription = replacement.subscribe<ScaleRow>(
+                            readRef,
+                            { organizationId: entry.organizationId, body },
+                            observer.listener
                         );
-                        await inBatches(jobs, SCALE_MUTATION_BATCH, async job => {
-                            const result = await mutator.client.mutate<{
-                                readonly id: string;
-                                readonly userId: string;
-                                readonly tenantId: string | null;
-                            }>(writeRef, {
-                                id: job.id,
-                                organizationId: tenant.organizationId,
-                                body,
-                                createdAt: 10_000 + job.index,
-                            });
-                            expect(result).toMatchObject({
-                                id: job.id,
-                                userId: tenant.subject,
-                                tenantId: tenant.organizationId,
-                            });
-                        });
+                        entry.client = replacement;
+                        entry.observer = observer;
+                        entry.subscriptions.splice(0, entry.subscriptions.length, subscription);
                     })
                 );
-                const mutationMs = performance.now() - mutationStartedAt;
+                await Promise.all(churnTargets.map(entry => drainUntilSettled(entry.clientId, [1])));
+                await Promise.all(
+                    churnTargets.map(entry =>
+                        entry.observer.waitFor(
+                            observation =>
+                                observation.state === "live" && observation.rows.length === firstMutationCount,
+                            `${entry.clientId} post-churn fanout snapshot`
+                        )
+                    )
+                );
+                const churnMs = performance.now() - churnStartedAt;
+
+                mutationMs += await runMutationSlice(firstMutationCount, SCALE_MUTATIONS_PER_TENANT);
 
                 const convergenceStartedAt = performance.now();
                 const settledStates = await Promise.all(clients.map(entry => drainUntilSettled(entry.clientId, [1])));
@@ -1337,7 +1390,11 @@ describe("public durable live queries in real workerd", () => {
                 expect((await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId })).invalidations).toEqual([]);
 
                 const mutationCount = tenants.length * SCALE_MUTATIONS_PER_TENANT;
-                const logicalRowDeliveries = clients.length * SCALE_MUTATIONS_PER_TENANT;
+                const finalDeliveryRows =
+                    SCALE_MUTATIONS_PER_TENANT > firstMutationCount ? clients.length * SCALE_MUTATIONS_PER_TENANT : 0;
+                const logicalRowDeliveries =
+                    clients.length * firstMutationCount + churnTargets.length * firstMutationCount + finalDeliveryRows;
+                const deliveryMs = midConvergenceMs + churnMs + convergenceMs;
                 console.info(
                     JSON.stringify({
                         type: "chardb-workerd-benchmark",
@@ -1347,9 +1404,14 @@ describe("public durable live queries in real workerd", () => {
                         initialMs: Number(initialMs.toFixed(2)),
                         mutationMs: Number(mutationMs.toFixed(2)),
                         mutationsPerSecond: rate(mutationCount, mutationMs),
+                        midConvergenceMs: Number(midConvergenceMs.toFixed(2)),
+                        churnMs: Number(churnMs.toFixed(2)),
+                        reconnectedClients: churnTargets.length,
+                        reconnectedClientsPerSecond: rate(churnTargets.length, churnMs),
                         convergenceMs: Number(convergenceMs.toFixed(2)),
+                        deliveryMs: Number(deliveryMs.toFixed(2)),
                         logicalRowDeliveries,
-                        logicalRowDeliveriesPerSecond: rate(logicalRowDeliveries, convergenceMs),
+                        logicalRowDeliveriesPerSecond: rate(logicalRowDeliveries, deliveryMs),
                     })
                 );
             } finally {
