@@ -107,6 +107,13 @@ export {
     type MountChardbOptions,
 } from "./entrypoint.ts";
 export { chardb, type ChardbApp, type ChardbFactoryInput } from "./chardb.ts";
+export {
+    defineMigrations,
+    pendingMigrations,
+    type ChardbMigration,
+    type ChardbMigrationInput,
+    type ChardbMigrationJournal,
+} from "./schema-migrations.ts";
 export { Cdb } from "./do/cdb.ts";
 export type {
     CatalogMutationRpc,
