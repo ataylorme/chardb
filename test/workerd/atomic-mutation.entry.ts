@@ -41,7 +41,22 @@ const securedEntries = cdbTable(
     { tenantBy: "organizationId", roles: { member: { create: ["id"], update: ["id"] } } }
 );
 
-const securedSchema = { entries, securedEntries };
+const tenantEntries = cdbTable(
+    "atomic_tenant_entries",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organization.id),
+        value: text("value").notNull(),
+    },
+    {
+        tenantBy: "organizationId",
+        roles: { member: { read: "*", create: ["id", "value"], update: ["value"], delete: "*" } },
+    }
+);
+
+const securedSchema = { entries, securedEntries, tenantEntries };
 
 interface ExecuteArgs {
     readonly mode:
@@ -54,10 +69,16 @@ interface ExecuteArgs {
         | "deletePolicy"
         | "hookCommit"
         | "hookEmpty"
-        | "hookThrow";
+        | "hookThrow"
+        | "tenantCreate"
+        | "tenantRead"
+        | "tenantUpdate"
+        | "tenantDelete";
     readonly mutId: string;
     readonly firstId: string;
     readonly secondId: string;
+    readonly tenantId?: string;
+    readonly value?: string;
 }
 
 type ProbeEnv = Record<string, never>;
@@ -80,6 +101,9 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
             sql.exec(
                 "CREATE TABLE IF NOT EXISTS atomic_secured_entries (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, secret_note TEXT)"
             );
+            sql.exec(
+                "CREATE TABLE IF NOT EXISTS atomic_tenant_entries (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, value TEXT NOT NULL)"
+            );
         });
     }
 
@@ -97,8 +121,19 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
                 principalId: "probe-user",
                 mutId: args.mutId,
                 ref: "src/probe.ts#writePair",
-                args: { firstId: args.firstId, secondId: args.secondId },
-                auth: { userId: "probe-user", tenantId: "probe-org", role: "member", roles: ["member"], claims: {} },
+                args: {
+                    firstId: args.firstId,
+                    secondId: args.secondId,
+                    tenantId: args.tenantId ?? "probe-org",
+                    value: args.value ?? "value",
+                },
+                auth: {
+                    userId: "probe-user",
+                    tenantId: args.tenantId ?? "probe-org",
+                    role: "member",
+                    roles: ["member"],
+                    claims: {},
+                },
                 schemaEpoch: 1,
             },
             cookie: `probe:${args.mutId}`,
@@ -132,8 +167,27 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
                     args.mode === "updatePolicy" ||
                     args.mode === "deletePolicy"
                         ? securedSchema
-                        : schema,
+                        : args.mode.startsWith("tenant")
+                          ? securedSchema
+                          : schema,
                 handler: ({ db }) => {
+                    if (args.mode === "tenantCreate") {
+                        db.insert(tenantEntries)
+                            .values({ id: args.firstId, value: args.value ?? "created" })
+                            .run();
+                        return db.select().from(tenantEntries).all();
+                    }
+                    if (args.mode === "tenantRead") return db.select().from(tenantEntries).all();
+                    if (args.mode === "tenantUpdate") {
+                        db.update(tenantEntries)
+                            .set({ value: args.value ?? "updated" })
+                            .run();
+                        return db.select().from(tenantEntries).all();
+                    }
+                    if (args.mode === "tenantDelete") {
+                        db.delete(tenantEntries).run();
+                        return db.select().from(tenantEntries).all();
+                    }
                     if (args.mode === "hookEmpty") return { ids: [] };
                     db.insert(entries).values({ id: args.firstId, sequence: 1 }).run();
                     if (args.mode === "forbidden") {
@@ -179,6 +233,7 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
 
     inspect(): {
         readonly entries: readonly { id: string; sequence: number }[];
+        readonly tenantEntries: readonly { id: string; organization_id: string; value: string }[];
         readonly hookEvents: readonly { id: string; touched_tables: string }[];
         readonly opLogRows: number;
     } {
@@ -189,8 +244,11 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
         const hookEvents = sql.all<{ id: string; touched_tables: string }>(
             "SELECT id, touched_tables FROM atomic_write_hook_events ORDER BY id"
         );
+        const tenantRows = sql.all<{ id: string; organization_id: string; value: string }>(
+            "SELECT id, organization_id, value FROM atomic_tenant_entries ORDER BY organization_id, id"
+        );
         const count = sql.one<{ count: number }>("SELECT COUNT(*) AS count FROM _chardb_op_log");
-        return { entries: rows, hookEvents, opLogRows: count?.count ?? 0 };
+        return { entries: rows, tenantEntries: tenantRows, hookEvents, opLogRows: count?.count ?? 0 };
     }
 }
 

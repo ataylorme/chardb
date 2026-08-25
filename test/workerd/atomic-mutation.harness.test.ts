@@ -61,10 +61,16 @@ async function execute(body: {
         | "deletePolicy"
         | "hookCommit"
         | "hookEmpty"
-        | "hookThrow";
+        | "hookThrow"
+        | "tenantCreate"
+        | "tenantRead"
+        | "tenantUpdate"
+        | "tenantDelete";
     readonly mutId: string;
     readonly firstId: string;
     readonly secondId: string;
+    readonly tenantId?: string;
+    readonly value?: string;
 }) {
     if (!mf) throw new Error("miniflare not initialized");
     return mf.dispatchFetch("http://example.com/execute", {
@@ -76,6 +82,7 @@ async function execute(body: {
 
 async function inspect(): Promise<{
     readonly entries: readonly { id: string; sequence: number }[];
+    readonly tenantEntries: readonly { id: string; organization_id: string; value: string }[];
     readonly hookEvents: readonly { id: string; touched_tables: string }[];
     readonly opLogRows: number;
 }> {
@@ -83,6 +90,7 @@ async function inspect(): Promise<{
     const response = await mf.dispatchFetch("http://example.com/inspect");
     return (await response.json()) as {
         readonly entries: readonly { id: string; sequence: number }[];
+        readonly tenantEntries: readonly { id: string; organization_id: string; value: string }[];
         readonly hookEvents: readonly { id: string; touched_tables: string }[];
         readonly opLogRows: number;
     };
@@ -123,6 +131,7 @@ describe("atomic domain mutation on real Durable Object SqlStorage", () => {
                 { id: "committed-1", sequence: 1 },
                 { id: "committed-2", sequence: 2 },
             ],
+            tenantEntries: [],
             hookEvents: [],
             opLogRows: 1,
         });
@@ -280,5 +289,45 @@ describe("atomic domain mutation on real Durable Object SqlStorage", () => {
             message: "atomic_secured_entries: caller has no applicable delete grant",
         });
         expect(await inspect()).toEqual(before);
+    });
+
+    test("tenant policy scopes every CRUD verb on real Durable Object SQL", async () => {
+        const run = async (
+            mode: "tenantCreate" | "tenantRead" | "tenantUpdate" | "tenantDelete",
+            tenantId: string,
+            mutId: string,
+            firstId = "unused",
+            value = "value"
+        ): Promise<unknown> => {
+            const response = await execute({ mode, tenantId, mutId, firstId, secondId: "unused", value });
+            expect(response.status).toBe(200);
+            return await response.json();
+        };
+
+        await run("tenantCreate", "tenant-b", "tenant-b-create", "tenant-b-row", "b-original");
+        await run("tenantCreate", "tenant-a", "tenant-a-create", "tenant-a-row", "a-original");
+        expect((await inspect()).tenantEntries).toEqual([
+            { id: "tenant-a-row", organization_id: "tenant-a", value: "a-original" },
+            { id: "tenant-b-row", organization_id: "tenant-b", value: "b-original" },
+        ]);
+
+        expect(await run("tenantRead", "tenant-a", "tenant-a-read")).toMatchObject({
+            result: [{ id: "tenant-a-row", organizationId: "tenant-a", value: "a-original" }],
+        });
+        expect(await run("tenantUpdate", "tenant-a", "tenant-a-update", "unused", "a-updated")).toMatchObject({
+            result: [{ id: "tenant-a-row", organizationId: "tenant-a", value: "a-updated" }],
+        });
+        expect((await inspect()).tenantEntries).toEqual([
+            { id: "tenant-a-row", organization_id: "tenant-a", value: "a-updated" },
+            { id: "tenant-b-row", organization_id: "tenant-b", value: "b-original" },
+        ]);
+
+        expect(await run("tenantDelete", "tenant-a", "tenant-a-delete")).toMatchObject({ result: [] });
+        expect((await inspect()).tenantEntries).toEqual([
+            { id: "tenant-b-row", organization_id: "tenant-b", value: "b-original" },
+        ]);
+        expect(await run("tenantRead", "tenant-b", "tenant-b-read")).toMatchObject({
+            result: [{ id: "tenant-b-row", organizationId: "tenant-b", value: "b-original" }],
+        });
     });
 });
