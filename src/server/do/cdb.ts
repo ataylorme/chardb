@@ -1895,12 +1895,13 @@ export class Cdb extends DurableObject<CdbEnv> {
             const request = { ...input, args: snapshotCdbQueryArgs(input.args) };
             this.assertActiveSchemaEpoch(request.domainSchemaEpoch);
             const descriptor = resolveQuery(this.mutationManifest(), request.ref);
-            if (request.placement) {
-                const routed = routeValidatedQuery(
-                    this.mutationManifest(),
-                    { ref: request.ref, args: request.args },
-                    tables => cdbPolicyDigest(this.mutationSchema(), tables)
-                );
+            const routed =
+                request.placement || descriptor.compilePlan
+                    ? routeValidatedQuery(this.mutationManifest(), { ref: request.ref, args: request.args }, tables =>
+                          cdbPolicyDigest(this.mutationSchema(), tables)
+                      )
+                    : undefined;
+            if (request.placement && routed) {
                 if (
                     routed.authority !== request.placement.authority ||
                     routed.partitionKey !== request.placement.partitionKey
@@ -1908,7 +1909,8 @@ export class Cdb extends DurableObject<CdbEnv> {
                     throw subscriptionInvariant("query placement does not match its server manifest route");
                 }
             }
-            const declaredIntent = descriptor.extractIntent ? descriptor.extractIntent(request.args) : undefined;
+            const declaredIntent =
+                routed?.intent ?? (descriptor.extractIntent ? descriptor.extractIntent(request.args) : undefined);
             const readTables = new Set<string>();
             const readRanges = new Map<object, QueryReadRangeObservation>();
             const database = wrapQueryDb(

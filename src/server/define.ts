@@ -18,6 +18,7 @@ import type { CdbIntent } from "../wire.ts";
 import { wrapDb } from "./cdb-db-proxy.ts";
 import { type PolicyDefinition, chardbPolicy } from "./policy.ts";
 import { attachRef } from "./refs.ts";
+import { type RegisteredQueryPlan, compileRegisteredQueryPlan } from "./registered-query-plan.ts";
 
 /**
  * Type-level inference helper. `InferArgs<S>` resolves to the output
@@ -146,6 +147,8 @@ export type QueryFn<TDb, TArgs, TResult> = ((ctx: QueryCtx<TDb>, args: TArgs) =>
      * from its local manifest; clients send only the query ref and raw args.
      */
     readonly __chardbIntent?: (args: TArgs) => CdbIntent;
+    /** Runtime-compiled plan for the single-source Drizzle query form. */
+    readonly __chardbCompilePlan?: (args: TArgs) => RegisteredQueryPlan;
 };
 
 export type CronFn = (() => void) & {
@@ -426,6 +429,24 @@ export type QueryConfig<TDb, TArgs extends Record<string, unknown>, TResult> =
       })
     | (QueryConfigBase<TDb, TArgs, TResult> & { readonly authority?: undefined });
 
+export interface PlannedQueryConfig<TDb, TArgs extends Record<string, unknown>, TBuilder extends PlannedQueryBuilder> {
+    /** Stable across Wrangler, Vite, browser, Gateway, and Cdb builds. */
+    readonly ref: string;
+    readonly args?: StandardSchemaV1<unknown, TArgs>;
+    /** Pure synchronous builder. Chardb compiles it before Catalog and executes it inside Cdb. */
+    readonly query: (db: TDb, args: TArgs) => TBuilder;
+    readonly handler?: never;
+    readonly authority?: never;
+    readonly partitionKey?: never;
+    readonly intent?: never;
+}
+
+export interface PlannedQueryBuilder {
+    readonly _: { readonly result: unknown };
+}
+
+type PlannedQueryResult<TBuilder extends PlannedQueryBuilder> = TBuilder["_"]["result"];
+
 /**
  * Read handler. Body executes against a read-only `Cdb` shard view; live-query
  * fan-in shares the same shape. Accepts either a config object with an
@@ -435,14 +456,22 @@ export type QueryConfig<TDb, TArgs extends Record<string, unknown>, TResult> =
 export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>(
     config: QueryConfig<TDb, TArgs, TResult>
 ): QueryFn<TDb, TArgs, TResult>;
+export function defineQuery<TDb, TArgs extends Record<string, unknown>, TBuilder extends PlannedQueryBuilder>(
+    config: PlannedQueryConfig<TDb, TArgs, TBuilder>
+): QueryFn<TDb, TArgs, PlannedQueryResult<TBuilder>>;
 export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>(
     handler: (ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>
 ): QueryFn<TDb, TArgs, TResult>;
 export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>(
-    configOrHandler: QueryConfig<TDb, TArgs, TResult> | ((ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>)
+    configOrHandler:
+        | QueryConfig<TDb, TArgs, TResult>
+        | PlannedQueryConfig<TDb, TArgs, PlannedQueryBuilder>
+        | ((ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>)
 ): QueryFn<TDb, TArgs, TResult> {
     const isConfig = typeof configOrHandler === "object";
-    const handler = isConfig ? configOrHandler.handler : configOrHandler;
+    const isPlanned = isConfig && "query" in configOrHandler;
+    const handler = isPlanned ? undefined : isConfig ? configOrHandler.handler : configOrHandler;
+    const plannedQuery = isPlanned ? configOrHandler.query : undefined;
     const validator: StandardSchemaV1<unknown, TArgs> | undefined = isConfig ? configOrHandler.args : undefined;
     const intent = isConfig ? configOrHandler.intent : undefined;
     const authority = isConfig ? configOrHandler.authority : undefined;
@@ -457,6 +486,15 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
               }
             : partitionKey;
     const explicitRef = isConfig ? configOrHandler.ref : undefined;
+    if (isPlanned) {
+        if (typeof plannedQuery !== "function") {
+            throw new TypeError("chardb: planned query requires a query callback");
+        }
+        const mixed = ["handler", "authority", "partitionKey", "intent"].filter(field => field in configOrHandler);
+        if (mixed.length > 0) {
+            throw new TypeError(`chardb: planned query cannot mix query with ${mixed.join(", ")}`);
+        }
+    }
     if (explicitRef !== undefined && (explicitRef.length === 0 || !explicitRef.includes("#"))) {
         throw new TypeError("chardb: query ref must be a nonempty string containing #");
     }
@@ -469,15 +507,26 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
     if (authority === "global" && intent === undefined) {
         throw new TypeError("chardb: global queries require an explicit intent extractor");
     }
+    if (isPlanned && explicitRef === undefined) {
+        throw new TypeError("chardb: planned queries require an explicit ref");
+    }
     const invokeValidated = async (ctx: QueryCtx<TDb>, args: TArgs): Promise<TResult> => {
         const wrappedCtx = wrapCtxDb(ctx) as QueryCtx<TDb>;
-        return handler(wrappedCtx, args);
+        if (plannedQuery) {
+            const builder = plannedQuery(wrappedCtx.db, args);
+            const all = (builder as unknown as { all(): unknown }).all;
+            if (typeof all !== "function") {
+                throw new TypeError("chardb: planned query callback did not return an executable select builder");
+            }
+            return (await all.call(builder)) as TResult;
+        }
+        return (handler as (ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>)(wrappedCtx, args);
     };
     const fn = (async (ctx: QueryCtx<TDb>, args: TArgs) => {
         const validated = validator ? await runValidator(validator, args) : args;
         return invokeValidated(ctx, validated);
     }) as QueryFn<TDb, TArgs, TResult>;
-    if (handler.name && handler.name !== "fn") {
+    if (handler?.name && handler.name !== "fn") {
         Object.defineProperty(fn, "name", { value: handler.name, configurable: true });
     }
     if (explicitRef) {
@@ -486,6 +535,14 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
     if (intent) {
         Object.defineProperty(fn, "__chardbIntent", {
             value: intent,
+            enumerable: false,
+            configurable: false,
+        });
+    }
+    if (plannedQuery) {
+        Object.defineProperty(fn, "__chardbCompilePlan", {
+            value: (args: TArgs) =>
+                compileRegisteredQueryPlan(plannedQuery as unknown as (db: unknown, args: TArgs) => unknown, args),
             enumerable: false,
             configurable: false,
         });
@@ -675,6 +732,9 @@ export interface ChardbApi<TSchema extends Record<string, unknown>> {
     query<TArgs extends Record<string, unknown>, TResult>(
         config: QueryConfig<ChardbDb<TSchema>, TArgs, TResult>
     ): QueryFn<ChardbDb<TSchema>, TArgs, TResult>;
+    query<TArgs extends Record<string, unknown>, TBuilder extends PlannedQueryBuilder>(
+        config: PlannedQueryConfig<ChardbDb<TSchema>, TArgs, TBuilder>
+    ): QueryFn<ChardbDb<TSchema>, TArgs, PlannedQueryResult<TBuilder>>;
     query<TArgs extends Record<string, unknown>, TResult>(
         handler: (ctx: QueryCtx<ChardbDb<TSchema>>, args: TArgs) => Promise<TResult>
     ): QueryFn<ChardbDb<TSchema>, TArgs, TResult>;

@@ -68,6 +68,77 @@ describe("@chardb/vite-plugin", () => {
         for (const ref of refs) expect(registry).toContain(`"ref": "${ref}"`);
     });
 
+    test("requires a stable ref for planned queries without evaluating their query callbacks", () => {
+        const p = makePlugin();
+        const code = `
+      import { api } from "chardb/server";
+      export const listPosts = api.query({
+        args: {},
+        query: (db, args) => db.select({ id: posts.id }).from(posts).where(eq(posts.id, args.id)),
+      });
+    `;
+        expect(() => transform(p, code, "/abs/proj/src/routes/planned.ts")).toThrow(
+            "Planned query listPosts requires a literal ref"
+        );
+    });
+
+    test("preserves explicit refs for additive planned queries", () => {
+        const p = makePlugin();
+        const out = transform(
+            p,
+            `
+      import { defineQuery } from "chardb/server";
+      export const listPosts = defineQuery({
+        ref: "api/posts#planned-list",
+        args: {},
+        query(db, args) { return db.select().from(posts).where(eq(posts.id, args.id)); },
+      });
+    `,
+            "/abs/proj/src/routes/planned.ts"
+        );
+        expect(out.code).toContain('value: "api/posts#planned-list"');
+        expect(out.code).not.toContain("src/routes/planned.ts#listPosts");
+    });
+
+    test("rejects planned query configs that mix legacy query metadata", () => {
+        for (const legacy of ["handler", "authority", "partitionKey", "intent"]) {
+            const p = makePlugin();
+            expect(() =>
+                p.transform(
+                    `
+            import { api } from "chardb/server";
+            export const listPosts = api.query({
+              ref: "api/posts#planned-list",
+              args: {},
+              query: (db) => db.select().from(posts),
+              ${legacy}: ${legacy === "authority" ? '"organization"' : "() => null"},
+            });
+          `,
+                    "/abs/proj/src/routes/planned.ts"
+                )
+            ).toThrow(`Planned query listPosts cannot mix query with ${legacy}`);
+        }
+    });
+
+    test("does not treat objects inside a planned callback as legacy metadata", () => {
+        const p = makePlugin();
+        const out = transform(
+            p,
+            `
+      import { api } from "chardb/server";
+      export const listPosts = api.query({
+        ref: "api/posts#planned-list",
+        query: (db) => {
+          const diagnostic = { handler: "local", authority: "local", ...extra };
+          return db.select({ id: posts.id }).from(posts);
+        },
+      });
+    `,
+            "/abs/proj/src/routes/planned.ts"
+        );
+        expect(out.code).toContain('value: "api/posts#planned-list"');
+    });
+
     test("preserves explicit config refs for two mutations and a query", () => {
         const p = makePlugin();
         const code = `

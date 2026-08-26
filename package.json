@@ -39,6 +39,7 @@
         "test:correctness": "bun scripts/test-correctness.mjs",
         "test:watch": "bun scripts/test-correctness.mjs --watch",
         "test:scale": "bun test test/workerd/gateway-live.harness.test.ts --test-name-pattern 'scaled SDK'",
+        "bench:planned-query": "bun test test/workerd/planned-query.harness.test.ts --test-name-pattern 'scales exact ordered'",
         "bench:live": "bun scripts/run-scale-benchmark.mjs",
         "security:history": "bun scripts/scan-git-history.mjs",
         "typecheck": "tsc --noEmit",

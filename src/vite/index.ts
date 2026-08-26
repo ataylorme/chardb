@@ -340,14 +340,33 @@ function collectExports(code: string, id: string): FoundExport[] {
         if (config.properties.some(property => ts.isSpreadAssignment(property))) {
             throw new Error(`[chardb/vite] ${exportName} config cannot spread ref metadata`);
         }
-        const namedProperty = (name: string) =>
-            config.properties.find(
-                candidate =>
-                    ((ts.isPropertyAssignment(candidate) || ts.isShorthandPropertyAssignment(candidate)) &&
-                        ((ts.isIdentifier(candidate.name) && candidate.name.text === name) ||
-                            (ts.isStringLiteral(candidate.name) && candidate.name.text === name))) ||
-                    (ts.isPropertyAssignment(candidate) && ts.isComputedPropertyName(candidate.name))
+        const exactNamedProperty = (name: string) =>
+            config.properties.find(candidate => {
+                if (!("name" in candidate) || !candidate.name) return false;
+                return (
+                    (ts.isIdentifier(candidate.name) || ts.isStringLiteral(candidate.name)) &&
+                    candidate.name.text === name
+                );
+            });
+        const computedProperty = config.properties.find(
+            candidate => "name" in candidate && candidate.name && ts.isComputedPropertyName(candidate.name)
+        );
+        // Preserve the legacy fail-closed handling of computed metadata. A
+        // computed key could otherwise hide ref or placement fields from the
+        // build transform.
+        const namedProperty = (name: string) => exactNamedProperty(name) ?? computedProperty;
+        const plannedQuery = kind === "defineQuery" && exactNamedProperty("query") !== undefined;
+        if (plannedQuery) {
+            if (computedProperty) {
+                throw new Error(`[chardb/vite] Planned query ${exportName} config cannot use computed properties`);
+            }
+            const mixed = ["handler", "authority", "partitionKey", "intent"].filter(
+                name => exactNamedProperty(name) !== undefined
             );
+            if (mixed.length > 0) {
+                throw new Error(`[chardb/vite] Planned query ${exportName} cannot mix query with ${mixed.join(", ")}`);
+            }
+        }
         const refProperty = namedProperty("ref");
         const authorityProperty = namedProperty("authority");
         let declaredAuthority: string | undefined;
@@ -369,6 +388,9 @@ function collectExports(code: string, id: string): FoundExport[] {
             ? `${stableAuthority[0]?.toUpperCase()}${stableAuthority.slice(1)}`
             : undefined;
         if (!refProperty) {
+            if (plannedQuery) {
+                throw new Error(`[chardb/vite] Planned query ${exportName} requires a literal ref`);
+            }
             if (authorityLabel) {
                 throw new Error(
                     `[chardb/vite] ${authorityLabel} ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires a literal ref`
@@ -522,8 +544,25 @@ function regexExplicitConfigRef(
     }
     const config = kind === "defineMutation" && !firstIsConfig ? args[1] : args[0];
     if (!config?.startsWith("{")) return undefined;
-    if (/\.\.\./.test(config)) {
+    const propertyNames = topLevelObjectPropertyNames(config);
+    const plannedQuery = kind === "defineQuery" && propertyNames.has("query");
+    if ((plannedQuery && propertyNames.has("<spread>")) || (!plannedQuery && /\.\.\./.test(config))) {
         throw new Error(`[chardb/vite] ${exportName} config cannot spread ref metadata`);
+    }
+    if (plannedQuery) {
+        if (propertyNames.has("<computed>")) {
+            throw new Error(`[chardb/vite] Planned query ${exportName} config cannot use computed properties`);
+        }
+        const mixed = ["handler", "authority", "partitionKey", "intent"].filter(name => propertyNames.has(name));
+        if (mixed.length > 0) {
+            throw new Error(`[chardb/vite] Planned query ${exportName} cannot mix query with ${mixed.join(", ")}`);
+        }
+        if (!propertyNames.has("ref")) {
+            throw new Error(`[chardb/vite] Planned query ${exportName} requires a literal ref`);
+        }
+        const literal = /\bref\s*:\s*(["'])([^"'\\]*)\1/.exec(config);
+        if (!literal?.[2]) throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a string literal`);
+        return validExplicitRef(literal[2], exportName);
     }
     const hasAuthority = /\bauthority\s*:/.test(config);
     const literalAuthority = /\bauthority\s*:\s*(["'])([^"'\\]*)\1/.exec(config);
@@ -558,6 +597,130 @@ function regexExplicitConfigRef(
         throw new Error(`[chardb/vite] Global query ${exportName} requires an explicit intent extractor`);
     }
     return explicitRef;
+}
+
+/**
+ * Read only the keys in an inline config object's outermost level. The
+ * fallback scanner must not mistake object literals inside a query callback
+ * for Chardb metadata.
+ */
+function topLevelObjectPropertyNames(source: string): Set<string> {
+    const names = new Set<string>();
+    let braces = 0;
+    let parens = 0;
+    let brackets = 0;
+    let quote: '"' | "'" | "`" | null = null;
+    let escaped = false;
+    let lineComment = false;
+    let blockComment = false;
+    let expectProperty = false;
+
+    for (let cursor = 0; cursor < source.length; cursor++) {
+        const character = source[cursor] as string;
+        const next = source[cursor + 1] ?? "";
+        if (lineComment) {
+            if (character === "\n") lineComment = false;
+            continue;
+        }
+        if (blockComment) {
+            if (character === "*" && next === "/") {
+                blockComment = false;
+                cursor++;
+            }
+            continue;
+        }
+        if (quote) {
+            if (escaped) escaped = false;
+            else if (character === "\\") escaped = true;
+            else if (character === quote) quote = null;
+            continue;
+        }
+        if (character === "/" && next === "/") {
+            lineComment = true;
+            cursor++;
+            continue;
+        }
+        if (character === "/" && next === "*") {
+            blockComment = true;
+            cursor++;
+            continue;
+        }
+        if (
+            (character === '"' || character === "'") &&
+            braces === 1 &&
+            parens === 0 &&
+            brackets === 0 &&
+            expectProperty
+        ) {
+            let end = cursor + 1;
+            let propertyEscaped = false;
+            for (; end < source.length; end++) {
+                const candidate = source[end] as string;
+                if (propertyEscaped) propertyEscaped = false;
+                else if (candidate === "\\") propertyEscaped = true;
+                else if (candidate === character) break;
+            }
+            names.add(source.slice(cursor + 1, end));
+            expectProperty = false;
+            cursor = end;
+            continue;
+        }
+        if (character === '"' || character === "'" || character === "`") {
+            quote = character;
+            continue;
+        }
+        if (character === "{") {
+            braces++;
+            if (braces === 1 && parens === 0 && brackets === 0) expectProperty = true;
+            continue;
+        }
+        if (character === "}") {
+            braces--;
+            continue;
+        }
+        if (character === "(") {
+            parens++;
+            continue;
+        }
+        if (character === ")") {
+            parens--;
+            continue;
+        }
+        if (character === "[") {
+            if (braces === 1 && parens === 0 && brackets === 0 && expectProperty) {
+                names.add("<computed>");
+                expectProperty = false;
+            }
+            brackets++;
+            continue;
+        }
+        if (character === "]") {
+            brackets--;
+            continue;
+        }
+        if (braces !== 1 || parens !== 0 || brackets !== 0) continue;
+        if (character === ",") {
+            expectProperty = true;
+            continue;
+        }
+        if (!expectProperty || /\s/.test(character)) continue;
+        if (character === "." && source.slice(cursor, cursor + 3) === "...") {
+            names.add("<spread>");
+            expectProperty = false;
+            cursor += 2;
+            continue;
+        }
+        if (!/[A-Za-z_$]/.test(character)) {
+            expectProperty = false;
+            continue;
+        }
+        let end = cursor + 1;
+        while (/[A-Za-z0-9_$]/.test(source[end] ?? "")) end++;
+        names.add(source.slice(cursor, end));
+        expectProperty = false;
+        cursor = end - 1;
+    }
+    return names;
 }
 
 function cleanModuleId(id: string): string {

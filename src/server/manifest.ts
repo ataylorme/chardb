@@ -41,6 +41,7 @@ import { stableJson } from "../util/canonical.ts";
 import type { CdbIntent } from "../wire.ts";
 import type { MutationAuthority } from "./define.ts";
 import type { ChardbFunctionKind } from "./refs.ts";
+import type { RegisteredQueryPlan } from "./registered-query-plan.ts";
 import {
     CDB_JSON_MAX_AGGREGATE_MEMBERS,
     CDB_QUERY_ARGS_MAX_BYTES,
@@ -71,6 +72,7 @@ interface QueryMarked extends RefMarked {
     readonly __chardbAuthority?: MutationAuthority;
     readonly __chardbPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
     readonly __chardbInvokeValidated?: (ctx: unknown, args: RawJson) => Promise<unknown>;
+    readonly __chardbCompilePlan?: (args: RawJson) => RegisteredQueryPlan;
 }
 
 interface CronMarked extends RefMarked {
@@ -96,6 +98,7 @@ export interface QueryDescriptor {
     readonly extractIntent?: (args: RawJson) => CdbIntent;
     readonly authority?: MutationAuthority;
     readonly extractPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
+    readonly compilePlan?: (args: RawJson) => RegisteredQueryPlan;
 }
 
 export type QueryRouteResponse =
@@ -202,6 +205,7 @@ export function manifestFromExports(exports: Record<string, unknown>): ChardbMan
                     ...(query.__chardbIntent ? { extractIntent: query.__chardbIntent } : {}),
                     ...(query.__chardbAuthority ? { authority: query.__chardbAuthority } : {}),
                     ...(query.__chardbPartitionKey ? { extractPartitionKey: query.__chardbPartitionKey } : {}),
+                    ...(query.__chardbCompilePlan ? { compilePlan: query.__chardbCompilePlan } : {}),
                 });
                 break;
             }
@@ -264,14 +268,22 @@ export function routeValidatedQuery(
 ): Extract<QueryRouteResponse, { readonly ok: true }> {
     const callbackArgs = snapshotCdbQueryArgs(input.args);
     const descriptor = resolveQuery(manifest, input.ref as ChardbRef);
-    if (!descriptor.extractIntent) {
+    if (!descriptor.extractIntent && !descriptor.compilePlan) {
         throw new CdbError({
             code: "CDB_NO_INTENT_FOR_RAW_SQL",
             message: `query ${input.ref} has no server intent extractor`,
         });
     }
-    const intentCandidate = descriptor.extractIntent(callbackArgs);
-    const key = descriptor.extractPartitionKey?.(callbackArgs);
+    const plan = descriptor.compilePlan?.(callbackArgs);
+    const intentCandidate = plan?.intent ?? descriptor.extractIntent?.(callbackArgs);
+    if (!intentCandidate) {
+        throw new CdbError({
+            code: "CDB_NO_INTENT_FOR_RAW_SQL",
+            message: `query ${input.ref} has no server intent extractor`,
+        });
+    }
+    const authority = plan?.authority ?? descriptor.authority;
+    const key = plan?.partitionKey ?? descriptor.extractPartitionKey?.(callbackArgs);
     const args = snapshotCdbQueryArgs(callbackArgs);
     const intent = snapshotCdbJsonByteLimit(
         intentCandidate as unknown as RawJson,
@@ -284,14 +296,20 @@ export function routeValidatedQuery(
         { maxAggregateMembers: CDB_JSON_MAX_AGGREGATE_MEMBERS, maxDepth: CDB_QUERY_ARGS_MAX_DEPTH }
     ) as unknown as CdbIntent;
     const policyDigest = policyDigestForTables(intent.tables);
-    requireAuthorityPartition(descriptor.authority, "query", input.ref, key);
+    requireAuthorityPartition(authority, "query", input.ref, key);
     return {
         ok: true,
         args,
         intent,
         policyDigest,
-        queryHash: stableJson({ ref: input.ref, args, intent, policyDigest }),
-        authority: descriptor.authority ?? null,
+        queryHash: stableJson({
+            ref: input.ref,
+            args,
+            intent,
+            policyDigest,
+            ...(plan ? { planHash: plan.planHash } : {}),
+        }),
+        authority: authority ?? null,
         partitionKey: key === undefined ? null : String(key),
     };
 }
@@ -305,7 +323,7 @@ export async function routeQuery(
     try {
         const rawArgs = snapshotCdbQueryArgs(input.args);
         const descriptor = resolveQuery(manifest, input.ref as ChardbRef);
-        if (!descriptor.extractIntent) {
+        if (!descriptor.extractIntent && !descriptor.compilePlan) {
             throw new CdbError({
                 code: "CDB_NO_INTENT_FOR_RAW_SQL",
                 message: `query ${input.ref} has no server intent extractor`,

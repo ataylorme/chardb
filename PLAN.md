@@ -185,6 +185,12 @@ Protocol v3 subscription requests send a query reference and raw arguments. Quer
 - [x] Connect public authorized registration to `onSub`, installing the exact Gateway generation before `Cdb.subscribe` and pre-arming durable recovery before the RPC.
 - [x] Rebuild 4,096 active Cdb registrations incrementally from the storage cursor. Keep a legacy active row with over-limit arguments in its table and interval maps so invalidation still reaches it, but reject its registered execution with terminal `CDB_INVALID_ARGS` before the handler.
 - [x] Add dedicated configured Gateway snapshot-runner coverage for a reconstructed legacy registration with over-limit arguments. Keep the Cdb row active and table-mapped through reconstruction, invalidate it with a real mutation, return terminal `CDB_INVALID_ARGS`, retire the Gateway head, and complete exact Cdb cleanup.
+- [x] Add the single-source `api.query({ query: (db, args) => ... })` form. Compile its sessionless Drizzle builder before Catalog, derive authority, one exact partition, tables, recognized intervals, full-row projection, deterministic primary-key-suffixed ordering, and a bounded limit, then include the plan hash in query identity.
+- [x] Compile the same planned query again inside Cdb before direct or registered execution. Reject Gateway-to-Cdb plan drift, and execute the callback only through the policy-wrapped read database.
+- [x] Keep legacy `handler`, `authority`, `partitionKey`, and `intent` queries compatible while rejecting mixed legacy and planned metadata. Require a literal stable ref for planned queries in both runtime definitions and Vite discovery.
+- [x] Fail closed on async callbacks, raw or unrecognized predicates, placeholders, projections, joins, CTEs, distinct, grouping, aggregates, set operations, offset pagination, multiple partitions, missing limits, limits over 100, and ordering without the primary-key suffix.
+- [x] Convert the chat application's organization, user, and global reads to the planned form and pass its packed-package typecheck and Vite build.
+- [x] Prove the planned organization query through real Miniflare workerd, configured Gateway, Catalog, and Cdb. Assert exact channel rows and order, cross-organization denial, and same-ref plan-drift rejection. Keep an environment-scalable profile whose default seeds 8 channels and 800 rows, installs 32 registrations, and verifies 25 exact ordered rows per snapshot while recording timing as telemetry, not a service target.
 
 ## 8. Implement live updates with simple invalidation first
 

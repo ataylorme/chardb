@@ -29,7 +29,13 @@ Same-Worker apps expose one typed `env.DB` handle and resolve Chardb's internal 
 - Explicit stable refs, server-owned query intent, current Catalog authority, policy checks, and migration epochs remain behind the handle.
 - The clean-tarball chat proof executes both binding methods across organization, user, and global authority, checks idempotent mutation replay and two-client live invalidation, restarts Miniflare over persisted storage, and runs frozen concurrent binding-query telemetry profiles.
 
-Raw Drizzle builders over RPC remain outside this package. Adding them would require a bounded serializable query representation that preserves the same server-owned intent and authorization guarantees.
+Registered handles now support a single-source Drizzle callback. Gateway and Cdb compile that callback locally, and only the stable ref and JSON arguments cross RPC. Direct Drizzle builders over `env.DB` remain outside this completed package.
+
+## Native binding select syntax
+
+The next developer-experience package can restore the landing-page form `client(env.DB, auth).select().from(table)...` without sending SQL strings. An isolated internal compiler now produces a strict version-1 JSON plan for full-row selects. It recognizes typed comparisons, ranges, `inArray`, `between`, null checks, boolean composition, ordering, limit, `all()`, `get()`, and awaitable execution. It rejects SQL outside that grammar, projections, joins, callbacks, placeholders, foreign-table columns, non-JSON values, and unknown plan keys. The compiler locks plan size at 64 KiB, predicates at 128 nodes and 16 levels, boolean children at 16, `IN` values at 100, ordering at four columns, and limit at 256.
+
+That compiler is not wired to the public client or `DB` entrypoint yet. The package still needs explicit organization scoping or an exact tenant predicate, server-side table and column revalidation, Catalog authority, Cdb policy execution, result bounds, Wrangler and JSONC consumer fixtures, and a clean-tarball Workerd proof. The client build also needs a server-query erasure transform so importing a handle does not retain the server schema and Drizzle compiler in the browser chunk.
 
 ## Query shapes
 

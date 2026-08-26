@@ -30,6 +30,8 @@ export {
     type MutationCtx,
     type MutationFn,
     type MutationOptions,
+    type PlannedQueryBuilder,
+    type PlannedQueryConfig,
     type PresenceKey,
     type QueryConfig,
     type QueryCtx,

@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { eq } from "drizzle-orm";
+import { text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { isCdbError } from "../../src/errors.ts";
+import { globalScope } from "../../src/server/cdb-tenant.ts";
 import {
     type MutationCtx,
+    createApi,
     defineCron,
     defineGsi,
     defineMutation,
@@ -42,6 +46,31 @@ describe("defineXxx — function-ref identity", () => {
         expect((l as { __chardbKind: string }).__chardbKind).toBe("ledger");
         expect(c.__chardbKind).toBe("cron");
         expect(c.__chardbCron).toBe("0 3 * * *");
+    });
+
+    test("planned query carries a runtime compiler and requires a stable ref", () => {
+        const { cdbTable } = globalScope();
+        const rows = cdbTable(
+            "define_planned_rows",
+            { id: text("id").primaryKey(), scope: text("scope").notNull() },
+            { partitionBy: "scope", roles: { user: { read: "*" } } }
+        );
+        const planned = createApi({ rows }).query({
+            ref: "api/define#planned",
+            query: (db, args: { scope: string }) =>
+                db.select().from(rows).where(eq(rows.scope, args.scope)).orderBy(rows.id).limit(10),
+        });
+        expect(planned.__chardbCompilePlan?.({ scope: "shared" }).partitionKey).toBe("shared");
+        expect(() => defineQuery({ query: (() => null) as never } as never)).toThrow(
+            "planned queries require an explicit ref"
+        );
+        expect(() =>
+            defineQuery({
+                ref: "api/define#mixed",
+                query: (() => null) as never,
+                intent: (() => null) as never,
+            } as never)
+        ).toThrow("cannot mix query with intent");
     });
 
     test("defineGsi's strict flag defaults false (CDB_GSI_STRICT_REQUIRES_2PC until v1.1)", () => {

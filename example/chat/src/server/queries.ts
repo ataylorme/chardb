@@ -1,99 +1,51 @@
-// Client-safe query handles + intent extractors.
-//
-// This module is intentionally free of `chardb({...})` factory imports
-// (no `worker.ts`, no `chatRoles`) so the React bundle that calls
-// `useQuery(listMessages, args)` doesn't drag the server-side schema /
-// auth / Drizzle runtime into the browser. Every export is a chardb
-// query handle the Vite plugin discovers at build time.
+// Single-source server query plans and client-addressable handles.
+// The current Vite build discovers these explicit refs, but still shares this
+// module graph with the browser. Server-query erasure is the next bundle-size
+// package tracked in NEXT_SCOPE.md.
 
 import { api } from "chardb/server";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { globalNotices, messages, userPreferences } from "./schema.ts";
 
 const listMessagesArgs = z.object({
     organizationId: z.string(),
     channelId: z.string(),
-    limit: z.number().int().positive(),
+    limit: z.number().int().min(1).max(100),
 });
 
 export const listMessages = api.query({
     ref: "src/server/queries.ts#listMessages",
     args: listMessagesArgs,
-    authority: "organization",
-    partitionKey: "organizationId",
-    // The configured Gateway evaluates this extractor from its local
-    // manifest; the browser sends only the handle ref and raw args. The shape
-    // MUST match what
-    // the handler's `where` would compile to via `StaticIntentExtractor`
-    // — partition values, intervals, table list — otherwise the
-    // subscription and the read will return divergent rows.
-    intent: args => ({
-        kind: "select",
-        tables: ["messages"],
-        partitionKey: { table: "messages", column: "organization_id", values: [args.organizationId] },
-        joinShape: "colocated",
-        intervals: [
-            {
-                table: "messages",
-                indexName: "channel_id",
-                intervals: [
-                    {
-                        kind: "range",
-                        lo: { kind: "value", value: [args.channelId], inclusive: true },
-                        hi: { kind: "value", value: [args.channelId], inclusive: true },
-                    },
-                ],
-            },
-        ],
-    }),
-    handler: async (ctx, args) =>
-        ctx.db
+    query: (db, args) =>
+        db
             .select()
             .from(messages)
             .where(and(eq(messages.organizationId, args.organizationId), eq(messages.channelId, args.channelId)))
+            .orderBy(desc(messages.createdAt), desc(messages.id))
             .limit(args.limit),
 });
 
 export const listUserPreferences = api.query({
     ref: "src/server/queries.ts#listUserPreferences",
     args: z.object({ userId: z.string() }),
-    authority: "user",
-    partitionKey: "userId",
-    intent: args => ({
-        kind: "select",
-        tables: ["user_preferences"],
-        partitionKey: { table: "user_preferences", column: "user_id", values: [args.userId] },
-        joinShape: "colocated",
-        intervals: [{ table: "user_preferences", indexName: "user_id", intervals: [{ kind: "full" }] }],
-    }),
-    handler: async (ctx, args) =>
-        ctx.db.select().from(userPreferences).where(eq(userPreferences.userId, args.userId)).all(),
+    query: (db, args) =>
+        db
+            .select()
+            .from(userPreferences)
+            .where(eq(userPreferences.userId, args.userId))
+            .orderBy(userPreferences.id)
+            .limit(100),
 });
 
 export const listGlobalNotices = api.query({
     ref: "src/server/queries.ts#listGlobalNotices",
     args: z.object({ namespace: z.string() }),
-    authority: "global",
-    partitionKey: "namespace",
-    intent: args => ({
-        kind: "select",
-        tables: ["global_notices"],
-        partitionKey: { table: "global_notices", column: "namespace", values: [args.namespace] },
-        joinShape: "colocated",
-        intervals: [
-            {
-                table: "global_notices",
-                indexName: "namespace",
-                intervals: [
-                    {
-                        kind: "range",
-                        lo: { kind: "value", value: [args.namespace], inclusive: true },
-                        hi: { kind: "value", value: [args.namespace], inclusive: true },
-                    },
-                ],
-            },
-        ],
-    }),
-    handler: async ctx => ctx.db.select().from(globalNotices).orderBy(globalNotices.id).all(),
+    query: (db, args) =>
+        db
+            .select()
+            .from(globalNotices)
+            .where(eq(globalNotices.namespace, args.namespace))
+            .orderBy(globalNotices.id)
+            .limit(100),
 });

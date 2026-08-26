@@ -72,33 +72,17 @@ Queries live in `queries.ts` so the React bundle can value-import them without d
 ```ts
 // src/server/queries.ts
 import { api } from "chardb/server";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { messages } from "./schema.ts";
 
 export const listMessages = api.query({
   ref: "src/server/queries.ts#listMessages",
-  args: z.object({ organizationId: z.string(), channelId: z.string(), limit: z.number().int().positive() }),
-  authority: "organization",
-  partitionKey: "organizationId",
-  // Developer-declared routing intent evaluated on the server. The browser
-  // sends only this export's stamped ref and the raw arguments passed to useQuery.
-  intent: (args) => ({
-    kind: "select",
-    tables: ["messages"],
-    partitionKey: { table: "messages", column: "organization_id", values: [args.organizationId] },
-    joinShape: "colocated",
-    intervals: [{
-      table: "messages", indexName: "channel_id",
-      intervals: [{ kind: "range",
-        lo: { kind: "value", value: [args.channelId], inclusive: true },
-        hi: { kind: "value", value: [args.channelId], inclusive: true } }],
-    }],
-  }),
-  handler: async (ctx, args) =>
-    ctx.db.select().from(messages).where(
+  args: z.object({ organizationId: z.string(), channelId: z.string(), limit: z.number().int().min(1).max(100) }),
+  query: (db, args) =>
+    db.select().from(messages).where(
       and(eq(messages.organizationId, args.organizationId), eq(messages.channelId, args.channelId))
-    ).limit(args.limit),
+    ).orderBy(desc(messages.createdAt), desc(messages.id)).limit(args.limit),
 });
 ```
 
@@ -137,7 +121,7 @@ src/
     worker.ts                defineAuth + chardb({ auth, schema, api }) + routes + DOs
     schema.ts                Drizzle domain tables (channels, messages)
     api.ts                   api.mutation + presence handles
-    queries.ts               api.query handles + intent extractors (client-safe value imports)
+    queries.ts               api.query handles + single-source Drizzle plans
   web/
     main.tsx                 createRoot + <StrictMode> + styles.css
     App.tsx                  createAuthClient + <ChardbProvider endpoint=/ws auth={authClient} crossTab>
@@ -180,13 +164,13 @@ The reserved chardb prefixes (`/ws`, `/_chardb/*`) and the optional `/api/auth/*
 
 Handlers can use typed builders only against registered `cdbTable` definitions. Chardb rejects raw SQL, session and client access, relational and count shortcuts, plain-table CRUD, insert-select, conflict methods, `returning`, and unsupported builder paths before policy enforcement can be bypassed. For live queries, Cdb records `cdbTable` dependencies at `FROM` construction and in tracked filters or ordering. It rejects raw or untracked predicates, embedded subqueries, and `orderBy` callbacks. Projections, joins, grouping, and richer query shapes remain closed.
 
-### Validator-driven args, intent extractors, no per-operation type aliases
+### Validator-driven args and compiled query plans
 
 `api.ts` never declares a `Db`, `*Args`, or `*Row` alias. Each `api.mutation({...})` / `api.query({...})` call takes a **StandardSchemaV1 validator** such as zod, valibot, arktype, typebox, or drizzle-zod as its `args:` field. Chardb infers `TArgs` from the validator. For public organization mutations and queries, Gateway validates and transforms raw arguments once, then uses that exact value for partition extraction, Catalog authorization, the Cdb request, and the validated handler entry point.
 
-`authority: "organization"` is an explicit opt-in. Mutations and queries require a literal stable `ref` and a nonempty string partition key; queries also require a developer-declared intent callback that Gateway evaluates on the server. Gateway sends Catalog only the verified JWT subject and the organization extracted from validated arguments. Catalog returns current membership, role, roles, and global, tenant, and principal auth epochs. JWT tenant, role, and custom claims are ignored. Cdb treats the request as a trusted post-validation internal seam and runs the validated handler without applying the argument transform again. Operations without the authority declaration stay closed with `CDB_AUTH_NOT_BOUND`.
+Mutations still declare `authority` and `partitionKey`. Planned queries use one synchronous Drizzle builder callback instead. Chardb derives authority, the exact partition, table dependencies, predicate intervals, projection, ordering, and limit from that builder before asking Catalog for authority. Cdb compiles the same callback again before execution and includes the plan hash in query identity, so a Gateway and Cdb build mismatch fails closed. SQL text never crosses the RPC boundary.
 
-`api.query({...})` accepts an `intent: (args) => CdbIntent` extractor. The Vite transform stamps the exported handle with a stable ref. `useQuery(handle, args)` sends that ref and the raw arguments under protocol v3. Gateway resolves the server manifest, validates the arguments, and runs the intent extractor locally:
+Planned queries require an explicit stable `ref`. `useQuery(handle, args)` sends that ref and the raw arguments under protocol v3. Gateway resolves the server manifest, validates the arguments, and compiles the builder locally:
 
 ```tsx
 // src/web/hooks.ts
@@ -200,7 +184,9 @@ export function useChatMessages(channelId: string) {
 }
 ```
 
-For an explicit organization query, Gateway requires the declared partition and developer-declared server-side intent to identify the same exact organization and one virtual shard. It re-derives authority through Catalog and persists a unique generation before `Cdb.subscribe`. Matching commits enter the Cdb invalidation outbox. Gateway reruns dirty registrations with current Catalog authority and stages replacement snapshots until the client acknowledges the exact cookie. The client deduplicates and re-acknowledges a same-cookie retry. Before Cdb returns a supported full-row result, it compares the conservatively recorded `cdbTable` dependencies with `intent.tables`. Gateway and Cdb also persist a static digest of those tables' declared row and column policy metadata. They reject policy drift before registered execution or staged delivery. The digest excludes arbitrary function source, and a quiet registration detects drift on its next work trigger. Declared interval coverage is not yet verified.
+The first planned-query version accepts one full-row `cdbTable` select with recognized typed predicate shapes, one exact nonempty string partition, at most 100 `inArray` values, deterministic ordering ending in the primary key, and a limit from 1 through 100. It rejects projections, joins, CTEs, raw SQL outside that recognized predicate grammar, placeholders, grouping, aggregates, set operations, offset pagination, multiple partitions, and async callbacks. Legacy `handler` plus `intent` queries remain compatible while applications migrate.
+
+Gateway re-derives authority through Catalog and persists a unique generation before `Cdb.subscribe`. Matching commits enter the Cdb invalidation outbox. Gateway reruns dirty registrations with current Catalog authority and stages replacement snapshots until the client acknowledges the exact cookie. The client deduplicates and re-acknowledges a same-cookie retry. Cdb compares the derived table and range declaration with the reads it observes after row policy is applied. Gateway and Cdb also persist a static digest of those tables' row and column policy metadata.
 
 Downstream consumers pull the wire shape out of the handle via `InferRow` / `InferArgs`:
 

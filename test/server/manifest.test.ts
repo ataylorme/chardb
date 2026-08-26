@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { eq } from "drizzle-orm";
+import { text } from "drizzle-orm/sqlite-core";
 import { isCdbError } from "../../src/errors.ts";
-import { defineCron, defineMutation, defineQuery } from "../../src/server/define.ts";
+import { globalScope } from "../../src/server/cdb-tenant.ts";
+import { createApi, defineCron, defineMutation, defineQuery } from "../../src/server/define.ts";
 import {
     manifestFromExports,
     resolveMutation,
@@ -75,6 +78,29 @@ describe("manifestFromExports", () => {
         const descriptor = resolveQuery(manifest, listOrganizationPosts.__chardbRef);
         expect(descriptor.authority).toBe("organization");
         expect(descriptor.extractPartitionKey?.({ organizationId: "org-1" })).toBe("org-1");
+    });
+
+    test("preserves and routes a runtime-compiled query plan", () => {
+        const { cdbTable } = globalScope();
+        const rows = cdbTable(
+            "manifest_planned_rows",
+            { id: text("id").primaryKey(), scope: text("scope").notNull() },
+            { partitionBy: "scope", roles: { user: { read: "*" } } }
+        );
+        const query = createApi({ rows }).query({
+            ref: "api/manifest#planned",
+            query: (db, args: { scope: string }) =>
+                db.select().from(rows).where(eq(rows.scope, args.scope)).orderBy(rows.id).limit(10),
+        });
+        const manifest = manifestFromExports({ query });
+        expect(resolveQuery(manifest, query.__chardbRef).compilePlan).toBeDefined();
+        const route = routeValidatedQuery(
+            manifest,
+            { ref: query.__chardbRef, args: { scope: "shared" } },
+            () => "policy"
+        );
+        expect(route).toMatchObject({ authority: "global", partitionKey: "shared" });
+        expect(route.queryHash).toContain("planHash");
     });
 
     test("preserves and routes global mutation and query placement", () => {
