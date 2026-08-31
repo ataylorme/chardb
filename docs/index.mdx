@@ -5,22 +5,19 @@ description: "Organization-owned SQLite and live Drizzle queries inside a Cloudf
 
 # A real database inside your Worker
 
-Chardb gives a Cloudflare Worker one typed database binding. Organization rows, Better Auth membership, file ownership, and live-query routing share the same organization boundary.
+Chardb gives a Cloudflare Worker one typed database binding. Better Auth organizations decide where rows live and who can read or write them.
 
-The generated app is a working message board. It signs in through Better Auth, creates organizations, writes and streams organization messages, stores optional image attachments in R2, and survives a local Wrangler restart.
+The starter is a working message app with live queries and optional R2 attachments. Generate it, run it, then replace the message table with your own schema.
 
 <Note>
-  `@chardb/core@0.1.0` is a preview for data you can rebuild. The organization SQL, live-query, migration, local R2, and deployment paths are implemented. Backup, restore, failover, and automatic resharding are not.
+  `@chardb/core@0.1.0` is for data you can rebuild. It has no backup, restore, failover, or automatic resharding path.
 </Note>
 
-<CardGroup cols={3}>
-  <Card title="Create a Worker" icon="bolt" href="/quickstart">
-    Run the generated app locally and exercise the full path.
+<CardGroup cols={2}>
+  <Card title="Run the starter" icon="bolt" href="/quickstart">
+    Get the generated app running in a few minutes.
   </Card>
-  <Card title="Define the boundary" icon="building" href="/build/tenancy-and-auth">
-    Connect Better Auth organizations to a Drizzle table policy.
-  </Card>
-  <Card title="Deploy it" icon="cloud-arrow-up" href="/run/deploy">
-    Provision R2, upload the Worker, and activate its schema.
+  <Card title="Understand the model" icon="database" href="/data-model">
+    See how one table, query, and mutation fit together.
   </Card>
 </CardGroup>

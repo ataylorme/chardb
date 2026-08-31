@@ -1,0 +1,49 @@
+---
+title: "Going live"
+description: "Generate the next migration, deploy, and know where to stop."
+---
+
+## Generate the migration
+
+`chardb init` creates version 1. After an additive schema change, run:
+
+```bash
+bunx @chardb/core migrations generate --name add_message_edited_at
+bun run typecheck
+bun run test
+bun run build
+```
+
+Commit the generated JSON and TypeScript snapshots. Never edit a migration after deployment.
+
+The generator accepts new tables, nonunique indexes, and nullable columns without new constraints. It rejects drops, renames, type changes, constraint changes, unique indexes, and edited history.
+
+## Deploy
+
+Copy `.env.example` to `.env.local` and fill in the Worker URL plus both secrets. Then run:
+
+```bash
+bun run setup:cloudflare
+bun run deploy:bootstrap
+```
+
+The first command creates or checks the generated R2 bucket. The second uploads the Worker and activates its schema.
+
+Later releases use:
+
+```bash
+bun run typecheck
+bun run test
+bun run build
+bun run deploy
+```
+
+If a migration is interrupted, rerun the same command with the same migration ID and target. Chardb resumes recorded work. Schema history only moves forward.
+
+## Know where to stop
+
+Version 0.1.0 has no backup, export, restore, point-in-time recovery, replica promotion, or regional failover. Use it only where the source data exists elsewhere or can be rebuilt.
+
+Chardb adds no service fee. Cloudflare bills Workers, Durable Objects, R2, and optional Vectorize. One mutation can touch several internal rows, so measure Cloudflare counters instead of estimating from API calls.
+
+See Cloudflare's current [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/), [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/), and [R2 pricing](https://developers.cloudflare.com/r2/pricing/) before deployment.

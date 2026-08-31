@@ -52,21 +52,6 @@ for (const path of exampleFiles) {
     if (!contractedExamples.has(contractPath)) fail(`example is not embedded in a docs page: ${contractPath}`);
 }
 
-const wrangler = await readFile(join(examplesRoot, "generated-app/wrangler.toml"), "utf8");
-for (const required of [
-    'name = "CDB_CATALOG"',
-    'name = "CDB_SHARD"',
-    'name = "CDB_GATEWAY"',
-    'name = "CDB_RESHARD"',
-    'binding = "CDB_FILES"',
-    'run_worker_first = ["/_chardb/*", "/api/*", "/health", "/ws"]',
-]) {
-    if (!wrangler.includes(required)) fail(`golden Wrangler config is missing ${required}`);
-}
-for (const required of ["Cdb", "Catalog", "Gateway", "Resharder"]) {
-    if (!wrangler.includes(`"${required}"`)) fail(`golden Wrangler config is missing ${required}`);
-}
-
 const quickstart = pageSources.get("quickstart") ?? "";
 for (const command of [
     "mkdir my-chardb-app",

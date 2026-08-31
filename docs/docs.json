@@ -16,23 +16,8 @@
         "pages": ["index", "quickstart"]
       },
       {
-        "group": "Build",
-        "pages": [
-          "build/tenancy-and-auth",
-          "build/reads-and-writes",
-          "build/live-queries"
-        ]
-      },
-      {
-        "group": "Reference",
-        "pages": [
-          "configuration",
-          "build/schema-and-migrations"
-        ]
-      },
-      {
-        "group": "Run",
-        "pages": ["run/deploy", "run/operations"]
+        "group": "Guide",
+        "pages": ["data-model", "going-live"]
       }
     ]
   }

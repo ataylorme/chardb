@@ -3,7 +3,7 @@ title: "Quickstart"
 description: "Generate, check, and run the app shipped by @chardb/core 0.1.0."
 ---
 
-You need Bun 1.2.22 or newer. Local development uses Wrangler and Miniflare, so a Cloudflare login is not required yet.
+You need Bun 1.2.22 or newer. You do not need a Cloudflare login for local development.
 
 `chardb init` writes into the current directory. Create an empty one first:
 
@@ -17,7 +17,7 @@ bun run test
 bun run build
 ```
 
-The CLI refuses a directory containing anything except `.git` and `.DS_Store`. It checks the whole write set before creating a file.
+The CLI refuses a nonempty directory.
 
 Now start both local servers:
 
@@ -25,15 +25,15 @@ Now start both local servers:
 bun run dev
 ```
 
-The script starts Wrangler on `127.0.0.1:8787`, reads the packaged schema version from `/health`, applies that migration, and then starts Vite on `127.0.0.1:5173`. It prints the browser URL only after both are ready.
+The script starts Wrangler, applies the generated migration, and then starts Vite. Open the URL it prints.
 
-Open the printed URL. The generated app signs in anonymously, then lets you:
+The app signs in anonymously. Try the whole path once:
 
 1. Create an organization.
 2. Post a message and watch the live query replace its result.
 3. Attach a JPEG or PNG through the local R2 binding.
-4. Stop and restart `bun run dev`, then reload the persisted message.
+4. Restart `bun run dev` and reload the persisted message.
 
-The generated test covers the same server path inside Cloudflare's Vitest integration. It migrates a fresh database, checks the Durable Object and R2 bindings, creates a Better Auth organization, then writes and reads an organization message.
+`bun run test` covers the same server path in workerd. It migrates a fresh database, creates an organization, and writes and reads one message.
 
-Next, read [Tenancy and auth](/build/tenancy-and-auth) before changing the schema. The generated migration is immutable once deployed.
+Next, read [The data model](/data-model). It shows the three files you will change first.
