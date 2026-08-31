@@ -140,6 +140,11 @@ function ReactClientSnippet() {
 function RustClientSnippet() {
     return (
         <code>
+            <span className="syntax-keyword">use</span> <span className="syntax-variable">crate</span>::
+            <span className="syntax-variable">operations</span>::{"{"}
+            <span className="syntax-type">ListMessagesArgs</span>,{" "}
+            <span className="syntax-variable">LIST_MESSAGES</span>
+            {"};\n\n"}
             <span className="syntax-keyword">let</span> <span className="syntax-variable">client</span> {"= "}
             <span className="syntax-type">AsyncClient</span>::<span className="syntax-function">connect</span>(
             <span className="syntax-type">ClientConfig</span>::<span className="syntax-function">new</span>(
@@ -149,13 +154,10 @@ function RustClientSnippet() {
             {"\n\n"}
             <span className="syntax-keyword">let mut</span> <span className="syntax-variable">messages</span> {"= "}
             <span className="syntax-variable">client</span>.<span className="syntax-function">subscribe</span>({"\n  "}
-            <span className="syntax-string">"src/queries.ts#listMessages"</span>,{"\n  "}
-            <span className="syntax-function">json</span>!({"{"} <span className="syntax-string">"organizationId"</span>
-            : {""}
-            <span className="syntax-variable">organization_id</span>, <span className="syntax-string">"limit"</span>:{" "}
-            {""}
-            <span className="syntax-number">50</span> {"}"}),
-            {"\n"}
+            <span className="syntax-variable">LIST_MESSAGES</span>,{"\n  &"}
+            <span className="syntax-type">ListMessagesArgs</span> {"{"}
+            <span className="syntax-property"> organization_id</span>, <span className="syntax-property">limit</span>:{" "}
+            <span className="syntax-number">50</span> {"}"},{"\n"}
             ).<span className="syntax-keyword">await</span>?;
             {"\n\n"}
             <span className="syntax-keyword">while let</span> <span className="syntax-type">Some</span>(

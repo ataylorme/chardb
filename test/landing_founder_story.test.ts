@@ -67,6 +67,8 @@ describe("founder story landing contract", () => {
         expect(overview).toContain("db.auth.signOut");
         expect(overview).toContain("/brands/file-react-ts.svg");
         expect(overview).toContain("/brands/file-rust.svg");
+        expect(overview).toContain("LIST_MESSAGES");
+        expect(overview).not.toContain('"src/queries.ts#listMessages"');
         for (const sdk of ["React", "Rust", "Python", "Swift", "Flutter", "Expo"]) {
             expect(overview).toContain(`name: "${sdk}"`);
         }
