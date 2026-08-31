@@ -1,0 +1,170 @@
+name: Rust client
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-client-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_VERSION: 1.96.0
+  MSRV: 1.85.0
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal --component rustfmt,clippy
+          rustup default "${RUST_VERSION}"
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+
+      - name: Check explicit feature combinations
+        run: |
+          cargo check --manifest-path rust/Cargo.toml --locked --no-default-features
+          cargo check --manifest-path rust/Cargo.toml --locked --no-default-features --features introspection
+          cargo check --manifest-path rust/Cargo.toml --locked --no-default-features --features sync,rustls-webpki-roots
+          cargo check --manifest-path rust/Cargo.toml --locked --no-default-features --features async,rustls-webpki-roots
+          cargo check --manifest-path rust/Cargo.toml --locked --all-features
+
+      - name: Lint all targets and features
+        run: cargo clippy --manifest-path rust/Cargo.toml --locked --all-targets --all-features -- -D warnings
+
+      - name: Test and document
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo test --manifest-path rust/Cargo.toml --locked --all-features
+          cargo doc --manifest-path rust/Cargo.toml --locked --all-features --no-deps
+
+      - name: Verify publish package
+        run: cargo package --manifest-path rust/chardb/Cargo.toml --locked
+
+  native:
+    name: Native ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Run native sync and async tests
+        run: cargo test --manifest-path rust/Cargo.toml --locked --all-features
+
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install exact MSRV
+        run: |
+          rustup toolchain install "${MSRV}" --profile minimal
+          rustup default "${MSRV}"
+
+      - name: Check MSRV feature combinations
+        run: |
+          cargo check --manifest-path rust/Cargo.toml --locked --no-default-features
+          cargo check --manifest-path rust/Cargo.toml --locked --no-default-features --features introspection
+          cargo check --manifest-path rust/Cargo.toml --locked --no-default-features --features sync,rustls-webpki-roots
+          cargo check --manifest-path rust/Cargo.toml --locked --no-default-features --features async,rustls-webpki-roots
+          cargo check --manifest-path rust/Cargo.toml --locked --all-features
+
+  targets:
+    name: Target ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: windows-2025
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Rust target
+        shell: bash
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install Linux cross compiler
+        if: matrix.cc
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-aarch64-linux-gnu
+
+      - name: Compile target
+        env:
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.cc }}
+        run: cargo check --manifest-path rust/Cargo.toml --locked --all-features --target ${{ matrix.target }}
+
+  workerd-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up pinned Bun
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: 1.2.22
+
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Install locked TypeScript dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build Rust conformance client
+        run: cargo build --manifest-path rust/Cargo.toml --locked --example workerd_conformance
+
+      - name: Verify shared wire corpus
+        run: bun test test/wire.test.ts test/rust_wire_contract.test.ts
+
+      - name: Run Rust against real Workerd Gateway
+        env:
+          CHARDB_RUST_CONFORMANCE_BIN: ${{ github.workspace }}/rust/target/debug/examples/workerd_conformance
+        run: bun test test/workerd/gateway-jwt.harness.test.ts --test-name-pattern "runs the Rust client"

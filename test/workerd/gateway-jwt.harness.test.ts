@@ -483,6 +483,30 @@ async function authorityControl(pathname: "/authority-waiting" | "/authority-rel
 }
 
 describe("configured Gateway JWT handshake in real workerd", () => {
+    test.skipIf(!process.env.CHARDB_RUST_CONFORMANCE_BIN)(
+        "runs the Rust client through the real Gateway, Catalog, shard, and JWT verifier",
+        async () => {
+            if (!workerdUrl) throw new Error("miniflare not initialized");
+            const executable = process.env.CHARDB_RUST_CONFORMANCE_BIN;
+            if (!executable) throw new Error("Rust conformance binary is not configured");
+            const endpoint = new URL("/ws", workerdUrl);
+            endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
+            const rowId = `rust-conformance-${crypto.randomUUID()}`;
+            const processResult = Bun.spawn([executable, endpoint.toString(), await signed(), rowId], {
+                stdout: "pipe",
+                stderr: "pipe",
+            });
+            const [exitCode, stdout, stderr] = await Promise.all([
+                processResult.exited,
+                new Response(processResult.stdout).text(),
+                new Response(processResult.stderr).text(),
+            ]);
+            expect(exitCode, stderr).toBe(0);
+            expect(JSON.parse(stdout)).toEqual({ ok: true, rowId });
+        },
+        15_000
+    );
+
     test("fetches the configured JWKS URL once and reuses the Catalog cache", async () => {
         expect(await jwksStats()).toEqual({ fetchCount: 0, lastUrl: null, kids: [KID] });
 
