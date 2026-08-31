@@ -217,6 +217,7 @@ pub enum SubscriptionEvent<T> {
     Snapshot { rows: Vec<T> },
     Update { rows: Vec<T> },
     Refetching { reason: RefetchReason },
+    Retrying { error: Error, retry_in: Duration },
     Error(Error),
     Closed,
 }
@@ -225,6 +226,7 @@ enum RawSubscriptionEvent {
     Snapshot(Vec<Value>),
     Update(Vec<Value>),
     Refetching(RefetchReason),
+    Retrying(Error, Duration),
     Error(Error),
     Closed,
 }
@@ -560,7 +562,13 @@ impl<T: DeserializeOwned> SubscriptionCore<T> {
             RawSubscriptionEvent::Refetching(reason) => {
                 Ok(SubscriptionEvent::Refetching { reason })
             }
-            RawSubscriptionEvent::Error(error) => Ok(SubscriptionEvent::Error(error)),
+            RawSubscriptionEvent::Retrying(error, retry_in) => {
+                Ok(SubscriptionEvent::Retrying { error, retry_in })
+            }
+            RawSubscriptionEvent::Error(error) => {
+                self.ended = true;
+                Ok(SubscriptionEvent::Error(error))
+            }
             RawSubscriptionEvent::Closed => {
                 self.ended = true;
                 Ok(SubscriptionEvent::Closed)
@@ -686,6 +694,8 @@ struct PendingRefresh {
     claims: JwtClaims,
     deadline: Instant,
     response: Option<flume::Sender<Result<()>>>,
+    server_acknowledged: bool,
+    awaiting_subscriptions: HashSet<u64>,
 }
 
 struct Session {
@@ -807,17 +817,12 @@ impl Session {
                         self.set_state(ConnectionState::Open);
                         break;
                     }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            ErrorKind::Authentication | ErrorKind::Protocol
-                        ) =>
-                    {
+                    Err(error) if is_reconnectable_error(&error) => {
+                        backoff = (backoff * 2).min(RECONNECT_MAX);
+                    }
+                    Err(error) => {
                         self.finish(error);
                         return;
-                    }
-                    Err(_) => {
-                        backoff = (backoff * 2).min(RECONNECT_MAX);
                     }
                 }
             }
@@ -882,7 +887,6 @@ impl Session {
                     }
                     self.last_cookie = Some(resumed_from_cookie.unwrap_or(base_cookie));
                     self.current_claims = claims;
-                    self.pending_refresh = None;
                     self.send_session_state(&mut socket)?;
                     return Ok(socket);
                 }
@@ -966,14 +970,14 @@ impl Session {
                 if self.stop.load(Ordering::Acquire) {
                     return LoopExit::Stop;
                 }
-                return if error.kind() == ErrorKind::Transport {
+                return if is_reconnectable_error(&error) {
                     LoopExit::Disconnect
                 } else {
                     LoopExit::Terminal(error)
                 };
             }
             if let Err(error) = self.send_due_refetches(socket) {
-                return if error.kind() == ErrorKind::Transport {
+                return if is_reconnectable_error(&error) {
                     LoopExit::Disconnect
                 } else {
                     LoopExit::Terminal(error)
@@ -999,14 +1003,14 @@ impl Session {
                     ping_sent = None;
                     match self.handle_down(socket, message) {
                         Ok(()) => {}
-                        Err(error) if error.kind() == ErrorKind::Transport => {
+                        Err(error) if is_reconnectable_error(&error) => {
                             return LoopExit::Disconnect
                         }
                         Err(error) => return LoopExit::Terminal(error),
                     }
                 }
                 Ok(None) => {}
-                Err(error) if error.kind() == ErrorKind::Transport => return LoopExit::Disconnect,
+                Err(error) if is_reconnectable_error(&error) => return LoopExit::Disconnect,
                 Err(error) => return LoopExit::Terminal(error),
             }
         }
@@ -1057,6 +1061,13 @@ impl Session {
                 }
                 Command::Unsubscribe { id } => {
                     self.release_retained(id.get());
+                    self.fail_refresh_subscription(
+                        id.get(),
+                        Error::local(
+                            ErrorKind::Closed,
+                            "subscription closed while authentication refresh was refetching it",
+                        ),
+                    );
                     if self.subscriptions.remove(&id.get()).is_some() {
                         if let Some(open) = socket.as_deref_mut() {
                             send_up(open, &Up::Unsubscribe { sub_id: id })?;
@@ -1071,6 +1082,13 @@ impl Session {
                     response,
                 } => {
                     if response.is_disconnected() {
+                        continue;
+                    }
+                    if self.mutations.contains_key(&mutation_id) {
+                        let _ = response.send(Err(Error::local(
+                            ErrorKind::Configuration,
+                            format!("mutation ID {mutation_id} is already pending"),
+                        )));
                         continue;
                     }
                     if self.mutations.len() >= MAX_PENDING_MUTATIONS {
@@ -1149,79 +1167,222 @@ impl Session {
                 Ok(())
             }
             Down::MustRefetch { sub_ids, reason } => {
-                if reason == RefetchReason::AuthChanged && sub_ids.is_empty() {
-                    if let Some(mut pending) = self.pending_refresh.take() {
-                        self.current_claims = Some(pending.claims);
-                        if let Some(response) = pending.response.take() {
-                            let _ = response.send(Ok(()));
-                        }
-                    }
-                    return Ok(());
-                }
-                for id in sub_ids {
-                    self.release_retained(id.get());
-                    if let Some(subscription) = self.subscriptions.get_mut(&id.get()) {
-                        subscription.rows.clear();
-                        subscription.last_snapshot_cookie = None;
-                        let _ = subscription
-                            .events
-                            .try_send(RawSubscriptionEvent::Refetching(reason));
-                        if reason == RefetchReason::ShardsChanged {
-                            subscription.refetch_due =
-                                Some(Instant::now() + subscription.refetch_backoff);
-                            subscription.refetch_backoff =
-                                (subscription.refetch_backoff * 2).min(Duration::from_secs(2));
-                        } else {
-                            send_up(
-                                socket,
-                                &Up::Subscribe {
-                                    sub_id: id,
-                                    r#ref: subscription.reference.clone(),
-                                    args: subscription.args.clone(),
-                                    ttl_ms: None,
-                                },
-                            )?;
-                        }
-                    }
-                }
-                Ok(())
+                self.handle_must_refetch(socket, sub_ids, reason)
             }
             Down::Error {
                 code,
                 sub_id,
+                stream_request_id,
                 retryable,
                 correlation_id,
                 docs,
-                ..
-            } => {
-                let error = Error::remote(
+            } => self.handle_remote_error(
+                Error::remote(
                     code,
                     retryable,
                     Some(correlation_id),
                     Some(docs),
                     "Chardb rejected an operation",
-                );
-                if self.pending_refresh.is_some() && sub_id.is_none() {
-                    if let Some(mut pending) = self.pending_refresh.take() {
-                        if let Some(response) = pending.response.take() {
-                            let _ = response.send(Err(error.clone()));
-                        }
-                    }
-                    return Err(error);
-                }
-                if let Some(id) = sub_id {
-                    self.release_retained(id.get());
-                    if let Some(subscription) = self.subscriptions.get_mut(&id.get()) {
-                        subscription.rows.clear();
-                        subscription.last_snapshot_cookie = None;
-                        let _ = subscription
-                            .events
-                            .try_send(RawSubscriptionEvent::Error(error));
-                    }
-                }
-                Ok(())
-            }
+                ),
+                sub_id,
+                stream_request_id,
+            ),
             Down::Presence { .. } | Down::StreamChunk { .. } | Down::StreamEnd { .. } => Ok(()),
+        }
+    }
+
+    fn handle_must_refetch(
+        &mut self,
+        socket: &mut Socket,
+        sub_ids: Vec<SafeId>,
+        reason: RefetchReason,
+    ) -> Result<()> {
+        let mut unique_ids = Vec::with_capacity(sub_ids.len());
+        let mut seen = HashSet::with_capacity(sub_ids.len());
+        for id in sub_ids {
+            if seen.insert(id.get()) {
+                unique_ids.push(id);
+            }
+        }
+        if reason == RefetchReason::AuthChanged {
+            self.begin_auth_refetch(&unique_ids)?;
+        }
+        self.refetch_subscriptions(socket, unique_ids, reason)?;
+        self.settle_pending_refresh_if_complete();
+        Ok(())
+    }
+
+    fn begin_auth_refetch(&mut self, sub_ids: &[SafeId]) -> Result<()> {
+        if self.pending_refresh.is_none() {
+            return Ok(());
+        }
+        if let Some(id) = sub_ids
+            .iter()
+            .find(|id| !self.subscriptions.contains_key(&id.get()))
+        {
+            let error = Error::local(
+                ErrorKind::Protocol,
+                format!("authChanged named unknown subscription {}", id.get()),
+            );
+            self.fail_pending_refresh(error.clone());
+            return Err(error);
+        }
+        if let Some(pending) = self.pending_refresh.as_mut() {
+            if pending.server_acknowledged {
+                let error = Error::local(
+                    ErrorKind::Protocol,
+                    "received duplicate authChanged acknowledgement",
+                );
+                self.fail_pending_refresh(error.clone());
+                return Err(error);
+            }
+            pending.server_acknowledged = true;
+            pending.awaiting_subscriptions = sub_ids.iter().map(|id| id.get()).collect();
+        }
+        Ok(())
+    }
+
+    fn handle_remote_error(
+        &mut self,
+        error: Error,
+        sub_id: Option<SafeId>,
+        stream_request_id: Option<SafeId>,
+    ) -> Result<()> {
+        if sub_id.is_some() && stream_request_id.is_some() {
+            return Err(Error::local(
+                ErrorKind::Protocol,
+                "error envelope has both subscription and stream scopes",
+            ));
+        }
+        if let Some(id) = sub_id {
+            self.handle_subscription_error(id, error);
+            return Ok(());
+        }
+        if stream_request_id.is_some() {
+            return Err(Error::local(
+                ErrorKind::Protocol,
+                "received an error for an unsupported stream request",
+            ));
+        }
+        self.fail_pending_refresh(error.clone());
+        Err(error)
+    }
+
+    fn handle_subscription_error(&mut self, id: SafeId, error: Error) {
+        self.release_retained(id.get());
+        if error.is_retryable() {
+            let mut retire = false;
+            if let Some(subscription) = self.subscriptions.get_mut(&id.get()) {
+                subscription.rows.clear();
+                subscription.last_snapshot_cookie = None;
+                if subscription.refetch_due.is_none() {
+                    let retry_in = subscription.refetch_backoff;
+                    subscription.refetch_due = Some(Instant::now() + retry_in);
+                    subscription.refetch_backoff = (retry_in * 2).min(Duration::from_secs(2));
+                    retire = subscription
+                        .events
+                        .try_send(RawSubscriptionEvent::Retrying(error, retry_in))
+                        .is_err();
+                }
+            }
+            if retire {
+                self.fail_refresh_subscription(id.get(), closed_error());
+                self.subscriptions.remove(&id.get());
+            }
+        } else if let Some(subscription) = self.subscriptions.remove(&id.get()) {
+            let _ = subscription
+                .events
+                .try_send(RawSubscriptionEvent::Error(error.clone()));
+            self.fail_refresh_subscription(id.get(), error);
+        }
+    }
+
+    fn refetch_subscriptions(
+        &mut self,
+        socket: &mut Socket,
+        sub_ids: Vec<SafeId>,
+        reason: RefetchReason,
+    ) -> Result<()> {
+        let mut retired = Vec::new();
+        for id in sub_ids {
+            self.release_retained(id.get());
+            let Some(subscription) = self.subscriptions.get_mut(&id.get()) else {
+                continue;
+            };
+            subscription.rows.clear();
+            subscription.last_snapshot_cookie = None;
+            if subscription
+                .events
+                .try_send(RawSubscriptionEvent::Refetching(reason))
+                .is_err()
+            {
+                retired.push(id);
+                continue;
+            }
+            if reason == RefetchReason::ShardsChanged {
+                subscription.refetch_due = Some(Instant::now() + subscription.refetch_backoff);
+                subscription.refetch_backoff =
+                    (subscription.refetch_backoff * 2).min(Duration::from_secs(2));
+            } else {
+                subscription.refetch_due = None;
+                send_up(
+                    socket,
+                    &Up::Subscribe {
+                        sub_id: id,
+                        r#ref: subscription.reference.clone(),
+                        args: subscription.args.clone(),
+                        ttl_ms: None,
+                    },
+                )?;
+            }
+        }
+        for id in retired {
+            self.subscriptions.remove(&id.get());
+            self.fail_refresh_subscription(id.get(), closed_error());
+            send_up(socket, &Up::Unsubscribe { sub_id: id })?;
+        }
+        Ok(())
+    }
+
+    fn settle_pending_refresh_if_complete(&mut self) {
+        let complete = self.pending_refresh.as_ref().is_some_and(|pending| {
+            pending.server_acknowledged && pending.awaiting_subscriptions.is_empty()
+        });
+        if !complete {
+            return;
+        }
+        let mut pending = self
+            .pending_refresh
+            .take()
+            .expect("pending refresh completion was checked");
+        self.current_claims = Some(pending.claims);
+        if let Some(response) = pending.response.take() {
+            let _ = response.send(Ok(()));
+        }
+    }
+
+    fn acknowledge_refresh_subscription(&mut self, id: u64) {
+        if let Some(pending) = self.pending_refresh.as_mut() {
+            pending.awaiting_subscriptions.remove(&id);
+        }
+        self.settle_pending_refresh_if_complete();
+    }
+
+    fn fail_pending_refresh(&mut self, error: Error) {
+        if let Some(mut pending) = self.pending_refresh.take() {
+            if let Some(response) = pending.response.take() {
+                let _ = response.send(Err(error));
+            }
+        }
+    }
+
+    fn fail_refresh_subscription(&mut self, id: u64, error: Error) {
+        let awaited = self
+            .pending_refresh
+            .as_ref()
+            .is_some_and(|pending| pending.awaiting_subscriptions.contains(&id));
+        if awaited {
+            self.fail_pending_refresh(error);
         }
     }
 
@@ -1238,7 +1399,9 @@ impl Session {
         };
         if existing.last_snapshot_cookie.as_deref() == Some(cookie.as_str()) {
             self.release_retained(id);
-            return send_up(socket, &Up::Ack { cookie });
+            send_up(socket, &Up::Ack { cookie })?;
+            self.acknowledge_refresh_subscription(id);
+            return Ok(());
         }
         validate_subscription_rows(&rows)?;
         self.validate_aggregate(Some((id, &rows)))?;
@@ -1258,9 +1421,12 @@ impl Session {
             .is_err()
         {
             self.subscriptions.remove(&id);
+            self.fail_refresh_subscription(id, closed_error());
             return send_up(socket, &Up::Unsubscribe { sub_id });
         }
-        send_up(socket, &Up::Ack { cookie })
+        send_up(socket, &Up::Ack { cookie })?;
+        self.acknowledge_refresh_subscription(id);
+        Ok(())
     }
 
     fn apply_patches(&mut self, socket: &mut Socket, patches: Vec<RowPatch>) -> Result<()> {
@@ -1288,10 +1454,10 @@ impl Session {
                     == Some(patch.row_key.as_str())
             });
             if patch.op == RowPatchOp::Del {
-                if patch.row.is_some() {
+                if patch.row.as_ref().is_some_and(|row| !row.is_object()) {
                     return Err(Error::local(
                         ErrorKind::Protocol,
-                        "delete patch must not contain a row",
+                        "delete patch row must be an object when present",
                     ));
                 }
                 if let Some(index) = index {
@@ -1376,6 +1542,10 @@ impl Session {
 
     fn begin_reconnect(&mut self) {
         self.set_state(ConnectionState::Reconnecting);
+        self.fail_pending_refresh(Error::local(
+            ErrorKind::Transport,
+            "connection was lost while authentication refresh was pending",
+        ));
         for mutation in self.mutations.values_mut() {
             mutation.in_flight = false;
         }
@@ -1443,7 +1613,7 @@ impl Session {
                 .take()
                 .expect("pending refresh was checked");
             let error = Error::local(
-                ErrorKind::Authentication,
+                ErrorKind::Timeout,
                 "timed out waiting for auth refresh acknowledgement",
             );
             if let Some(response) = pending.response.take() {
@@ -1534,6 +1704,8 @@ impl Session {
             claims,
             deadline: Instant::now() + self.config.auth_refresh_timeout,
             response,
+            server_acknowledged: false,
+            awaiting_subscriptions: HashSet::new(),
         });
         Ok(())
     }
@@ -1633,6 +1805,10 @@ impl Session {
     fn set_state(&self, state: ConnectionState) {
         self.state.store(state as u8, Ordering::Release);
     }
+}
+
+fn is_reconnectable_error(error: &Error) -> bool {
+    error.is_retryable() || matches!(error.kind(), ErrorKind::Transport | ErrorKind::Timeout)
 }
 
 fn connect_socket(

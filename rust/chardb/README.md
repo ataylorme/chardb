@@ -1,13 +1,13 @@
 # Chardb Rust client
 
-`chardb-client` is the native Rust client for Chardb protocol version 3. It
-supports Windows, macOS, and Linux. Blocking and async callers use one session
-worker, so reconnects, deadlines, subscription state, and mutation replay have
-the same behavior in both APIs.
+`chardb-client` is the native Rust client for Chardb protocol version 3.
+Blocking and async callers use one session worker, so reconnects, deadlines,
+subscription state, and mutation replay have the same implementation in both
+APIs. Repository CI is configured to test native builds on Windows, macOS, and
+Linux.
 
-Chardb itself is still experimental. The client is designed for release, but
-it does not change the database's current backup, restore, failover, or regional
-resilience status.
+Chardb and this crate are experimental. This client does not change the
+database's current backup, restore, failover, or regional resilience status.
 
 ## Install
 
@@ -187,6 +187,10 @@ for reconciliation. Use `mutate_with_id` when the application must persist the
 ID before dispatch. Chardb currently retains mutation replay records for 24
 hours, so a mutation ID is not a permanent idempotency key.
 
+Only one unsettled operation may own a mutation ID in a client session. A
+second concurrent `mutate_with_id` call with the same ID fails locally without
+replacing or changing the first call.
+
 Cookie-backed rows stay visible for at most 30 seconds after the first
 disconnect. If the server does not replay a subscription in that window, the
 client clears those rows, emits `SubscriptionEvent::Refetching`, drops the stale
@@ -202,24 +206,28 @@ The client decodes `sub` and `exp` only to schedule refresh 60 seconds before
 expiry. It does not trust those claims. The Gateway verifies every token. A
 refresh must keep the same subject, extend the expiry, and receive the
 protocol's `mustRefetch` acknowledgment with reason `authChanged`. The refresh
-acknowledgment has its own 10-second default deadline.
+acknowledgment has its own 10-second default deadline. If that acknowledgment
+names subscriptions to refetch, `refresh_auth` completes after each replacement
+snapshot has been accepted and acknowledged. A terminal failure of any named
+subscription fails the refresh.
 
 Call `refresh_auth` to rotate early. A principal change requires a new client.
 `ClientConfig` and client errors never include JWT text in `Debug` or `Display`.
 
 ## TLS and plaintext
 
-`wss://` uses Rustls on every supported operating system. There is no fallback
-to plaintext and no option that disables certificate or hostname checks.
+Native `wss://` builds use Rustls. There is no fallback to plaintext and no
+option that disables certificate or hostname checks.
 
 `ws://` is accepted for `localhost`, `127.0.0.1`, and `::1`. A non-loopback
 plaintext endpoint requires `allow_plaintext_non_loopback(true)`, which is
 intended for a trusted private network during development. The client does not
-implement HTTP proxy tunneling or redirect following in this release.
+implement HTTP proxy tunneling or redirect following.
 
-TCP connect, TLS negotiation, the WebSocket upgrade, and the Chardb welcome are
-bounded by configuration. Operating system DNS lookup time is outside Rust's
-`TcpStream` timeout on some platforms.
+The configured connect deadline covers address connection attempts, TLS
+negotiation, and the WebSocket upgrade. The welcome, mutation, and auth-refresh
+waits have separate deadlines. A synchronous token provider and operating
+system DNS lookup can run outside those socket deadlines.
 
 ## Subscription behavior
 
@@ -233,9 +241,17 @@ is bounded. If a consumer stops reading and fills it, the worker retires that
 local subscription instead of letting network input allocate memory without a
 limit.
 
-The wire module decodes presence and stream messages because they belong to
-protocol version 3. The public client does not send them. The current Gateway
-does not expose those operations as supported product APIs.
+A retryable subscription error clears stale rows, emits
+`SubscriptionEvent::Retrying`, and resends the same subscription after a
+bounded exponential delay. A nonretryable subscription error retires only that
+subscription and emits a terminal `SubscriptionEvent::Error`.
+
+The public Rust client supports live-query rows and registered mutations. It
+does not implement files, vectors, presence, streams, or a Cloudflare Workers
+Rust transport. The wire module decodes presence and stream messages only
+because their envelopes belong to protocol version 3. Its native transport uses
+`std::net::TcpStream` and an operating-system thread; it does not target
+`workers-rs` or `wasm32`.
 
 ## Limits
 
@@ -256,10 +272,19 @@ be finite and cannot be negative zero.
 
 The committed protocol corpus is read by both `src/wire.ts` and the Rust wire
 module. It covers every protocol-v3 tag and the additive normalization rules.
-The Rust session tests run the same reconnect, replay, patch, auth, and timeout
-scenario through blocking and async clients.
+Blocking and async clients run the same scripted reconnect, mutation replay,
+patch, and empty-list auth-refresh scenario. Additional blocking tests cover
+retryable and terminal session errors, subscription retry, row-carrying delete
+patches, duplicate in-flight mutation IDs, multi-subscription auth refresh, and
+connect, welcome, mutation, and auth-refresh timeout paths. The WSS test uses an
+application-supplied test root; it does not exercise public or operating-system
+roots.
 
 `examples/workerd_conformance.rs` is also launched by the repository's Gateway
 JWT harness when `CHARDB_RUST_CONFORMANCE_BIN` points to the compiled example.
 That path runs against the real Miniflare/Workerd Gateway, Catalog, Cdb shard,
-JWKS verifier, registered query, and mutation handler.
+JWKS verifier, registered query, and mutation handler on the CI host. It checks
+one initial snapshot, one stable-ID mutation, one live update, and the verified
+organization, user, and role values returned by that mutation. It does not
+exercise Rust reconnect, refresh, TLS, files, vectors, presence, or streams
+through Workerd.

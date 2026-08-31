@@ -15,7 +15,7 @@
   "down": [
     { "t": "welcome", "protocolV": 3, "baseCookie": "client-1:0", "region": "WNAM", "colo": "SJC", "resumedFromCookie": "client-1:4" },
     { "t": "poke", "cookie": "client-1:5", "patches": [{ "op": "put", "subId": 1, "rowKey": "message-1", "row": { "body": "hello" } }], "mutResults": [{ "mutId": "018f-test", "ok": true, "result": { "id": "message-1" }, "cookie": "client-1:5" }] },
-    { "t": "poke", "cookie": "client-1:6", "patches": [], "mutResults": [{ "mutId": "018f-failed", "ok": false, "error": { "code": "CDB_RATE_LIMITED", "retryable": true, "docs": "https://chardb.dev/errors/cdb_rate_limited" } }] },
+    { "t": "poke", "cookie": "client-1:6", "patches": [{ "op": "del", "subId": 1, "rowKey": "message-1", "row": { "__key": "conflicting-key", "body": "ignored" } }], "mutResults": [{ "mutId": "018f-failed", "ok": false, "error": { "code": "CDB_RATE_LIMITED", "retryable": true, "docs": "https://chardb.dev/errors/cdb_rate_limited" } }] },
     { "t": "snapshot", "subId": 1, "cookie": "client-1:4", "rows": [{ "id": "message-1", "body": "hello" }] },
     { "t": "mustRefetch", "subIds": [1], "reason": "shardsChanged" },
     { "t": "presence", "key": "room-1", "version": 1, "states": [{ "clientId": "client-2", "state": { "typing": true }, "ts": 1730000000000 }] },
