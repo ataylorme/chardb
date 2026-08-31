@@ -20,6 +20,10 @@
                 "pages": ["deploy", "schema-migrations"]
             },
             {
+                "group": "Plan ahead",
+                "pages": ["plan-ahead"]
+            },
+            {
                 "group": "Cookbook",
                 "pages": ["cookbook/chat-app"]
             }

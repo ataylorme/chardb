@@ -1,0 +1,32 @@
+---
+title: "Plan Ahead"
+description: "Design for Chardb's current durability, recovery, and capacity limits."
+---
+
+Chardb is an experimental database. Use it only when every stored value is disposable or can be rebuilt from an independent source.
+
+## Keep an independent source of data
+
+Chardb has no supported backup, export, restore, or point-in-time recovery command. R2 objects and Vectorize records do not fill that gap. Chardb still needs the SQLite rows that hold ownership, routing, file metadata, vector state, and application data.
+
+Design the application so it can rebuild a new Chardb deployment without reading from the failed one. Keep stable application IDs in the independent source, define how you will replay them, and test a full rebuild and readback before storing data you care about.
+
+Do not treat a local Miniflare directory, a live-query snapshot, mutation replay records, migration checkpoints, or range-movement copies as a backup.
+
+## Write an incident plan
+
+Chardb can resume some interrupted work while the original Durable Object storage remains intact. Live clients reconnect, retryable mutations can reuse the same mutation ID, forward migrations resume from durable checkpoints, and an experimental range movement exposes status, drive, recover, and abort operations.
+
+Those mechanisms do not recover missing or corrupt data. There is no replica to promote, regional failover, reverse migration, repair tool for a lost Catalog or Cdb, or supported way to merge data written into the wrong Durable Object namespace.
+
+Before a deployment, record the Worker bundle, migration journal, schema version and epoch, Durable Object class names, namespace bindings, and any active migration ID. Monitor Chardb error codes and add business-level counts or checksums for data whose absence you need to detect. Keep traffic closed when a migration or range movement has an unknown outcome.
+
+Read [Deploy](/deploy) and [Schema migrations](/schema-migrations) before changing a running experiment.
+
+## Leave capacity headroom
+
+One organization is the placement and transaction boundary. Chardb does not split one organization's transaction across shards, and it does not watch load or move ranges automatically.
+
+Range movement exists as a private experimental operator command. It needs an explicit virtual-shard range, a fresh destination, an admin token, and operator supervision. It is not an automatic balancer, merge service, or recovery copy.
+
+Set organization size and traffic limits in the application. Leave room for spikes, watch per-organization latency and rate-limit errors, and plan a maintenance window before a shard reaches its limit. If the application requires automatic resharding, regional failover, or an availability target, Chardb does not meet that requirement today.

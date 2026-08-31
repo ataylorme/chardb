@@ -75,6 +75,7 @@ try {
         "vectors",
         "deploy",
         "schema-migrations",
+        "plan-ahead",
         "cookbook/chat-app",
     ];
     if (JSON.stringify(pageNames) !== JSON.stringify(expectedPages)) {
@@ -228,6 +229,16 @@ try {
     }
     for (const claim of ["unmeasured", "no backup", "automatic resharding"]) {
         requireText(deploy.toLowerCase(), claim, `deploy page is missing the ${claim} limit`);
+    }
+
+    const planAhead = pageSources.get("plan-ahead")?.toLowerCase() ?? "";
+    for (const claim of [
+        "independent source",
+        "no supported backup, export, restore, or point-in-time recovery",
+        "missing or corrupt data",
+        "does not watch load or move ranges automatically",
+    ]) {
+        requireText(planAhead, claim, `plan-ahead page is missing the ${claim} limit`);
     }
 
     console.log(
