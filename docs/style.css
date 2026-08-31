@@ -7,3 +7,20 @@
   letter-spacing: -0.025em;
   text-transform: lowercase;
 }
+
+.sidebar-title,
+.mdx-content th {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 500;
+}
+
+.sidebar-title {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+}
+
+.mdx-content th {
+  font-size: 12px;
+  letter-spacing: 0.035em;
+}
