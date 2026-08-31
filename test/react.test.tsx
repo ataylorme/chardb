@@ -317,8 +317,11 @@ describe("@chardb/react — hook lifecycle", () => {
         expect(authBaseURL).toBe("https://db.example.com");
         expect(typeof sdk.auth.signIn.email).toBe("function");
         expect(typeof sdk.auth.$fetch).toBe("function");
-        expect(typeof sdk.auth.$store.atoms.session.get).toBe("function");
-        expect(typeof sdk.auth.$store.atoms.session.subscribe).toBe("function");
+        const sessionAtom = sdk.auth.$store.atoms.session;
+        expect(sessionAtom).toBeDefined();
+        if (!sessionAtom) throw new Error("Better Auth client did not expose its session atom");
+        expect(typeof sessionAtom.get).toBe("function");
+        expect(typeof sessionAtom.subscribe).toBe("function");
 
         const directAuthDoesNotCompile = () => {
             // @ts-expect-error A preconfigured client can point auth at a different origin.
