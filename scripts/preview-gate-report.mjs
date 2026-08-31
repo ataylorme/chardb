@@ -18,8 +18,10 @@ export const REQUIRED_PREVIEW_STEPS = Object.freeze([
     "diff whitespace",
     "serialized correctness",
     "exact npm tarball",
+    "exact React npm tarball",
     "prepare staging dogfood app",
     "public package boundary",
+    "public React package boundary",
     "packed organization user",
     "packed organization user evidence identity",
     "generated organization app",
@@ -68,15 +70,25 @@ export function parsePreviewGateArgs(argv, cwd = process.cwd()) {
     return { help, outputDirectory: resolvedOutput, platformName };
 }
 
-export function assertMatchingBrowserReport(browser, fingerprint) {
+export function assertMatchingBrowserReport(browser, fingerprint, reactFingerprint) {
     assertBrowserProofReport(browser);
     if (!isDeepStrictEqual(browser.package?.tarball, fingerprint)) {
         throw new Error("browser evidence does not identify the preview tarball");
     }
+    if (
+        browser.reactPackage?.name !== "@chardb/react" ||
+        (reactFingerprint !== undefined && !isDeepStrictEqual(browser.reactPackage?.tarball, reactFingerprint))
+    ) {
+        throw new Error("browser evidence does not identify the preview React tarball");
+    }
     return browser;
 }
 
-export function assertPassingPreviewGateReport(report, expectedFingerprint = report?.package?.tarball) {
+export function assertPassingPreviewGateReport(
+    report,
+    expectedFingerprint = report?.package?.tarball,
+    expectedReactFingerprint = report?.reactPackage?.tarball
+) {
     if (report === null || typeof report !== "object" || Array.isArray(report)) {
         throw new Error("preview gate report must be an object");
     }
@@ -101,6 +113,12 @@ export function assertPassingPreviewGateReport(report, expectedFingerprint = rep
         throw new Error("preview gate report identifies a different candidate tarball");
     }
     if (
+        report.reactPackage?.name !== "@chardb/react" ||
+        !isDeepStrictEqual(report.reactPackage?.tarball, expectedReactFingerprint)
+    ) {
+        throw new Error("preview gate report identifies a different React candidate tarball");
+    }
+    if (
         !Array.isArray(report.steps) ||
         !isDeepStrictEqual(
             report.steps.map(step => step.name),
@@ -113,10 +131,10 @@ export function assertPassingPreviewGateReport(report, expectedFingerprint = rep
     if (report.summary.completedSteps !== REQUIRED_PREVIEW_STEPS.length || report.summary.failedStep !== null) {
         throw new Error("preview gate passing summary is inconsistent with its steps");
     }
-    assertMatchingGeneratedProjectReport(report.generatedProject, fingerprint);
-    assertMatchingPackedChatReport(report.packedChat, fingerprint);
-    assertMatchingPackedPublicVectorReport(report.packedPublicVector, fingerprint);
-    assertMatchingBrowserReport(report.browser, fingerprint);
+    assertMatchingGeneratedProjectReport(report.generatedProject, fingerprint, expectedReactFingerprint);
+    assertMatchingPackedChatReport(report.packedChat, fingerprint, expectedReactFingerprint);
+    assertMatchingPackedPublicVectorReport(report.packedPublicVector, fingerprint, expectedReactFingerprint);
+    assertMatchingBrowserReport(report.browser, fingerprint, expectedReactFingerprint);
     return report;
 }
 
@@ -133,6 +151,7 @@ export function buildPreviewGateReport(input) {
     const missingStep = REQUIRED_PREVIEW_STEPS.find(name => !stepNames.includes(name));
     const missingEvidence = [
         ["package evidence", input.packageEvidence],
+        ["React package evidence", input.reactPackageEvidence],
         ["generated evidence", input.generatedProjectEvidence],
         ["packed chat evidence", input.packedChatEvidence],
         ["packed public vector evidence", input.packedPublicVectorEvidence],
@@ -145,6 +164,7 @@ export function buildPreviewGateReport(input) {
         source: { ...input.source },
         platform: { ...input.platform },
         package: input.packageEvidence ?? null,
+        reactPackage: input.reactPackageEvidence ?? null,
         steps: input.steps.map(step => ({ ...step, command: [...step.command] })),
         generatedProject: input.generatedProjectEvidence ?? null,
         packedChat: input.packedChatEvidence ?? null,

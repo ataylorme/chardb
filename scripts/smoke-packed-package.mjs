@@ -13,7 +13,7 @@ const COMMAND_TIMEOUT_MS = 3 * 60_000;
 
 const RUNTIME_SPECIFIC_EXPORTS = new Map([
     ["./server", "requires the Cloudflare Workers runtime and the optional better-auth peer"],
-    ["./react", "requires the optional react peer"],
+    ["./internal/react", "is consumed only by @chardb/react and requires the optional react peer"],
 ]);
 
 const REMOVED_EXPORTS = [

@@ -4,6 +4,7 @@ export const GENERATED_PROJECT_REPORT_SCHEMA = "chardb.generated-project.report.
 
 export const GENERATED_PROJECT_INVARIANTS = Object.freeze([
     "generatedByPackedCli",
+    "exactReactPackageInstalled",
     "initialMigrationGeneratedByPackedCli",
     "versionTwoMigrationGeneratedByPackedCli",
     "versionThreeMigrationGeneratedByPackedCli",
@@ -51,6 +52,7 @@ export const GENERATED_PROJECT_INVARIANTS = Object.freeze([
 
 export function parseGeneratedProjectArgs(argv) {
     let tarball;
+    let reactTarball;
     let reportPath;
     for (let index = 0; index < argv.length; index += 1) {
         const argument = argv[index];
@@ -61,16 +63,25 @@ export function parseGeneratedProjectArgs(argv) {
             reportPath = value;
             continue;
         }
+        if (argument === "--react") {
+            const value = argv[++index];
+            if (!value) throw new Error("--react requires a path");
+            if (reactTarball !== undefined) throw new Error("--react may be provided only once");
+            reactTarball = value;
+            continue;
+        }
         if (argument.startsWith("-")) {
             throw new Error(`unknown generated-project smoke argument ${JSON.stringify(argument)}`);
         }
         if (tarball !== undefined) throw new Error("generated-project smoke accepts one tarball");
         tarball = argument;
     }
-    if (tarball === undefined) {
-        throw new Error("usage: bun scripts/smoke-generated-project.mjs <package.tgz> [--report <path>]");
+    if (tarball === undefined || reactTarball === undefined) {
+        throw new Error(
+            "usage: bun scripts/smoke-generated-project.mjs <core.tgz> --react <react.tgz> [--report <path>]"
+        );
     }
-    return { tarball, reportPath };
+    return { tarball, reactTarball, reportPath };
 }
 
 function assertInvariants(invariants) {
@@ -122,6 +133,11 @@ export function buildGeneratedProjectReport(input) {
             version: input.packageEvidence.version,
             tarball: { ...input.packageEvidence.tarball },
         },
+        reactPackage: {
+            name: input.reactPackageEvidence.name,
+            version: input.reactPackageEvidence.version,
+            tarball: { ...input.reactPackageEvidence.tarball },
+        },
         platform: { ...input.platform },
         runtime: { ...input.runtime },
         migrations: {
@@ -138,7 +154,7 @@ export function buildGeneratedProjectReport(input) {
     };
 }
 
-export function assertMatchingGeneratedProjectReport(report, fingerprint) {
+export function assertMatchingGeneratedProjectReport(report, fingerprint, reactFingerprint) {
     if (report === null || typeof report !== "object" || Array.isArray(report)) {
         throw new Error("generated-project evidence must be an object");
     }
@@ -147,6 +163,18 @@ export function assertMatchingGeneratedProjectReport(report, fingerprint) {
     }
     if (!isDeepStrictEqual(report.package?.tarball, fingerprint)) {
         throw new Error("generated-project evidence does not identify the preview tarball");
+    }
+    const react = report.reactPackage;
+    if (
+        react?.name !== "@chardb/react" ||
+        typeof react.version !== "string" ||
+        react.tarball?.algorithm !== "sha256" ||
+        typeof react.tarball.digest !== "string" ||
+        !Number.isSafeInteger(react.tarball.bytes) ||
+        react.tarball.bytes <= 0 ||
+        (reactFingerprint !== undefined && !isDeepStrictEqual(react.tarball, reactFingerprint))
+    ) {
+        throw new Error("generated-project evidence does not identify the preview React tarball");
     }
     assertMigrations(report.migrations);
     assertInvariants(report.invariants);

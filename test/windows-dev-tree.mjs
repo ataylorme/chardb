@@ -1,8 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { arch, release, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { join, relative, resolve } from "node:path";
 import { fingerprintFile, writeJsonAtomically } from "../scripts/browser-proof-report.mjs";
 import { buildWindowsOsCiReport, githubActionsRunFromEnvironment } from "../scripts/os-ci-evidence.mjs";
 
@@ -12,15 +11,21 @@ const tarballArgument = process.argv.indexOf("--tarball");
 if (tarballArgument === -1 || !process.argv[tarballArgument + 1]) {
     throw new Error("usage: bun test/windows-dev-tree.mjs --tarball <package.tgz> [--report <report.json>]");
 }
+const reactTarballArgument = process.argv.indexOf("--react-tarball");
+if (reactTarballArgument === -1 || !process.argv[reactTarballArgument + 1]) {
+    throw new Error("--react-tarball <package.tgz> is required");
+}
 const reportArgument = process.argv.indexOf("--report");
 if (reportArgument !== -1 && !process.argv[reportArgument + 1]) throw new Error("--report requires a path");
 
 const tarball = resolve(process.argv[tarballArgument + 1]);
+const reactTarball = resolve(process.argv[reactTarballArgument + 1]);
 const reportPath = reportArgument === -1 ? undefined : resolve(process.argv[reportArgument + 1]);
-const corePackage = pathToFileURL(tarball).href;
 const root = await mkdtemp(join(tmpdir(), "chardb-windows-dev-tree-"));
 const bootstrap = join(root, "bootstrap");
 const project = join(bootstrap, "generated-app");
+const corePackage = `file:${relative(project, tarball).replaceAll("\\", "/")}`;
+const reactPackage = `file:${relative(project, reactTarball).replaceAll("\\", "/")}`;
 const persistTo = join(project, ".wrangler", "state");
 const messageId = `windows-persistence-${Date.now().toString(36)}`;
 const startedAt = new Date().toISOString();
@@ -35,7 +40,11 @@ try {
     const candidatePackage = JSON.parse(
         await readFile(join(bootstrap, "node_modules", "@chardb", "core", "package.json"), "utf8")
     );
-    await mustRun(process.execPath, [chardb, "init", "generated-app", "--core-package", corePackage], bootstrap);
+    await mustRun(
+        process.execPath,
+        [chardb, "init", "generated-app", "--core-package", corePackage, "--react-package", reactPackage],
+        bootstrap
+    );
 
     const packageJson = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
     if (packageJson.dependencies?.["@chardb/core"] !== corePackage) {
@@ -43,14 +52,25 @@ try {
             `generated @chardb/core specifier ${String(packageJson.dependencies?.["@chardb/core"])} does not match ${corePackage}`
         );
     }
+    if (packageJson.dependencies?.["@chardb/react"] !== reactPackage) {
+        throw new Error(
+            `generated @chardb/react specifier ${String(packageJson.dependencies?.["@chardb/react"])} does not match ${reactPackage}`
+        );
+    }
     await mustRun(process.execPath, ["install"], project);
     const installedPackage = JSON.parse(
         await readFile(join(project, "node_modules", "@chardb", "core", "package.json"), "utf8")
+    );
+    const installedReactPackage = JSON.parse(
+        await readFile(join(project, "node_modules", "@chardb", "react", "package.json"), "utf8")
     );
     if (installedPackage.name !== candidatePackage.name || installedPackage.version !== candidatePackage.version) {
         throw new Error(
             `generated app installed ${String(installedPackage.name)}@${String(installedPackage.version)} instead of the packed candidate`
         );
+    }
+    if (installedReactPackage.name !== "@chardb/react") {
+        throw new Error("generated app did not install the packed @chardb/react candidate");
     }
     const installedChardb = join(project, "node_modules", "@chardb", "core", "dist", "cli", "bin.mjs");
     const [candidateCliBytes, installedCliBytes] = await Promise.all([readFile(chardb), readFile(installedChardb)]);
@@ -150,6 +170,11 @@ try {
                     version: installedPackage.version,
                     tarball: await fingerprintFile(tarball),
                 },
+                reactPackage: {
+                    name: installedReactPackage.name,
+                    version: installedReactPackage.version,
+                    tarball: await fingerprintFile(reactTarball),
+                },
                 platform: {
                     name: "windows-latest",
                     operatingSystem: process.platform,
@@ -172,6 +197,7 @@ try {
                 forcedParentTerminationCycles: 3,
                 checks: {
                     packedCandidateInstalled: true,
+                    packedReactCandidateInstalled: true,
                     generatedTypecheckPassed: true,
                     cloudflareVitestPassed: true,
                     generatedBuildPassed: true,

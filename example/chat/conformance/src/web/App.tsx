@@ -1,4 +1,4 @@
-import { ChardbProvider } from "@chardb/core/react";
+import { ChardbProvider } from "@chardb/react";
 import { anonymousClient } from "better-auth/client/plugins";
 import { createAuthClient } from "better-auth/react";
 import { useEffect, useState } from "react";
@@ -37,7 +37,7 @@ export function App() {
     }
 
     return (
-        <ChardbProvider endpoint={chardbEndpoint()} auth={authClient}>
+        <ChardbProvider ownership="user" endpoint={chardbEndpoint()} auth={authClient}>
             <Workspace />
         </ChardbProvider>
     );

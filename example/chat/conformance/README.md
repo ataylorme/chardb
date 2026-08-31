@@ -94,7 +94,7 @@ The React side uses the stamped handle without spelling out a `CdbIntent` or sen
 // src/web/App.tsx
 import { createAuthClient } from "better-auth/client";
 import { anonymousClient } from "better-auth/client/plugins";
-import { ChardbProvider, useQuery } from "@chardb/core/react";
+import { ChardbProvider, useQuery } from "@chardb/react";
 import { listMessages } from "../server/queries.ts";
 
 const authClient = createAuthClient({ baseURL: location.origin, plugins: [anonymousClient()] });
@@ -176,7 +176,7 @@ Planned queries require an explicit stable `ref`. `useQuery(handle, args)` sends
 
 ```tsx
 // src/web/hooks.ts
-import { useQuery } from "@chardb/core/react";
+import { useQuery } from "@chardb/react";
 import { listMessages } from "../server/queries.ts";
 
 export function useChatMessages(channelId: string) {
@@ -193,7 +193,7 @@ Gateway re-derives authority through Catalog and persists a unique generation be
 Downstream consumers pull the wire shape out of the handle via `InferRow` / `InferArgs`:
 
 ```ts
-import type { InferArgs, InferRow } from "@chardb/core/react";
+import type { InferArgs, InferRow } from "@chardb/react";
 
 type PostMessageArgs = InferArgs<typeof postMessage>;
 type MessageRow      = InferRow<typeof listMessages>;

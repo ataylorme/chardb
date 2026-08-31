@@ -29,6 +29,22 @@ const REQUIREMENTS = [
     },
     {
         file: "src/web/App.tsx",
+        test: source =>
+            /import\s*\{\s*createChardbReactClient\s*\}\s*from\s*"@chardb\/react"/.test(source) &&
+            source.includes("const db = createChardbReactClient({") &&
+            source.includes('ownership: "organization"'),
+        message: "configure the organization-scoped @chardb/react client once",
+    },
+    {
+        file: "src/web/App.tsx",
+        test: source =>
+            source.includes("const workerUrl = window.location.origin") &&
+            source.includes("url: workerUrl") &&
+            source.includes("auth: ({ baseURL }) => createAuthClient({"),
+        message: "let the configured client pass its public Worker URL to Better Auth",
+    },
+    {
+        file: "src/web/App.tsx",
         test: source => /\borganizationClient\s*\(/.test(source),
         message: "register organizationClient() in the native Better Auth client",
     },
@@ -39,8 +55,8 @@ const REQUIREMENTS = [
     },
     {
         file: "src/web/App.tsx",
-        test: source => /\bauthClient\.useSession\s*\(\s*\)/.test(source),
-        message: "read session state with Better Auth's native authClient.useSession() hook",
+        test: source => /\bdb\.auth\.useSession\s*\(\s*\)/.test(source),
+        message: "read session state through db.auth.useSession()",
     },
     {
         file: "src/web/App.tsx",
@@ -49,23 +65,23 @@ const REQUIREMENTS = [
     },
     {
         file: "src/web/App.tsx",
-        test: source => /\bauthClient\.useListOrganizations\s*\(\s*\)/.test(source),
-        message: "read organizations with Better Auth's native authClient.useListOrganizations() hook",
+        test: source => /\bdb\.auth\.useListOrganizations\s*\(\s*\)/.test(source),
+        message: "read organizations through db.auth.useListOrganizations()",
     },
     {
         file: "src/web/App.tsx",
-        test: source => source.includes("authClient.organization.create"),
-        message: "create organizations with authClient.organization.create",
+        test: source => source.includes("db.auth.organization.create"),
+        message: "create organizations with db.auth.organization.create",
     },
     {
         file: "src/web/App.tsx",
-        test: source => source.includes("authClient.organization.setActive"),
-        message: "switch organizations with authClient.organization.setActive",
+        test: source => source.includes("db.auth.organization.setActive"),
+        message: "switch organizations with db.auth.organization.setActive",
     },
     {
         file: "src/web/App.tsx",
         test: source =>
-            source.includes("authClient.organization.delete") && source.includes('data-testid="delete-organization"'),
+            source.includes("db.auth.organization.delete") && source.includes('data-testid="delete-organization"'),
         message: "delete organizations with Better Auth's native organization client",
     },
     {
@@ -76,8 +92,23 @@ const REQUIREMENTS = [
     {
         file: "src/web/App.tsx",
         test: source =>
-            source.includes('fileRef("messages", "attachment")') && source.includes("useFile(messageAttachment)"),
+            source.includes('fileRef("messages", "attachment")') && source.includes("db.useFile(messageAttachment)"),
         message: "bind the generated attachment through the browser-safe Chardb file client",
+    },
+    {
+        file: "src/web/App.tsx",
+        test: source =>
+            !/attachment\.upload\(\{\s*organizationId[,}]/.test(source) &&
+            !/attachment\.downloadUrl\(\{\s*organizationId[,}]/.test(source),
+        message: "let the configured file client inject organization ownership",
+    },
+    {
+        file: "src/web/App.tsx",
+        test: source =>
+            source.includes("db.useQuery(listMessages, { limit: 50 })") &&
+            source.includes("db.useMutation(postMessage)") &&
+            !source.includes("db.useQuery(listMessages, { organizationId"),
+        message: "let the configured SDK inject organization ownership into queries and mutations",
     },
     {
         file: "src/web/App.tsx",
@@ -131,8 +162,16 @@ const REQUIREMENTS = [
     },
     {
         file: "src/web/App.tsx",
-        test: source => !/import\s*\{[^}]*\buseSession\b[^}]*\}\s*from\s*"@chardb\/core\/react"/s.test(source),
+        test: source => !/import\s*\{[^}]*\buseSession\b[^}]*\}\s*from\s*"@chardb\/react"/s.test(source),
         message: "do not import Chardb's useSession hook for Better Auth state",
+    },
+    {
+        file: "src/web/App.tsx",
+        test: source =>
+            !/import\s*\{[^}]*(?:\bChardbProvider\b|\buseQuery\b|\buseMutation\b|\buseFile\b)[^}]*\}\s*from\s*"@chardb\/react"/s.test(
+                source
+            ),
+        message: "use the configured db client instead of importing raw React bindings",
     },
 ];
 

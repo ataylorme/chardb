@@ -7,6 +7,8 @@ describe("preview deployment preparation", () => {
             parsePreviewPrepareArgs([
                 "--tarball",
                 "artifacts/preview/chardb.tgz",
+                "--react-tarball",
+                "artifacts/preview/chardb-react.tgz",
                 "--output",
                 "artifacts/preview/staging-app",
                 "--name",
@@ -15,12 +17,25 @@ describe("preview deployment preparation", () => {
         ).toEqual({
             help: false,
             tarball: "artifacts/preview/chardb.tgz",
+            reactTarball: "artifacts/preview/chardb-react.tgz",
             output: "artifacts/preview/staging-app",
             name: "chardb-preview-pr-42",
         });
         expect(() => parsePreviewPrepareArgs(["--output", "staging-app"])).toThrow("--tarball is required");
+        expect(() => parsePreviewPrepareArgs(["--tarball", "chardb.tgz", "--output", "staging-app"])).toThrow(
+            "--react-tarball is required"
+        );
         expect(() =>
-            parsePreviewPrepareArgs(["--tarball", "chardb.tgz", "--output", "staging-app", "--name", "Bad Name"])
+            parsePreviewPrepareArgs([
+                "--tarball",
+                "chardb.tgz",
+                "--react-tarball",
+                "react.tgz",
+                "--output",
+                "staging-app",
+                "--name",
+                "Bad Name",
+            ])
         ).toThrow("Cloudflare Worker name");
     });
 

@@ -168,6 +168,8 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
 interface DeferredChardbClientControllerOptions {
     /** @internal Let an auth-aware owner decide when queued work may connect. */
     readonly autoStartOnOperation?: boolean;
+    /** @internal Bounded retries for retryable JWT bootstrap failures. */
+    readonly initialJwtFailureRetries?: number;
 }
 
 /** @internal Used by the React provider to keep connection startup out of render. */
@@ -179,6 +181,10 @@ export function createDeferredChardbClientController(
     readonly start: () => void;
 } {
     const autoStartOnOperation = controllerOpts.autoStartOnOperation ?? true;
+    const initialJwtFailureRetries = controllerOpts.initialJwtFailureRetries ?? 0;
+    if (!Number.isSafeInteger(initialJwtFailureRetries) || initialJwtFailureRetries < 0) {
+        throw new RangeError("initialJwtFailureRetries must be a non-negative integer");
+    }
     const mutationTimeoutMs = opts.mutationTimeoutMs ?? DEFAULT_MUTATION_TIMEOUT_MS;
     if (!Number.isSafeInteger(mutationTimeoutMs) || mutationTimeoutMs <= 0 || mutationTimeoutMs > MAX_TIMER_DELAY_MS) {
         throw new RangeError(`mutationTimeoutMs must be an integer between 1 and ${MAX_TIMER_DELAY_MS}`);
@@ -204,6 +210,7 @@ export function createDeferredChardbClientController(
     let authRefreshReadBackoffMs = JWT_REFRESH_READ_INITIAL_BACKOFF_MS;
     let pendingAuthRefresh: PendingAuthRefresh | null = null;
     let openedSession = false;
+    let initialJwtFailures = 0;
 
     function clearAuthRefreshTimer(): void {
         if (authRefreshTimer === null) return;
@@ -349,8 +356,13 @@ export function createDeferredChardbClientController(
         try {
             jwt = await opts.getJwt();
         } catch (error) {
-            if (!openedSession) throw error;
             if (terminated || attempt !== connectionAttempt) return;
+            if (!openedSession) {
+                if (!isCdbError(error) || !error.retryable || initialJwtFailures >= initialJwtFailureRetries) {
+                    throw error;
+                }
+                initialJwtFailures += 1;
+            }
             scheduleReconnect();
             return;
         }
@@ -421,8 +433,12 @@ export function createDeferredChardbClientController(
 
     function startConnect(): void {
         const attempt = ++connectionAttempt;
-        void connect(attempt).catch(() => {
+        void connect(attempt).catch(error => {
             if (terminated || attempt !== connectionAttempt) return;
+            if (isCdbError(error)) {
+                failSession(error.code, error.message, "connect");
+                return;
+            }
             failSession("CDB_INVARIANT", "failed to establish Chardb client session", "connect");
         });
     }

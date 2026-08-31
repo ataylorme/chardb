@@ -9,6 +9,7 @@ const COPIED_DIRECTORIES = ["src"];
 
 export function parsePreviewPrepareArgs(argv) {
     let tarball;
+    let reactTarball;
     let output;
     let name = "chardb-preview";
     let help = false;
@@ -18,21 +19,28 @@ export function parsePreviewPrepareArgs(argv) {
             help = true;
             continue;
         }
-        if (argument !== "--tarball" && argument !== "--output" && argument !== "--name") {
+        if (
+            argument !== "--tarball" &&
+            argument !== "--react-tarball" &&
+            argument !== "--output" &&
+            argument !== "--name"
+        ) {
             throw new Error(`Unknown preview prepare argument ${JSON.stringify(argument)}`);
         }
         const value = argv[++index];
         if (value === undefined || value.length === 0) throw new Error(`${argument} requires a value`);
         if (argument === "--tarball") tarball = value;
+        else if (argument === "--react-tarball") reactTarball = value;
         else if (argument === "--output") output = value;
         else name = value;
     }
     if (!help && tarball === undefined) throw new Error("--tarball is required");
+    if (!help && reactTarball === undefined) throw new Error("--react-tarball is required");
     if (!help && output === undefined) throw new Error("--output is required");
     if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name)) {
         throw new Error("--name must be a lowercase Cloudflare Worker name with at most 63 characters");
     }
-    return { help, tarball, output, name };
+    return { help, tarball, reactTarball, output, name };
 }
 
 export function renderPreviewWrangler(source, name, releaseSha256) {
@@ -47,6 +55,7 @@ function usage() {
         "Usage: bun scripts/prepare-preview-chat.mjs [options]",
         "",
         "  --tarball <path> exact chardb package tarball",
+        "  --react-tarball <path> exact @chardb/react package tarball",
         "  --output <path>  empty destination for the deployable chat",
         "  --name <name>    Cloudflare Worker name, default chardb-preview",
         "  --help           show this help",
@@ -60,6 +69,7 @@ async function main() {
         return;
     }
     const tarball = path.resolve(options.tarball);
+    const reactTarball = path.resolve(options.reactTarball);
     const tarballFingerprint = await fingerprintFile(tarball);
     const output = path.resolve(options.output);
     await mkdir(output, { recursive: true });
@@ -72,6 +82,7 @@ async function main() {
 
     const packageJson = JSON.parse(await readFile(path.join(CHAT, "package.json"), "utf8"));
     const relativeTarball = path.relative(output, tarball).split(path.sep).join("/");
+    const relativeReactTarball = path.relative(output, reactTarball).split(path.sep).join("/");
     packageJson.name = options.name;
     packageJson.scripts = {
         typecheck: "tsc --noEmit",
@@ -81,6 +92,10 @@ async function main() {
     };
     const packageTarball = relativeTarball.startsWith(".") ? relativeTarball : `./${relativeTarball}`;
     packageJson.dependencies["@chardb/core"] = `file:${packageTarball}`;
+    const packageReactTarball = relativeReactTarball.startsWith(".")
+        ? relativeReactTarball
+        : `./${relativeReactTarball}`;
+    packageJson.dependencies["@chardb/react"] = `file:${packageReactTarball}`;
     await writeFile(path.join(output, "package.json"), `${JSON.stringify(packageJson, null, 2)}\n`);
 
     const wrangler = await readFile(path.join(CHAT, "wrangler.template.toml"), "utf8");
@@ -95,6 +110,10 @@ async function main() {
                 schema: "chardb.preview-deployment.v1",
                 workerName: options.name,
                 package: { tarball: tarballFingerprint, relativePath: relativeTarball },
+                reactPackage: {
+                    tarball: await fingerprintFile(reactTarball),
+                    relativePath: relativeReactTarball,
+                },
             },
             null,
             2

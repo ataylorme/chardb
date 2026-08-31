@@ -94,7 +94,8 @@ async function refreshManifest(directory: string, relative: string) {
 
 async function writeOsCiFixture(
     directory: string,
-    exact: { algorithm: "sha256"; digest: string; bytes: number }
+    exact: { algorithm: "sha256"; digest: string; bytes: number },
+    reactExact: { algorithm: "sha256"; digest: string; bytes: number }
 ): Promise<void> {
     const ci = (job: string) => ({
         provider: "github-actions",
@@ -108,7 +109,7 @@ async function writeOsCiFixture(
     const generated = (kind: "linux" | "macos", job: string) => {
         const platform = OS_CI_PLATFORM_TUPLES[kind];
         return {
-            ...buildGeneratedProjectEvidence(exact),
+            ...buildGeneratedProjectEvidence(exact, reactExact),
             run: {
                 id: `${kind}-run`,
                 startedAt: "2026-08-31T00:00:00.000Z",
@@ -131,6 +132,7 @@ async function writeOsCiFixture(
         "generated-windows-report.json",
         buildWindowsOsCiReport({
             package: { name: "@chardb/core", version: "0.1.0", tarball: exact },
+            reactPackage: { name: "@chardb/react", version: "0.1.0", tarball: reactExact },
             platform: { ...OS_CI_PLATFORM_TUPLES.windows, release: "10.0.26100" },
             runtime: {
                 bun: "1.2.22",
@@ -163,12 +165,20 @@ async function releaseFixture() {
 
     const tarball = tarballForPackage("@chardb/core", "0.1.0");
     const exact = { algorithm: "sha256" as const, digest: sha256(tarball), bytes: tarball.byteLength };
+    const reactTarball = tarballForPackage("@chardb/react", "0.1.0");
+    const reactExact = {
+        algorithm: "sha256" as const,
+        digest: sha256(reactTarball),
+        bytes: reactTarball.byteLength,
+    };
     const packageIdentity = { name: "@chardb/core", version: "0.1.0", tarball: exact };
+    const reactPackageIdentity = { name: "@chardb/react", version: "0.1.0", tarball: reactExact };
     await writeFile(path.join(directories.preview, "chardb-core-0.1.0.tgz"), tarball);
-    const generatedProject = buildGeneratedProjectEvidence(exact);
-    const packedChat = buildPackedChatEvidence(exact);
-    const packedPublicVector = buildPackedPublicVectorEvidence(exact);
-    const browser = buildBrowserEvidence(exact);
+    await writeFile(path.join(directories.preview, "chardb-react-0.1.0.tgz"), reactTarball);
+    const generatedProject = buildGeneratedProjectEvidence(exact, reactExact);
+    const packedChat = buildPackedChatEvidence(exact, reactExact);
+    const packedPublicVector = buildPackedPublicVectorEvidence(exact, reactExact);
+    const browser = buildBrowserEvidence(exact, reactExact);
     await json(directories.preview, "generated-project.json", generatedProject);
     await json(directories.preview, "packed-chat.json", packedChat);
     await json(
@@ -186,6 +196,7 @@ async function releaseFixture() {
         suite: "organization-preview-release-gate",
         source: { gitSha: "abc123", dirty: false },
         package: packageIdentity,
+        reactPackage: reactPackageIdentity,
         steps: REQUIRED_PREVIEW_STEPS.map(name => ({ name, status: "passed" })),
         generatedProject,
         packedChat,
@@ -325,7 +336,7 @@ async function releaseFixture() {
     await manifest(directories["cloudflare-vectors"], "evidence.sha256", ["vectorize-proof-report.json"]);
     await manifest(directories["cloudflare-vectors"], "preparation.sha256", ["vectorize-proof-preparation.json"]);
     await manifest(directories["cloudflare-vectors"], "execution.sha256", ["vectorize-proof-execution.json"]);
-    await writeOsCiFixture(directories["os-ci"], exact);
+    await writeOsCiFixture(directories["os-ci"], exact, reactExact);
 
     return { root, directories, exact, packageIdentity };
 }

@@ -39,10 +39,26 @@ export function fixtureSha256(value: string | Uint8Array): string {
     return createHash("sha256").update(value).digest("hex");
 }
 
-export function buildGeneratedProjectEvidence(candidate: ExactCandidate) {
+function reactCandidateFor(candidate: ExactCandidate): ExactCandidate {
+    return {
+        algorithm: "sha256",
+        digest: fixtureSha256(`react:${candidate.digest}:${candidate.bytes}`),
+        bytes: candidate.bytes + 17,
+    };
+}
+
+export function buildGeneratedProjectEvidence(
+    candidate: ExactCandidate,
+    reactCandidate = reactCandidateFor(candidate)
+) {
     return buildGeneratedProjectReport({
         run: { id: "release-admission-generated" },
         packageEvidence: { name: "@chardb/core", version: "0.1.0", tarball: candidate },
+        reactPackageEvidence: {
+            name: "@chardb/react",
+            version: "0.1.0",
+            tarball: reactCandidate,
+        },
         platform: { name: "test-linux-x64" },
         runtime: { bun: "1.2.22", wrangler: "4.125.0" },
         migrations: {
@@ -58,11 +74,16 @@ export function buildGeneratedProjectEvidence(candidate: ExactCandidate) {
     });
 }
 
-export function buildPackedChatEvidence(candidate: ExactCandidate) {
+export function buildPackedChatEvidence(candidate: ExactCandidate, reactCandidate = reactCandidateFor(candidate)) {
     const route = (path: string) => ({ method: "POST", path, status: 200 });
     return buildPackedChatReport({
         run: { id: "release-admission-chat" },
         packageEvidence: { name: "@chardb/core", version: "0.1.0", tarball: candidate },
+        reactPackageEvidence: {
+            name: "@chardb/react",
+            version: "0.1.0",
+            tarball: reactCandidate,
+        },
         platform: { operatingSystem: "linux", release: "6.11.0", architecture: "x64" },
         runtime: {
             name: "packed-chat-miniflare-process-restart",
@@ -95,13 +116,21 @@ export function buildPackedChatEvidence(candidate: ExactCandidate) {
     });
 }
 
-export function buildPackedPublicVectorEvidence(candidate: ExactCandidate) {
+export function buildPackedPublicVectorEvidence(
+    candidate: ExactCandidate,
+    reactCandidate = reactCandidateFor(candidate)
+) {
     const queryArgs = { organizationId: "org-browser-proof", values: [1, 0, 0], limit: 5 };
     return {
         schema: PACKED_PUBLIC_VECTOR_SCHEMA,
         ok: true,
         capability: PACKED_LOCAL_VECTOR_CAPABILITY,
         package: { name: "@chardb/core", version: "0.1.0", tarball: candidate },
+        reactPackage: {
+            name: "@chardb/react",
+            version: "0.1.0",
+            tarball: reactCandidate,
+        },
         proof: {
             schema: PACKED_PUBLIC_VECTOR_SCHEMA,
             queryRef: PUBLIC_VECTOR_QUERY_REF,
@@ -123,13 +152,18 @@ export function buildPackedPublicVectorEvidence(candidate: ExactCandidate) {
     };
 }
 
-export function buildBrowserEvidence(candidate: ExactCandidate) {
+export function buildBrowserEvidence(candidate: ExactCandidate, reactCandidate = reactCandidateFor(candidate)) {
     const route = (path: string) => ({ method: "POST", path, status: 200 });
     const sessionIdSha256 = fixtureSha256("release-admission-browser-session");
     const cookieJarSha256 = fixtureSha256("release-admission-browser-cookies");
     return buildBrowserProofReport({
         run: { id: "release-admission-browser", startedAt: "2026-08-30T00:00:00.000Z" },
         package: { name: "@chardb/core", version: "0.1.0", tarball: candidate },
+        reactPackage: {
+            name: "@chardb/react",
+            version: "0.1.0",
+            tarball: reactCandidate,
+        },
         platform: { operatingSystem: "test" },
         runtime: { name: "wrangler" },
         identity: { userId: "user-1" },

@@ -25,11 +25,18 @@ async function fixture() {
     const directory = await mkdtemp(path.join(tmpdir(), "chardb-preview-evidence-"));
     const tarball = "exact tarball";
     const fingerprint = { algorithm: "sha256" as const, digest: digest(tarball), bytes: tarball.length };
-    const generatedProject = buildGeneratedProjectEvidence(fingerprint);
-    const packedChat = buildPackedChatEvidence(fingerprint);
-    const packedPublicVector = buildPackedPublicVectorEvidence(fingerprint);
-    const browser = buildBrowserEvidence(fingerprint);
+    const reactTarball = "exact React tarball";
+    const reactFingerprint = {
+        algorithm: "sha256" as const,
+        digest: digest(reactTarball),
+        bytes: reactTarball.length,
+    };
+    const generatedProject = buildGeneratedProjectEvidence(fingerprint, reactFingerprint);
+    const packedChat = buildPackedChatEvidence(fingerprint, reactFingerprint);
+    const packedPublicVector = buildPackedPublicVectorEvidence(fingerprint, reactFingerprint);
+    const browser = buildBrowserEvidence(fingerprint, reactFingerprint);
     await writeFile(path.join(directory, "chardb-core-0.1.0.tgz"), tarball);
+    await writeFile(path.join(directory, "chardb-react-0.1.0.tgz"), reactTarball);
     await mkdir(path.join(directory, "nested"));
     await writeFile(path.join(directory, "nested", "proof.json"), '{"ok":true}\n');
     await writeFile(path.join(directory, "generated-project.json"), `${JSON.stringify(generatedProject)}\n`);
@@ -56,6 +63,11 @@ async function fixture() {
                 version: "0.1.0",
                 tarball: fingerprint,
             },
+            reactPackage: {
+                name: "@chardb/react",
+                version: "0.1.0",
+                tarball: reactFingerprint,
+            },
             steps: REQUIRED_PREVIEW_STEPS.map(name => ({ name, status: "passed" })),
             generatedProject,
             packedChat,
@@ -64,7 +76,7 @@ async function fixture() {
             summary: { passed: true, completedSteps: REQUIRED_PREVIEW_STEPS.length, failedStep: null },
         })}\n`
     );
-    return { directory, tarball };
+    return { directory, tarball, reactTarball };
 }
 
 describe("preview evidence finalization", () => {
@@ -79,6 +91,7 @@ describe("preview evidence finalization", () => {
         expect(manifest.files.map(file => file.path)).toEqual([
             "browser-proof.json",
             "chardb-core-0.1.0.tgz",
+            "chardb-react-0.1.0.tgz",
             "generated-project.json",
             "nested/proof.json",
             "packed-chat.json",
@@ -102,6 +115,12 @@ describe("preview evidence finalization", () => {
         const drifted = await fixture();
         await writeFile(path.join(drifted.directory, "chardb-core-0.1.0.tgz"), "changed");
         await expect(buildPreviewEvidenceManifest(drifted.directory)).rejects.toThrow("does not match");
+
+        const reactDrifted = await fixture();
+        await writeFile(path.join(reactDrifted.directory, "chardb-react-0.1.0.tgz"), "changed");
+        await expect(buildPreviewEvidenceManifest(reactDrifted.directory)).rejects.toThrow(
+            "React tarball does not match"
+        );
 
         const linked = await fixture();
         await symlink(path.join(linked.directory, "nested", "proof.json"), path.join(linked.directory, "linked"));
@@ -135,6 +154,7 @@ describe("preview evidence finalization", () => {
                 suite: complete.suite,
                 source: complete.source,
                 package: complete.package,
+                reactPackage: complete.reactPackage,
                 summary: complete.summary,
             })
         );

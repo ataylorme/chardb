@@ -22,7 +22,7 @@ try {
     if (packageJson.name !== rootPackage.name || packageJson.version !== rootPackage.version) {
         fail(`packed identity is ${packageJson.name}@${packageJson.version}`);
     }
-    const expectedExports = [".", "./server", "./react", "./files", "./vite"];
+    const expectedExports = [".", "./server", "./internal/react", "./files", "./vite"];
     if (JSON.stringify(Object.keys(packageJson.exports)) !== JSON.stringify(expectedExports)) {
         fail(`public exports must be ${expectedExports.join(", ")}`);
     }

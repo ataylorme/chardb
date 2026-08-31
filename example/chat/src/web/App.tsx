@@ -1,4 +1,4 @@
-import { ChardbProvider, useMutation, useQuery } from "@chardb/core/react";
+import { ChardbProvider, useMutation, useQuery } from "@chardb/react";
 import { type Organization, anonymousClient, jwtClient, organizationClient } from "better-auth/client/plugins";
 import { createAuthClient } from "better-auth/react";
 import { type FormEvent, useEffect, useState } from "react";
@@ -50,7 +50,7 @@ export function App() {
     }
 
     return (
-        <ChardbProvider endpoint={endpoint()} auth={authClient}>
+        <ChardbProvider ownership="organization" endpoint={endpoint()} auth={authClient}>
             <Workspace activeOrganizationId={session.data.session.activeOrganizationId} userId={session.data.user.id} />
         </ChardbProvider>
     );

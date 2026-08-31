@@ -37,11 +37,11 @@ describe("published API boundary", () => {
         expect(Object.keys(viteApi).sort()).toEqual(["chardb", "default"]);
     });
 
-    test("package publishes five supported entry points", async () => {
+    test("core publishes four supported entries and the React package bridge", async () => {
         const pkg = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as {
             readonly exports: Record<string, unknown>;
         };
-        expect(Object.keys(pkg.exports)).toEqual([".", "./server", "./react", "./files", "./vite"]);
+        expect(Object.keys(pkg.exports)).toEqual([".", "./server", "./internal/react", "./files", "./vite"]);
     });
 
     test("packed export smoke owns and bounds its child process tree", async () => {
@@ -49,7 +49,7 @@ describe("published API boundary", () => {
 
         expect(source).toContain('const LOADABLE_EXPORTS = [".", "./files", "./vite"]');
         expect(source).toContain('["./server", "requires the Cloudflare Workers runtime');
-        expect(source).toContain('["./react", "requires the optional react peer"]');
+        expect(source).toContain('["./internal/react", "is consumed only by @chardb/react');
         expect(source).toContain('"./observability"');
         expect(source).toContain('label: "packed package smoke"');
         expect(source).toContain("timeoutMs: 5 * 60_000");

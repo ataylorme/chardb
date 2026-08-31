@@ -5,12 +5,14 @@ export declare const PACKED_CHAT_INVARIANTS: readonly string[];
 
 export declare function parsePackedChatArgs(argv: readonly string[]): {
     readonly tarball: string;
+    readonly reactTarball: string;
     readonly reportPath: string | undefined;
 };
 
 export declare function buildPackedChatReport<TInvariants extends Readonly<Record<string, boolean>>>(input: {
     readonly run: object;
     readonly packageEvidence: { readonly name: string; readonly version: string; readonly tarball: object };
+    readonly reactPackageEvidence: { readonly name: string; readonly version: string; readonly tarball: object };
     readonly platform: object;
     readonly runtime: object;
     readonly identity: { readonly ownerUserId: string; readonly memberUserId: string };
@@ -37,7 +39,11 @@ export declare function buildPackedChatReport<TInvariants extends Readonly<Recor
     readonly invariants: TInvariants;
 }): object & { readonly invariants: TInvariants };
 
-export declare function assertMatchingPackedChatReport<T extends object>(report: T, fingerprint: object): T;
+export declare function assertMatchingPackedChatReport<T extends object>(
+    report: T,
+    fingerprint: object,
+    reactFingerprint?: object
+): T;
 
 export declare function buildPackedChatRestartHandoff(input: {
     readonly tarball: object;

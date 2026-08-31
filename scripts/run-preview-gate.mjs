@@ -56,13 +56,16 @@ const packedOrgUserPath = path.join(outputDirectory, "packed-org-user.json");
 const packedPublicVectorPath = path.join(outputDirectory, "packed-public-vector.json");
 const stagingAppPath = path.join(outputDirectory, "staging-app");
 const packageJson = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8"));
+const reactPackageJson = JSON.parse(await readFile(path.join(ROOT, "packages", "react", "package.json"), "utf8"));
 const tarballPath = path.join(outputDirectory, npmPackFilename(packageJson.name, packageJson.version));
+const reactTarballPath = path.join(outputDirectory, npmPackFilename(reactPackageJson.name, reactPackageJson.version));
 const scratch = await mkdtemp(path.join(tmpdir(), "chardb-preview-gate-"));
 const npmCache = path.join(scratch, "npm-cache");
 const startedAt = new Date().toISOString();
 const startedAtMs = performance.now();
 const steps = [];
 let packageEvidence;
+let reactPackageEvidence;
 let browserEvidence;
 let generatedProjectEvidence;
 let packedChatEvidence;
@@ -107,6 +110,7 @@ async function writeReport() {
         source,
         platform: platformEvidence,
         packageEvidence,
+        reactPackageEvidence,
         steps,
         browserEvidence,
         generatedProjectEvidence,
@@ -188,21 +192,38 @@ try {
         tarball: await fingerprintFile(tarballPath),
         path: tarballPath,
     };
+    await step("exact React npm tarball", ["npm", "pack", "--pack-destination", outputDirectory, "./packages/react"]);
+    reactPackageEvidence = {
+        name: reactPackageJson.name,
+        version: reactPackageJson.version,
+        tarball: await fingerprintFile(reactTarballPath),
+        path: reactTarballPath,
+    };
     await step("prepare staging dogfood app", [
         "bun",
         "scripts/prepare-preview-chat.mjs",
         "--tarball",
         tarballPath,
+        "--react-tarball",
+        reactTarballPath,
         "--output",
         stagingAppPath,
         "--name",
         "chardb-preview",
     ]);
     await step("public package boundary", ["bun", "scripts/smoke-packed-package.mjs", tarballPath]);
+    await step("public React package boundary", [
+        "bun",
+        "scripts/smoke-packed-react.mjs",
+        tarballPath,
+        reactTarballPath,
+    ]);
     await step("packed organization user", [
         "bun",
         "scripts/smoke-packed-org-user.mjs",
         tarballPath,
+        "--react",
+        reactTarballPath,
         "--report",
         packedOrgUserPath,
     ]);
@@ -226,26 +247,32 @@ try {
     await internalStep("generated evidence identity", ["internal", "verify-generated-evidence"], async () => {
         generatedProjectEvidence = assertMatchingGeneratedProjectReport(
             JSON.parse(await readFile(generatedProjectPath, "utf8")),
-            packageEvidence.tarball
+            packageEvidence.tarball,
+            reactPackageEvidence.tarball
         );
     });
     await step("packed organization chat", [
         "bun",
         "scripts/smoke-packed-chat.mjs",
         tarballPath,
+        "--react",
+        reactTarballPath,
         "--report",
         packedChatPath,
     ]);
     await internalStep("packed chat evidence identity", ["internal", "verify-packed-chat-evidence"], async () => {
         packedChatEvidence = assertMatchingPackedChatReport(
             JSON.parse(await readFile(packedChatPath, "utf8")),
-            packageEvidence.tarball
+            packageEvidence.tarball,
+            reactPackageEvidence.tarball
         );
     });
     await step("packed public vector browser", [
         "bun",
         "scripts/smoke-packed-public-vector.mjs",
         tarballPath,
+        "--react",
+        reactTarballPath,
         "--report",
         packedPublicVectorPath,
     ]);
@@ -255,15 +282,17 @@ try {
         async () => {
             packedPublicVectorEvidence = assertMatchingPackedPublicVectorReport(
                 JSON.parse(await readFile(packedPublicVectorPath, "utf8")),
-                packageEvidence.tarball
+                packageEvidence.tarball,
+                reactPackageEvidence.tarball
             );
         }
     );
-    await step("packed browser", ["bun", "scripts/smoke-packed-browser.mjs", tarballPath]);
+    await step("packed browser", ["bun", "scripts/smoke-packed-browser.mjs", tarballPath, "--react", reactTarballPath]);
     await internalStep("browser evidence identity", ["internal", "verify-browser-evidence"], async () => {
         browserEvidence = assertMatchingBrowserReport(
             JSON.parse(await readFile(browserPath, "utf8")),
-            packageEvidence.tarball
+            packageEvidence.tarball,
+            reactPackageEvidence.tarball
         );
     });
     const report = await writeReport();

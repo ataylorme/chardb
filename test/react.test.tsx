@@ -1,18 +1,30 @@
 /**
- * Lifecycle tests for `@chardb/core/react` hooks. We render through
+ * Lifecycle tests for `@chardb/react` hooks. We render through
  * `react-test-renderer` with a stub `ChardbClient` so we can observe the
  * subscribe → patch → unsubscribe contract without booting a real
  * WebSocket. Covers what the audit flagged: hooks were entirely unverified.
  */
 import { describe, expect, test } from "bun:test";
+import { createAuthClient } from "better-auth/react";
 import * as React from "react";
 import * as TestRenderer from "react-test-renderer";
 import type { ChardbClient } from "../src/client/index.ts";
+import { fileRef } from "../src/files/index.ts";
 import * as ChardbReact from "../src/react/index.ts";
-import { ChardbProvider, useChardb, useMutation, useQuery } from "../src/react/index.ts";
+import {
+    type ChardbProviderProps,
+    ChardbProvider as CoreChardbProvider,
+    useChardb,
+    useMutation,
+    useQuery,
+} from "../src/react/index.ts";
 import { PROTOCOL_V, type RawJson } from "../src/wire.ts";
 
 type TestSubState = "pending" | "live" | "refetching" | "error" | "closed";
+
+function ChardbProvider(props: React.PropsWithChildren<Omit<ChardbProviderProps, "ownership">>) {
+    return React.createElement(CoreChardbProvider, { ...props, ownership: "organization" });
+}
 
 interface SubInstance {
     readonly ref: string;
@@ -103,9 +115,16 @@ function mutableSessionAuth() {
     const listeners = new Set<() => void>();
     let userId: string | null = null;
     let sessionId: string | null = null;
+    let activeOrganizationId: string | null = null;
     const sessionAtom: ChardbReact.AuthSessionAtom = {
         get: () => ({
-            data: userId === null ? null : { user: { id: userId }, session: { id: sessionId ?? "missing" } },
+            data:
+                userId === null
+                    ? null
+                    : {
+                          user: { id: userId },
+                          session: { id: sessionId ?? "missing", activeOrganizationId },
+                      },
             isPending: false,
         }),
         subscribe(listener) {
@@ -131,9 +150,18 @@ function mutableSessionAuth() {
     return {
         auth,
         activity,
-        setUser(nextUserId: string | null, nextSessionId: string | null = nextUserId && `session-${nextUserId}`) {
+        setUser(
+            nextUserId: string | null,
+            nextSessionId: string | null = nextUserId && `session-${nextUserId}`,
+            nextOrganizationId: string | null = activeOrganizationId
+        ) {
             userId = nextUserId;
             sessionId = nextSessionId;
+            activeOrganizationId = nextUserId === null ? null : nextOrganizationId;
+            for (const listener of listeners) listener();
+        },
+        setOrganization(nextOrganizationId: string | null) {
+            activeOrganizationId = nextOrganizationId;
             for (const listener of listeners) listener();
         },
     };
@@ -150,14 +178,280 @@ function nestedEmptyJson(depth: number): RawJson {
     return value;
 }
 
-describe("@chardb/core/react — hook lifecycle", () => {
+describe("@chardb/react — hook lifecycle", () => {
     test("exports only supported hooks", () => {
-        for (const name of ["ChardbProvider", "useChardb", "useQuery", "useMutation", "useFile"]) {
+        for (const name of [
+            "ChardbProvider",
+            "createChardbReactClient",
+            "useChardb",
+            "useChardbIdentity",
+            "useQuery",
+            "useMutation",
+        ]) {
             expect(name in ChardbReact).toBe(true);
         }
-        for (const name of ["useSession", "usePresence", "useUpload", "useStream", "useVectorSearch"]) {
+        for (const name of ["useFile", "useSession", "usePresence", "useUpload", "useStream", "useVectorSearch"]) {
             expect(name in ChardbReact).toBe(false);
         }
+    });
+
+    test("narrows Better Auth identity through organization selection", () => {
+        const session = mutableSessionAuth();
+        const { client } = stubClient();
+        let identity: ChardbReact.ChardbIdentity<ChardbReact.ChardbOwnership> | undefined;
+        function Probe() {
+            identity = ChardbReact.useChardbIdentity();
+            return null;
+        }
+        let tree!: TestRenderer.ReactTestRenderer;
+        TestRenderer.act(() => {
+            tree = TestRenderer.create(
+                React.createElement(
+                    CoreChardbProvider,
+                    { ownership: "organization", client, auth: session.auth },
+                    React.createElement(Probe)
+                )
+            );
+        });
+        expect(identity).toMatchObject({ ownership: "organization", status: "signed-out", user: null });
+
+        TestRenderer.act(() => session.setUser("user-a", "session-a", null));
+        expect(identity).toMatchObject({
+            ownership: "organization",
+            status: "select-organization",
+            user: { id: "user-a" },
+            organizationId: null,
+        });
+
+        TestRenderer.act(() => session.setOrganization("org-a"));
+        expect(identity).toMatchObject({
+            ownership: "organization",
+            status: "ready",
+            user: { id: "user-a" },
+            organizationId: "org-a",
+        });
+        TestRenderer.act(() => tree.unmount());
+    });
+
+    test("configured React client injects the authenticated organization into a live query", async () => {
+        const realWebSocket = globalThis.WebSocket;
+        ProviderWebSocket.instances.length = 0;
+        (globalThis as { WebSocket: unknown }).WebSocket = ProviderWebSocket;
+        const session = mutableSessionAuth();
+        session.setUser("user-sdk", "session-sdk", "org-sdk");
+        const sdk = ChardbReact.createChardbReactClient({
+            url: "https://db.example.com",
+            ownership: "organization",
+            auth: () => session.auth,
+            clientId: "configured-sdk",
+        });
+        expect(sdk.auth).toBe(session.auth);
+        const query = Object.assign(
+            async (_ctx: never, _args: { organizationId: string; limit: number }) => [{ id: "unused" }],
+            { __chardbRef: { toString: () => "src/queries.ts#listMessages" } }
+        );
+        let result: ChardbReact.UseQueryResult<{ id: string }> | undefined;
+        function Probe() {
+            result = sdk.useQuery(query, { limit: 25 });
+            return null;
+        }
+        let tree: TestRenderer.ReactTestRenderer | undefined;
+        try {
+            await TestRenderer.act(async () => {
+                tree = TestRenderer.create(React.createElement(sdk.Provider, null, React.createElement(Probe)));
+                await flushMicrotasks();
+            });
+            expect(result?.state).toBe("pending");
+            const socket = ProviderWebSocket.instances[0];
+            if (!socket) throw new Error("expected configured SDK socket");
+            const socketUrl = new URL(socket.url);
+            expect(socketUrl.origin).toBe("wss://db.example.com");
+            expect(socketUrl.pathname).toBe("/ws");
+            expect(socketUrl.searchParams.get("clientId")).toBe("configured-sdk");
+            socket.onmessage?.({
+                data: JSON.stringify({
+                    t: "welcome",
+                    protocolV: PROTOCOL_V,
+                    baseCookie: "c-sdk:1",
+                    region: "test",
+                }),
+            });
+            const subscription = socket.sent
+                .map(raw => JSON.parse(raw) as { readonly t: string; readonly args?: RawJson })
+                .find(message => message.t === "sub");
+            expect(subscription?.args).toEqual({ organizationId: "org-sdk", limit: 25 });
+        } finally {
+            TestRenderer.act(() => tree?.unmount());
+            (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;
+        }
+    });
+
+    test("uses one canonical Worker origin to configure Better Auth, sockets, and files", () => {
+        const session = mutableSessionAuth();
+        let authBaseURL: string | undefined;
+        const sdk = ChardbReact.createChardbReactClient({
+            url: "https://db.example.com/",
+            ownership: "organization",
+            auth: ({ baseURL }) => {
+                authBaseURL = baseURL;
+                return Object.assign(session.auth, { pluginAction: () => "typed-plugin" as const });
+            },
+        });
+
+        expect(authBaseURL).toBe("https://db.example.com");
+        expect(sdk.url).toBe("https://db.example.com");
+        expect(sdk.auth.pluginAction()).toBe("typed-plugin");
+    });
+
+    test("configures a real Better Auth React client without losing its inferred actions", () => {
+        let authBaseURL: string | undefined;
+        const sdk = ChardbReact.createChardbReactClient({
+            url: "https://db.example.com",
+            ownership: "user",
+            auth: ({ baseURL }) => {
+                authBaseURL = baseURL;
+                return createAuthClient({ baseURL });
+            },
+        });
+
+        expect(authBaseURL).toBe("https://db.example.com");
+        expect(typeof sdk.auth.signIn.email).toBe("function");
+        expect(typeof sdk.auth.$fetch).toBe("function");
+        expect(typeof sdk.auth.$store.atoms.session.get).toBe("function");
+        expect(typeof sdk.auth.$store.atoms.session.subscribe).toBe("function");
+
+        const directAuthDoesNotCompile = () => {
+            // @ts-expect-error A preconfigured client can point auth at a different origin.
+            ChardbReact.createChardbReactClient({ url: "https://db.example.com", ownership: "user", auth: sdk.auth });
+        };
+        expect(typeof directAuthDoesNotCompile).toBe("function");
+    });
+
+    test("rejects public Worker URLs whose path or metadata would be discarded", () => {
+        for (const url of [
+            "/relative",
+            "wss://db.example.com",
+            "https://user:secret@db.example.com",
+            "https://db.example.com/app",
+            "https://db.example.com?stage=one",
+            "https://db.example.com#client",
+        ]) {
+            expect(() =>
+                ChardbReact.createChardbReactClient({
+                    url,
+                    ownership: "organization",
+                    auth: () => mutableSessionAuth().auth,
+                })
+            ).toThrow("public Worker URL");
+        }
+    });
+
+    test("organization file hooks inject the ready organization and hide it from callers", async () => {
+        const originalFetch = globalThis.fetch;
+        const realWebSocket = globalThis.WebSocket;
+        ProviderWebSocket.instances.length = 0;
+        (globalThis as { WebSocket: unknown }).WebSocket = ProviderWebSocket;
+        const session = mutableSessionAuth();
+        session.setUser("user-files", "session-files", "org-files");
+        const sdk = ChardbReact.createChardbReactClient({
+            url: "https://db.example.com",
+            ownership: "organization",
+            auth: () => session.auth,
+        });
+        let files: ChardbReact.ChardbOrganizationFileClient | undefined;
+        function Probe() {
+            files = sdk.useFile(fileRef("messages", "attachment"));
+            return null;
+        }
+        let requested: string | undefined;
+        globalThis.fetch = (async (input: string | URL | Request) => {
+            requested = String(input);
+            return new Response("file");
+        }) as typeof globalThis.fetch;
+        let tree: TestRenderer.ReactTestRenderer | undefined;
+        try {
+            TestRenderer.act(() => {
+                tree = TestRenderer.create(React.createElement(sdk.Provider, null, React.createElement(Probe)));
+            });
+            if (!files) throw new Error("expected the scoped file client");
+            await files.download({ rowId: "row-1" });
+            expect(requested).toBe(
+                "https://db.example.com/_chardb/files/download?organizationId=org-files&table=messages&column=attachment&rowId=row-1"
+            );
+            await TestRenderer.act(async () => {
+                session.setOrganization("org-files-next");
+                await flushMicrotasks();
+            });
+            await files.download({ rowId: "row-2" });
+            expect(requested).toBe(
+                "https://db.example.com/_chardb/files/download?organizationId=org-files-next&table=messages&column=attachment&rowId=row-2"
+            );
+            const callerCannotSupplyOrganization = () => {
+                // @ts-expect-error Organization scope comes from Better Auth, not caller input.
+                files.download({ organizationId: "org-other", rowId: "row-1" });
+            };
+            expect(typeof callerCannotSupplyOrganization).toBe("function");
+        } finally {
+            tree?.unmount();
+            globalThis.fetch = originalFetch;
+            (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;
+        }
+    });
+
+    test("organization file hooks reject signed-out and cross-origin browser operations", async () => {
+        const realWebSocket = globalThis.WebSocket;
+        ProviderWebSocket.instances.length = 0;
+        (globalThis as { WebSocket: unknown }).WebSocket = ProviderWebSocket;
+        const session = mutableSessionAuth();
+        const sdk = ChardbReact.createChardbReactClient({
+            url: "https://db.example.com",
+            ownership: "organization",
+            auth: () => session.auth,
+        });
+        let files: ChardbReact.ChardbOrganizationFileClient | undefined;
+        function Probe() {
+            files = sdk.useFile(fileRef("messages", "attachment"));
+            return null;
+        }
+        const tree = TestRenderer.create(React.createElement(sdk.Provider, null, React.createElement(Probe)));
+        try {
+            if (!files) throw new Error("expected the scoped file client");
+            await expect(files.download({ rowId: "row-1" })).rejects.toThrow("organization identity is signed-out");
+
+            await TestRenderer.act(async () => {
+                session.setUser("user-files", "session-files", "org-files");
+                await flushMicrotasks();
+            });
+            const originalWindow = globalThis.window;
+            Object.defineProperty(globalThis, "window", {
+                configurable: true,
+                value: { location: { origin: "https://app.example.com" } },
+            });
+            try {
+                await expect(files.download({ rowId: "row-1" })).rejects.toThrow("must share the app origin");
+                expect(() => files?.downloadUrl({ rowId: "row-1" })).toThrow("must share the app origin");
+            } finally {
+                if (originalWindow === undefined) Reflect.deleteProperty(globalThis, "window");
+                else Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
+            }
+        } finally {
+            tree.unmount();
+            (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;
+        }
+    });
+
+    test("user-owned clients do not expose organization-only file hooks", () => {
+        const sdk = ChardbReact.createChardbReactClient({
+            url: "https://db.example.com",
+            ownership: "user",
+            auth: () => mutableSessionAuth().auth,
+        });
+        expect("useFile" in sdk).toBe(false);
+        const userFileHookDoesNotCompile = () => {
+            // @ts-expect-error User-owned Chardb apps do not have organization file routes.
+            sdk.useFile(fileRef("messages", "attachment"));
+        };
+        expect(typeof userFileHookDoesNotCompile).toBe("function");
     });
 
     test("ChardbProvider forwards mutationTimeoutMs to its client", () => {
@@ -600,6 +894,79 @@ describe("@chardb/core/react — hook lifecycle", () => {
             expect(ProviderWebSocket.instances).toHaveLength(3);
             expect(session.activity.fetchCalls).toBe(3);
             expect(thirdSocket.closeCalls).toBe(1);
+        } finally {
+            tree?.unmount();
+            (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;
+        }
+    });
+
+    test("re-authenticates when the active Better Auth organization changes", async () => {
+        const realWebSocket = globalThis.WebSocket;
+        ProviderWebSocket.instances.length = 0;
+        (globalThis as { WebSocket: unknown }).WebSocket = ProviderWebSocket;
+        const session = mutableSessionAuth();
+        session.setUser("user-a", "session-a", "org-a");
+        let tree: TestRenderer.ReactTestRenderer | undefined;
+
+        try {
+            await TestRenderer.act(async () => {
+                tree = TestRenderer.create(
+                    React.createElement(ChardbProvider, {
+                        endpoint: "wss://example.com/auth-organization",
+                        auth: session.auth,
+                        clientId: "provider-auth-organization",
+                    })
+                );
+                await flushMicrotasks();
+            });
+            expect(ProviderWebSocket.instances).toHaveLength(1);
+            expect(session.activity.fetchCalls).toBe(1);
+            const firstSocket = ProviderWebSocket.instances[0];
+            if (!firstSocket) throw new Error("expected the first organization socket");
+
+            await TestRenderer.act(async () => {
+                session.setOrganization("org-b");
+                await flushMicrotasks();
+            });
+            expect(ProviderWebSocket.instances).toHaveLength(2);
+            expect(session.activity.fetchCalls).toBe(2);
+            expect(firstSocket.closeCalls).toBe(1);
+        } finally {
+            tree?.unmount();
+            (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;
+        }
+    });
+
+    test("keeps a user-owned connection when unrelated active organization state changes", async () => {
+        const realWebSocket = globalThis.WebSocket;
+        ProviderWebSocket.instances.length = 0;
+        (globalThis as { WebSocket: unknown }).WebSocket = ProviderWebSocket;
+        const session = mutableSessionAuth();
+        session.setUser("user-a", "session-a", "org-a");
+        let tree: TestRenderer.ReactTestRenderer | undefined;
+
+        try {
+            await TestRenderer.act(async () => {
+                tree = TestRenderer.create(
+                    React.createElement(CoreChardbProvider, {
+                        ownership: "user",
+                        endpoint: "wss://example.com/auth-user",
+                        auth: session.auth,
+                        clientId: "provider-auth-user",
+                    })
+                );
+                await flushMicrotasks();
+            });
+            const socket = ProviderWebSocket.instances[0];
+            if (!socket) throw new Error("expected the user-owned socket");
+
+            await TestRenderer.act(async () => {
+                session.setOrganization("org-b");
+                await flushMicrotasks();
+            });
+            expect(ProviderWebSocket.instances).toHaveLength(1);
+            expect(session.activity.fetchCalls).toBe(1);
+            expect(socket.closeCalls).toBe(0);
         } finally {
             tree?.unmount();
             (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;

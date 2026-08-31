@@ -62,7 +62,7 @@ fn custom_rustls_roots_complete_a_real_wss_handshake() {
         .with_root_certificates(roots)
         .with_no_client_auth();
     let client = Client::connect(
-        ClientConfig::with_token(format!("wss://localhost:{}/ws", address.port()), "token")
+        ClientConfig::with_token(format!("wss://127.0.0.1:{}/ws", address.port()), "token")
             .client_id("tls-client")
             .connect_timeout(Duration::from_secs(2))
             .welcome_timeout(Duration::from_secs(2))

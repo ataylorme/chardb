@@ -17,9 +17,10 @@ if (await isolateProcessTree(import.meta.url, { label: "packed public vector smo
     process.exit(0);
 }
 
-const { tarballArgument, reportArgument } = parseArgs(process.argv.slice(2));
+const { tarballArgument, reactTarballArgument, reportArgument } = parseArgs(process.argv.slice(2));
 
 const tarballPath = resolve(tarballArgument);
+const reactTarballPath = resolve(reactTarballArgument);
 const scratch = await mkdtemp(join(tmpdir(), "chardb-packed-public-vector-"));
 const project = join(scratch, "app");
 let browser;
@@ -27,7 +28,7 @@ let server;
 let passed = false;
 
 try {
-    await writeFixture(project, tarballPath);
+    await writeFixture(project, tarballPath, reactTarballPath);
     run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund"], project);
     const doctor = join(project, "node_modules", ".bin", "chardb");
     assertDoctor(runCapture(doctor, ["doctor"], project), "wrangler.toml");
@@ -75,8 +76,14 @@ try {
     const installedPackage = JSON.parse(
         await readFile(join(project, "node_modules", "@chardb", "core", "package.json"), "utf8")
     );
+    const installedReactPackage = JSON.parse(
+        await readFile(join(project, "node_modules", "@chardb", "react", "package.json"), "utf8")
+    );
     if (installedPackage?.name !== "@chardb/core" || typeof installedPackage.version !== "string") {
         throw new Error("installed packed public vector candidate has an invalid package identity");
+    }
+    if (installedReactPackage?.name !== "@chardb/react" || typeof installedReactPackage.version !== "string") {
+        throw new Error("installed packed public vector React candidate has an invalid package identity");
     }
 
     const report = {
@@ -87,6 +94,12 @@ try {
             version: installedPackage.version,
             filename: basename(tarballPath),
             tarball: await fingerprintFile(tarballPath),
+        },
+        reactPackage: {
+            name: installedReactPackage.name,
+            version: installedReactPackage.version,
+            filename: basename(reactTarballPath),
+            tarball: await fingerprintFile(reactTarballPath),
         },
         capability: PACKED_LOCAL_VECTOR_CAPABILITY,
         proof,
@@ -137,23 +150,32 @@ try {
 function parseArgs(argv) {
     const [tarball, ...rest] = argv;
     if (!tarball) {
-        throw new Error("usage: bun scripts/smoke-packed-public-vector.mjs <package.tgz> [--report <path>]");
+        throw new Error(
+            "usage: bun scripts/smoke-packed-public-vector.mjs <core.tgz> --react <react.tgz> [--report <path>]"
+        );
     }
     let report;
+    let reactTarball;
     for (let index = 0; index < rest.length; index += 1) {
         const argument = rest[index];
-        if (argument !== "--report") {
+        if (argument !== "--report" && argument !== "--react") {
             throw new Error(`unknown packed public vector argument ${JSON.stringify(argument)}`);
         }
         const value = rest[++index];
         if (!value) throw new Error("--report requires a path");
-        if (report !== undefined) throw new Error("--report may be provided only once");
-        report = value;
+        if (argument === "--react") {
+            if (reactTarball !== undefined) throw new Error("--react may be provided only once");
+            reactTarball = value;
+        } else {
+            if (report !== undefined) throw new Error("--report may be provided only once");
+            report = value;
+        }
     }
-    return { tarballArgument: tarball, reportArgument: report };
+    if (!reactTarball) throw new Error("--react <react.tgz> is required");
+    return { tarballArgument: tarball, reactTarballArgument: reactTarball, reportArgument: report };
 }
 
-async function writeFixture(cwd, packageTarball) {
+async function writeFixture(cwd, packageTarball, reactPackageTarball) {
     await mkdir(join(cwd, "src", "web"), { recursive: true });
     const files = {
         "package.json": `${JSON.stringify(
@@ -164,6 +186,7 @@ async function writeFixture(cwd, packageTarball) {
                 dependencies: {
                     "better-auth": "1.6.30",
                     "@chardb/core": `file:${packageTarball}`,
+                    "@chardb/react": `file:${reactPackageTarball}`,
                     "drizzle-orm": "0.45.2",
                     react: "18.3.1",
                     "react-dom": "18.3.1",
@@ -473,7 +496,7 @@ void [
 `,
         "src/web/App.tsx": `
 import { createChardbClient } from "@chardb/core";
-import { ChardbProvider, useQuery } from "@chardb/core/react";
+import { ChardbProvider, useQuery } from "@chardb/react";
 import { useEffect } from "react";
 import { searchMessages } from "../queries.ts";
 
@@ -508,7 +531,7 @@ function Results() {
 }
 
 export function App() {
-  return <ChardbProvider client={client}><Results /></ChardbProvider>;
+  return <ChardbProvider client={client} ownership="organization"><Results /></ChardbProvider>;
 }
 `,
         "src/web/main.tsx": `

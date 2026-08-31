@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { CHARDB_PACKAGE_NAME, npmPackFilename } from "../scripts/package-identity.mjs";
+import { CHARDB_PACKAGE_NAME, CHARDB_REACT_PACKAGE_NAME, npmPackFilename } from "../scripts/package-identity.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const SCANNED_EXTENSIONS = new Set([".json", ".md", ".mjs", ".mts", ".ts", ".tsx", ".toml", ".yml", ".yaml"]);
@@ -38,6 +38,10 @@ describe("scoped npm package identity", () => {
             "SECURITY.md",
         ]);
         expect(npmPackFilename(CHARDB_PACKAGE_NAME, packageJson.version)).toBe("chardb-core-0.1.0.tgz");
+        const reactPackage = JSON.parse(await readFile(path.join(ROOT, "packages", "react", "package.json"), "utf8"));
+        expect(reactPackage.name).toBe(CHARDB_REACT_PACKAGE_NAME);
+        expect(reactPackage.publishConfig).toEqual({ access: "public" });
+        expect(npmPackFilename(CHARDB_REACT_PACKAGE_NAME, reactPackage.version)).toBe("chardb-react-0.1.0.tgz");
     });
 
     test("keeps the one-line project command direct", async () => {

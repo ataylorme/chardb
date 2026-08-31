@@ -34,10 +34,11 @@ jobs:
       - name: Build and pack candidate once
         shell: bash
         run: |
-          bun run build
+          bun run build:react
           mkdir .ci-pack
-          tarball="$(npm pack --ignore-scripts --pack-destination .ci-pack)"
-          bun scripts/ci-candidate-artifact.mjs --stage ".ci-pack/${tarball}" --directory ci-candidate
+          core_tarball="$(npm pack --ignore-scripts --pack-destination .ci-pack)"
+          react_tarball="$(npm pack --ignore-scripts --pack-destination .ci-pack ./packages/react)"
+          bun scripts/ci-candidate-artifact.mjs --stage ".ci-pack/${core_tarball}" --react ".ci-pack/${react_tarball}" --directory ci-candidate
 
       - name: Upload exact candidate
         uses: actions/upload-artifact@v4
@@ -77,8 +78,8 @@ jobs:
         env:
           CDB_GENERATED_E2E_PLATFORM_NAME: macos-latest
         run: |
-          bun scripts/smoke-packed-package.mjs ci-candidate/candidate.tgz
-          bun scripts/smoke-generated-project.mjs ci-candidate/candidate.tgz --report generated-macos-report.json
+          bun scripts/smoke-packed-package.mjs ci-candidate/core.tgz
+          bun scripts/smoke-generated-project.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz --report generated-macos-report.json
 
       - name: Upload generated app evidence
         uses: actions/upload-artifact@v4
@@ -116,7 +117,7 @@ jobs:
       - name: Exercise generated dev shutdown
         shell: pwsh
         run: |
-          bun test/windows-dev-tree.mjs --tarball ci-candidate/candidate.tgz --report generated-windows-report.json
+          bun test/windows-dev-tree.mjs --tarball ci-candidate/core.tgz --react-tarball ci-candidate/react.tgz --report generated-windows-report.json
 
       - name: Upload generated app evidence
         uses: actions/upload-artifact@v4
@@ -160,7 +161,7 @@ jobs:
 
       - name: Verify docs against the exact candidate
         env:
-          CHARDB_DOCS_TARBALL: ci-candidate/candidate.tgz
+          CHARDB_DOCS_TARBALL: ci-candidate/core.tgz
         run: bun run test:docs
 
       - name: Scan Git history for high-confidence secrets
@@ -177,9 +178,10 @@ jobs:
         env:
           CDB_GENERATED_E2E_PLATFORM_NAME: ubuntu-latest
         run: |
-          bun scripts/smoke-packed-package.mjs ci-candidate/candidate.tgz
-          bun scripts/smoke-generated-project.mjs ci-candidate/candidate.tgz --report generated-linux-report.json
-          bun scripts/smoke-packed-chat.mjs ci-candidate/candidate.tgz
+          bun scripts/smoke-packed-package.mjs ci-candidate/core.tgz
+          bun scripts/smoke-packed-react.mjs ci-candidate/core.tgz ci-candidate/react.tgz
+          bun scripts/smoke-generated-project.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz --report generated-linux-report.json
+          bun scripts/smoke-packed-chat.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz
 
       - name: Upload generated app evidence
         uses: actions/upload-artifact@v4
@@ -192,7 +194,7 @@ jobs:
         working-directory: example/chat
         run: |
           npm ci
-          npm install --ignore-scripts --no-audit --no-fund --no-save ../../ci-candidate/candidate.tgz
+          npm install --ignore-scripts --no-audit --no-fund --no-save ../../ci-candidate/core.tgz ../../ci-candidate/react.tgz
 
       - name: Typecheck chat consumer
         working-directory: example/chat

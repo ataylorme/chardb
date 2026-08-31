@@ -23,6 +23,7 @@ const VERSION_FOUR_STATEMENT = 'ALTER TABLE "messages" ADD COLUMN "archived_at" 
 
 const options = parseGeneratedProjectArgs(process.argv.slice(2));
 const tarballPath = resolve(options.tarball);
+const reactTarballPath = resolve(options.reactTarball);
 const reportPath = options.reportPath === undefined ? undefined : resolve(options.reportPath);
 const smokeDirectory = await mkdtemp(join(tmpdir(), "chardb-generated-project-"));
 const bootstrapDirectory = join(smokeDirectory, "bootstrap");
@@ -50,11 +51,21 @@ try {
     );
     run(
         "npm",
-        ["exec", "--", "chardb", "init", "generated app", "--core-package", `file:${tarballPath}`],
+        [
+            "exec",
+            "--",
+            "chardb",
+            "init",
+            "generated app",
+            "--core-package",
+            `file:${tarballPath}`,
+            "--react-package",
+            `file:${reactTarballPath}`,
+        ],
         bootstrapDirectory,
         environment
     );
-    await proveInitBoundaries(smokeDirectory, bootstrapDirectory, environment, tarballPath);
+    await proveInitBoundaries(smokeDirectory, bootstrapDirectory, environment, tarballPath, reactTarballPath);
 
     const installedChardb = JSON.parse(
         await readFile(join(bootstrapDirectory, "node_modules", "@chardb", "core", "package.json"), "utf8")
@@ -72,12 +83,18 @@ try {
             `generated @chardb/core specifier ${String(packageJson.dependencies["@chardb/core"])} does not match file:${tarballPath}`
         );
     }
-    assertExactDependencyVersions(packageJson, `file:${tarballPath}`);
+    if (packageJson.dependencies["@chardb/react"] !== `file:${reactTarballPath}`) {
+        throw new Error(`generated @chardb/react specifier does not match file:${reactTarballPath}`);
+    }
+    assertExactDependencyVersions(packageJson, `file:${tarballPath}`, `file:${reactTarballPath}`);
 
     if (!JSON.stringify(packageJson).includes(`file:${tarballPath}`)) {
         throw new Error("generated package.json does not consume the packed chardb tarball");
     }
     run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund"], projectDirectory, environment);
+    const installedReact = JSON.parse(
+        await readFile(join(projectDirectory, "node_modules", "@chardb", "react", "package.json"), "utf8")
+    );
     const versionOne = await regenerateVersionOneWithPackedCli(projectDirectory, environment);
     run("npm", ["run", "typecheck"], projectDirectory, environment);
     run("npm", ["run", "test"], projectDirectory, environment);
@@ -113,6 +130,11 @@ try {
             version: installedChardb.version,
             tarball: await fingerprintFile(tarballPath),
         },
+        reactPackageEvidence: {
+            name: installedReact.name,
+            version: installedReact.version,
+            tarball: await fingerprintFile(reactTarballPath),
+        },
         platform: {
             name: process.env.CDB_GENERATED_E2E_PLATFORM_NAME ?? `${platform()}-${arch()}`,
             operatingSystem: platform(),
@@ -140,6 +162,7 @@ try {
         },
         invariants: {
             generatedByPackedCli: true,
+            exactReactPackageInstalled: true,
             initialMigrationGeneratedByPackedCli: true,
             versionTwoMigrationGeneratedByPackedCli: true,
             versionThreeMigrationGeneratedByPackedCli: true,
@@ -212,20 +235,31 @@ function rejectMonorepoAliases(generatedConfigText) {
     }
 }
 
-function assertExactDependencyVersions(packageJson, corePackage) {
+function assertExactDependencyVersions(packageJson, corePackage, reactPackage) {
     const dependencies = { ...packageJson.dependencies, ...packageJson.devDependencies };
     for (const [name, version] of Object.entries(dependencies)) {
         if (name === "@chardb/core" && version === corePackage) continue;
+        if (name === "@chardb/react" && version === reactPackage) continue;
         if (typeof version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
             throw new Error(`generated dependency ${name} is not pinned to an exact version: ${String(version)}`);
         }
     }
 }
 
-async function proveInitBoundaries(root, bootstrap, extraEnvironment, candidate) {
+async function proveInitBoundaries(root, bootstrap, extraEnvironment, candidate, reactCandidate) {
     run(
         "bunx",
-        ["--bun", "--no-install", "@chardb/core", "init", "bun app", "--core-package", `file:${candidate}`],
+        [
+            "--bun",
+            "--no-install",
+            "@chardb/core",
+            "init",
+            "bun app",
+            "--core-package",
+            `file:${candidate}`,
+            "--react-package",
+            `file:${reactCandidate}`,
+        ],
         bootstrap,
         extraEnvironment
     );
@@ -233,6 +267,9 @@ async function proveInitBoundaries(root, bootstrap, extraEnvironment, candidate)
     if (bunPackage.name !== "bun-app") throw new Error("bunx @chardb/core init did not preserve the named target");
     if (bunPackage.dependencies["@chardb/core"] !== `file:${candidate}`) {
         throw new Error("bunx @chardb/core init did not preserve the exact package specifier");
+    }
+    if (bunPackage.dependencies["@chardb/react"] !== `file:${reactCandidate}`) {
+        throw new Error("bunx @chardb/core init did not preserve the exact React package specifier");
     }
 
     for (const name of [".", "..", "../outside", "nested/app", "nested\\app", "/absolute", "C:\\absolute"]) {

@@ -431,9 +431,9 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.get("/tmp/proj/src/migrations/v1.ts")).toContain("defineSchemaSnapshot");
         expect(files.get("/tmp/proj/src/worker.ts")).toContain('app.get("/api/messages"');
         expect(files.get("/tmp/proj/src/worker.ts")).toContain('app.post("/api/messages"');
-        expect(files.get("/tmp/proj/src/web/App.tsx")).toContain("authClient.signIn.anonymous()");
-        expect(files.get("/tmp/proj/src/web/App.tsx")).toContain("useQuery(listMessages");
-        expect(files.get("/tmp/proj/src/web/App.tsx")).toContain("useMutation<");
+        expect(files.get("/tmp/proj/src/web/App.tsx")).toContain("db.auth.signIn.anonymous()");
+        expect(files.get("/tmp/proj/src/web/App.tsx")).toContain("db.useQuery(listMessages");
+        expect(files.get("/tmp/proj/src/web/App.tsx")).toContain("db.useMutation(postMessage)");
         expect(files.get("/tmp/proj/src/web/App.tsx")).toContain('fileRef("messages", "attachment")');
         expect(files.get("/tmp/proj/vite.config.ts")).toContain('import { chardb } from "@chardb/core/vite"');
         expect(files.get("/tmp/proj/vitest.config.ts")).toContain(

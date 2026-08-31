@@ -13,12 +13,14 @@ import {
 } from "../scripts/packed-chat-report.mjs";
 
 const fingerprint = { algorithm: "sha256", digest: "abc123", bytes: 42 };
+const reactFingerprint = { algorithm: "sha256", digest: "react123", bytes: 24 };
 const exactFingerprint = { algorithm: "sha256", digest: "a".repeat(64), bytes: 42 };
 
 function reportInput() {
     return {
         run: { id: "run-1" },
         packageEvidence: { name: "@chardb/core", version: "0.1.0", tarball: fingerprint },
+        reactPackageEvidence: { name: "@chardb/react", version: "0.1.0", tarball: reactFingerprint },
         platform: { operatingSystem: "linux", release: "6.11.0", architecture: "x64" },
         runtime: {
             name: "packed-chat-miniflare-process-restart",
@@ -59,13 +61,18 @@ function reportInput() {
 
 describe("packed-chat evidence", () => {
     test("parses one tarball and an optional report path", () => {
-        expect(parsePackedChatArgs(["package.tgz"])).toEqual({ tarball: "package.tgz", reportPath: undefined });
-        expect(parsePackedChatArgs(["package.tgz", "--report", "proof.json"])).toEqual({
+        expect(parsePackedChatArgs(["package.tgz", "--react", "react.tgz"])).toEqual({
             tarball: "package.tgz",
+            reactTarball: "react.tgz",
+            reportPath: undefined,
+        });
+        expect(parsePackedChatArgs(["package.tgz", "--react", "react.tgz", "--report", "proof.json"])).toEqual({
+            tarball: "package.tgz",
+            reactTarball: "react.tgz",
             reportPath: "proof.json",
         });
         expect(() => parsePackedChatArgs([])).toThrow("usage");
-        expect(() => parsePackedChatArgs(["a.tgz", "b.tgz"])).toThrow("one tarball");
+        expect(() => parsePackedChatArgs(["a.tgz", "b.tgz", "--react", "react.tgz"])).toThrow("one tarball");
         expect(() => parsePackedChatArgs(["a.tgz", "--unknown"])).toThrow("unknown");
     });
 
@@ -77,7 +84,7 @@ describe("packed-chat evidence", () => {
             identity: reportInput().identity,
             organizations: reportInput().organizations,
         });
-        expect(assertMatchingPackedChatReport(report, fingerprint)).toEqual(report);
+        expect(assertMatchingPackedChatReport(report, fingerprint, reactFingerprint)).toEqual(report);
     });
 
     test("rejects missing lifecycle proof and a different tarball", () => {
@@ -111,8 +118,11 @@ describe("packed-chat evidence", () => {
             })
         ).toThrow("distinct principals");
         const report = buildPackedChatReport(reportInput());
-        expect(() => assertMatchingPackedChatReport(report, { ...fingerprint, bytes: 43 })).toThrow(
+        expect(() => assertMatchingPackedChatReport(report, { ...fingerprint, bytes: 43 }, reactFingerprint)).toThrow(
             "does not identify"
+        );
+        expect(() => assertMatchingPackedChatReport(report, fingerprint, { ...reactFingerprint, bytes: 25 })).toThrow(
+            "React tarball"
         );
     });
 
@@ -139,7 +149,9 @@ describe("packed-chat evidence", () => {
         const reportWithoutRuntime = Object.fromEntries(
             Object.entries(buildPackedChatReport(reportInput())).filter(([key]) => key !== "runtime")
         );
-        expect(() => assertMatchingPackedChatReport(reportWithoutRuntime, fingerprint)).toThrow("runtime");
+        expect(() => assertMatchingPackedChatReport(reportWithoutRuntime, fingerprint, reactFingerprint)).toThrow(
+            "runtime"
+        );
     });
 
     test("hands private session state to another process and emits a secret-free restart result", () => {

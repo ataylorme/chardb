@@ -3,12 +3,18 @@ export declare const GENERATED_PROJECT_INVARIANTS: readonly string[];
 
 export declare function parseGeneratedProjectArgs(argv: readonly string[]): {
     readonly tarball: string;
+    readonly reactTarball: string;
     readonly reportPath: string | undefined;
 };
 
 export declare function buildGeneratedProjectReport<TInvariants extends Readonly<Record<string, boolean>>>(input: {
     readonly run: object;
     readonly packageEvidence: {
+        readonly name: string;
+        readonly version: string;
+        readonly tarball: object;
+    };
+    readonly reactPackageEvidence: {
         readonly name: string;
         readonly version: string;
         readonly tarball: object;
@@ -31,4 +37,8 @@ export declare function buildGeneratedProjectReport<TInvariants extends Readonly
     readonly invariants: TInvariants;
 }): object & { readonly invariants: TInvariants };
 
-export declare function assertMatchingGeneratedProjectReport<T extends object>(report: T, fingerprint: object): T;
+export declare function assertMatchingGeneratedProjectReport<T extends object>(
+    report: T,
+    fingerprint: object,
+    reactFingerprint?: object
+): T;

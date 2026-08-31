@@ -16,5 +16,6 @@ export declare function assertPackedPublicVectorBrowserProof(proof: unknown): vo
 export declare function assertPackedLocalVectorCapability(value: unknown): unknown;
 export declare function assertMatchingPackedPublicVectorReport(
     report: unknown,
-    fingerprint: { readonly algorithm: string; readonly digest: string; readonly bytes: number }
+    fingerprint: { readonly algorithm: string; readonly digest: string; readonly bytes: number },
+    reactFingerprint: { readonly algorithm: string; readonly digest: string; readonly bytes: number }
 ): unknown;

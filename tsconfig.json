@@ -28,7 +28,8 @@
             "@chardb/core": ["./src/index.ts"],
             "@chardb/core/server": ["./src/server/index.ts"],
             "@chardb/core/files": ["./src/files/index.ts"],
-            "@chardb/core/react": ["./src/react/index.ts"],
+            "@chardb/core/internal/react": ["./src/react/index.ts"],
+            "@chardb/react": ["./packages/react/src/index.ts"],
             "@chardb/core/vite": ["./src/vite/index.ts"]
         }
     },

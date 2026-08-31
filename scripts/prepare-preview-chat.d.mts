@@ -1,6 +1,7 @@
 export declare function parsePreviewPrepareArgs(argv: readonly string[]): {
     readonly help: boolean;
     readonly tarball: string | undefined;
+    readonly reactTarball: string | undefined;
     readonly output: string | undefined;
     readonly name: string;
 };

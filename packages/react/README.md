@@ -1,0 +1,23 @@
+# @chardb/react
+
+React hooks for Chardb. Configure Better Auth once, then query and mutate with the authenticated user or organization scope.
+
+```tsx
+import { organizationClient, jwtClient } from "better-auth/client/plugins";
+import { createAuthClient } from "better-auth/react";
+import { createChardbReactClient } from "@chardb/react";
+
+const workerUrl = new URL(window.location.origin).origin;
+
+export const db = createChardbReactClient({
+    url: workerUrl,
+    ownership: "organization",
+    auth: ({ baseURL }) =>
+        createAuthClient({
+            baseURL,
+            plugins: [organizationClient(), jwtClient()],
+        }),
+});
+```
+
+See [chardb.dev](https://chardb.dev) for the setup guide.

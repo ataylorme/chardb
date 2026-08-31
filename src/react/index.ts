@@ -1,5 +1,5 @@
 /**
- * `@chardb/core/react` — `ChardbProvider` + hooks. All hooks accept function refs
+ * Internal implementation for `@chardb/react`. All hooks accept function refs
  * from `@chardb/core/server`; users never type a wire identifier as a string.
  */
 
@@ -19,8 +19,16 @@ import {
 } from "react";
 import type { ChardbClient, ChardbClientOptions } from "../client/index.ts";
 import { createDeferredChardbClientController } from "../client/index.ts";
+import { normalizePublicWorkerUrl, publicWorkerWebSocketUrl } from "../client/public-url.ts";
 import { snapshotSubscriptionArguments } from "../client/serialized-json.ts";
-import { type ChardbFileClient, type FileRef, createFileClient } from "../files/index.ts";
+import { CdbError } from "../errors.ts";
+import {
+    type FileDownloadInput,
+    type FileRef,
+    type FileUploadInput,
+    type FileUploadResult,
+    createFileClient,
+} from "../files/index.ts";
 import { stableJson } from "../util/canonical.ts";
 import type { RawJson } from "../wire.ts";
 
@@ -60,7 +68,10 @@ export interface AuthClientLike {
     readonly $fetch: <T = unknown>(
         path: string,
         init?: { method?: string; body?: unknown }
-    ) => Promise<{ data: T | null; error: { message?: string } | null }>;
+    ) => Promise<{
+        data: T | null;
+        error: { message?: string; status?: number; statusText?: string } | null;
+    }>;
     readonly useSession?: AuthSessionAtom | (() => unknown);
     readonly $store?: {
         readonly atoms: { readonly session?: AuthSessionAtom; readonly [key: string]: unknown };
@@ -84,8 +95,56 @@ export interface SessionData {
     readonly [k: string]: unknown;
 }
 
+/** The one ownership axis selected by a Chardb application. */
+export type ChardbOwnership = "organization" | "user";
+
+type SessionUser = NonNullable<SessionData["user"]>;
+type SessionRecord = NonNullable<SessionData["session"]>;
+
+interface PendingIdentity<M extends ChardbOwnership> {
+    readonly ownership: M;
+    readonly status: "loading" | "signed-out";
+    readonly user: null;
+    readonly session: null;
+    readonly organizationId: null;
+}
+
+interface UserIdentity {
+    readonly ownership: "user";
+    readonly status: "ready";
+    readonly user: SessionUser;
+    readonly session: SessionRecord;
+    readonly userId: string;
+    readonly organizationId: null;
+}
+
+interface OrganizationSelectionIdentity {
+    readonly ownership: "organization";
+    readonly status: "select-organization";
+    readonly user: SessionUser;
+    readonly session: SessionRecord;
+    readonly userId: string;
+    readonly organizationId: null;
+}
+
+interface OrganizationIdentity {
+    readonly ownership: "organization";
+    readonly status: "ready";
+    readonly user: SessionUser;
+    readonly session: SessionRecord;
+    readonly userId: string;
+    readonly organizationId: string;
+}
+
+/** Better Auth session state, narrowed by the application's fixed ownership mode. */
+export type ChardbIdentity<M extends ChardbOwnership> = M extends "organization"
+    ? PendingIdentity<"organization"> | OrganizationSelectionIdentity | OrganizationIdentity
+    : PendingIdentity<"user"> | UserIdentity;
+
 interface ChardbContextValue {
     readonly client: ChardbClient;
+    readonly ownership: ChardbOwnership;
+    readonly sessionAtom: AuthSessionAtom | null;
 }
 
 type ProviderClientResource =
@@ -112,20 +171,40 @@ function authSessionAtom(auth: AuthClientLike | null): AuthSessionAtom | null {
     return stored && typeof stored.get === "function" && typeof stored.subscribe === "function" ? stored : null;
 }
 
-function sessionIdentity(atom: AuthSessionAtom | null): string | null {
+function sessionIdentity(atom: AuthSessionAtom | null, ownership: ChardbOwnership): string | null {
     const data = atom?.get().data;
     const userId = data?.user?.id ?? data?.session?.userId;
     if (!userId) return null;
-    return JSON.stringify([userId, data?.session?.id ?? null]);
+    return JSON.stringify([
+        userId,
+        data?.session?.id ?? null,
+        ownership === "organization" ? (data?.session?.activeOrganizationId ?? null) : null,
+    ]);
 }
 
-function useAuthSessionIdentity(atom: AuthSessionAtom | null): string | null {
+function useAuthSessionIdentity(atom: AuthSessionAtom | null, ownership: ChardbOwnership): string | null {
     const subscribe = useCallback((listener: () => void) => (atom ? atom.subscribe(listener) : () => {}), [atom]);
-    const getSnapshot = useCallback(() => sessionIdentity(atom), [atom]);
+    const getSnapshot = useCallback(() => sessionIdentity(atom, ownership), [atom, ownership]);
     return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
+function isRetryableTokenStatus(status: number | undefined): boolean {
+    return (
+        status === 0 || status === 408 || status === 425 || status === 429 || (status !== undefined && status >= 500)
+    );
+}
+
+function authTokenFailure(message: string, retryable: boolean, cause?: unknown): CdbError {
+    return new CdbError({
+        code: retryable ? "CDB_STREAM_ABORTED" : "CDB_FORBIDDEN",
+        message,
+        ...(cause === undefined ? {} : { cause }),
+    });
+}
+
 export interface ChardbProviderProps extends Partial<ChardbClientOptions> {
+    /** Must match the application's server-side `chardb({ ownership })` setting. */
+    readonly ownership: ChardbOwnership;
     readonly client?: ChardbClient;
     /**
      * better-auth `createAuthClient(...)` instance. When provided,
@@ -141,7 +220,7 @@ export interface ChardbProviderProps extends Partial<ChardbClientOptions> {
 export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): ReactElement {
     const jwtAuth = props.getJwt === undefined ? props.auth : undefined;
     const sessionAtom = authSessionAtom(props.auth ?? null);
-    const authSessionIdentity = useAuthSessionIdentity(sessionAtom);
+    const authSessionIdentity = useAuthSessionIdentity(sessionAtom, props.ownership);
     const jwtSessionIdentity = jwtAuth === undefined ? null : authSessionIdentity;
     const resource = useMemo<ProviderClientResource>(() => {
         if (props.client !== undefined) return { client: props.client, owned: false };
@@ -150,11 +229,25 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
             (jwtAuth
                 ? async () => {
                       if (jwtSessionIdentity === null) {
-                          throw new Error("chardb: cannot fetch a JWT without an authenticated Better Auth session");
+                          throw authTokenFailure(
+                              "chardb: cannot fetch a JWT without an authenticated Better Auth session",
+                              false
+                          );
                       }
-                      const r = await jwtAuth.$fetch<{ token: string }>("/token");
+                      let r: {
+                          data: { token: string } | null;
+                          error: { message?: string; status?: number; statusText?: string } | null;
+                      };
+                      try {
+                          r = await jwtAuth.$fetch<{ token: string }>("/token");
+                      } catch (cause) {
+                          throw authTokenFailure("chardb: Better Auth token request failed", true, cause);
+                      }
                       if (r.error || !r.data?.token) {
-                          throw new Error(`chardb: failed to fetch JWT (${r.error?.message ?? "no token"})`);
+                          throw authTokenFailure(
+                              `chardb: failed to fetch JWT (${r.error?.message ?? "no token"})`,
+                              r.error !== null && isRetryableTokenStatus(r.error.status)
+                          );
                       }
                       return r.data.token;
                   }
@@ -168,8 +261,9 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
                 getJwt,
                 ...(props.clientId !== undefined ? { clientId: props.clientId } : {}),
                 ...(props.mutationTimeoutMs !== undefined ? { mutationTimeoutMs: props.mutationTimeoutMs } : {}),
+                ...(props.onSessionError !== undefined ? { onSessionError: props.onSessionError } : {}),
             },
-            { autoStartOnOperation: false }
+            { autoStartOnOperation: false, initialJwtFailureRetries: 3 }
         );
         return { client: controller.client, owned: true, start: controller.start };
     }, [
@@ -180,6 +274,7 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
         jwtSessionIdentity,
         props.clientId,
         props.mutationTimeoutMs,
+        props.onSessionError,
     ]);
     const pendingCloses = useRef(new WeakMap<ChardbClient, Set<PendingClientClose>>());
 
@@ -207,7 +302,10 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
         };
     }, [resource, jwtAuth, jwtSessionIdentity]);
 
-    const value = useMemo<ChardbContextValue>(() => ({ client: resource.client }), [resource.client]);
+    const value = useMemo<ChardbContextValue>(
+        () => ({ client: resource.client, ownership: props.ownership, sessionAtom }),
+        [resource.client, props.ownership, sessionAtom]
+    );
 
     return createElement(ChardbCtx.Provider, { value }, props.children);
 }
@@ -218,9 +316,79 @@ export function useChardb(): ChardbClient {
     return c.client;
 }
 
+function sessionSnapshotKey(atom: AuthSessionAtom | null): string {
+    if (!atom) return "missing";
+    const snapshot = atom.get();
+    return JSON.stringify([snapshot.isPending, snapshot.data ?? null]);
+}
+
+/** Read the Better Auth identity that owns the current Chardb scope. */
+export function useChardbIdentity(): ChardbIdentity<ChardbOwnership> {
+    const context = useContext(ChardbCtx);
+    if (!context) throw new Error("useChardbIdentity must be used inside <ChardbProvider>");
+    const subscribe = useCallback(
+        (listener: () => void) => (context.sessionAtom ? context.sessionAtom.subscribe(listener) : () => {}),
+        [context.sessionAtom]
+    );
+    const getSnapshot = useCallback(() => sessionSnapshotKey(context.sessionAtom), [context.sessionAtom]);
+    useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+
+    if (!context.sessionAtom) {
+        throw new Error("useChardbIdentity requires <ChardbProvider auth={createAuthClient(...)}>");
+    }
+    const snapshot = context.sessionAtom.get();
+    const data = snapshot.data;
+    const userId = data?.user?.id ?? data?.session?.userId;
+    if (snapshot.isPending) {
+        return {
+            ownership: context.ownership,
+            status: "loading",
+            user: null,
+            session: null,
+            organizationId: null,
+        } as ChardbIdentity<ChardbOwnership>;
+    }
+    if (!data?.user || !userId) {
+        return {
+            ownership: context.ownership,
+            status: "signed-out",
+            user: null,
+            session: null,
+            organizationId: null,
+        } as ChardbIdentity<ChardbOwnership>;
+    }
+    const session: SessionRecord = data.session ?? { userId };
+    if (context.ownership === "user") {
+        return {
+            ownership: "user",
+            status: "ready",
+            user: data.user,
+            session,
+            userId,
+            organizationId: null,
+        };
+    }
+    const organizationId = data.session?.activeOrganizationId ?? null;
+    return organizationId
+        ? { ownership: "organization", status: "ready", user: data.user, session, userId, organizationId }
+        : {
+              ownership: "organization",
+              status: "select-organization",
+              user: data.user,
+              session,
+              userId,
+              organizationId: null,
+          };
+}
+
 export interface UseQueryResult<T> {
     readonly data: T[] | undefined;
-    readonly state: "pending" | "live" | "error" | "refetching" | "closed";
+    readonly state: "idle" | "pending" | "live" | "error" | "refetching" | "closed";
+}
+
+export interface UseQueryOptions {
+    /** Do not open a subscription until the caller's scope is ready. */
+    readonly enabled?: boolean;
 }
 
 /**
@@ -245,25 +413,31 @@ type ArgsOf<F> = F extends (ctx: never, args: infer A) => unknown ? A : never;
 
 export function useQuery<F extends (...args: never[]) => Promise<unknown>>(
     handle: F & QueryHandleStamp<ArgsOf<F>>,
-    args: ArgsOf<F>
+    args: ArgsOf<F>,
+    options: UseQueryOptions = {}
 ): UseQueryResult<RowOf<F>> {
     const client = useChardb();
     if (!isHandle(handle)) throw new TypeError("useQuery requires a defineQuery handle and raw JSON args");
+    const enabled = options.enabled ?? true;
     const ref = handle.__chardbRef.toString();
-    const ownedArgs = snapshotSubscriptionArguments(args as RawJson);
-    const argsIdentity = stableJson(ownedArgs);
+    const ownedArgs = enabled ? snapshotSubscriptionArguments(args as RawJson) : ({} as RawJson);
+    const argsIdentity = enabled ? stableJson(ownedArgs) : "disabled";
     const argsCache = useRef<{ readonly identity: string; readonly args: RawJson }>();
     if (argsCache.current?.identity !== argsIdentity) {
         argsCache.current = { identity: argsIdentity, args: ownedArgs };
     }
     const stableArgs = argsCache.current.args;
-    const identity = useMemo(() => ({ client, ref, argsIdentity }), [client, ref, argsIdentity]);
+    const identity = useMemo(() => ({ client, ref, argsIdentity, enabled }), [client, ref, argsIdentity, enabled]);
     const [snapshot, setSnapshot] = useState<{
         readonly identity: typeof identity;
         readonly data: RowOf<F>[];
         readonly state: UseQueryResult<RowOf<F>>["state"];
     }>();
     useEffect(() => {
+        if (!enabled) {
+            setSnapshot(undefined);
+            return;
+        }
         let active = true;
         setSnapshot(current => (current?.identity === identity ? current : undefined));
         const sub = client.subscribe<RowOf<F>>(ref, stableArgs, (rows, state) => {
@@ -273,9 +447,9 @@ export function useQuery<F extends (...args: never[]) => Promise<unknown>>(
             active = false;
             sub.unsubscribe();
         };
-    }, [client, identity, ref, stableArgs]);
+    }, [client, enabled, identity, ref, stableArgs]);
     const data = snapshot?.identity === identity ? snapshot.data : undefined;
-    const state = snapshot?.identity === identity ? snapshot.state : "pending";
+    const state = enabled ? (snapshot?.identity === identity ? snapshot.state : "pending") : "idle";
     return { data, state };
 }
 
@@ -287,14 +461,180 @@ export interface MutationFnLike {
     readonly __chardbRef: { toString(): string };
 }
 
+export function useMutation<TArgs extends RawJson, TResult>(
+    fn: ((ctx: never, args: TArgs) => TResult) & MutationFnLike
+): (args: TArgs) => Promise<Awaited<TResult>>;
 export function useMutation<TArgs extends RawJson = RawJson, TResult = RawJson>(
     fn: MutationFnLike
-): (args: TArgs) => Promise<TResult> {
+): (args: TArgs) => Promise<TResult>;
+export function useMutation(fn: MutationFnLike): (...args: never[]) => Promise<unknown> {
     const client = useChardb();
-    return useCallback((args: TArgs) => client.mutate<TResult>(fn.__chardbRef.toString(), args), [client, fn]);
+    return useCallback((args: RawJson) => client.mutate(fn.__chardbRef.toString(), args), [client, fn]) as (
+        ...args: never[]
+    ) => Promise<unknown>;
 }
 
-/** Bind a Drizzle `file(...)` column to authenticated same-origin upload and download operations. */
-export function useFile(column: Column | FileRef): ChardbFileClient {
-    return useMemo(() => createFileClient(column), [column]);
+type OwnershipArgs<M extends ChardbOwnership> = M extends "organization"
+    ? { readonly organizationId: string }
+    : { readonly userId: string };
+
+type PublicArgs<M extends ChardbOwnership, TArgs> = Omit<TArgs, keyof OwnershipArgs<M>>;
+
+type QueryRow<TResult> = TResult extends readonly (infer Row)[] ? Row : TResult;
+
+export interface CreateChardbReactClientOptions<M extends ChardbOwnership, A extends AuthClientLike>
+    extends Pick<ChardbClientOptions, "clientId" | "mutationTimeoutMs" | "onSessionError"> {
+    readonly ownership: M;
+    /**
+     * Creates the Better Auth client from the same public Worker URL Chardb
+     * uses for sockets and files.
+     */
+    readonly auth: ChardbAuthFactory<A>;
+    /**
+     * Public HTTP origin of the Chardb Worker. Browser apps that use files
+     * must expose the Worker routes at the app's origin.
+     */
+    readonly url: string;
+}
+
+export interface ChardbAuthFactoryOptions {
+    /** Pass this value to Better Auth's `createAuthClient({ baseURL })`. */
+    readonly baseURL: string;
+}
+
+export type ChardbAuthFactory<A extends AuthClientLike> = (options: ChardbAuthFactoryOptions) => A;
+
+export interface ChardbOrganizationFileClient {
+    upload(input: Omit<FileUploadInput, "organizationId">): Promise<FileUploadResult>;
+    download(input: Omit<FileDownloadInput, "organizationId">): Promise<Response>;
+    downloadUrl(input: Omit<FileDownloadInput, "organizationId">): string;
+}
+
+interface ChardbReactClientBase<M extends ChardbOwnership, A extends AuthClientLike> {
+    /** Canonical public Worker origin used for auth, sockets, and file requests. */
+    readonly url: string;
+    /** The Better Auth client used by Chardb, kept intact with its inferred plugins. */
+    readonly auth: A;
+    readonly Provider: (props: PropsWithChildren) => ReactElement;
+    readonly useIdentity: () => ChardbIdentity<M>;
+    readonly useQuery: <TArgs extends Record<string, unknown> & OwnershipArgs<M>, TResult>(
+        handle: ((ctx: never, args: TArgs) => Promise<TResult>) & QueryHandleStamp<TArgs>,
+        args: PublicArgs<M, TArgs>
+    ) => UseQueryResult<QueryRow<TResult>>;
+    readonly useMutation: <TArgs extends RawJson & OwnershipArgs<M>, TResult>(
+        fn: ((ctx: never, args: TArgs) => TResult) & MutationFnLike
+    ) => (args: PublicArgs<M, TArgs>) => Promise<Awaited<TResult>>;
+}
+
+export type ChardbReactClient<M extends ChardbOwnership, A extends AuthClientLike> = ChardbReactClientBase<M, A> &
+    (M extends "organization"
+        ? { readonly useFile: (column: Column | FileRef) => ChardbOrganizationFileClient }
+        : Record<never, never>);
+
+/**
+ * Configure the React SDK once from the Better Auth client and ownership mode.
+ * Scoped hooks then inject the authenticated organization or user key, so app
+ * code supplies only business arguments.
+ */
+export function createChardbReactClient<const M extends ChardbOwnership, const A extends AuthClientLike>(
+    options: CreateChardbReactClientOptions<M, A>
+): ChardbReactClient<M, A> {
+    const publicUrl = normalizePublicWorkerUrl(options.url);
+    const endpoint = publicWorkerWebSocketUrl(publicUrl);
+    const auth = options.auth({ baseURL: publicUrl });
+
+    const Provider = ({ children }: PropsWithChildren): ReactElement => {
+        return createElement(
+            ChardbProvider,
+            {
+                ownership: options.ownership,
+                auth,
+                endpoint,
+                ...(options.clientId !== undefined ? { clientId: options.clientId } : {}),
+                ...(options.mutationTimeoutMs !== undefined ? { mutationTimeoutMs: options.mutationTimeoutMs } : {}),
+                ...(options.onSessionError !== undefined ? { onSessionError: options.onSessionError } : {}),
+            },
+            children
+        );
+    };
+    Provider.displayName = "ChardbClientProvider";
+
+    const useIdentity = (): ChardbIdentity<M> => useChardbIdentity() as ChardbIdentity<M>;
+
+    const useOwnedQuery = <TArgs extends Record<string, unknown> & OwnershipArgs<M>, TResult>(
+        handle: ((ctx: never, args: TArgs) => Promise<TResult>) & QueryHandleStamp<TArgs>,
+        args: PublicArgs<M, TArgs>
+    ): UseQueryResult<QueryRow<TResult>> => {
+        const identity = useIdentity();
+        const scopeId =
+            identity.status === "ready"
+                ? options.ownership === "organization"
+                    ? identity.organizationId
+                    : identity.user.id
+                : null;
+        const scopeKey = options.ownership === "organization" ? "organizationId" : "userId";
+        const scopedArgs = scopeId === null ? {} : { ...args, [scopeKey]: scopeId };
+        return useQuery(handle, scopedArgs as TArgs, { enabled: scopeId !== null });
+    };
+
+    const useOwnedMutation = <TArgs extends RawJson & OwnershipArgs<M>, TResult>(
+        fn: ((ctx: never, args: TArgs) => TResult) & MutationFnLike
+    ): ((args: PublicArgs<M, TArgs>) => Promise<Awaited<TResult>>) => {
+        const identity = useIdentity();
+        const mutate = useMutation(fn);
+        const ownership = options.ownership;
+        return useCallback(
+            (args: PublicArgs<M, TArgs>) => {
+                if (identity.status !== "ready") {
+                    return Promise.reject(new Error(`chardb: identity is ${identity.status}`));
+                }
+                const scopeKey = ownership === "organization" ? "organizationId" : "userId";
+                const scopeId = ownership === "organization" ? identity.organizationId : identity.user.id;
+                if (!scopeId) return Promise.reject(new Error("chardb: authenticated ownership scope is missing"));
+                return mutate({ ...args, [scopeKey]: scopeId } as unknown as TArgs);
+            },
+            [identity, mutate, ownership]
+        );
+    };
+
+    const useOwnedFile = (column: Column | FileRef): ChardbOrganizationFileClient => {
+        const identity = useIdentity();
+        const client = useMemo(() => createFileClient(column, { baseUrl: publicUrl }), [column]);
+        const fileOrigin = publicUrl;
+        const scope = useCallback((): string => {
+            if (identity.status !== "ready" || identity.ownership !== "organization") {
+                throw new Error(`chardb: organization identity is ${identity.status}`);
+            }
+            if (typeof window !== "undefined" && window.location.origin !== fileOrigin) {
+                throw new Error(
+                    "chardb: browser file routes must share the app origin; proxy the Worker routes through this origin"
+                );
+            }
+            return identity.organizationId;
+        }, [fileOrigin, identity]);
+        return useMemo(
+            () =>
+                Object.freeze({
+                    upload: async (input: Omit<FileUploadInput, "organizationId">) =>
+                        await client.upload({ ...input, organizationId: scope() }),
+                    download: async (input: Omit<FileDownloadInput, "organizationId">) =>
+                        await client.download({ ...input, organizationId: scope() }),
+                    downloadUrl: (input: Omit<FileDownloadInput, "organizationId">) =>
+                        client.downloadUrl({ ...input, organizationId: scope() }),
+                }),
+            [client, scope]
+        );
+    };
+
+    const base = {
+        url: publicUrl,
+        auth,
+        Provider,
+        useIdentity,
+        useQuery: useOwnedQuery,
+        useMutation: useOwnedMutation,
+    };
+    return Object.freeze(
+        options.ownership === "organization" ? { ...base, useFile: useOwnedFile } : base
+    ) as ChardbReactClient<M, A>;
 }

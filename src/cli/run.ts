@@ -8,7 +8,7 @@ import type { CliContext } from "./context.ts";
 const HELP = `chardb — experimental organization database for Cloudflare Workers
 
 Commands:
-  chardb init <name> [--core-package <specifier>]
+  chardb init <name> [--core-package <specifier>] [--react-package <specifier>]
                                 scaffold a new chardb app directory
   chardb doctor [wrangler]      validate wrangler.toml or wrangler.jsonc
   chardb migrations generate --name <name>
@@ -34,10 +34,26 @@ export async function runCli(ctx: CliContext, argv: readonly string[]): Promise<
             return 0;
         case "init": {
             const directory = rest[0];
+            if (!directory) {
+                ctx.stderr("usage: chardb init <name> [--core-package <specifier>] [--react-package <specifier>]\n");
+                return 2;
+            }
             let corePackage: string | undefined;
-            if (rest.length === 3 && rest[1] === "--core-package" && rest[2]) corePackage = rest[2];
-            if (!directory || (rest.length !== 1 && corePackage === undefined)) {
-                ctx.stderr("usage: chardb init <name> [--core-package <specifier>]\n");
+            let reactPackage: string | undefined;
+            let valid = true;
+            for (let index = 1; index < rest.length; index += 2) {
+                const flag = rest[index];
+                const value = rest[index + 1];
+                if (!value || (flag !== "--core-package" && flag !== "--react-package")) {
+                    valid = false;
+                    break;
+                }
+                if (flag === "--core-package" && corePackage === undefined) corePackage = value;
+                else if (flag === "--react-package" && reactPackage === undefined) reactPackage = value;
+                else valid = false;
+            }
+            if (!valid || rest.length % 2 === 0) {
+                ctx.stderr("usage: chardb init <name> [--core-package <specifier>] [--react-package <specifier>]\n");
                 return 2;
             }
             try {
@@ -47,7 +63,12 @@ export async function runCli(ctx: CliContext, argv: readonly string[]): Promise<
                     .replace(/[^a-z0-9-]+/g, "-")
                     .replace(/^-+|-+$/g, "");
                 if (!name) throw new Error("project directory must have a name");
-                await runInit(ctx, { name, directory, ...(corePackage === undefined ? {} : { corePackage }) });
+                await runInit(ctx, {
+                    name,
+                    directory,
+                    ...(corePackage === undefined ? {} : { corePackage }),
+                    ...(reactPackage === undefined ? {} : { reactPackage }),
+                });
                 return 0;
             } catch (error) {
                 ctx.stderr(`chardb init: ${error instanceof Error ? error.message : String(error)}\n`);

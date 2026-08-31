@@ -66,36 +66,48 @@ describe("packed public vector browser contract", () => {
 
     test("binds local semantic acceptance to the exact packed candidate without claiming provider proof", () => {
         const fingerprint = { algorithm: "sha256", digest: "a".repeat(64), bytes: 123 };
+        const reactFingerprint = { algorithm: "sha256", digest: "b".repeat(64), bytes: 87 };
         const report = {
             schema: PACKED_PUBLIC_VECTOR_SCHEMA,
             ok: true,
             package: { tarball: fingerprint },
+            reactPackage: { name: "@chardb/react", version: "0.1.0", tarball: reactFingerprint },
             capability: PACKED_LOCAL_VECTOR_CAPABILITY,
             proof: validProof(),
         };
         expect(assertPackedLocalVectorCapability(report.capability)).toBe(report.capability);
-        expect(assertMatchingPackedPublicVectorReport(report, fingerprint)).toBe(report);
+        expect(assertMatchingPackedPublicVectorReport(report, fingerprint, reactFingerprint)).toBe(report);
         expect(() =>
             assertMatchingPackedPublicVectorReport(
                 { ...report, package: { tarball: { ...fingerprint, bytes: 124 } } },
-                fingerprint
+                fingerprint,
+                reactFingerprint
             )
         ).toThrow("does not identify the preview tarball");
         expect(() =>
             assertMatchingPackedPublicVectorReport(
                 { ...report, package: { tarball: { ...fingerprint, digest: "b".repeat(64) } } },
-                fingerprint
+                fingerprint,
+                reactFingerprint
             )
         ).toThrow("does not identify the preview tarball");
-        expect(() => assertMatchingPackedPublicVectorReport({ ...report, ok: false }, fingerprint)).toThrow(
-            "did not pass"
-        );
+        expect(() =>
+            assertMatchingPackedPublicVectorReport({ ...report, ok: false }, fingerprint, reactFingerprint)
+        ).toThrow("did not pass");
         expect(() =>
             assertMatchingPackedPublicVectorReport(
                 { ...report, capability: { ...PACKED_LOCAL_VECTOR_CAPABILITY, realVectorize: true } },
-                fingerprint
+                fingerprint,
+                reactFingerprint
             )
         ).toThrow("local semantic fake");
+        expect(() =>
+            assertMatchingPackedPublicVectorReport(
+                { ...report, reactPackage: { ...report.reactPackage, tarball: { ...reactFingerprint, bytes: 88 } } },
+                fingerprint,
+                reactFingerprint
+            )
+        ).toThrow("React tarball");
     });
 
     test("keeps browser proof intact while cleanup advances after an earlier teardown failure", async () => {

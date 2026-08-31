@@ -10,7 +10,7 @@ import { assertFileReshardDeploymentPair } from "./file-reshard-deployment-proof
 import { buildPreviewEvidenceManifest } from "./finalize-preview-evidence.mjs";
 import { assertMatchingGeneratedProjectReport } from "./generated-project-report.mjs";
 import { validateOsCiEvidence } from "./os-ci-evidence.mjs";
-import { CHARDB_PACKAGE_NAME, npmPackFilename } from "./package-identity.mjs";
+import { CHARDB_PACKAGE_NAME, CHARDB_REACT_PACKAGE_NAME, npmPackFilename } from "./package-identity.mjs";
 import { assertMatchingPackedChatReport } from "./packed-chat-report.mjs";
 import { assertMatchingPackedOrgUserReport } from "./packed-org-user-report.mjs";
 import { assertMatchingPackedPublicVectorReport } from "./packed-public-vector-contract.mjs";
@@ -88,7 +88,7 @@ function tarOctal(bytes, start, end, label) {
     return parsed;
 }
 
-function packageIdentityFromTarball(tarball) {
+function packageIdentityFromTarball(tarball, expectedName = CHARDB_PACKAGE_NAME) {
     let archive;
     try {
         archive = gunzipSync(tarball);
@@ -126,7 +126,7 @@ function packageIdentityFromTarball(tarball) {
         offset = dataStart + Math.ceil(size / 512) * 512;
     }
     object(packageJson, "preview candidate package.json");
-    check(packageJson.name === CHARDB_PACKAGE_NAME, `preview candidate package name must be ${CHARDB_PACKAGE_NAME}`);
+    check(packageJson.name === expectedName, `preview candidate package name must be ${expectedName}`);
     check(VERSION.test(packageJson.version ?? ""), "preview candidate package version is invalid");
     return { name: packageJson.name, version: packageJson.version };
 }
@@ -367,7 +367,30 @@ async function validatePreview(directory) {
         "preview candidate tarball package name or version differs from the gate report"
     );
     const candidate = { name: CHARDB_PACKAGE_NAME, version: report.package.version, ...fingerprint };
-    assertPassingPreviewGateReport(report, fingerprint);
+    check(
+        report.reactPackage?.name === CHARDB_REACT_PACKAGE_NAME,
+        `preview gate React package must be ${CHARDB_REACT_PACKAGE_NAME}`
+    );
+    check(VERSION.test(report.reactPackage?.version ?? ""), "preview gate React package version is invalid");
+    const reactFingerprint = exactCandidate(report.reactPackage?.tarball, "preview gate React tarball");
+    const reactTarballName = npmPackFilename(report.reactPackage.name, report.reactPackage.version);
+    const reactTarballBytes = await regularBytes(
+        path.join(root, reactTarballName),
+        "preview React candidate tarball",
+        root
+    );
+    sameCandidate(
+        { algorithm: "sha256", digest: sha256(reactTarballBytes), bytes: reactTarballBytes.byteLength },
+        reactFingerprint,
+        "preview React candidate tarball"
+    );
+    const packedReactIdentity = packageIdentityFromTarball(reactTarballBytes, CHARDB_REACT_PACKAGE_NAME);
+    check(
+        packedReactIdentity.name === report.reactPackage.name &&
+            packedReactIdentity.version === report.reactPackage.version,
+        "preview React tarball package name or version differs from the gate report"
+    );
+    assertPassingPreviewGateReport(report, fingerprint, reactFingerprint);
     for (const [file, key] of [
         ["generated-project.json", "generatedProject"],
         ["packed-chat.json", "packedChat"],
@@ -382,7 +405,7 @@ async function validatePreview(directory) {
             packedPublicVector: assertMatchingPackedPublicVectorReport,
             browser: assertMatchingBrowserReport,
         }[key];
-        validator(child.value, fingerprint);
+        validator(child.value, fingerprint, reactFingerprint);
         reportCandidate(child.value, candidate, `preview ${file}`);
     }
     const packedOrgUser = await jsonFile(path.join(root, "packed-org-user.json"), "preview packed-org-user.json", root);

@@ -27,11 +27,13 @@
     "workspaces": ["landing"],
     "scripts": {
         "build": "unbuild",
+        "build:react": "bun run build && bun run --cwd packages/react build",
         "build:stub": "unbuild --stub",
         "prepack": "bun run build",
         "smoke:package": "bun scripts/smoke-packed-package.mjs",
         "smoke:org-user": "bun scripts/smoke-packed-org-user.mjs",
         "smoke:browser": "bun scripts/smoke-packed-browser.mjs",
+        "smoke:react": "bun scripts/smoke-packed-react.mjs",
         "smoke:vector:browser": "bun scripts/smoke-packed-public-vector.mjs",
         "test": "bun scripts/test-correctness.mjs",
         "test:correctness": "bun scripts/test-correctness.mjs",
@@ -81,9 +83,9 @@
             "types": "./dist/server/index.d.mts",
             "import": "./dist/server/index.mjs"
         },
-        "./react": {
-            "types": "./dist/react/index.d.mts",
-            "import": "./dist/react/index.mjs"
+        "./internal/react": {
+            "types": "./dist/internal/react.d.mts",
+            "import": "./dist/internal/react.mjs"
         },
         "./files": {
             "types": "./dist/files/index.d.mts",
@@ -96,13 +98,9 @@
     },
     "peerDependencies": {
         "drizzle-orm": ">=0.36.0",
-        "better-auth": "~1.6.30",
-        "react": ">=18.0.0"
+        "better-auth": "~1.6.30"
     },
     "peerDependenciesMeta": {
-        "react": {
-            "optional": true
-        },
         "better-auth": {
             "optional": true
         }

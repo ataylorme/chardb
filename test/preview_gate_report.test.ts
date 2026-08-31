@@ -12,6 +12,7 @@ import {
 } from "../scripts/preview-gate-report.mjs";
 
 const fingerprint = { algorithm: "sha256", digest: "abc123", bytes: 42 };
+const reactFingerprint = { algorithm: "sha256", digest: "react123", bytes: 24 };
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 
@@ -20,6 +21,7 @@ function browserReport() {
         schema: "chardb.packed-browser-proof.report.v1",
         suite: "packed-generated-better-auth-browser",
         package: { tarball: fingerprint },
+        reactPackage: { name: "@chardb/react", version: "0.1.0", tarball: reactFingerprint },
         identity: { userId: "user-1" },
         organizations: { first: { id: "org-a" }, second: { id: "org-b" } },
         restart: {
@@ -103,17 +105,19 @@ describe("preview release gate evidence", () => {
     });
 
     test("requires native Better Auth browser evidence from the exact tarball", () => {
-        expect(assertMatchingBrowserReport(browserReport(), fingerprint)).toEqual(browserReport());
+        expect(assertMatchingBrowserReport(browserReport(), fingerprint, reactFingerprint)).toEqual(browserReport());
         expect(() =>
             assertMatchingBrowserReport(
                 { ...browserReport(), package: { tarball: { ...fingerprint, bytes: 43 } } },
-                fingerprint
+                fingerprint,
+                reactFingerprint
             )
         ).toThrow("does not identify");
         expect(() =>
             assertMatchingBrowserReport(
                 { ...browserReport(), invariants: { ...browserReport().invariants, nativeOrganizationSwitch: false } },
-                fingerprint
+                fingerprint,
+                reactFingerprint
             )
         ).toThrow("nativeOrganizationSwitch");
         expect(() =>
@@ -128,7 +132,8 @@ describe("preview release gate evidence", () => {
                         },
                     },
                 },
-                fingerprint
+                fingerprint,
+                reactFingerprint
             )
         ).toThrow("unexpected anonymous sign-in");
     });
@@ -149,7 +154,8 @@ describe("preview release gate evidence", () => {
             expect(() =>
                 assertMatchingBrowserReport(
                     { ...report, invariants: { ...report.invariants, [name]: false } },
-                    fingerprint
+                    fingerprint,
+                    reactFingerprint
                 )
             ).toThrow(name);
         }
@@ -157,12 +163,12 @@ describe("preview release gate evidence", () => {
 
     test("uses the full producer contract for suite and Better Auth route evidence", () => {
         const report = browserReport();
-        expect(() => assertMatchingBrowserReport({ ...report, suite: "forged-browser-suite" }, fingerprint)).toThrow(
-            "suite"
-        );
-        expect(() => assertMatchingBrowserReport({ ...report, betterAuthRoutes: [] }, fingerprint)).toThrow(
-            "create calls"
-        );
+        expect(() =>
+            assertMatchingBrowserReport({ ...report, suite: "forged-browser-suite" }, fingerprint, reactFingerprint)
+        ).toThrow("suite");
+        expect(() =>
+            assertMatchingBrowserReport({ ...report, betterAuthRoutes: [] }, fingerprint, reactFingerprint)
+        ).toThrow("create calls");
     });
 
     test("records an exact failed step without claiming the gate passed", () => {
@@ -171,6 +177,7 @@ describe("preview release gate evidence", () => {
             source: { gitSha: "sha-1", dirty: false },
             platform: { name: "linux-x64" },
             packageEvidence: { tarball: fingerprint },
+            reactPackageEvidence: { tarball: reactFingerprint },
             generatedProjectEvidence: { schema: "chardb.generated-project.report.v1" },
             packedChatEvidence: { schema: "chardb.packed-chat-proof.report.v1" },
             packedPublicVectorEvidence: { schema: "chardb.packed-public-vector-browser.v1" },
@@ -206,6 +213,7 @@ describe("preview release gate evidence", () => {
             source: { gitSha: "sha-1", dirty: true },
             platform: { name: "linux-x64" },
             packageEvidence: { tarball: fingerprint },
+            reactPackageEvidence: { tarball: reactFingerprint },
             steps: [
                 {
                     name: "typecheck",
@@ -227,6 +235,7 @@ describe("preview release gate evidence", () => {
             source: { gitSha: "sha-1", dirty: false },
             platform: { name: "linux-x64" },
             packageEvidence: { tarball: fingerprint },
+            reactPackageEvidence: { tarball: reactFingerprint },
             generatedProjectEvidence: { schema: "chardb.generated-project.report.v1" },
             packedChatEvidence: { schema: "chardb.packed-chat-proof.report.v1" },
             packedPublicVectorEvidence: { schema: "chardb.packed-public-vector-browser.v1" },

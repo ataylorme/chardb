@@ -2,6 +2,7 @@
 
 import { type Column, getTableName } from "drizzle-orm";
 import { customType } from "drizzle-orm/sqlite-core";
+import { normalizePublicWorkerUrl } from "../client/public-url.ts";
 import { CdbError, isCdbErrorCode } from "../errors.ts";
 import type { Brand } from "../types.ts";
 
@@ -118,6 +119,14 @@ export interface ChardbFileClient {
     downloadUrl(input: FileDownloadInput): string;
 }
 
+export interface FileClientOptions {
+    /**
+     * Public Chardb Worker origin. Relative file routes are used when omitted.
+     * Browser file requests must remain same-origin with the Worker.
+     */
+    readonly baseUrl?: string;
+}
+
 export interface FileRef {
     readonly table: string;
     readonly column: string;
@@ -168,6 +177,11 @@ function requestPath(
     return `/_chardb/files/${action}?${query}`;
 }
 
+function fileRequestUrl(path: string, baseUrl: string | undefined): string {
+    if (baseUrl === undefined) return path;
+    return new URL(path, baseUrl).toString();
+}
+
 async function fileRequestError(response: Response): Promise<Error> {
     let error: FileResponseError["error"];
     try {
@@ -191,9 +205,12 @@ async function fileRequestError(response: Response): Promise<Error> {
  * Bind one schema file column to Chardb's same-origin upload and download routes.
  * Better Auth's session cookie is sent by the browser automatically.
  */
-export function createFileClient(column: Column | FileRef): ChardbFileClient {
+export function createFileClient(column: Column | FileRef, options: FileClientOptions = {}): ChardbFileClient {
     const locator = fileLocator(column);
     const config = "dataType" in column ? getChardbFileColumnConfig(column) : undefined;
+    const baseUrl = options.baseUrl === undefined ? undefined : normalizePublicWorkerUrl(options.baseUrl);
+    const path = (action: "upload" | "download", input: FileDownloadInput | Pick<FileUploadInput, "organizationId">) =>
+        fileRequestUrl(requestPath(action, locator, input), baseUrl);
     return Object.freeze({
         async upload(input: FileUploadInput) {
             if (!(input.file instanceof Blob) || input.file.size < 1 || !input.file.type) {
@@ -205,8 +222,9 @@ export function createFileClient(column: Column | FileRef): ChardbFileClient {
             if (config && config.contentTypes !== "*" && !config.contentTypes.includes(contentType)) {
                 throw new TypeError("file content type is not accepted by the column");
             }
-            const response = await globalThis.fetch(requestPath("upload", locator, input), {
+            const response = await globalThis.fetch(path("upload", input), {
                 method: "PUT",
+                credentials: "include",
                 headers: {
                     "content-type": contentType,
                     "idempotency-key": input.idempotencyKey ?? crypto.randomUUID(),
@@ -234,12 +252,12 @@ export function createFileClient(column: Column | FileRef): ChardbFileClient {
             });
         },
         async download(input: FileDownloadInput) {
-            const response = await globalThis.fetch(requestPath("download", locator, input));
+            const response = await globalThis.fetch(path("download", input), { credentials: "include" });
             if (!response.ok) throw await fileRequestError(response);
             return response;
         },
         downloadUrl(input: FileDownloadInput) {
-            return requestPath("download", locator, input);
+            return path("download", input);
         },
     });
 }

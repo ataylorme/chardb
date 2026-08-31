@@ -57,7 +57,8 @@ describe("release documentation contract", () => {
         }
         expect(publicDocs).not.toMatch(/Candidate\d+|exact-candidate|construction diary/i);
         expect(publicDocs).not.toContain("github.com/zpg6/chardb/blob/main");
-        expect(plan).toContain("Pack `@chardb/core` once");
+        expect(plan).toContain("Every release is built once and tested as the artifact users install");
+        expect(plan).toContain("same packed `@chardb/core` tarball");
     });
 
     test("keeps the production warning as prose rather than a closable gate", () => {
@@ -73,6 +74,30 @@ describe("release documentation contract", () => {
         expect(readme).toContain("The `roles` block is Chardb's policy for domain rows");
         expect(readme).toContain("It does not add roles or permissions to Better Auth's organization or admin plugins");
         expect(readme).toContain("manage their roles through Better Auth");
+    });
+
+    test("documents the configured React client instead of raw transport wiring", () => {
+        const readme = read("README.md");
+        const reactReadme = read("packages/react/README.md");
+        const ownership = read("docs/ownership.mdx");
+        const fileDocs = read("docs/files.mdx");
+        const chatRecipe = read("docs/cookbook/chat-app.mdx");
+
+        for (const source of [readme, reactReadme]) {
+            expect(source).toContain("createChardbReactClient({");
+            expect(source).toContain("auth: ({ baseURL }) =>");
+            expect(source).not.toContain('from "@chardb/core/react"');
+        }
+        expect(readme).toContain("db.useQuery(listMessages, { limit: 50 })");
+        expect(readme).not.toContain("const chardbEndpoint");
+        expect(readme).not.toContain("<ChardbProvider");
+        expect(reactReadme).toContain("const workerUrl = new URL(window.location.origin).origin");
+        expect(reactReadme).not.toContain("PUBLIC_CHARD_DB_URL");
+        expect(ownership).toContain("configured React client reads the active organization");
+        expect(ownership).not.toContain("The caller supplies `organizationId`");
+        for (const source of [fileDocs, chatRecipe]) {
+            expect(source).not.toMatch(/attachment\.(?:upload|downloadUrl)\(\{\s*organizationId/);
+        }
     });
 
     test("runs package consumers on Linux, macOS, and Windows", () => {
@@ -98,7 +123,8 @@ describe("release documentation contract", () => {
         expect(packageJson.files).toContain("COST.md");
         expect(readme).toContain("[COST.md](COST.md) maps Chardb operations to Cloudflare's published meters");
         expect(status).toMatch(/cost.*unmeasured|unmeasured.*cost/i);
-        expect(plan).toContain("Cloudflare file, vector, and range-movement checks");
+        expect(plan).toContain("File, vector, and range-movement proofs");
+        expect(plan).toContain("disposable Cloudflare resources");
         expect(nextScope).toContain("Do not build a calculator or infer billable compute from latency");
         expect(cost).toContain("End-to-end latency cannot be converted into Worker CPU time or Durable Object GB-s");
         expect(cost).toContain("Chardb does not publish a total monthly-cost claim");

@@ -12,9 +12,13 @@ export function Hero() {
                         style={{ fontSize: "clamp(40px, 6vw, 72px)", lineHeight: 1.05, letterSpacing: "-0.02em" }}
                     >
                         A real database inside your
-                        <span className="mt-[0.12em] flex w-fit max-w-full items-center gap-[0.16em] rounded-[0.2em] border border-accent/20 bg-accent/[0.08] px-[0.14em] py-[0.08em] text-[min(0.74em,7.4vw)] leading-[1.08] tracking-[-0.025em] shadow-[inset_0_1px_0_rgba(255,136,88,0.08)]">
-                            <CloudflareWorkersMark />
-                            <span>Cloudflare Worker.</span>
+                        <span className="worker-lockup">
+                            <span className="worker-mark">
+                                <CloudflareWorkersMark />
+                            </span>
+                            <span>
+                                <span className="worker-cloudflare">Cloudflare</span> Worker.
+                            </span>
                         </span>
                     </h1>
                     <p

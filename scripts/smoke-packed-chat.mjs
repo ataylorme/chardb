@@ -25,6 +25,7 @@ const internalControlIndex = process.argv.indexOf("--control");
 const internalControl = internalControlIndex < 0 ? undefined : process.argv[internalControlIndex + 1];
 const options = internalPhase === undefined ? parsePackedChatArgs(process.argv.slice(2)) : undefined;
 const tarball = options === undefined ? undefined : resolve(options.tarball);
+const reactTarball = options === undefined ? undefined : resolve(options.reactTarball);
 const reportPath =
     options === undefined
         ? undefined
@@ -779,7 +780,10 @@ async function runIsolatedPhase(phase, controlPath) {
 }
 
 async function main() {
-    assert(tarball && reportPath, "packed-chat orchestrator requires a tarball and report path");
+    assert(
+        tarball && reactTarball && reportPath,
+        "packed-chat orchestrator requires core and React tarballs and a report path"
+    );
     assert(
         Object.keys(DURABLE_OBJECTS).every(name => !name.startsWith("CDB_")),
         "packed chat must use native exported class names"
@@ -799,6 +803,7 @@ async function main() {
 
         const packageJson = JSON.parse(await readFile(join(CHAT, "package.json"), "utf8"));
         packageJson.dependencies["@chardb/core"] = `file:${tarball}`;
+        packageJson.dependencies["@chardb/react"] = `file:${reactTarball}`;
         await writeFile(join(consumer, "package.json"), `${JSON.stringify(packageJson, null, 4)}\n`);
         const npmCache = process.env.CHARDDB_PACKED_CHAT_NPM_CACHE ?? join(scratch, "npm-cache");
         run(
@@ -811,7 +816,11 @@ async function main() {
         const installed = JSON.parse(
             await readFile(join(consumer, "node_modules", "@chardb", "core", "package.json"), "utf8")
         );
+        const installedReact = JSON.parse(
+            await readFile(join(consumer, "node_modules", "@chardb", "react", "package.json"), "utf8")
+        );
         assert(installed.name === "@chardb/core", "packed consumer did not install @chardb/core");
+        assert(installedReact.name === "@chardb/react", "packed consumer did not install @chardb/react");
         run("npm", ["run", "typecheck"], consumer);
         run("npm", ["run", "build"], consumer);
 
@@ -868,6 +877,11 @@ async function main() {
                 durationMs: performance.now() - runStartedAtMs,
             },
             packageEvidence: { name: installed.name, version: installed.version, tarball: tarballFingerprint },
+            reactPackageEvidence: {
+                name: installedReact.name,
+                version: installedReact.version,
+                tarball: await fingerprintFile(reactTarball),
+            },
             platform: { operatingSystem: process.platform, release: release(), architecture: process.arch },
             runtime: {
                 name: "packed-chat-miniflare-process-restart",
@@ -883,6 +897,7 @@ async function main() {
             benchmark: handoff.benchmark,
             invariants: {
                 packedPackageInstalled: true,
+                packedReactPackageInstalled: true,
                 wranglerTomlConsumer: true,
                 tutorialTypecheckPassed: true,
                 tutorialBuildPassed: true,

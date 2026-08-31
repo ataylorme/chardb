@@ -95,7 +95,7 @@ export function assertPackedLocalVectorCapability(value) {
     return value;
 }
 
-export function assertMatchingPackedPublicVectorReport(report, fingerprint) {
+export function assertMatchingPackedPublicVectorReport(report, fingerprint, reactFingerprint) {
     assert(
         report !== null && typeof report === "object" && !Array.isArray(report),
         "packed public vector evidence must be an object"
@@ -109,6 +109,11 @@ export function assertMatchingPackedPublicVectorReport(report, fingerprint) {
     assert(
         isDeepStrictEqual(report.package?.tarball, fingerprint),
         "packed public vector evidence does not identify the preview tarball"
+    );
+    assert(
+        report.reactPackage?.name === "@chardb/react" &&
+            (reactFingerprint === undefined || isDeepStrictEqual(report.reactPackage?.tarball, reactFingerprint)),
+        "packed public vector evidence does not identify the preview React tarball"
     );
     assertPackedPublicVectorBrowserProof(report.proof);
     return report;

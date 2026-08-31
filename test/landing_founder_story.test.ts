@@ -43,19 +43,49 @@ describe("founder story landing contract", () => {
     test("keeps the homepage compact and grounded in the generated project", () => {
         const app = read("landing/src/App.tsx");
         const overview = read("landing/src/components/ProductOverview.tsx");
+        const sdkStrip = read("landing/src/components/SdkStrip.tsx");
         const footer = read("landing/src/components/Footer.tsx");
 
         expect(app).toContain("<ProductOverview />");
+        expect(app).toContain("<SdkStrip />");
         for (const oldSection of ["Today", "Binding", "Scale", "Tenancy", "Auth", "Files", "License", "Closing"]) {
             expect(app).not.toContain(`<${oldSection} />`);
         }
-        for (const filename of ["schema.ts", "auth.ts", "worker.ts", "wrangler.toml"]) {
-            expect(overview).toContain(filename);
+        expect(overview).toContain("src/database.ts");
+        expect(overview).toContain("src/App.tsx");
+        expect(overview).not.toContain("worker.ts");
+        expect(overview).not.toContain("wrangler.toml");
+        expect(overview).toContain("Set up your Worker. Use it like an app SDK.");
+        expect(overview).toContain("defineAuth");
+        expect(overview).toContain("cdbTable");
+        expect(overview).toContain("createChardbReactClient");
+        expect(overview).toContain("useIdentity");
+        expect(overview).toContain("useQuery");
+        expect(overview).toContain("// Better Auth config");
+        expect(overview).toContain("// Drizzle + Better Auth ownership");
+        expect(overview).toContain('className="syntax-property">signIn</span>');
+        expect(overview).toContain("db.auth.signOut");
+        expect(overview).toContain("/brands/file-react-ts.svg");
+        expect(overview).toContain("/brands/file-rust.svg");
+        for (const sdk of ["React", "Rust", "Python", "Swift", "Flutter", "Expo"]) {
+            expect(overview).toContain(`name: "${sdk}"`);
         }
-        expect(overview).toContain("The organization is the shard key.");
+        expect(overview).toContain("Better Auth JWT");
+        expect(overview).toContain("syntax-punctuation");
+        expect(overview).toContain('label: "Realtime"');
+        expect(overview).not.toContain('label: "SQL + live"');
         expect(overview).toContain("File columns route to R2. Vector columns route to Vectorize.");
         expect(overview).toContain("Miniflare and Cloudflare's Vitest integration run it locally.");
         expect(overview).toContain("Docs soon");
+        for (const available of ["React", "Rust"]) {
+            expect(sdkStrip).toContain(
+                `name: "${available}", icon: "/brands/${available.toLowerCase()}.svg", available: true`
+            );
+        }
+        for (const comingSoon of ["Python", "Swift", "Flutter", "Expo"]) {
+            expect(sdkStrip).toContain(`name: "${comingSoon}"`);
+            expect(sdkStrip).toContain(`icon: "/brands/${comingSoon.toLowerCase()}.svg"`);
+        }
         expect(footer).toContain("infrastructure billed by Cloudflare · no Chardb service fee");
     });
 });

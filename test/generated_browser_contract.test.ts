@@ -22,18 +22,29 @@ defineAuth({ plugins: [organization()], trustedOrigins: trustedDevelopmentOrigin
 
 const appSource = `
 import { createAuthClient } from "better-auth/react";
+import { createChardbReactClient } from "@chardb/react";
 organizationClient();
 jwtClient();
-authClient.useSession();
-anonymousSignInRequest ??= authClient.signIn.anonymous();
+const workerUrl = window.location.origin;
+const db = createChardbReactClient({
+  url: workerUrl,
+  ownership: "organization",
+  auth: ({ baseURL }) => createAuthClient({ baseURL }),
+});
+db.auth.useSession();
+anonymousSignInRequest ??= db.auth.signIn.anonymous();
 const authFailure = "Sign-in failed:";
-authClient.useListOrganizations();
-authClient.organization.create({ name, slug });
-authClient.organization.setActive({ organizationId });
-authClient.organization.delete({ organizationId });
+db.auth.useListOrganizations();
+db.auth.organization.create({ name, slug });
+db.auth.organization.setActive({ organizationId });
+db.auth.organization.delete({ organizationId });
 const organizationId = session.data.session.activeOrganizationId;
 const messageAttachment = fileRef("messages", "attachment");
-useFile(messageAttachment);
+db.useFile(messageAttachment);
+attachment.upload({ file, idempotencyKey });
+attachment.downloadUrl({ rowId });
+db.useQuery(listMessages, { limit: 50 });
+db.useMutation(postMessage);
 replaceMessageAttachment();
 <output data-testid="auth-status" data-user-id={userId} />;
 <select data-testid="organization-select" />;
@@ -62,7 +73,7 @@ describe("generated Better Auth browser contract", () => {
         const failures = generatedBrowserContractFailures(incomplete);
         expect(failures).toContain("src/auth.ts: enable Better Auth's server organization plugin");
         expect(failures).toContain("src/web/App.tsx: create the client with createAuthClient from better-auth/react");
-        expect(failures).toContain("src/web/App.tsx: switch organizations with authClient.organization.setActive");
+        expect(failures).toContain("src/web/App.tsx: switch organizations with db.auth.organization.setActive");
         expect(failures).toContain(
             "src/auth.ts and src/web/App.tsx: remove the hardcoded demo-org and let Better Auth own organization ids"
         );
@@ -76,7 +87,7 @@ describe("generated Better Auth browser contract", () => {
         expect(generatedBrowserContractFailures({ authSource, appSource: wrappers })).toContain(
             "src/web/App.tsx: remove local auth session and organization hook wrappers"
         );
-        const chardbSession = `${appSource}\nimport { useSession } from "@chardb/core/react";`;
+        const chardbSession = `${appSource}\nimport { useSession } from "@chardb/react";`;
         expect(generatedBrowserContractFailures({ authSource, appSource: chardbSession })).toContain(
             "src/web/App.tsx: do not import Chardb's useSession hook for Better Auth state"
         );
@@ -90,7 +101,7 @@ describe("generated Better Auth browser contract", () => {
 
         expect(source).toContain('import { createAuthClient } from "better-auth/react"');
         expect(source).toContain("authClient.useSession()");
-        expect(source).not.toContain('useSession } from "@chardb/core/react"');
+        expect(source).not.toContain('useSession } from "@chardb/react"');
         expect(source).not.toContain("function useAuthSession");
     });
 });

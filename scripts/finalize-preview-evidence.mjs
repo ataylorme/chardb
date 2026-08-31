@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { CHARDB_PACKAGE_NAME, npmPackFilename } from "./package-identity.mjs";
+import { CHARDB_PACKAGE_NAME, CHARDB_REACT_PACKAGE_NAME, npmPackFilename } from "./package-identity.mjs";
 import { assertMatchingPackedOrgUserReport } from "./packed-org-user-report.mjs";
 import { assertPassingPreviewGateReport } from "./preview-gate-report.mjs";
 
@@ -40,6 +40,13 @@ export async function buildPreviewEvidenceManifest(directory) {
     if (!VERSION.test(report.package?.version ?? "")) {
         throw new Error("preview gate package version is invalid");
     }
+    const reactCandidate = report.reactPackage?.tarball;
+    if (report.reactPackage?.name !== CHARDB_REACT_PACKAGE_NAME) {
+        throw new Error(`preview gate React package must be ${CHARDB_REACT_PACKAGE_NAME}`);
+    }
+    if (!VERSION.test(report.reactPackage?.version ?? "")) {
+        throw new Error("preview gate React package version is invalid");
+    }
     const listedFiles = await filesUnder(root);
     for (const [relative, key] of [
         ["generated-project.json", "generatedProject"],
@@ -64,6 +71,12 @@ export async function buildPreviewEvidenceManifest(directory) {
     const tarball = files.find(file => file.path === npmPackFilename(report.package.name, report.package.version));
     if (!tarball || tarball.sha256 !== candidate.digest || tarball.bytes !== candidate.bytes) {
         throw new Error("preview evidence tarball does not match the gate report");
+    }
+    const reactTarball = files.find(
+        file => file.path === npmPackFilename(report.reactPackage.name, report.reactPackage.version)
+    );
+    if (!reactTarball || reactTarball.sha256 !== reactCandidate.digest || reactTarball.bytes !== reactCandidate.bytes) {
+        throw new Error("preview evidence React tarball does not match the gate report");
     }
     return {
         schema: PREVIEW_EVIDENCE_MANIFEST_SCHEMA,

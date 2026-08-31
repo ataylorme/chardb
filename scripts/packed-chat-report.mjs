@@ -6,6 +6,7 @@ export const PACKED_CHAT_RESTART_RESULT_SCHEMA = "chardb.packed-chat-restart-res
 
 export const PACKED_CHAT_INVARIANTS = Object.freeze([
     "packedPackageInstalled",
+    "packedReactPackageInstalled",
     "wranglerTomlConsumer",
     "tutorialTypecheckPassed",
     "tutorialBuildPassed",
@@ -83,6 +84,7 @@ function assertRuntime(runtime) {
 
 export function parsePackedChatArgs(argv) {
     let tarball;
+    let reactTarball;
     let reportPath;
     for (let index = 0; index < argv.length; index += 1) {
         const argument = argv[index];
@@ -93,14 +95,21 @@ export function parsePackedChatArgs(argv) {
             reportPath = value;
             continue;
         }
+        if (argument === "--react") {
+            const value = argv[++index];
+            if (!value) throw new Error("--react requires a path");
+            if (reactTarball !== undefined) throw new Error("--react may be provided only once");
+            reactTarball = value;
+            continue;
+        }
         if (argument.startsWith("-")) throw new Error(`unknown packed-chat smoke argument ${JSON.stringify(argument)}`);
         if (tarball !== undefined) throw new Error("packed-chat smoke accepts one tarball");
         tarball = argument;
     }
-    if (tarball === undefined) {
-        throw new Error("usage: bun scripts/smoke-packed-chat.mjs <package.tgz> [--report <path>]");
+    if (tarball === undefined || reactTarball === undefined) {
+        throw new Error("usage: bun scripts/smoke-packed-chat.mjs <core.tgz> --react <react.tgz> [--report <path>]");
     }
-    return { tarball, reportPath };
+    return { tarball, reactTarball, reportPath };
 }
 
 function assertInvariants(invariants) {
@@ -263,6 +272,11 @@ export function buildPackedChatReport(input) {
             version: input.packageEvidence.version,
             tarball: { ...input.packageEvidence.tarball },
         },
+        reactPackage: {
+            name: input.reactPackageEvidence.name,
+            version: input.reactPackageEvidence.version,
+            tarball: { ...input.reactPackageEvidence.tarball },
+        },
         platform: { ...input.platform },
         runtime: { ...input.runtime },
         identity: { ...input.identity },
@@ -280,7 +294,7 @@ export function buildPackedChatReport(input) {
     };
 }
 
-export function assertMatchingPackedChatReport(report, fingerprint) {
+export function assertMatchingPackedChatReport(report, fingerprint, reactFingerprint) {
     if (report === null || typeof report !== "object" || Array.isArray(report)) {
         throw new Error("packed-chat evidence must be an object");
     }
@@ -289,6 +303,12 @@ export function assertMatchingPackedChatReport(report, fingerprint) {
     }
     if (!isDeepStrictEqual(report.package?.tarball, fingerprint)) {
         throw new Error("packed-chat evidence does not identify the preview tarball");
+    }
+    if (
+        report.reactPackage?.name !== "@chardb/react" ||
+        (reactFingerprint !== undefined && !isDeepStrictEqual(report.reactPackage?.tarball, reactFingerprint))
+    ) {
+        throw new Error("packed-chat evidence does not identify the preview React tarball");
     }
     assertPlatform(report.platform);
     assertRuntime(report.runtime);

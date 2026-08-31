@@ -26,6 +26,13 @@ const candidate = {
     digest: createHash("sha256").update("candidate").digest("hex"),
     bytes: 1024,
 };
+const reactCandidate = {
+    name: "@chardb/react" as const,
+    version: "0.1.0",
+    algorithm: "sha256" as const,
+    digest: createHash("sha256").update("react-candidate").digest("hex"),
+    bytes: 512,
+};
 
 afterEach(async () => {
     await Promise.all(temporaryDirectories.splice(0).map(directory => rm(directory, { recursive: true, force: true })));
@@ -72,6 +79,15 @@ function generated(
                 bytes: evidenceCandidate.bytes,
             },
         },
+        reactPackageEvidence: {
+            name: reactCandidate.name,
+            version: reactCandidate.version,
+            tarball: {
+                algorithm: reactCandidate.algorithm,
+                digest: reactCandidate.digest,
+                bytes: reactCandidate.bytes,
+            },
+        },
         platform: { ...platform, release: "1.2.3" },
         runtime: { bun: "1.2.22", nodeCompatibility: "22.14.0", wrangler: "4.125.0", miniflare: "4.1.0" },
         migrations: {
@@ -108,6 +124,15 @@ function windows(
                 algorithm: evidenceCandidate.algorithm,
                 digest: evidenceCandidate.digest,
                 bytes: evidenceCandidate.bytes,
+            },
+        },
+        reactPackage: {
+            name: reactCandidate.name,
+            version: reactCandidate.version,
+            tarball: {
+                algorithm: reactCandidate.algorithm,
+                digest: reactCandidate.digest,
+                bytes: reactCandidate.bytes,
             },
         },
         platform: { name: "windows-latest", operatingSystem: "win32", release: "10.0.26100", architecture: "x64" },
@@ -192,24 +217,27 @@ describe("cross-OS CI evidence", () => {
         const workflow = await readFile(path.resolve(import.meta.dir, "../.github/workflows/ci.yml"), "utf8");
         const occurrences = (needle: string): number => workflow.split(needle).length - 1;
 
-        expect(occurrences("npm pack --ignore-scripts")).toBe(1);
-        expect(occurrences("bun run build\n")).toBe(1);
+        expect(occurrences("npm pack --ignore-scripts")).toBe(2);
+        expect(occurrences("bun run build:react\n")).toBe(1);
         expect(occurrences("needs: candidate")).toBe(3);
         expect(occurrences("uses: actions/download-artifact@v4")).toBe(4);
         expect(occurrences("name: candidate-${{ github.sha }}-${{ github.run_attempt }}")).toBe(4);
         expect(occurrences("path: ci-candidate")).toBe(4);
         expect(occurrences("ci-candidate-artifact.mjs --verify --directory ci-candidate")).toBe(3);
         expect(workflow).toContain(
-            'bun scripts/ci-candidate-artifact.mjs --stage ".ci-pack/${tarball}" --directory ci-candidate'
+            'bun scripts/ci-candidate-artifact.mjs --stage ".ci-pack/${core_tarball}" --react ".ci-pack/${react_tarball}" --directory ci-candidate'
         );
         expect(workflow).toContain(
-            "bun scripts/smoke-generated-project.mjs ci-candidate/candidate.tgz --report generated-linux-report.json"
+            'react_tarball="$(npm pack --ignore-scripts --pack-destination .ci-pack ./packages/react)"'
         );
         expect(workflow).toContain(
-            "bun scripts/smoke-generated-project.mjs ci-candidate/candidate.tgz --report generated-macos-report.json"
+            "bun scripts/smoke-generated-project.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz --report generated-linux-report.json"
         );
         expect(workflow).toContain(
-            "bun test/windows-dev-tree.mjs --tarball ci-candidate/candidate.tgz --report generated-windows-report.json"
+            "bun scripts/smoke-generated-project.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz --report generated-macos-report.json"
+        );
+        expect(workflow).toContain(
+            "bun test/windows-dev-tree.mjs --tarball ci-candidate/core.tgz --react-tarball ci-candidate/react.tgz --report generated-windows-report.json"
         );
     });
 

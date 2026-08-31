@@ -7,6 +7,7 @@ export interface BrowserProofRoute {
 export interface BrowserProofInput {
     readonly run: { readonly id: string; readonly startedAt: string };
     readonly package: Record<string, unknown>;
+    readonly reactPackage?: Record<string, unknown>;
     readonly platform: Record<string, unknown>;
     readonly runtime: Record<string, unknown>;
     readonly identity: { readonly userId: string };

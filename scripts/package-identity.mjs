@@ -1,4 +1,5 @@
 export const CHARDB_PACKAGE_NAME = "@chardb/core";
+export const CHARDB_REACT_PACKAGE_NAME = "@chardb/react";
 
 const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*|[a-z0-9][a-z0-9._-]*)$/;
 const PACKAGE_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;

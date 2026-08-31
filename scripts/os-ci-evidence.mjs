@@ -21,6 +21,7 @@ export const OS_CI_PLATFORM_TUPLES = Object.freeze({
 });
 export const OS_CI_WINDOWS_CHECKS = Object.freeze([
     "packedCandidateInstalled",
+    "packedReactCandidateInstalled",
     "generatedTypecheckPassed",
     "cloudflareVitestPassed",
     "generatedBuildPassed",
@@ -61,6 +62,24 @@ function sha256(bytes) {
 function assertCandidate(value, label) {
     object(value, label);
     check(value.name === CHARDB_PACKAGE_NAME, `${label}.name must be ${CHARDB_PACKAGE_NAME}`);
+    check(VERSION.test(value.version ?? ""), `${label}.version is invalid`);
+    const tarball = object(value.tarball, `${label}.tarball`);
+    exactKeys(tarball, ["algorithm", "digest", "bytes"], `${label}.tarball`);
+    check(tarball.algorithm === "sha256", `${label}.tarball.algorithm must be sha256`);
+    check(SHA256.test(tarball.digest ?? ""), `${label}.tarball.digest is invalid`);
+    check(Number.isSafeInteger(tarball.bytes) && tarball.bytes > 0, `${label}.tarball.bytes is invalid`);
+    return {
+        name: value.name,
+        version: value.version,
+        algorithm: tarball.algorithm,
+        digest: tarball.digest,
+        bytes: tarball.bytes,
+    };
+}
+
+function assertReactCandidate(value, label) {
+    object(value, label);
+    check(value.name === "@chardb/react", `${label}.name must be @chardb/react`);
     check(VERSION.test(value.version ?? ""), `${label}.version is invalid`);
     const tarball = object(value.tarball, `${label}.tarball`);
     exactKeys(tarball, ["algorithm", "digest", "bytes"], `${label}.tarball`);
@@ -150,11 +169,12 @@ function assertGeneratedReport(report, expectedPlatform, expectedJob, expectedCa
         digest: candidate.digest,
         bytes: candidate.bytes,
     });
+    const reactCandidate = assertReactCandidate(report.reactPackage, `${label}.reactPackage`);
     if (expectedCandidate) sameCandidate(candidate, expectedCandidate, label);
     assertPlatform(report.platform, expectedPlatform, `${label}.platform`);
     assertRuntime(report.runtime, ["bun", "nodeCompatibility", "wrangler", "miniflare"], `${label}.runtime`);
     const { run, ci } = assertRun(report.run, expectedJob, `${label}.run`);
-    return { candidate, ci, report, run };
+    return { candidate, reactCandidate, ci, report, run };
 }
 
 export function githubActionsRunFromEnvironment(environment = process.env) {
@@ -175,6 +195,7 @@ export function githubActionsRunFromEnvironment(environment = process.env) {
 
 export function buildWindowsOsCiReport(input) {
     const candidate = assertCandidate(input.package, "Windows OS CI package");
+    const reactCandidate = assertReactCandidate(input.reactPackage, "Windows OS CI React package");
     assertPlatform(input.platform, OS_CI_PLATFORM_TUPLES.windows, "Windows OS CI platform");
     assertRuntime(
         input.runtime,
@@ -198,6 +219,15 @@ export function buildWindowsOsCiReport(input) {
             version: candidate.version,
             tarball: { algorithm: candidate.algorithm, digest: candidate.digest, bytes: candidate.bytes },
         },
+        reactPackage: {
+            name: reactCandidate.name,
+            version: reactCandidate.version,
+            tarball: {
+                algorithm: reactCandidate.algorithm,
+                digest: reactCandidate.digest,
+                bytes: reactCandidate.bytes,
+            },
+        },
         platform: { ...input.platform },
         runtime: { ...input.runtime },
         run: { ...run, ci: { ...run.ci } },
@@ -212,6 +242,7 @@ function assertWindowsReport(report, expectedCandidate) {
     check(report.suite === "generated-windows-dev-tree", "Windows OS CI report suite drifted");
     const rebuilt = buildWindowsOsCiReport({
         package: report.package,
+        reactPackage: report.reactPackage,
         platform: report.platform,
         runtime: report.runtime,
         run: report.run,
@@ -220,8 +251,9 @@ function assertWindowsReport(report, expectedCandidate) {
     });
     check(isDeepStrictEqual(report, rebuilt), "Windows OS CI report fields drifted");
     const candidate = assertCandidate(report.package, "Windows OS CI report.package");
+    const reactCandidate = assertReactCandidate(report.reactPackage, "Windows OS CI report.reactPackage");
     if (expectedCandidate) sameCandidate(candidate, expectedCandidate, "Windows OS CI report");
-    return { candidate, ci: report.run.ci, report, run: report.run };
+    return { candidate, reactCandidate, ci: report.run.ci, report, run: report.run };
 }
 
 function sameRun(actual, expected, label) {
@@ -278,10 +310,13 @@ async function readReports(root, expectedCandidate) {
         "macOS OS CI report"
     );
     const windows = assertWindowsReport(values["generated-windows-report.json"], candidate);
+    sameCandidate(macos.reactCandidate, linux.reactCandidate, "macOS OS CI React package");
+    sameCandidate(windows.reactCandidate, linux.reactCandidate, "Windows OS CI React package");
     sameRun(macos.ci, linux.ci, "macOS OS CI report");
     sameRun(windows.ci, linux.ci, "Windows OS CI report");
     return {
         candidate,
+        reactCandidate: linux.reactCandidate,
         ci: linux.ci,
         bytes,
         observations: {

@@ -16,13 +16,22 @@ export declare function parsePreviewGateArgs(
     argv: readonly string[],
     cwd?: string
 ): { readonly help: boolean; readonly outputDirectory: string; readonly platformName: string | undefined };
-export declare function assertMatchingBrowserReport<T extends object>(browser: T, fingerprint: object): T;
-export declare function assertPassingPreviewGateReport<T extends object>(report: T, expectedFingerprint?: object): T;
+export declare function assertMatchingBrowserReport<T extends object>(
+    browser: T,
+    fingerprint: object,
+    reactFingerprint?: object
+): T;
+export declare function assertPassingPreviewGateReport<T extends object>(
+    report: T,
+    expectedFingerprint?: object,
+    expectedReactFingerprint?: object
+): T;
 export declare function buildPreviewGateReport(input: {
     readonly run: object;
     readonly source: object;
     readonly platform: object;
     readonly packageEvidence?: object;
+    readonly reactPackageEvidence?: object;
     readonly steps: readonly PreviewGateStep[];
     readonly generatedProjectEvidence?: object;
     readonly packedChatEvidence?: object | undefined;

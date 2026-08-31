@@ -4,7 +4,7 @@ export default defineBuildConfig({
     entries: [
         "src/index",
         "src/server/index",
-        "src/react/index",
+        { input: "src/react/index", name: "internal/react" },
         "src/files/index",
         "src/internal/vector-proof",
         { input: "src/cli/bin", name: "cli/bin" },

@@ -1,0 +1,42 @@
+{
+    "name": "@chardb/react",
+    "version": "0.1.0",
+    "description": "React hooks for Chardb and Better Auth",
+    "type": "module",
+    "license": "MIT",
+    "publishConfig": {
+        "access": "public"
+    },
+    "homepage": "https://chardb.dev",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/zpg6/chardb.git",
+        "directory": "packages/react"
+    },
+    "files": ["dist", "README.md"],
+    "scripts": {
+        "build": "unbuild",
+        "prepack": "bun run build",
+        "typecheck": "tsc --noEmit"
+    },
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.mts",
+            "import": "./dist/index.mjs"
+        }
+    },
+    "peerDependencies": {
+        "@chardb/core": "^0.1.0",
+        "better-auth": "~1.6.30",
+        "drizzle-orm": ">=0.36.0",
+        "react": ">=18.0.0"
+    },
+    "devDependencies": {
+        "@types/react": "^18.3.12",
+        "better-auth": "~1.6.30",
+        "drizzle-orm": "^0.45.2",
+        "react": "^18.3.1",
+        "typescript": "^5.6.3",
+        "unbuild": "^3.6.1"
+    }
+}

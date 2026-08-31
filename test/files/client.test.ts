@@ -23,6 +23,7 @@ describe("public file client", () => {
             expect(String(input)).toBe("/_chardb/files/upload?organizationId=org-1&table=documents&column=attachment");
             expect(init).toMatchObject({
                 method: "PUT",
+                credentials: "include",
                 headers: { "content-type": "image/png", "idempotency-key": "stable-retry" },
             });
             expect(await new Response(init?.body).text()).toBe("pixels");
@@ -67,6 +68,40 @@ describe("public file client", () => {
             })
         ).toBe("/_chardb/files/download?organizationId=org-1&table=documents&column=attachment&rowId=row-1");
         expect(() => fileRef("", "attachment")).toThrow("file table");
+    });
+
+    test("targets the configured public Worker URL", async () => {
+        const fetch = mock(async (input: string | URL | Request, init?: RequestInit) => {
+            expect(String(input)).toBe(
+                "https://db.example.com/_chardb/files/download?organizationId=org-1&table=documents&column=attachment&rowId=row-1"
+            );
+            expect(init?.credentials).toBe("include");
+            return new Response("exact");
+        });
+        globalThis.fetch = fetch as unknown as typeof globalThis.fetch;
+        const client = createFileClient(fileRef("documents", "attachment"), {
+            baseUrl: "https://db.example.com",
+        });
+
+        expect(client.downloadUrl({ organizationId: "org-1", rowId: "row-1" })).toBe(
+            "https://db.example.com/_chardb/files/download?organizationId=org-1&table=documents&column=attachment&rowId=row-1"
+        );
+        expect(await (await client.download({ organizationId: "org-1", rowId: "row-1" })).text()).toBe("exact");
+    });
+
+    test("rejects a file base URL that would silently discard configuration", () => {
+        for (const baseUrl of [
+            "/relative",
+            "wss://db.example.com",
+            "https://user:secret@db.example.com",
+            "https://db.example.com/app",
+            "https://db.example.com?stage=one",
+            "https://db.example.com#files",
+        ]) {
+            expect(() => createFileClient(fileRef("documents", "attachment"), { baseUrl })).toThrow(
+                "public Worker URL"
+            );
+        }
     });
 
     test("rejects non-file columns, invalid blobs, server failures, and malformed successes", async () => {

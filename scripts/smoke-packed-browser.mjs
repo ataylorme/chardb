@@ -16,9 +16,14 @@ if (await isolateProcessTree(import.meta.url, { label: "packed browser smoke", t
 const ADMIN_TOKEN = "packed-browser-migration-secret";
 const AUTH_SECRET = "packed-browser-auth-secret-at-least-32-characters";
 const tarballArgument = process.argv[2];
-if (!tarballArgument) throw new Error("usage: bun scripts/smoke-packed-browser.mjs <package.tgz>");
+const reactArgumentIndex = process.argv.indexOf("--react");
+const reactTarballArgument = reactArgumentIndex < 0 ? undefined : process.argv[reactArgumentIndex + 1];
+if (!tarballArgument || !reactTarballArgument) {
+    throw new Error("usage: bun scripts/smoke-packed-browser.mjs <core.tgz> --react <react.tgz>");
+}
 
 const tarballPath = resolve(tarballArgument);
+const reactTarballPath = resolve(reactTarballArgument);
 const reportPath = resolve(process.env.CDB_BROWSER_PROOF_REPORT ?? `${tarballPath}.browser-proof.json`);
 const runStartedAt = new Date().toISOString();
 const scratch = await mkdtemp(join(tmpdir(), "chardb-packed-browser-"));
@@ -65,7 +70,11 @@ try {
     );
     run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarballPath], bootstrap);
     const packageVersion = await readPackageVersion(bootstrap, "@chardb/core");
-    run(join(bootstrap, "node_modules", ".bin", "chardb"), ["init", "browser-app"], scratch);
+    run(
+        join(bootstrap, "node_modules", ".bin", "chardb"),
+        ["init", "browser-app", "--core-package", `file:${tarballPath}`, "--react-package", `file:${reactTarballPath}`],
+        scratch
+    );
 
     const protectedBefore = await fingerprintGeneratedApp(project);
     assertGeneratedBrowserContract({
@@ -403,6 +412,11 @@ try {
     const report = buildBrowserProofReport({
         run: { id: runId, startedAt: runStartedAt },
         package: { name: "@chardb/core", version: packageVersion, tarball: await fingerprintFile(tarballPath) },
+        reactPackage: {
+            name: "@chardb/react",
+            version: await readPackageVersion(project, "@chardb/react"),
+            tarball: await fingerprintFile(reactTarballPath),
+        },
         platform: { operatingSystem: process.platform, release: release(), architecture: process.arch },
         runtime: {
             name: "generated-bun-dev-wrangler-miniflare-vite",
@@ -506,6 +520,7 @@ async function installPackedDependency(cwd) {
     const generatedPackage = await readFile(packagePath, "utf8");
     const packageJson = JSON.parse(generatedPackage);
     packageJson.dependencies["@chardb/core"] = `file:${tarballPath}`;
+    packageJson.dependencies["@chardb/react"] = `file:${reactTarballPath}`;
     await writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
     try {
         run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund"], cwd);

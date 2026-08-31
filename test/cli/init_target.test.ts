@@ -149,7 +149,9 @@ describe("init target contract", () => {
             });
             expect(await runCli(rejected.ctx, argv)).toBe(2);
             expect(prepared).toBe(0);
-            expect(rejected.stderr).toEqual(["usage: chardb init <name> [--core-package <specifier>]\n"]);
+            expect(rejected.stderr).toEqual([
+                "usage: chardb init <name> [--core-package <specifier>] [--react-package <specifier>]\n",
+            ]);
         }
     });
 
@@ -211,12 +213,14 @@ describe("init target contract", () => {
             name: "candidate-app",
             directory: "candidate-app",
             corePackage: specifier,
+            reactPackage: "file:/private/tmp/exact-chardb-react-candidate.tgz",
         });
 
         const root = "/tmp/chardb-init-target/candidate-app";
         const manifest = JSON.parse(project.files.get(`${root}/package.json`) ?? "null");
         const readme = project.files.get(`${root}/README.md`) ?? "";
         expect(manifest.dependencies["@chardb/core"]).toBe(specifier);
+        expect(manifest.dependencies["@chardb/react"]).toBe("file:/private/tmp/exact-chardb-react-candidate.tgz");
         expect(readme).toContain("bunx @chardb/core migrations generate --name <name>");
         expect(readme).toContain("bunx @chardb/core vectorize prepare");
         expect(readme).not.toMatch(/\bbun chardb\b/);

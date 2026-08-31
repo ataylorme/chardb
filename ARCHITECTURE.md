@@ -23,7 +23,7 @@ The npm package has five import paths:
 
 - `@chardb/core` for clients, the native binding builder, and shared errors;
 - `@chardb/core/server` for organization tables, server handles, auth, migrations, and `chardb()`;
-- `@chardb/core/react` for the provider and hooks;
+- `@chardb/react` for the provider and hooks;
 - `@chardb/core/files` for organization file columns and the same-origin file client;
 - `@chardb/core/vite` for stable refs and ref-only query and mutation handles in browser builds.
 

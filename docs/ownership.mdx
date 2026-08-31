@@ -44,7 +44,7 @@ export const messages = cdbTable(
 );
 ```
 
-The organization foreign key selects the partition. The policy decides which current members may read or write each column. The caller supplies `organizationId` for routing, but Chardb verifies the JWT and current Better Auth membership before using it.
+The organization foreign key selects the partition. The query definition includes `organizationId` because the router needs it. The configured React client reads the active organization from Better Auth and adds that value to query and mutation arguments. Chardb still verifies the JWT and current membership before using it.
 
 Chardb fills `organizationId` and `authorId` from verified authority during inserts. Mutation handlers omit both values.
 

@@ -727,7 +727,7 @@ type RowFromTable<TTable> = TTable extends { readonly $inferSelect: infer R } ? 
  * );
  * ```
  *
- * The `@chardb/core/react` hooks derive their `TArgs` / `TResult` types from
+ * The `@chardb/react` hooks derive their `TArgs` / `TResult` types from
  * the returned function via `Parameters<typeof postMessage>[1]` and
  * `Awaited<ReturnType<typeof postMessage>>`, so the user never exports a
  * separate `*Args` type alias for the wire shape.

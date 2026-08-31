@@ -1,10 +1,10 @@
-import { useMutation, useQuery } from "@chardb/core/react";
+import { useMutation, useQuery } from "@chardb/react";
 import { useCallback } from "react";
 import { uuidv7 } from "uuidv7";
 import { postMessage } from "../server/api.ts";
 import { listMessages } from "../server/queries.ts";
 
-import type { InferRow } from "@chardb/core/react";
+import type { InferRow } from "@chardb/react";
 
 type MessageRow = InferRow<typeof listMessages>;
 export type { MessageRow };

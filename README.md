@@ -327,30 +327,33 @@ app.get("/api/messages", async c => {
 
 The planned live query and direct select compile to the same versioned select plan. Both execute through one policy-wrapped runner. No SQL string crosses RPC.
 
-In React, Better Auth remains the only session and organization store. Pass that same client to Chardb so the database hooks can request a JWT:
+In React, configure Chardb once with the public Worker URL. The client gives that URL to Better Auth, derives `/ws`, and adds the active organization to database operations.
 
 ```tsx
 import { createAuthClient } from "better-auth/react";
 import { anonymousClient, jwtClient, organizationClient } from "better-auth/client/plugins";
-import { ChardbProvider, useQuery } from "@chardb/core/react";
+import { createChardbReactClient } from "@chardb/react";
 import { listMessages } from "./queries.ts";
 
-const authClient = createAuthClient({
-    baseURL: window.location.origin,
-    plugins: [anonymousClient(), organizationClient(), jwtClient()],
+const workerUrl = window.location.origin;
+const db = createChardbReactClient({
+    url: workerUrl,
+    ownership: "organization",
+    auth: ({ baseURL }) =>
+        createAuthClient({
+            baseURL,
+            plugins: [anonymousClient(), organizationClient(), jwtClient()],
+        }),
 });
 
-const socketProtocol = window.location.protocol === "https:" ? "wss" : "ws";
-const chardbEndpoint = `${socketProtocol}://${window.location.host}/ws`;
-
-function Messages({ organizationId }: { readonly organizationId: string }) {
-    const { data = [] } = useQuery(listMessages, { organizationId });
+function Messages() {
+    const { data = [] } = db.useQuery(listMessages, { limit: 50 });
     return <ul>{data.map(message => <li key={message.id}>{message.body}</li>)}</ul>;
 }
 
 export function App() {
-    const session = authClient.useSession();
-    const organizations = authClient.useListOrganizations();
+    const session = db.auth.useSession();
+    const organizations = db.auth.useListOrganizations();
     if (!session.data) return <p>Sign in to continue.</p>;
 
     const activeOrganizationId = session.data.session.activeOrganizationId;
@@ -359,7 +362,7 @@ export function App() {
             <select
                 value={activeOrganizationId ?? ""}
                 onChange={event =>
-                    void authClient.organization.setActive({ organizationId: event.target.value || null })
+                    void db.auth.organization.setActive({ organizationId: event.target.value || null })
                 }
             >
                 <option value="">Choose an organization</option>
@@ -367,12 +370,9 @@ export function App() {
                     <option key={org.id} value={org.id}>{org.name}</option>
                 ))}
             </select>
-            <ChardbProvider
-                endpoint={chardbEndpoint}
-                auth={authClient}
-            >
-                {activeOrganizationId ? <Messages organizationId={activeOrganizationId} /> : null}
-            </ChardbProvider>
+            <db.Provider>
+                {activeOrganizationId ? <Messages /> : null}
+            </db.Provider>
         </>
     );
 }
@@ -380,13 +380,13 @@ export function App() {
 
 ## Public package entries
 
-The package publishes five import paths:
+Chardb publishes these public imports:
 
 | Import | Purpose |
 | --- | --- |
 | `@chardb/core` | Browser client, native binding client, and shared errors |
 | `@chardb/core/server` | Organization tables, API handles, auth, migrations, vectors, and `chardb()` |
-| `@chardb/core/react` | `ChardbProvider`, query, and mutation hooks for a Better Auth client |
+| `@chardb/react` | Configured React client with Better Auth identity and owner-scoped hooks |
 | `@chardb/core/files` | Branded file columns, browser-safe locators, and the same-origin file client |
 | `@chardb/core/vite` | Ref-only browser handles for queries and mutations |
 

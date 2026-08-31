@@ -8,50 +8,54 @@ This recipe uses the app from [Quickstart](/quickstart). Do not rebuild it by ha
 ## Establish the Better Auth session
 
 ```tsx
-const authClient = createAuthClient({
-  baseURL: window.location.origin,
-  plugins: [anonymousClient(), organizationClient(), jwtClient()],
+const workerUrl = window.location.origin;
+const db = createChardbReactClient({
+  url: workerUrl,
+  ownership: "organization",
+  auth: ({ baseURL }) => createAuthClient({
+    baseURL,
+    plugins: [anonymousClient(), organizationClient(), jwtClient()],
+  }),
 });
 
-<ChardbProvider endpoint={endpoint()} auth={authClient}>
+<db.Provider>
   <Workspace />
-</ChardbProvider>
+</db.Provider>
 ```
 
-The generated browser signs in anonymously, creates an organization through Better Auth, and calls `organization.setActive`. The provider fetches the signed JWT used by live queries and mutations. File routes use the same-origin session cookie.
+The React client passes its normalized public Worker URL to the Better Auth factory, then uses that same origin for live WebSockets and file routes. The generated browser signs in anonymously through `db.auth`, creates an organization, and calls `db.auth.organization.setActive`. The provider fetches the signed JWT used by live queries and mutations.
 
 ## Read the active organization
 
 ```tsx
-const { data = [], state } = useQuery(listMessages, {
-  organizationId,
+const { data = [], state } = db.useQuery(listMessages, {
   limit: 50,
 });
 ```
 
-The routing value does not grant access. Gateway verifies current membership and the table policy before it registers the query.
+The configured client reads the active organization from the Better Auth session and adds it to the registered query arguments. Gateway still verifies current membership and the table policy before it registers the query.
 
 ## Upload, then write
 
 ```tsx
+const post = db.useMutation(postMessage);
+
 const uploaded = selectedFile
   ? await attachment.upload({
-      organizationId,
       file: selectedFile,
       idempotencyKey: retryKey,
     })
   : null;
 
-await mutate({
+await post({
   id: uuidv7(),
-  organizationId,
   body,
   attachment: uploaded?.fileId ?? null,
   clientCreatedAt: Date.now(),
 });
 ```
 
-The message insert and file upload are separate operations. Reuse the same upload idempotency key when retrying the selected file. The row stores only the opaque file ID.
+The SDK adds the active organization to the mutation and file upload. Reuse the same upload idempotency key when retrying the selected file. The row stores only the opaque file ID.
 
 Open the same organization in two tabs and post a message. Both subscriptions should receive the replacement snapshot. Switch one tab to another organization and confirm it cannot read or download the first organization's data.
 

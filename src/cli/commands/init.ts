@@ -10,13 +10,14 @@ export interface InitOptions {
     readonly directory?: string;
     readonly compatibilityDate?: string;
     readonly corePackage?: string;
+    readonly reactPackage?: string;
 }
 
 const ALLOWED_EXISTING_ROOT_ENTRIES = new Set([".DS_Store", ".git"]);
 
 const DEFAULT_COMPAT_DATE = "2026-05-10";
 
-const PACKAGE_TEMPLATE = (name: string, corePackage: string) =>
+const PACKAGE_TEMPLATE = (name: string, corePackage: string, reactPackage: string) =>
     `${JSON.stringify(
         {
             name,
@@ -39,6 +40,7 @@ const PACKAGE_TEMPLATE = (name: string, corePackage: string) =>
             dependencies: {
                 "better-auth": "1.6.30",
                 "@chardb/core": corePackage,
+                "@chardb/react": reactPackage,
                 "drizzle-orm": "0.45.2",
                 react: "18.3.1",
                 "react-dom": "18.3.1",
@@ -546,7 +548,7 @@ createRoot(root).render(
 const WEB_APP_TEMPLATE = `import { createAuthClient } from "better-auth/react";
 import { type Organization, anonymousClient, jwtClient, organizationClient } from "better-auth/client/plugins";
 import { fileRef } from "@chardb/core/files";
-import { ChardbProvider, useFile, useMutation, useQuery } from "@chardb/core/react";
+import { createChardbReactClient } from "@chardb/react";
 import { type FormEvent, useEffect, useState } from "react";
 import { uuidv7 } from "uuidv7";
 import { postMessage, replaceMessageAttachment } from "../api.ts";
@@ -554,27 +556,27 @@ import { listMessages } from "../queries.ts";
 
 const messageAttachment = fileRef("messages", "attachment");
 
-const authClient = createAuthClient({
-  baseURL: window.location.origin,
-  plugins: [anonymousClient(), organizationClient(), jwtClient()],
+const workerUrl = window.location.origin;
+const db = createChardbReactClient({
+  url: workerUrl,
+  ownership: "organization",
+  auth: ({ baseURL }) => createAuthClient({
+    baseURL,
+    plugins: [anonymousClient(), organizationClient(), jwtClient()],
+  }),
 });
 
-let anonymousSignInRequest: ReturnType<typeof authClient.signIn.anonymous> | undefined;
+let anonymousSignInRequest: ReturnType<typeof db.auth.signIn.anonymous> | undefined;
 
 function signInAnonymously() {
-  anonymousSignInRequest ??= authClient.signIn.anonymous().finally(() => {
+  anonymousSignInRequest ??= db.auth.signIn.anonymous().finally(() => {
     anonymousSignInRequest = undefined;
   });
   return anonymousSignInRequest;
 }
 
-function endpoint(): string {
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  return protocol + "://" + window.location.host + "/ws";
-}
-
 export function App() {
-  const session = authClient.useSession();
+  const session = db.auth.useSession();
   const [authError, setAuthError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -598,20 +600,17 @@ export function App() {
   }
 
   return (
-    <ChardbProvider endpoint={endpoint()} auth={authClient}>
-      <Workspace activeOrganizationId={session.data.session.activeOrganizationId} userId={session.data.user.id} />
-    </ChardbProvider>
+    <db.Provider>
+      <Workspace />
+    </db.Provider>
   );
 }
 
-function Workspace({
-  activeOrganizationId,
-  userId,
-}: {
-  readonly activeOrganizationId: string | null | undefined;
-  readonly userId: string;
-}) {
-  const organizations = authClient.useListOrganizations();
+function Workspace() {
+  const identity = db.useIdentity();
+  const organizations = db.auth.useListOrganizations();
+  const activeOrganizationId = identity.organizationId;
+  const userId = identity.user?.id;
   const [name, setName] = useState("");
   const [slug, setSlug] = useState("");
   const [savingOrganization, setSavingOrganization] = useState(false);
@@ -621,7 +620,7 @@ function Workspace({
     setSavingOrganization(true);
     setError(null);
     try {
-      const result = await authClient.organization.setActive({ organizationId });
+      const result = await db.auth.organization.setActive({ organizationId });
       if (result.error) throw new Error(result.error.message);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -638,7 +637,7 @@ function Workspace({
     setSavingOrganization(true);
     setError(null);
     try {
-      const created = await authClient.organization.create({
+      const created = await db.auth.organization.create({
         name: organizationName,
         slug: organizationSlug,
         keepCurrentActiveOrganization: true,
@@ -646,7 +645,7 @@ function Workspace({
       if (created.error || !created.data) {
         throw new Error(created.error?.message ?? "Better Auth did not return the new organization");
       }
-      const active = await authClient.organization.setActive({ organizationId: created.data.id });
+      const active = await db.auth.organization.setActive({ organizationId: created.data.id });
       if (active.error) throw new Error(active.error.message);
       setName("");
       setSlug("");
@@ -662,7 +661,7 @@ function Workspace({
     setSavingOrganization(true);
     setError(null);
     try {
-      const deleted = await authClient.organization.delete({ organizationId: activeOrganizationId });
+      const deleted = await db.auth.organization.delete({ organizationId: activeOrganizationId });
       if (deleted.error) throw new Error(deleted.error.message);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -735,7 +734,7 @@ function Workspace({
         </button>
       </section>
 
-      {activeOrganizationId ? (
+      {activeOrganizationId && userId ? (
         <Messages organizationId={activeOrganizationId} userId={userId} />
       ) : (
         <section className="messages" data-testid="message-list">
@@ -756,17 +755,13 @@ interface MessageRow {
 
 function MessageCard({
   message,
-  organizationId,
   userId,
 }: {
   readonly message: MessageRow;
-  readonly organizationId: string;
   readonly userId: string;
 }) {
-  const attachment = useFile(messageAttachment);
-  const replace = useMutation<Parameters<typeof replaceMessageAttachment>[1], { readonly id: string }>(
-    replaceMessageAttachment,
-  );
+  const attachment = db.useFile(messageAttachment);
+  const replace = db.useMutation(replaceMessageAttachment);
   const [selected, setSelected] = useState<{ readonly file: File; readonly retryKey: string } | null>(null);
   const [replacing, setReplacing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -778,11 +773,10 @@ function MessageCard({
     setError(null);
     try {
       const uploaded = await attachment.upload({
-        organizationId,
         file: selected.file,
         idempotencyKey: selected.retryKey,
       });
-      await replace({ id: message.id, organizationId, attachment: uploaded.fileId });
+      await replace({ id: message.id, attachment: uploaded.fileId });
       setSelected(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -802,7 +796,7 @@ function MessageCard({
       {message.attachment ? (
         <a
           data-testid="message-attachment"
-          href={attachment.downloadUrl({ organizationId, rowId: message.id })}
+          href={attachment.downloadUrl({ rowId: message.id })}
         >
           Download attachment
         </a>
@@ -832,9 +826,9 @@ function MessageCard({
 }
 
 function Messages({ organizationId, userId }: { readonly organizationId: string; readonly userId: string }) {
-  const { data = [], state } = useQuery(listMessages, { organizationId, limit: 50 });
-  const mutate = useMutation<Parameters<typeof postMessage>[1], { readonly id: string }>(postMessage);
-  const attachment = useFile(messageAttachment);
+  const { data = [], state } = db.useQuery(listMessages, { limit: 50 });
+  const mutate = db.useMutation(postMessage);
+  const attachment = db.useFile(messageAttachment);
   const [body, setBody] = useState("");
   const [selectedFile, setSelectedFile] = useState<{ readonly file: File; readonly retryKey: string } | null>(null);
   const [sending, setSending] = useState(false);
@@ -849,14 +843,12 @@ function Messages({ organizationId, userId }: { readonly organizationId: string;
     try {
       const uploaded = selectedFile
         ? await attachment.upload({
-            organizationId,
             file: selectedFile.file,
             idempotencyKey: selectedFile.retryKey,
           })
         : null;
       await mutate({
         id: uuidv7(),
-        organizationId,
         body: message,
         attachment: uploaded?.fileId ?? null,
         clientCreatedAt: Date.now(),
@@ -887,7 +879,6 @@ function Messages({ organizationId, userId }: { readonly organizationId: string;
           <MessageCard
             key={message.id}
             message={message}
-            organizationId={organizationId}
             userId={userId}
           />
         ))}
@@ -1437,6 +1428,8 @@ export async function runInit(ctx: CliContext, opts: InitOptions): Promise<void>
     const compat = opts.compatibilityDate ?? DEFAULT_COMPAT_DATE;
     const corePackage = opts.corePackage ?? "0.1.0";
     if (!corePackage) throw new Error("core package specifier must not be empty");
+    const reactPackage = opts.reactPackage ?? "0.1.0";
+    if (!reactPackage) throw new Error("react package specifier must not be empty");
     const filesBucket = generatedFilesBucket(opts.name);
     const wrangler = renderWrangler({
         name: opts.name,
@@ -1445,7 +1438,7 @@ export async function runInit(ctx: CliContext, opts: InitOptions): Promise<void>
         filesBucket,
     });
     const artifacts = [
-        { path: `${root}/package.json`, contents: PACKAGE_TEMPLATE(opts.name, corePackage) },
+        { path: `${root}/package.json`, contents: PACKAGE_TEMPLATE(opts.name, corePackage, reactPackage) },
         { path: `${root}/tsconfig.json`, contents: TSCONFIG_TEMPLATE },
         { path: `${root}/.gitignore`, contents: GITIGNORE_TEMPLATE },
         { path: `${root}/.env.example`, contents: ENV_EXAMPLE_TEMPLATE },
@@ -1535,6 +1528,6 @@ export async function runInit(ctx: CliContext, opts: InitOptions): Promise<void>
         throw error;
     }
     ctx.stdout(
-        `chardb: initialised "${opts.name}" with @chardb/core ${corePackage} and compat date ${compat}\nnext: bun install && bun run typecheck && bun run dev\n`
+        `chardb: initialised "${opts.name}" with @chardb/core ${corePackage}, @chardb/react ${reactPackage}, and compat date ${compat}\nnext: bun install && bun run typecheck && bun run dev\n`
     );
 }
