@@ -29,6 +29,9 @@ describe("preview deployment preparation", () => {
         expect(renderPreviewWrangler(source, "chardb-preview", "a".repeat(64))).toBe(
             `name = "chardb-preview"\nmain = "src/server/worker.ts"\n\n[vars]\nCDB_RELEASE_SHA256 = "${"a".repeat(64)}"\n`
         );
+        expect(renderPreviewWrangler(source, "chardb-chat-example", "b".repeat(64))).toBe(
+            `name = "chardb-chat-example"\nmain = "src/server/worker.ts"\n\n[vars]\nCDB_RELEASE_SHA256 = "${"b".repeat(64)}"\n`
+        );
         expect(() => renderPreviewWrangler('main = "worker.ts"\n', "chardb-preview", "a".repeat(64))).toThrow(
             "no Worker name"
         );
