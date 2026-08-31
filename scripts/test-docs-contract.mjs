@@ -14,25 +14,27 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const CANDIDATE = Object.freeze({
+const FINAL_ARTIFACT = Object.freeze({
   name: "@chardb/core",
   version: "0.1.0",
-  size: 455_344,
-  sha256: "4ec16920f255cd9eaefdb41cac004d9320d81e4c23e2f92e73a12cc680691ae4",
+  size: 454_690,
+  sha256: "73dd07bfa9f38a321ea612930563ce88b86266730a38fe114fd1059ecad100d2",
 });
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const docsRoot = join(repositoryRoot, "docs");
 const tarballInput = process.env.CHARDB_DOCS_TARBALL;
-if (!tarballInput) fail("set CHARDB_DOCS_TARBALL to the candidate .tgz");
+if (!tarballInput) fail("set CHARDB_DOCS_TARBALL to the final packed .tgz");
 const tarballPath = resolve(tarballInput);
 
-const tarball = await readFile(tarballPath).catch(() => fail(`cannot read candidate: ${tarballPath}`));
-if (tarball.byteLength !== CANDIDATE.size) {
-  fail(`candidate size is ${tarball.byteLength}; expected ${CANDIDATE.size}`);
+const tarball = await readFile(tarballPath).catch(() => fail(`cannot read packed artifact: ${tarballPath}`));
+if (tarball.byteLength !== FINAL_ARTIFACT.size) {
+  fail(`packed artifact size is ${tarball.byteLength}; expected ${FINAL_ARTIFACT.size}`);
 }
 const digest = createHash("sha256").update(tarball).digest("hex");
-if (digest !== CANDIDATE.sha256) fail(`candidate SHA-256 is ${digest}; expected ${CANDIDATE.sha256}`);
+if (digest !== FINAL_ARTIFACT.sha256) {
+  fail(`packed artifact SHA-256 is ${digest}; expected ${FINAL_ARTIFACT.sha256}`);
+}
 
 const temporaryRoot = await mkdtemp(join(tmpdir(), "chardb-docs-contract-"));
 try {
@@ -41,8 +43,8 @@ try {
 
   const packageRoot = join(temporaryRoot, "package");
   const packageJson = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
-  if (packageJson.name !== CANDIDATE.name || packageJson.version !== CANDIDATE.version) {
-    fail(`candidate identity is ${packageJson.name}@${packageJson.version}`);
+  if (packageJson.name !== FINAL_ARTIFACT.name || packageJson.version !== FINAL_ARTIFACT.version) {
+    fail(`packed identity is ${packageJson.name}@${packageJson.version}`);
   }
   const expectedExports = [".", "./server", "./react", "./files", "./vite"];
   if (JSON.stringify(Object.keys(packageJson.exports)) !== JSON.stringify(expectedExports)) {
@@ -70,8 +72,8 @@ try {
   requireText(init.stdout, 'initialised "my-chardb-app"', "initializer did not report the created directory");
   const appRoot = join(temporaryRoot, "my-chardb-app");
   const generatedPackage = JSON.parse(await readFile(join(appRoot, "package.json"), "utf8"));
-  if (generatedPackage.dependencies?.[CANDIDATE.name] !== CANDIDATE.version) {
-    fail("generated app does not pin the candidate package version");
+  if (generatedPackage.dependencies?.[FINAL_ARTIFACT.name] !== FINAL_ARTIFACT.version) {
+    fail("generated app does not pin the packed package version");
   }
 
   const config = JSON.parse(await readFile(join(docsRoot, "docs.json"), "utf8"));
@@ -207,17 +209,22 @@ try {
   const cost = (await readFile(join(packageRoot, "COST.md"), "utf8")).toLowerCase();
   const operations = (await readFile(join(packageRoot, "OPERATIONS.md"), "utf8")).toLowerCase();
   for (const phrase of ["does not add a hosted-service charge", "does not publish a total monthly-cost claim"]) {
-    requireText(cost, phrase, `candidate cost note is missing: ${phrase}`);
+    requireText(cost, phrase, `packed cost note is missing: ${phrase}`);
   }
   for (const phrase of ["there is no backup", "point-in-time recovery", "operator path, not automatic resharding"]) {
-    requireText(operations, phrase, `candidate operations note is missing: ${phrase}`);
+    requireText(operations, phrase, `packed operations note is missing: ${phrase}`);
   }
   for (const claim of ["unmeasured", "no backup", "operator-driven"]) {
     requireText(deploy.toLowerCase(), claim, `deploy page is missing the ${claim} limit`);
   }
 
   const audit = await readFile(join(repositoryRoot, "DOCS_GAPS.md"), "utf8");
-  for (const fact of [CANDIDATE.name, CANDIDATE.sha256, String(CANDIDATE.size), "creates the named directory"]) {
+  for (const fact of [
+    FINAL_ARTIFACT.name,
+    FINAL_ARTIFACT.sha256,
+    String(FINAL_ARTIFACT.size),
+    "creates the named directory",
+  ]) {
     requireText(audit, fact, `DOCS_GAPS.md is missing integration fact: ${fact}`);
   }
 
