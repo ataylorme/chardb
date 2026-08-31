@@ -1,0 +1,68 @@
+---
+title: "Queries and mutations"
+description: "Register the only reads and writes a browser may call."
+---
+
+The server exports registered handles. The browser bundle keeps each handle's stable ref and removes its server implementation.
+
+The generated query returns one organization's newest messages:
+
+{/* contract: ../docs-examples/generated-app/src/queries.ts */}
+```ts src/queries.ts
+import { api } from "@chardb/core/server";
+import { desc, eq } from "drizzle-orm";
+import { z } from "zod";
+import { messages } from "./schema.ts";
+
+export const listMessages = api.query({
+  ref: "src/queries.ts#listMessages",
+  args: z.object({
+    organizationId: z.string(),
+    limit: z.number().int().min(1).max(100).default(50),
+  }),
+  query: (db, args) => db
+    .select()
+    .from(messages)
+    .where(eq(messages.organizationId, args.organizationId))
+    .orderBy(desc(messages.createdAt), desc(messages.id))
+    .limit(args.limit),
+});
+```
+
+The mutation validates its arguments, names the organization partition, and writes through the policy-wrapped Drizzle database:
+
+```ts src/api.ts
+export const postMessage = api.mutation({
+  ref: "src/api.ts#postMessage",
+  authority: "organization",
+  args: z.object({
+    id: z.string(),
+    organizationId: z.string(),
+    body: z.string().trim().min(1).max(2_000),
+    attachment: z.string().min(1).max(128).transform(FileId).nullable(),
+    clientCreatedAt: z.number(),
+  }),
+  partitionKey: "organizationId",
+  handler: (ctx, args) => {
+    ctx.db.insert(messages).values({
+      id: args.id,
+      body: args.body,
+      attachment: args.attachment,
+      createdAt: args.clientCreatedAt,
+    }).run();
+    return { id: args.id };
+  },
+});
+```
+
+When `postMessage` runs:
+
+1. Zod checks the arguments.
+2. `organizationId` selects the application partition.
+3. Chardb checks current organization membership.
+4. The table policy checks the requested columns.
+5. The handler commits inside one physical Cdb transaction.
+
+Registered queries use one table, return full rows, use recognized predicates, and end deterministic ordering with the primary key. The limit cannot exceed 100.
+
+Joins, projections, aggregates, offset pagination, raw SQL, and cross-partition predicates fail during the build.

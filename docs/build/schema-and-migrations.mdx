@@ -1,0 +1,46 @@
+---
+title: "Migrations"
+description: "Generate immutable additive migrations and apply them explicitly."
+---
+
+`chardb init` already generates version 1 under `src/migrations/`. It includes the domain table, Better Auth Catalog tables, file descriptors, and a SHA-256 digest chain.
+
+Do not edit `v1.json` or `v1.ts` after a deployment reaches version 1.
+
+## Add the next version
+
+Change `src/schema.ts`, then run:
+
+```bash
+bunx @chardb/core migrations generate --name add_message_edited_at
+bun run typecheck
+bun run test
+bun run build
+```
+
+The generator inspects the schema twice in separate Bun processes and requires the same result. It verifies the complete old digest chain before writing the next JSON snapshot, TypeScript snapshot, and journal entry.
+
+The automatic diff accepts:
+
+- new tables
+- nonunique indexes
+- nullable columns without new constraints
+
+It rejects drops, renames, type changes, constraint changes, unique indexes, edited history, and changes to an existing file or vector descriptor. Write a reviewed migration path instead of disguising one of those changes as additive.
+
+## Apply a migration
+
+Local `bun run dev` reads the target from `/health` and applies it before starting Vite.
+
+For a remote Worker, the generated deployment script runs the packaged CLI. The underlying command is:
+
+```bash
+bunx @chardb/core migrate \
+  --url https://my-chardb-app.example.workers.dev \
+  --id schema-v2-<journal-digest> \
+  --target 2
+```
+
+Set `CHARDB_ADMIN_TOKEN` in the process environment. Reuse the same ID and target after a transport failure. The command resumes recorded shard and Catalog work instead of starting a second migration.
+
+Application traffic stays closed while the schema is migrating. There is no reverse migration command.

@@ -1,0 +1,80 @@
+---
+title: "Tenancy and auth"
+description: "Make a Better Auth organization the placement and policy boundary."
+---
+
+The generated app uses Better Auth for identity, sessions, organizations, and JWTs. Chardb does not keep a second membership model.
+
+{/* contract: ../docs-examples/generated-app/src/auth.ts */}
+```ts src/auth.ts
+import { anonymous } from "better-auth/plugins/anonymous";
+import { jwt } from "better-auth/plugins/jwt";
+import { organization } from "better-auth/plugins/organization";
+import { defineAuth } from "@chardb/core/server";
+
+function trustedDevelopmentOrigins(request?: Request): string[] {
+  if (!request) return [];
+  try {
+    const worker = new URL(request.url);
+    const candidate = new URL(request.headers.get("origin") ?? request.headers.get("referer") ?? "");
+    const loopback = (hostname: string) =>
+      hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+    if (worker.protocol !== "http:" || !loopback(worker.hostname)) return [];
+    if (candidate.protocol !== "http:" || !loopback(candidate.hostname)) return [];
+    return [candidate.origin];
+  } catch {
+    return [];
+  }
+}
+
+export const auth = defineAuth({
+  appName: "my-chardb-app",
+  plugins: [anonymous(), organization(), jwt()],
+  trustedOrigins: trustedDevelopmentOrigins,
+});
+```
+
+Anonymous sign-in keeps the tutorial short. Replace it with the sign-in methods your app supports. Keep `organization()` and `jwt()` because the generated browser and Chardb authorization path use both.
+
+`forOrg()` makes the organization foreign key the placement key and policy boundary. This is the exact generated table:
+
+{/* contract: ../docs-examples/generated-app/src/schema.ts */}
+```ts src/schema.ts
+import { file } from "@chardb/core/files";
+import { integer, text } from "drizzle-orm/sqlite-core";
+import { forOrg } from "@chardb/core/server";
+import { auth } from "./auth.ts";
+
+const { cdbTable } = forOrg();
+
+export const messages = cdbTable(
+  "messages",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => auth.organization.id, { onDelete: "cascade" }),
+    authorId: text("author_id")
+      .notNull()
+      .references(() => auth.user.id, { onDelete: "cascade" }),
+    body: text("body").notNull(),
+    attachment: file("attachment", { maxSize: 5 * 1_024 * 1_024, contentTypes: ["image/jpeg", "image/png"] }),
+    createdAt: integer("created_at").notNull(),
+  },
+  {
+    selfBy: "authorId",
+    roles: {
+      owner: "*",
+      admin: "*",
+      member: { read: "*", create: ["id", "body", "attachment", "createdAt"] },
+      self: { read: "*", update: ["body", "attachment"], delete: true },
+    },
+  },
+);
+```
+
+The policy is small enough to audit. Members can read and create messages. Authors can update or delete their own messages. Owners and admins can use every column and operation.
+
+The client still sends `organizationId` for routing. Chardb verifies the JWT, reloads current membership from Catalog, applies the table policy, and fills the managed organization and author columns. Changing the route value does not grant access.
+
+The public 0.1.0 path is organization tenancy. User-owned and global tables are outside this release.

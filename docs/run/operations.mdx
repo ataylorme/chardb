@@ -1,0 +1,43 @@
+---
+title: "Operations and cost"
+description: "What the preview can operate, what Cloudflare meters, and when to stop."
+---
+
+## Shipped commands
+
+| Command | What it does |
+| --- | --- |
+| `chardb init <name>` | Writes the generated app into the current empty directory. |
+| `chardb doctor` | Validates Wrangler bindings and schema resource requirements. |
+| `chardb migrations generate --name <name>` | Appends one immutable additive migration. |
+| `chardb migrate ...` | Applies or resumes a forward migration. |
+| `chardb vectorize prepare` | Creates or verifies required Vectorize metadata indexes. |
+
+Operator-driven range movement exists under `chardb experimental shards`. It is not part of generated onboarding, automatic balancing, or the supported application contract.
+
+## Recovery rules
+
+After a transient Worker or Durable Object failure, retry only errors marked `retryable`. Reuse the original mutation ID. A new ID asks for a new write.
+
+After an interrupted migration, keep traffic closed and rerun the same migration command with the same ID, target version, and journal.
+
+If Durable Object storage is lost or corrupt, stop. Version 0.1.0 has no backup, export, restore, point-in-time recovery, replica promotion, or regional failover path.
+
+## Cloudflare meters
+
+Chardb adds no hosted-service fee. The app consumes Cloudflare Workers, Durable Objects, R2, and optional Vectorize.
+
+| Meter | Included each month on Workers Paid | Published overage |
+| --- | ---: | ---: |
+| Worker requests | 10 million | $0.30 per million |
+| Worker CPU time | 30 million CPU-ms | $0.02 per million CPU-ms |
+| Durable Object requests | 1 million | $0.15 per million |
+| Durable Object duration | 400,000 GB-s | $12.50 per million GB-s |
+| SQLite rows read | 25 billion | $0.001 per million |
+| SQLite rows written | 50 million | $1.00 per million |
+| SQLite storage | 5 GB-month | $0.20 per GB-month |
+| R2 Standard storage | 10 GB-month | $0.015 per GB-month |
+
+One application mutation can write the domain row, operation log, live-query state, file metadata, and delivery outbox. Count Cloudflare meters, not API calls.
+
+These rates were recorded on 2026-08-30. Check the current [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/), [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/), and [R2 pricing](https://developers.cloudflare.com/r2/pricing/) before estimating a bill.

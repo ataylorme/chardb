@@ -1,0 +1,39 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "chardb",
+  "description": "Organization-owned SQLite, Better Auth tenancy, files, and live Drizzle queries for Cloudflare Workers.",
+  "favicon": "/favicon.png",
+  "colors": {
+    "primary": "#EC5713",
+    "light": "#F0642B",
+    "dark": "#C83D09"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Start",
+        "pages": ["index", "quickstart"]
+      },
+      {
+        "group": "Build",
+        "pages": [
+          "build/tenancy-and-auth",
+          "build/reads-and-writes",
+          "build/live-queries"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "configuration",
+          "build/schema-and-migrations"
+        ]
+      },
+      {
+        "group": "Run",
+        "pages": ["run/deploy", "run/operations"]
+      }
+    ]
+  }
+}
