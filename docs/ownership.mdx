@@ -1,0 +1,71 @@
+---
+title: "Ownership"
+description: "Choose who owns a row, where it lives, and who can change it."
+---
+
+Every Chardb table has one owner. Most application data belongs to an organization. Private preferences belong to a user. Shared application data belongs to a named global partition.
+
+## Own rows with an organization
+
+`forOrg()` makes the organization foreign key the placement and authorization boundary.
+
+{/* contract: ../docs-examples/generated-app/src/schema.ts */}
+```ts src/schema.ts
+import { integer, text } from "drizzle-orm/sqlite-core";
+import { forOrg } from "@chardb/core/server";
+import { auth } from "./auth.ts";
+
+const { cdbTable } = forOrg();
+
+export const messages = cdbTable(
+  "messages",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => auth.organization.id, { onDelete: "cascade" }),
+    authorId: text("author_id")
+      .notNull()
+      .references(() => auth.user.id, { onDelete: "cascade" }),
+    body: text("body").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  {
+    selfBy: "authorId",
+    roles: {
+      owner: "*",
+      admin: "*",
+      member: { read: "*", create: ["id", "body", "createdAt"] },
+      self: { read: "*", update: ["body"], delete: true },
+    },
+  },
+);
+```
+
+The policy is close to the table because it changes with the table. Members can read messages and create a limited set of columns. Authors can edit their own body or delete their own message. Owners and admins can do either.
+
+Chardb fills `organizationId` and `authorId` after it checks the current session. Do not accept either value from an unchecked client write.
+
+## Route first, authorize second
+
+An organization ID chooses the database partition. It does not grant access. For every operation, Chardb:
+
+1. Verifies the signed session.
+2. Resolves current Better Auth membership.
+3. Routes to the organization's partition.
+4. Adds the table policy to the query or mutation.
+
+A user who guesses another organization ID still fails at membership. A member who reaches the right partition still cannot update columns excluded by the table policy.
+
+## Use the narrowest owner
+
+Use `forUser()` for data that follows one account, such as preferences or drafts. Use `globalScope()` for a named application partition, such as a public status feed.
+
+```ts src/schema.ts
+const { cdbTable: userTable } = forUser();
+const { cdbTable: globalTable } = globalScope();
+```
+
+Do not put organization data in a global partition to make a query easier. That removes the physical boundary you wanted in the first place.
+
+Next, make the message list update in [Live queries](/live-queries).

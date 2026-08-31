@@ -1,23 +1,19 @@
 ---
 title: "chardb"
-description: "Organization-owned SQLite and live Drizzle queries inside a Cloudflare Worker."
+description: "Typed data for Cloudflare Workers, owned by the people and organizations in your app."
 ---
 
 # A real database inside your Worker
 
-Chardb gives a Cloudflare Worker one typed database binding. Better Auth organizations decide where rows live and who can read or write them.
+Chardb gives a Cloudflare Worker one typed database binding for SQL, files, vectors, and live queries. Better Auth decides who owns each row and who can read or change it.
 
-The starter is a working message app with live queries and optional R2 attachments. Generate it, run it, then replace the message table with your own schema.
-
-<Note>
-  `@chardb/core@0.1.0` is for data you can rebuild. It has no backup, restore, failover, or automatic resharding path.
-</Note>
+The starter is a working chat app. Generate it, run it, then replace the message table with your own schema.
 
 <CardGroup cols={2}>
   <Card title="Run the starter" icon="bolt" href="/quickstart">
-    Get the generated app running in a few minutes.
+    Generate the app and send the first message.
   </Card>
-  <Card title="Understand the model" icon="database" href="/data-model">
-    See how one table, query, and mutation fit together.
+  <Card title="Set ownership" icon="users" href="/ownership">
+    Put each row behind an organization, user, or application partition.
   </Card>
 </CardGroup>

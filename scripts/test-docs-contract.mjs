@@ -10,6 +10,20 @@ const pageNames = [];
 collectPages(config.navigation, pageNames);
 if (pageNames.length === 0) fail("docs.json has no navigation pages");
 
+const expectedPages = [
+    "quickstart",
+    "ownership",
+    "live-queries",
+    "files",
+    "vectors",
+    "deploy",
+    "schema-migrations",
+    "cookbook/chat-app",
+];
+if (JSON.stringify(pageNames) !== JSON.stringify(expectedPages)) {
+    fail(`navigation must be ${expectedPages.join(", ")}`);
+}
+
 const pageSources = new Map();
 for (const page of pageNames) {
     const path = join(docsRoot, `${page}.mdx`);

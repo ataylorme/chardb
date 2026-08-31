@@ -1,0 +1,119 @@
+---
+title: "Chat app"
+description: "Build an organization-owned chat with live messages and attachments."
+---
+
+This recipe starts from the generated app in [Quickstart](/quickstart). Each organization gets its own channels, messages, live subscriptions, and R2 object keys.
+
+## Add channels and messages
+
+```ts src/schema.ts
+const { cdbTable } = forOrg();
+
+export const channels = cdbTable("channels", {
+  id: text("id").primaryKey(),
+  organizationId: text("organization_id")
+    .notNull()
+    .references(() => auth.organization.id),
+  name: text("name").notNull(),
+});
+
+export const messages = cdbTable(
+  "messages",
+  {
+    id: text("id").primaryKey(),
+    channelId: text("channel_id").notNull().references(() => channels.id),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => auth.organization.id),
+    authorId: text("author_id").notNull().references(() => auth.user.id),
+    body: text("body").notNull(),
+    attachment: file("attachment", {
+      maxSize: 5 * 1_024 * 1_024,
+      contentTypes: ["image/jpeg", "image/png"],
+    }),
+    createdAt: integer("created_at").notNull(),
+  },
+  {
+    selfBy: "authorId",
+    roles: {
+      member: { read: "*", create: ["id", "channelId", "body", "attachment", "createdAt"] },
+      self: { update: ["body", "attachment"], delete: true },
+    },
+  },
+);
+```
+
+The direct `organizationId` on `messages` is intentional. It makes routing and authorization explicit even though the channel already belongs to the same organization.
+
+## Register one channel query
+
+```ts src/queries.ts
+export const listMessages = api.query({
+  ref: "src/queries.ts#listMessages",
+  args: z.object({ organizationId: z.string(), channelId: z.string() }),
+  query: (db, args) => db
+    .select()
+    .from(messages)
+    .where(and(
+      eq(messages.organizationId, args.organizationId),
+      eq(messages.channelId, args.channelId),
+    ))
+    .orderBy(desc(messages.createdAt), desc(messages.id))
+    .limit(50),
+});
+```
+
+## Post a message
+
+```ts src/api.ts
+export const postMessage = api.mutation({
+  ref: "src/api.ts#postMessage",
+  authority: "organization",
+  partitionKey: "organizationId",
+  args: z.object({
+    id: z.string(),
+    organizationId: z.string(),
+    channelId: z.string(),
+    body: z.string().trim().min(1).max(2_000),
+  }),
+  handler: (ctx, args) => {
+    ctx.db.insert(messages).values({
+      id: args.id,
+      channelId: args.channelId,
+      body: args.body,
+      createdAt: Date.now(),
+    }).run();
+    return { id: args.id };
+  },
+});
+```
+
+Chardb fills the owner and author columns after checking the session and membership.
+
+## Render the channel
+
+```tsx src/Channel.tsx
+export function Channel({ organizationId, channelId }: Props) {
+  const { data: messages = [] } = useQuery(listMessages, {
+    organizationId,
+    channelId,
+  });
+  const post = useMutation(postMessage);
+
+  async function send(body: string) {
+    await post({
+      id: crypto.randomUUID(),
+      organizationId,
+      channelId,
+      body,
+    });
+  }
+
+  return <MessageList messages={messages} onSend={send} />;
+}
+```
+
+Open the channel in two tabs and send a message. Both subscriptions should receive the same replacement snapshot. Switch one tab to another organization and confirm it cannot read the first organization's channel.
+
+Add uploads with the handle flow in [Files](/files). Add semantic message search with [Vectors](/vectors).

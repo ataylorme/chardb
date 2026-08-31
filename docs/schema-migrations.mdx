@@ -1,0 +1,58 @@
+---
+title: "Schema migrations"
+description: "Generate, inspect, and apply a forward schema change."
+---
+
+The TypeScript schema describes the current database. The migration journal explains how an existing deployment reaches it. Commit both in the same change.
+
+## Generate the next version
+
+Add the column in `src/schema.ts`, then run the generator.
+
+```bash
+bunx @chardb/core migrations generate --name add_message_edited_at
+```
+
+For example:
+
+```ts src/schema.ts
+editedAt: integer("edited_at"),
+```
+
+The generator writes the next numbered migration and updates the packaged journal. Review the SQL before running it.
+
+```ts src/migrations/0002_add_message_edited_at.ts
+export default {
+  version: 2,
+  name: "add_message_edited_at",
+  statements: [
+    'ALTER TABLE "messages" ADD COLUMN "edited_at" INTEGER',
+  ],
+};
+```
+
+Never edit a migration after it has run in any shared environment. Generate a new version instead.
+
+## Prove the upgrade
+
+Run the migration test against both an empty database and the previous schema version.
+
+```bash
+bun run typecheck
+bun run test
+bun run build
+```
+
+The upgrade test should verify existing rows, the new write path, and a restart after activation. A migration that only passes on a fresh database is incomplete.
+
+## Apply it
+
+`bun run deploy` uploads the Worker and runs the packaged journal in maintenance mode. Reads and writes pause while Chardb upgrades each owned partition and the Better Auth catalog.
+
+If the command stops halfway through, rerun it with the same migration ID and target. Chardb resumes from durable progress rather than replaying completed steps.
+
+Schema history moves forward. There is no down migration. To undo an application change, ship another forward migration and deploy compatible code.
+
+<Warning>
+  A model or dimension change for a vector column needs a new column and a backfill. Renaming the old column in place would reinterpret existing index data.
+</Warning>

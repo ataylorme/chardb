@@ -1,0 +1,62 @@
+---
+title: "Files"
+description: "Put R2-backed files behind the same row and column policy as SQL."
+---
+
+Files are schema columns. The row decides who can upload, read, replace, or delete the object. Chardb owns the R2 key and keeps bucket paths out of application code.
+
+## Declare the column
+
+Use `file()` for one object and `fileArray()` for an ordered set.
+
+```ts src/schema.ts
+import { file, fileArray } from "@chardb/core/files";
+
+export const messages = cdbTable(
+  "messages",
+  {
+    // ordinary message columns
+    attachment: file("attachment", {
+      maxSize: 5 * 1_024 * 1_024,
+      contentTypes: ["image/jpeg", "image/png"],
+    }),
+    images: fileArray("images", {
+      maxSize: 10 * 1_024 * 1_024,
+      contentTypes: ["image/*"],
+    }),
+  },
+  {
+    selfBy: "authorId",
+    roles: {
+      member: { read: "*", create: ["id", "body", "attachment", "createdAt"] },
+      self: { update: ["body", "attachment", "images"] },
+    },
+  },
+);
+```
+
+The limits run before the upload becomes live. An image with the wrong content type or too many bytes never becomes a readable object.
+
+## Use the file handle
+
+A selected file column is a handle. It can upload a browser `Blob`, issue a short-lived download URL, or delete the object.
+
+```ts
+await message.attachment.upload(selectedFile);
+
+const imageUrl = await message.attachment.url({
+  ttlMs: 5 * 60_000,
+});
+
+await message.attachment.delete();
+```
+
+Uploads up to 25 MB pass through the Worker. Larger uploads use a direct R2 request, then multipart above 100 MB. The column's `maxSize` still wins, so the 5 MB attachment above always uses the simple path.
+
+Chardb allocates keys under the row's owner, verifies the final checksum, and changes the file from `pending` to `live`. Downloads repeat the current row and column policy check before issuing a URL.
+
+<Note>
+  Store the handle in the row, not a public R2 URL. Signed URLs expire and should be created when the user opens or downloads the file.
+</Note>
+
+Use [Vectors](/vectors) when the row also needs semantic search.

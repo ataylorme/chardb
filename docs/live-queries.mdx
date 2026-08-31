@@ -1,0 +1,74 @@
+---
+title: "Live queries"
+description: "Register a typed Drizzle query and keep its React result current."
+---
+
+A live query is a server-owned Drizzle query with a stable reference. The browser sends the reference and JSON arguments. It never sends SQL.
+
+## Register the query
+
+{/* contract: ../docs-examples/generated-app/src/queries.ts */}
+```ts src/queries.ts
+import { api } from "@chardb/core/server";
+import { desc, eq } from "drizzle-orm";
+import { z } from "zod";
+import { messages } from "./schema.ts";
+
+export const listMessages = api.query({
+  ref: "src/queries.ts#listMessages",
+  args: z.object({
+    organizationId: z.string(),
+    limit: z.number().int().min(1).max(100).default(50),
+  }),
+  query: (db, args) => db
+    .select()
+    .from(messages)
+    .where(eq(messages.organizationId, args.organizationId))
+    .orderBy(desc(messages.createdAt), desc(messages.id))
+    .limit(args.limit),
+});
+```
+
+Keep `ref` stable after release. It identifies the query across the browser bundle, Worker, reconnects, and pending subscriptions.
+
+The organization predicate is required even though Chardb also applies the ownership policy. It tells the router which partition can answer the query.
+
+## Subscribe in React
+
+Pass the exported handle directly to `useQuery`.
+
+```tsx src/MessageList.tsx
+import { useQuery } from "@chardb/core/react";
+import { listMessages } from "./queries.ts";
+
+export function MessageList({ organizationId }: { organizationId: string }) {
+  const { data: messages = [], state } = useQuery(listMessages, {
+    organizationId,
+    limit: 50,
+  });
+
+  if (state === "pending") return <p>Loading messages...</p>;
+
+  return messages.map((message) => (
+    <p key={message.id}>{message.body}</p>
+  ));
+}
+```
+
+`pending` means the first snapshot has not arrived. `live` means the subscription is current. `refetching` means Chardb reconnected and is replacing a snapshot it could not resume safely.
+
+## Write through a mutation
+
+```tsx
+const post = useMutation(postMessage);
+
+await post({
+  id: crypto.randomUUID(),
+  organizationId,
+  body: "ship it",
+});
+```
+
+The mutation commits once, even if the response is lost and the client reconnects. Every matching subscription then receives a complete replacement snapshot. There is no local cache merge rule to maintain.
+
+Use [Files](/files) when a row needs an attachment.

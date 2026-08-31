@@ -12,12 +12,16 @@
   "navigation": {
     "groups": [
       {
-        "group": "Start",
-        "pages": ["index", "quickstart"]
+        "group": "Core",
+        "pages": ["quickstart", "ownership", "live-queries", "files", "vectors"]
       },
       {
-        "group": "Guide",
-        "pages": ["data-model", "going-live"]
+        "group": "Operate",
+        "pages": ["deploy", "schema-migrations"]
+      },
+      {
+        "group": "Cookbook",
+        "pages": ["cookbook/chat-app"]
       }
     ]
   }

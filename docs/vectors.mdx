@@ -1,0 +1,59 @@
+---
+title: "Vectors"
+description: "Index embeddings without creating a second ownership model."
+---
+
+Vector columns inherit the table's owner and policy. A search scoped to one organization cannot return a match from another organization, even when both share the same Vectorize index.
+
+## Choose where the values live
+
+`vector()` stores embeddings in Cloudflare Vectorize. `inlineVector()` keeps them in the owner's SQLite partition.
+
+```ts src/schema.ts
+import { inlineVector, vector } from "@chardb/core/server";
+
+export const messages = cdbTable("messages", {
+  // ordinary message columns
+  embedding: vector("embedding", { dim: 1_536 }),
+  localEmbedding: inlineVector("local_embedding", { dim: 384 }),
+});
+```
+
+Use `vector()` for a growing collection and approximate nearest-neighbor search. Index updates are eventually consistent. Use `inlineVector()` for a small partition that needs strict read-after-write behavior.
+
+## Search inside the owner
+
+The query still names the organization predicate. Chardb turns it into both the SQL route and the Vectorize metadata filter.
+
+```ts src/queries.ts
+export const searchMessages = api.query({
+  ref: "src/queries.ts#searchMessages",
+  args: z.object({
+    organizationId: z.string(),
+    embedding: z.array(z.number()).length(1_536),
+  }),
+  query: (db, args) => db
+    .select({ id: messages.id, body: messages.body })
+    .from(messages)
+    .where(eq(messages.organizationId, args.organizationId))
+    .nearest(messages.embedding, args.embedding)
+    .limit(8),
+});
+```
+
+The result remains a registered query, so the browser receives a typed handle rather than index names or raw Vectorize calls.
+
+## Keep embedding work explicit
+
+Generate the embedding before the mutation, then write it with the row. This keeps model choice and retry policy in your application.
+
+```ts
+await postMessage({
+  id,
+  organizationId,
+  body,
+  embedding: await embed(body),
+});
+```
+
+Changing the model or dimension requires a new column and a backfill. Do not reinterpret stored values under a new model. Add the column through [Schema migrations](/schema-migrations), fill it, switch reads, then remove the old column in a later release.

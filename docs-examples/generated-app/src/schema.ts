@@ -1,4 +1,3 @@
-import { file } from "@chardb/core/files";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { forOrg } from "@chardb/core/server";
 import { auth } from "./auth.ts";
@@ -16,7 +15,6 @@ export const messages = cdbTable(
       .notNull()
       .references(() => auth.user.id, { onDelete: "cascade" }),
     body: text("body").notNull(),
-    attachment: file("attachment", { maxSize: 5 * 1_024 * 1_024, contentTypes: ["image/jpeg", "image/png"] }),
     createdAt: integer("created_at").notNull(),
   },
   {
@@ -24,8 +22,8 @@ export const messages = cdbTable(
     roles: {
       owner: "*",
       admin: "*",
-      member: { read: "*", create: ["id", "body", "attachment", "createdAt"] },
-      self: { read: "*", update: ["body", "attachment"], delete: true },
+      member: { read: "*", create: ["id", "body", "createdAt"] },
+      self: { read: "*", update: ["body"], delete: true },
     },
   },
 );

@@ -1,11 +1,13 @@
 ---
 title: "Quickstart"
-description: "Generate, check, and run the app shipped by @chardb/core 0.1.0."
+description: "Generate the starter and send a live message locally."
 ---
 
-You need Bun 1.2.22 or newer. You do not need a Cloudflare login for local development.
+You need Bun 1.2.22 or newer. Local development does not need a Cloudflare account.
 
-`chardb init` writes into the current directory. Create an empty one first:
+## Create the app
+
+`chardb init` writes into the current directory, so start with an empty one.
 
 ```bash
 mkdir my-chardb-app
@@ -17,23 +19,32 @@ bun run test
 bun run build
 ```
 
-The CLI refuses a nonempty directory.
+The generated test boots a Worker, applies the first schema migration, creates an organization, and reads back one message. If any command fails, fix it before starting the app.
 
-Now start both local servers:
+## Run it
+
+Start the Worker and web app together.
 
 ```bash
 bun run dev
 ```
 
-The script starts Wrangler, applies the generated migration, and then starts Vite. Open the URL it prints.
+Open the local URL printed by Vite. The app signs in anonymously, then creates a Better Auth account for that browser.
 
-The app signs in anonymously. Try the whole path once:
+Try the complete path once.
 
 1. Create an organization.
-2. Post a message and watch the live query replace its result.
-3. Attach a JPEG or PNG through the local R2 binding.
+2. Open the same organization in a second tab.
+3. Post a message and watch both tabs update.
 4. Restart `bun run dev` and reload the persisted message.
 
-`bun run test` covers the same server path in workerd. It migrates a fresh database, creates an organization, and writes and reads one message.
+## Know the four files
 
-Next, read [The data model](/data-model). It shows the three files you will change first.
+You will make most changes here:
+
+- `src/schema.ts` declares tables and ownership.
+- `src/queries.ts` declares the reads available to clients.
+- `src/api.ts` declares mutations.
+- `src/worker.ts` combines Chardb, Better Auth, and your routes.
+
+Next, read [Ownership](/ownership). It explains why `organizationId` controls placement and access rather than acting like an ordinary foreign key.

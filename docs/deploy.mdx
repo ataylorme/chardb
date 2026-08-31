@@ -1,0 +1,52 @@
+---
+title: "Deploy"
+description: "Create the Cloudflare resources and release the Worker."
+---
+
+Deploy from a clean commit after the local test and build pass.
+
+## Set production secrets
+
+Create `.env.local` from the generated example and fill in the Cloudflare account, Better Auth secret, and Chardb admin token.
+
+```dotenv .env.local
+CLOUDFLARE_ACCOUNT_ID=your_account_id
+CLOUDFLARE_API_TOKEN=your_api_token
+BETTER_AUTH_SECRET=use_a_long_random_value
+CHARDB_ADMIN_TOKEN=use_a_different_long_random_value
+```
+
+Do not commit this file. The deploy script sends the runtime secrets to Wrangler and keeps the Cloudflare API token on your machine.
+
+## First deploy
+
+Run the checks once more, create the external resources, then bootstrap the Worker.
+
+```bash
+bun run typecheck
+bun run test
+bun run build
+bun run setup:cloudflare
+bun run deploy:bootstrap
+```
+
+`setup:cloudflare` creates or verifies the R2 bucket and Vectorize indexes declared by the schema. `deploy:bootstrap` deploys the Worker, installs the packaged schema, and prints the production origin.
+
+## Later deploys
+
+Use the shorter release path when the resources already exist.
+
+```bash
+bun run typecheck
+bun run test
+bun run build
+bun run deploy
+```
+
+The deploy command refuses to activate code whose packaged schema is newer than the database. Generate and commit the migration first.
+
+<Note>
+  Keep `CHARDB_ADMIN_TOKEN` separate from `BETTER_AUTH_SECRET`. The first authorizes maintenance operations. The second signs application sessions.
+</Note>
+
+Read [Schema migrations](/schema-migrations) before changing a deployed table.
