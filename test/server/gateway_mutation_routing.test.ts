@@ -4,13 +4,12 @@ import { CdbError } from "../../src/errors.ts";
 import { defineMutation } from "../../src/server/define.ts";
 import {
     type TrustedMutationDispatchDeps,
-    cdbSubscriptionRequest,
     dispatchTrustedMutation,
-    gatewayErrorEnvelope,
     projectCdbMutationResponse,
     projectOrganizationMutationAuth,
     projectUserMutationAuth,
-} from "../../src/server/do/gateway.ts";
+} from "../../src/server/do/gateway-auth-dispatch.ts";
+import { cdbSubscriptionRequest, gatewayErrorEnvelope } from "../../src/server/do/gateway.ts";
 import { manifestFromExports, routeMutation } from "../../src/server/manifest.ts";
 import { CDB_JSON_MAX_AGGREGATE_MEMBERS, CDB_MUTATION_ARGS_MAX_DEPTH } from "../../src/server/result_limits.ts";
 import type {
@@ -43,6 +42,7 @@ const authority = {
     organizationId: TenantId("org-1"),
     role: "admin,member",
     roles: ["admin", "member"],
+    userRole: "admin,user",
     authEpochs: { global: 2, tenant: 3, principal: 4 },
 } as const;
 
@@ -84,7 +84,7 @@ function workingDeps(): TrustedMutationDispatchDeps {
                             role: "admin,member",
                             roles: ["admin", "member"],
                             authEpochs: { global: 2, tenant: 3, principal: 4 },
-                            claims: {},
+                            claims: { userRole: "admin,user" },
                         },
                         schemaEpoch: 9,
                         domainSchemaEpoch: 1,
@@ -103,6 +103,179 @@ function nestedArray(depth: number): RawJson {
 }
 
 describe("trusted Gateway mutation dispatch", () => {
+    test("refreshes Catalog authority and placement once after a typed stale-route response", async () => {
+        const attempts: CdbMutationRequest[] = [];
+        let catalogCalls = 0;
+        const result = await dispatchTrustedMutation(
+            {
+                routeMutation: workingDeps().routeMutation,
+                catalog: {
+                    async resolveOrganizationAuthority() {
+                        throw new Error("combined authority-route RPC must be used");
+                    },
+                    async route() {
+                        throw new Error("combined authority-route RPC must be used");
+                    },
+                    async resolveOrganizationAuthorityRoute() {
+                        catalogCalls += 1;
+                        return {
+                            authority: {
+                                ...authority,
+                                role: catalogCalls === 1 ? "member" : "admin",
+                                roles: [catalogCalls === 1 ? "member" : "admin"],
+                            },
+                            route: {
+                                shardId: ShardId(catalogCalls === 1 ? "source" : "destination"),
+                                schemaEpoch: catalogCalls,
+                                domainSchemaEpoch: 1,
+                            },
+                        };
+                    },
+                },
+                cdb: shardId => ({
+                    mutate(input) {
+                        attempts.push(input);
+                        return shardId === "source"
+                            ? {
+                                  ok: false,
+                                  error: new CdbError({
+                                      code: "CDB_STALE_EPOCH",
+                                      message: "source cut over",
+                                  }).toJSON(),
+                              }
+                            : { ok: true, cookie: "destination-cookie", ran: true, result: "done", rowsAffected: 1 };
+                    },
+                }),
+            },
+            request
+        );
+
+        expect(result).toMatchObject({ ok: true, cookie: "destination-cookie" });
+        expect(catalogCalls).toBe(2);
+        expect(attempts).toHaveLength(2);
+        expect(attempts.map(attempt => [attempt.mutId, attempt.args, attempt.schemaEpoch, attempt.auth.role])).toEqual([
+            [request.mutId, request.args, 1, "member"],
+            [request.mutId, request.args, 2, "admin"],
+        ]);
+    });
+
+    test("stops after two stale attempts and never retries terminal or unavailable Cdb failures", async () => {
+        const stale = new CdbError({ code: "CDB_STALE_EPOCH", message: "still stale" }).toJSON();
+        let staleCalls = 0;
+        const staleResult = await dispatchTrustedMutation(
+            {
+                ...workingDeps(),
+                cdb: () => ({
+                    mutate() {
+                        staleCalls += 1;
+                        return { ok: false, error: stale };
+                    },
+                }),
+            },
+            request
+        );
+        expect(staleResult).toEqual({ ok: false, error: stale });
+        expect(staleCalls).toBe(2);
+
+        for (const failure of [
+            { kind: "terminal", response: new CdbError({ code: "CDB_FORBIDDEN", message: "denied" }).toJSON() },
+            { kind: "unavailable", response: null },
+        ] as const) {
+            let calls = 0;
+            const result = await dispatchTrustedMutation(
+                {
+                    ...workingDeps(),
+                    cdb: () => ({
+                        mutate() {
+                            calls += 1;
+                            if (failure.response === null) throw new Error("offline");
+                            return { ok: false, error: failure.response };
+                        },
+                    }),
+                },
+                request
+            );
+            expect(result).toMatchObject({
+                ok: false,
+                error: { code: failure.kind === "terminal" ? "CDB_FORBIDDEN" : "CDB_SHARD_UNAVAILABLE" },
+            });
+            expect(calls).toBe(1);
+        }
+    });
+
+    test("uses one Catalog RPC for organization authority and placement", async () => {
+        const base = workingDeps();
+        let combinedCalls = 0;
+        const result = await dispatchTrustedMutation(
+            {
+                ...base,
+                catalog: {
+                    async resolveOrganizationAuthority() {
+                        throw new Error("legacy authority RPC must not run");
+                    },
+                    async route() {
+                        throw new Error("legacy route RPC must not run");
+                    },
+                    async resolveOrganizationAuthorityRoute(input) {
+                        combinedCalls += 1;
+                        expect(input).toEqual({
+                            principalId: PrincipalId("user-1"),
+                            organizationId: TenantId("org-1"),
+                            vshard: 73,
+                        });
+                        return {
+                            authority,
+                            route: { shardId: ShardId("shard-a"), schemaEpoch: 9, domainSchemaEpoch: 1 },
+                        };
+                    },
+                },
+            },
+            request
+        );
+
+        expect(result).toMatchObject({ ok: true });
+        expect(combinedCalls).toBe(1);
+    });
+
+    test("preserves the retryable migration fence from the combined Catalog boundary", async () => {
+        const base = workingDeps();
+        let cdbCalls = 0;
+        const result = await dispatchTrustedMutation(
+            {
+                ...base,
+                catalog: {
+                    async resolveOrganizationAuthority() {
+                        throw new Error("legacy authority RPC must not run");
+                    },
+                    async route() {
+                        throw new Error("legacy route RPC must not run");
+                    },
+                    async resolveOrganizationAuthorityRoute() {
+                        throw new CdbError({
+                            code: "CDB_STALE_EPOCH",
+                            message: "schema migration deploy-7 is in progress",
+                        });
+                    },
+                },
+                cdb() {
+                    cdbCalls += 1;
+                    return base.cdb("shard-a");
+                },
+            },
+            request
+        );
+
+        expect(result).toMatchObject({
+            ok: false,
+            error: {
+                code: "CDB_STALE_EPOCH",
+                retryable: true,
+                message: "schema migration deploy-7 is in progress",
+            },
+        });
+        expect(cdbCalls).toBe(0);
+    });
+
     test("builds the selected Cdb request from query ref, raw args, and server intent", () => {
         expect(
             cdbSubscriptionRequest({
@@ -113,6 +286,8 @@ describe("trusted Gateway mutation dispatch", () => {
                 subId: SubId(4),
                 principalId: PrincipalId("user-1"),
                 organizationId: TenantId("org-1"),
+                schemaEpoch: 7,
+                vshard: 19,
                 domainSchemaEpoch: 1,
                 ref: ChardbRef("queries.ts#listMessages"),
                 args: { organizationId: "org-1", channelId: "channel-1" },
@@ -133,6 +308,8 @@ describe("trusted Gateway mutation dispatch", () => {
             },
             principalId: PrincipalId("user-1"),
             organizationId: TenantId("org-1"),
+            schemaEpoch: 7,
+            vshard: 19,
             domainSchemaEpoch: 1,
             ref: ChardbRef("queries.ts#listMessages"),
             args: { organizationId: "org-1", channelId: "channel-1" },
@@ -528,7 +705,7 @@ describe("trusted Gateway mutation dispatch", () => {
             role: "admin,member",
             roles: ["admin", "member"],
             authEpochs: { global: 2, tenant: 3, principal: 4 },
-            claims: {},
+            claims: { userRole: "admin,user" },
         });
     });
 
@@ -591,6 +768,8 @@ describe("trusted Gateway mutation dispatch", () => {
         for (const malformed of [
             [],
             { ...authority, roles: "member" },
+            { ...authority, userRole: "" },
+            { ...authority, userRole: ["admin"] },
             { ...authority, authEpochs: { global: 1, tenant: Number.NaN, principal: 1 } },
         ]) {
             expect(projectOrganizationMutationAuth(malformed, expected)).toMatchObject({
@@ -598,6 +777,22 @@ describe("trusted Gateway mutation dispatch", () => {
                 code: "CDB_CATALOG_UNAVAILABLE",
             });
         }
+    });
+
+    test("keeps membership and user roles in separate policy namespaces", () => {
+        const expected = { principalId: PrincipalId("user-1"), organizationId: TenantId("org-1") };
+        expect(projectOrganizationMutationAuth(authority, expected)).toMatchObject({
+            ok: true,
+            auth: {
+                role: "admin,member",
+                roles: ["admin", "member"],
+                claims: { userRole: "admin,user" },
+            },
+        });
+        expect(projectOrganizationMutationAuth({ ...authority, userRole: undefined }, expected)).toMatchObject({
+            ok: true,
+            auth: { role: "admin,member", roles: ["admin", "member"], claims: {} },
+        });
     });
 
     test("authorization linearizes at the Catalog read and later revocation affects the next mutation", async () => {

@@ -2,9 +2,9 @@ import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
+import { globalScope } from "../../src/server/cdb-tenant.ts";
 import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
-import { globalScope } from "../../src/server/index.ts";
 import { manifestFromExports } from "../../src/server/manifest.ts";
 import { CDB_JSON_MAX_AGGREGATE_MEMBERS, CDB_MUTATION_ARGS_MAX_DEPTH } from "../../src/server/result_limits.ts";
 import type {
@@ -15,6 +15,7 @@ import type {
     LiveSubscriptionId,
 } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId, TenantId } from "../../src/types.ts";
+import { vshardOf } from "../../src/vshard.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -37,6 +38,13 @@ function sqlStorage(db: Database) {
             };
         },
     };
+}
+
+function expectInvalidationAlarms(actual: readonly number[], expected: number[]): void {
+    const retention = actual.filter(at => at >= 1_000_000_000_000);
+    expect([...new Set(actual.filter(at => at < 1_000_000_000_000))]).toEqual(expected);
+    expect(new Set(retention).size).toBeLessThanOrEqual(1);
+    if (expected.length > 0) expect(Math.min(...actual)).toBe(Math.min(...expected));
 }
 
 const { cdbTable } = globalScope();
@@ -148,9 +156,9 @@ const AUTH = {
     claims: {},
 } as const;
 
-function identity(registrationId: string, subId: number): LiveSubscriptionId {
+function identity(registrationId: string, subId: number, gatewayId = "gateway-1"): LiveSubscriptionId {
     return {
-        gatewayId: "gateway-1",
+        gatewayId,
         registrationId,
         connectionId: `connection-${registrationId}`,
         clientId: ClientId("client-1"),
@@ -163,6 +171,8 @@ function subscription(registration: LiveSubscriptionId, tables: readonly string[
         subscription: registration,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-1"),
+        schemaEpoch: 1,
+        vshard: Number(vshardOf(["org-1"])),
         domainSchemaEpoch: 1,
         ref: ChardbRef("queries.ts#outboxProbe"),
         args: {},
@@ -652,10 +662,12 @@ describe("Cdb invalidation outbox", () => {
              )
              INSERT INTO _chardb_live_subscriptions
                (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+                principal_id, organization_id, schema_epoch, vshard, domain_schema_epoch,
+                ref, args_json, policy_digest, query_hash,
                 tables_json, intervals_json)
              SELECT 'gateway-fanout', 'registration-fanout-' || n, 'connection-fanout-' || n,
                     'client-fanout-' || n, n, 'active', 'legacy-hash', 'principal-fanout', 'org-1', 1,
+                    ${Number(vshardOf(["org-1"]))}, 1,
                     'queries.ts#legacy', 'null', 'legacy-policy', 'legacy-query',
                     '["outbox_messages"]', '[]'
              FROM registrations`
@@ -678,10 +690,12 @@ describe("Cdb invalidation outbox", () => {
         db.prepare(
             `INSERT INTO _chardb_live_subscriptions
              (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-              principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+              principal_id, organization_id, schema_epoch, vshard, domain_schema_epoch,
+              ref, args_json, policy_digest, query_hash,
               tables_json, intervals_json)
              VALUES ('gateway-fanout', 'registration-fanout-4097', 'connection-fanout-4097',
                      'client-fanout-4097', 4097, 'active', 'legacy-hash', 'principal-fanout', 'org-1', 1,
+                     ${Number(vshardOf(["org-1"]))}, 1,
                      'queries.ts#legacy', 'null', 'legacy-policy', 'legacy-query', '["outbox_messages"]', '[]')`
         ).run();
         db.prepare(
@@ -749,7 +763,79 @@ describe("Cdb invalidation outbox", () => {
             ],
         });
         expect(outbox(db)).toEqual([]);
-        expect(alarms).toEqual([10_001]);
+        expectInvalidationAlarms(alarms, [10_001]);
+    });
+
+    test("starts every Gateway delivery before settling outcomes in stable order", async () => {
+        const { db, cdb, gateway } = await setup();
+        await cdb.subscribe(subscription(identity("parallel-a", 1, "gateway-a"), ["outbox_messages"]));
+        await cdb.subscribe(subscription(identity("parallel-b", 2, "gateway-b"), ["outbox_messages"]));
+        db.exec("CREATE TABLE settlement_log (gateway_id TEXT NOT NULL)");
+        db.exec(
+            `CREATE TRIGGER log_outbox_settlement AFTER DELETE ON _chardb_invalidation_outbox
+             BEGIN
+               INSERT INTO settlement_log (gateway_id) VALUES (OLD.gateway_id);
+             END`
+        );
+
+        const releases = new Map<string, (response: GatewayInvalidationResponse) => void>();
+        gateway.behavior = request =>
+            new Promise<GatewayInvalidationResponse>(resolve => {
+                releases.set(request.gatewayId, resolve);
+            });
+
+        const pending = cdb.mutate(mutation(putMessage, "parallel", { id: "parallel", value: 1 }));
+        for (let attempt = 0; attempt < 10 && gateway.calls.length < 2; attempt++) await Promise.resolve();
+        expect(gateway.calls.map(call => call.gatewayId)).toEqual(["gateway-a", "gateway-b"]);
+
+        const accepted = (gatewayId: string): GatewayInvalidationResponse => {
+            const request = gateway.calls.find(call => call.gatewayId === gatewayId);
+            if (!request) throw new Error(`missing ${gatewayId} request`);
+            return {
+                gatewayId,
+                acknowledgements: request.invalidations.map(invalidation => ({
+                    registrationId: invalidation.subscription.registrationId,
+                    changeSeq: invalidation.changeSeq,
+                    status: "accepted",
+                })),
+            };
+        };
+        releases.get("gateway-b")?.(accepted("gateway-b"));
+        await Promise.resolve();
+        expect(db.query("SELECT gateway_id FROM settlement_log").all()).toEqual([]);
+        releases.get("gateway-a")?.(accepted("gateway-a"));
+
+        await expect(pending).resolves.toMatchObject({ ok: true, ran: true });
+        expect(db.query("SELECT gateway_id FROM settlement_log ORDER BY rowid").all()).toEqual([
+            { gateway_id: "gateway-a" },
+            { gateway_id: "gateway-b" },
+        ]);
+        expect(outbox(db)).toEqual([]);
+    });
+
+    test("settles successful Gateway deliveries when another Gateway fails", async () => {
+        const { db, cdb, gateway } = await setup();
+        await cdb.subscribe(subscription(identity("partial-a", 1, "gateway-a"), ["outbox_messages"]));
+        await cdb.subscribe(subscription(identity("partial-b", 2, "gateway-b"), ["outbox_messages"]));
+        gateway.behavior = request => {
+            if (request.gatewayId === "gateway-a") throw new Error("gateway-a unavailable");
+            return {
+                gatewayId: request.gatewayId,
+                acknowledgements: request.invalidations.map(invalidation => ({
+                    registrationId: invalidation.subscription.registrationId,
+                    changeSeq: invalidation.changeSeq,
+                    status: "accepted",
+                })),
+            };
+        };
+
+        await expect(cdb.mutate(mutation(putMessage, "partial", { id: "partial", value: 1 }))).resolves.toMatchObject({
+            ok: true,
+            ran: true,
+        });
+        expect(gateway.calls.map(call => call.gatewayId)).toEqual(["gateway-a", "gateway-b"]);
+        expect(outboxDeliveryState(db, "partial-a")).toMatchObject({ attempts: 1, next_attempt_at: 11_000 });
+        expect(outboxDeliveryState(db, "partial-b")).toBeNull();
     });
 
     test("keeps malformed responses queued and retries them from the alarm", async () => {
@@ -776,7 +862,7 @@ describe("Cdb invalidation outbox", () => {
             next_attempt_at: 11_000,
             dead_lettered_at: null,
         });
-        expect(alarms).toEqual([10_001, 11_000]);
+        expectInvalidationAlarms(alarms, [10_001, 11_000]);
 
         gateway.behavior = request => ({
             gatewayId: request.gatewayId,
@@ -813,7 +899,7 @@ describe("Cdb invalidation outbox", () => {
 
         await cdb.mutate(mutation(putMessage, "advanced-sequence", { id: "advanced-sequence", value: 1 }));
         expect(outboxDeliveryState(db, "advanced")).toMatchObject({ change_seq: 2, attempts: 0 });
-        expect(alarms.at(-1)).toBe(10_001);
+        expectInvalidationAlarms(alarms, [10_001]);
 
         gateway.behavior = request => ({
             gatewayId: request.gatewayId,
@@ -894,7 +980,8 @@ describe("Cdb invalidation outbox", () => {
         expect(deadLetter?.dead_lettered_at).toBe(firstDeadLetteredAt);
         expect((deadLetter?.next_attempt_at as number) - clock.value).toBe(60_000);
         expect(gateway.calls).toHaveLength(9);
-        expect(alarms.at(-1)).toBe(deadLetter?.next_attempt_at as number);
+        expect(alarms.filter(at => at < 1_000_000_000_000).at(-1)).toBe(deadLetter?.next_attempt_at as number);
+        expect(new Set(alarms.filter(at => at >= 1_000_000_000_000)).size).toBeLessThanOrEqual(1);
     });
 
     test("drains at most one bounded batch and alarms the remainder", async () => {
@@ -915,11 +1002,32 @@ describe("Cdb invalidation outbox", () => {
         await cdb.mutate(mutation(putMessage, "bounded-batch", { id: "bounded-batch", value: 1 }));
         expect(gateway.calls.map(call => call.invalidations.length)).toEqual([64]);
         expect(db.prepare("SELECT COUNT(*) AS count FROM _chardb_invalidation_outbox").get()).toEqual({ count: 1 });
-        expect(alarms.at(-1)).toBe(10_001);
+        expectInvalidationAlarms(alarms, [10_001]);
 
         clock.value = 10_001;
         await cdb.alarm();
         expect(gateway.calls.map(call => call.invalidations.length)).toEqual([64, 1]);
         expect(outbox(db)).toEqual([]);
+    });
+
+    test("reports the first alarm-maintenance failure after attempting later work", async () => {
+        const { cdb } = await setup();
+        const first = new Error("organization deletion staging failed");
+        const later = new Error("invalidation delivery failed");
+        let invalidationAttempted = false;
+        const internals = cdb as unknown as {
+            stageNextVectorOrganizationDeletion: () => boolean;
+            maintainInvalidationDelivery: () => Promise<void>;
+        };
+        internals.stageNextVectorOrganizationDeletion = () => {
+            throw first;
+        };
+        internals.maintainInvalidationDelivery = async () => {
+            invalidationAttempted = true;
+            throw later;
+        };
+
+        await expect(cdb.alarm()).rejects.toBe(first);
+        expect(invalidationAttempted).toBe(true);
     });
 });

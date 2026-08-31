@@ -4,9 +4,7 @@ import type { SyncSql } from "../../src/oplog/wrapper.ts";
 import {
     GATEWAY_MAX_SNAPSHOT_REPLAY_ROWS,
     GATEWAY_REGISTRATION_DDL,
-    Gateway,
     type GatewayDirtyRun,
-    type GatewayEnv,
     type GatewayRegistrationInstall,
     type GatewaySnapshotSendAttempt,
     acknowledgeGatewaySnapshot,
@@ -21,7 +19,8 @@ import {
     retireClaimedGatewaySnapshot,
     retireGatewayRegistration,
     stageGatewaySnapshot,
-} from "../../src/server/do/gateway.ts";
+} from "../../src/server/do/gateway-registration-store.ts";
+import { Gateway, type GatewayEnv } from "../../src/server/do/gateway.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
@@ -168,6 +167,7 @@ describe("Gateway snapshot delivery state", () => {
             blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
                 ready = callback();
             },
+            getWebSockets: (): WebSocket[] => [],
         } as unknown as DurableObjectState;
         void new Gateway(state, {} as GatewayEnv);
         await ready;
@@ -295,6 +295,62 @@ describe("Gateway snapshot delivery state", () => {
             next_attempt_at: 400,
             last_sent_at: 300,
         });
+    });
+
+    test("a connection-scoped drain does not claim another connection's earlier snapshot", () => {
+        const other = registration("a-other", {
+            clientId: ClientId("client-other"),
+            connectionId: "connection-other",
+        });
+        const target = registration("z-target", {
+            clientId: ClientId("client-target"),
+            connectionId: "connection-target",
+        });
+        installActive(other);
+        installActive(target);
+        expect(stage(other, claim(other) as GatewayDirtyRun)).toBe(true);
+        expect(stage(target, claim(target) as GatewayDirtyRun)).toBe(true);
+
+        expect(() =>
+            db.transaction(() =>
+                claimDueGatewaySnapshot(sql, { nowMs: 220, attemptExpiresAt: 300, connectionId: "" })
+            )()
+        ).toThrow("connectionId must be nonempty");
+        expect(
+            db.transaction(() =>
+                claimDueGatewaySnapshot(sql, {
+                    nowMs: 220,
+                    attemptExpiresAt: 300,
+                    connectionId: target.connectionId,
+                })
+            )()
+        ).toMatchObject({ registrationId: target.registrationId, connectionId: target.connectionId });
+        expect(() =>
+            db.transaction(() =>
+                claimDueGatewaySnapshot(sql, {
+                    nowMs: 220,
+                    attemptExpiresAt: 300,
+                    excludedConnectionIds: [""],
+                })
+            )()
+        ).toThrow("excluded connection IDs must be nonempty");
+        expect(
+            db.transaction(() =>
+                claimDueGatewaySnapshot(sql, {
+                    nowMs: 220,
+                    attemptExpiresAt: 300,
+                    excludedConnectionIds: [other.connectionId, other.connectionId],
+                })
+            )()
+        ).toBeNull();
+        expect(
+            db
+                .query("SELECT send_attempts FROM _gw_snapshot_outbox WHERE registration_id = ?")
+                .get(other.registrationId)
+        ).toEqual({ send_attempts: 0 });
+        expect(
+            db.transaction(() => claimDueGatewaySnapshot(sql, { nowMs: 220, attemptExpiresAt: 300 }))()
+        ).toMatchObject({ registrationId: other.registrationId, connectionId: other.connectionId });
     });
 
     test("fences a stale send claimant after lease recovery and after acknowledgement", () => {
@@ -522,6 +578,15 @@ describe("Gateway snapshot delivery state", () => {
             cookie: lookup.cookie,
             rows: [{ body: "héllo", id: 1 }],
         });
+        for (const stale of [
+            { authEpochs: { ...lookup.authEpochs, tenant: lookup.authEpochs.tenant + 1 } },
+            { shardId: "logical-shard-after-cutover" },
+            { sourceCdbId: "physical-cdb-after-cutover" },
+            { schemaEpoch: lookup.schemaEpoch + 1 },
+            { domainSchemaEpoch: lookup.domainSchemaEpoch + 1 },
+        ]) {
+            expect(db.transaction(() => resolveGatewaySnapshotReplay(sql, { ...lookup, ...stale }))()).toBeNull();
+        }
         expect(
             db.transaction(() => resolveGatewaySnapshotReplay(sql, { ...lookup, policyDigest: "changed" }))()
         ).toBeNull();

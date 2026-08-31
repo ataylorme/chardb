@@ -9,31 +9,33 @@ export const CHARDB_SELECT_PLAN_MAX_DEPTH = 16;
 export const CHARDB_SELECT_PLAN_MAX_CHILDREN = 16;
 export const CHARDB_SELECT_PLAN_MAX_IN_VALUES = 100;
 export const CHARDB_SELECT_PLAN_MAX_ORDER_BY = 4;
-export const CHARDB_SELECT_PLAN_MAX_LIMIT = 256;
+export const CHARDB_SELECT_PLAN_MAX_LIMIT = 100;
 
 const CHARDB_TABLE_SYMBOL = Symbol.for("chardb.table");
 const TEXT_ENCODER = new TextEncoder();
 const MAX_IDENTIFIER_BYTES = 256;
+const MAX_PLAN_OBJECT_KEYS = 8;
 
 export type ChardbPlanScalar = string | number | boolean | null;
+export type ChardbPlanNonNullScalar = Exclude<ChardbPlanScalar, null>;
 
 export type ChardbPlanPredicateV1 =
     | {
           readonly kind: "compare";
           readonly op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte";
           readonly column: string;
-          readonly value: ChardbPlanScalar;
+          readonly value: ChardbPlanNonNullScalar;
       }
     | {
           readonly kind: "in";
           readonly column: string;
-          readonly values: readonly ChardbPlanScalar[];
+          readonly values: readonly ChardbPlanNonNullScalar[];
       }
     | {
           readonly kind: "between";
           readonly column: string;
-          readonly lower: ChardbPlanScalar;
-          readonly upper: ChardbPlanScalar;
+          readonly lower: ChardbPlanNonNullScalar;
+          readonly upper: ChardbPlanNonNullScalar;
       }
     | {
           readonly kind: "null";
@@ -145,9 +147,11 @@ function selectedColumn(value: unknown, table: SQLiteTable): string {
     return boundedIdentifier(value.name, "column name");
 }
 
-function parameter(value: unknown, subject: string): ChardbPlanScalar {
+function parameter(value: unknown, subject: string): ChardbPlanNonNullScalar {
     if (!is(value, Param)) throw unsupported(`${subject} must use a bound Drizzle value`);
-    return scalar(value.value, subject);
+    const decoded = scalar(value.value, subject);
+    if (decoded === null) throw unsupported(`${subject} cannot be null; use isNull() or isNotNull()`);
+    return decoded;
 }
 
 interface CompileCounter {
@@ -233,6 +237,12 @@ function compilePredicate(sql: SQL, table: SQLiteTable, depth: number, counter: 
     throw unsupported("predicate is outside the bounded eq/ne/range/inArray/between/null/and/or subset");
 }
 
+/** @internal Compile one recognized Drizzle predicate into the canonical select-plan AST. */
+export function compileChardbSelectPlanPredicate(expression: unknown, table: SQLiteTable): ChardbPlanPredicateV1 {
+    if (!is(expression, SQL)) throw unsupported("where() requires a recognized Drizzle predicate");
+    return compilePredicate(expression, table, 1, { nodes: 0 });
+}
+
 function matchBoolean(
     chunks: readonly unknown[]
 ): { readonly kind: "and" | "or"; readonly children: readonly SQL[] } | undefined {
@@ -257,8 +267,9 @@ function matchBoolean(
     return { kind, children };
 }
 
-function compileOrder(
-    expression: Column | SQL,
+/** @internal Compile one direct/asc/desc Drizzle order expression into its canonical plan item. */
+export function compileChardbSelectPlanOrder(
+    expression: unknown,
     table: SQLiteTable
 ): {
     readonly column: string;
@@ -321,7 +332,7 @@ class SelectQuery<TRow> implements ChardbSelectQuery<TRow> {
     where(predicate: SQL): ChardbSelectQuery<TRow> {
         if (this.state.where) throw unsupported("where() may be called only once");
         if (!is(predicate, SQL)) throw unsupported("where() requires a recognized Drizzle predicate");
-        const compiled = compilePredicate(predicate, this.state.table, 1, { nodes: 0 });
+        const compiled = compileChardbSelectPlanPredicate(predicate, this.state.table);
         return selectQueryProxy(new SelectQuery(this.execute, { ...this.state, where: compiled }));
     }
 
@@ -333,7 +344,7 @@ class SelectQuery<TRow> implements ChardbSelectQuery<TRow> {
         if (expressions.some(expression => typeof expression === "function")) {
             throw unsupported("orderBy callbacks are unavailable");
         }
-        const orderBy = expressions.map(expression => compileOrder(expression, this.state.table));
+        const orderBy = expressions.map(expression => compileChardbSelectPlanOrder(expression, this.state.table));
         return selectQueryProxy(new SelectQuery(this.execute, { ...this.state, orderBy }));
     }
 
@@ -410,8 +421,10 @@ function objectEntries(value: unknown, subject: string): Map<string, unknown> {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw invalid(`${subject} must be an object`);
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) throw invalid(`${subject} must be a plain object`);
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > MAX_PLAN_OBJECT_KEYS) throw invalid(`${subject} contains too many keys`);
     const entries = new Map<string, unknown>();
-    for (const key of Reflect.ownKeys(value)) {
+    for (const key of keys) {
         if (typeof key !== "string") throw invalid(`${subject} cannot contain symbol keys`);
         const descriptor = Object.getOwnPropertyDescriptor(value, key);
         if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
@@ -433,14 +446,16 @@ function exactKeys(
     for (const key of required) if (!entries.has(key)) throw invalid(`${subject} is missing ${key}`);
 }
 
-function strictArray(value: unknown, subject: string): readonly unknown[] {
+function strictArray(value: unknown, subject: string, maxLength: number): readonly unknown[] {
     if (!Array.isArray(value)) throw invalid(`${subject} must be an array`);
-    const keys = Reflect.ownKeys(value);
-    if (keys.some(key => typeof key === "symbol")) throw invalid(`${subject} cannot contain symbol keys`);
     const length = Object.getOwnPropertyDescriptor(value, "length")?.value;
-    if (!Number.isSafeInteger(length) || length < 0 || keys.length !== length + 1) {
+    if (!Number.isSafeInteger(length) || length < 0) {
         throw invalid(`${subject} must be a dense array without extra properties`);
     }
+    if (length > maxLength) throw invalid(`${subject} accepts at most ${maxLength} entries`);
+    const keys = Reflect.ownKeys(value);
+    if (keys.some(key => typeof key === "symbol")) throw invalid(`${subject} cannot contain symbol keys`);
+    if (keys.length !== length + 1) throw invalid(`${subject} must be a dense array without extra properties`);
     const out: unknown[] = [];
     for (let index = 0; index < length; index++) {
         const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
@@ -458,10 +473,51 @@ function decodedScalar(value: unknown, subject: string): ChardbPlanScalar {
     throw invalid(`${subject} must be a JSON scalar`);
 }
 
+function decodedNonNullScalar(value: unknown, subject: string): ChardbPlanNonNullScalar {
+    const decoded = decodedScalar(value, subject);
+    if (decoded === null) throw invalid(`${subject} cannot be null; use an explicit null predicate`);
+    return decoded;
+}
+
+interface PredicateDecodeCounter extends CompileCounter {
+    stringValueBytes: number;
+}
+
+function addPredicateStringValueBytes(counter: PredicateDecodeCounter, value: ChardbPlanNonNullScalar): void {
+    if (typeof value !== "string") return;
+    for (let index = 0; index < value.length; index++) {
+        const code = value.charCodeAt(index);
+        if (code <= 0x7f) counter.stringValueBytes += 1;
+        else if (code <= 0x7ff) counter.stringValueBytes += 2;
+        else if (code >= 0xd800 && code <= 0xdbff) {
+            const next = value.charCodeAt(index + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) {
+                counter.stringValueBytes += 4;
+                index++;
+            } else {
+                counter.stringValueBytes += 3;
+            }
+        } else counter.stringValueBytes += 3;
+        if (counter.stringValueBytes > CHARDB_SELECT_PLAN_MAX_BYTES) {
+            throw invalid(`predicate string values exceed ${CHARDB_SELECT_PLAN_MAX_BYTES} UTF-8 bytes`);
+        }
+    }
+}
+
+function decodedPredicateScalar(
+    value: unknown,
+    subject: string,
+    counter: PredicateDecodeCounter
+): ChardbPlanNonNullScalar {
+    const decoded = decodedNonNullScalar(value, subject);
+    addPredicateStringValueBytes(counter, decoded);
+    return decoded;
+}
+
 function decodePredicate(
     value: unknown,
     depth: number,
-    counter: CompileCounter,
+    counter: PredicateDecodeCounter,
     subject: string
 ): ChardbPlanPredicateV1 {
     if (depth > CHARDB_SELECT_PLAN_MAX_DEPTH) {
@@ -483,19 +539,19 @@ function decodePredicate(
             kind,
             op: op as Extract<ChardbPlanPredicateV1, { kind: "compare" }>["op"],
             column: boundedIdentifier(entries.get("column"), `${subject}.column`),
-            value: decodedScalar(entries.get("value"), `${subject}.value`),
+            value: decodedPredicateScalar(entries.get("value"), `${subject}.value`, counter),
         };
     }
     if (kind === "in") {
         exactKeys(entries, subject, ["kind", "column", "values"]);
-        const values = strictArray(entries.get("values"), `${subject}.values`);
+        const values = strictArray(entries.get("values"), `${subject}.values`, CHARDB_SELECT_PLAN_MAX_IN_VALUES);
         if (values.length === 0 || values.length > CHARDB_SELECT_PLAN_MAX_IN_VALUES) {
             throw invalid(`${subject}.values requires 1 through ${CHARDB_SELECT_PLAN_MAX_IN_VALUES} entries`);
         }
         return {
             kind,
             column: boundedIdentifier(entries.get("column"), `${subject}.column`),
-            values: values.map((entry, index) => decodedScalar(entry, `${subject}.values[${index}]`)),
+            values: values.map((entry, index) => decodedPredicateScalar(entry, `${subject}.values[${index}]`, counter)),
         };
     }
     if (kind === "between") {
@@ -503,8 +559,8 @@ function decodePredicate(
         return {
             kind,
             column: boundedIdentifier(entries.get("column"), `${subject}.column`),
-            lower: decodedScalar(entries.get("lower"), `${subject}.lower`),
-            upper: decodedScalar(entries.get("upper"), `${subject}.upper`),
+            lower: decodedPredicateScalar(entries.get("lower"), `${subject}.lower`, counter),
+            upper: decodedPredicateScalar(entries.get("upper"), `${subject}.upper`, counter),
         };
     }
     if (kind === "null") {
@@ -519,7 +575,11 @@ function decodePredicate(
     }
     if (kind === "and" || kind === "or") {
         exactKeys(entries, subject, ["kind", "predicates"]);
-        const predicates = strictArray(entries.get("predicates"), `${subject}.predicates`);
+        const predicates = strictArray(
+            entries.get("predicates"),
+            `${subject}.predicates`,
+            CHARDB_SELECT_PLAN_MAX_CHILDREN
+        );
         if (predicates.length < 2 || predicates.length > CHARDB_SELECT_PLAN_MAX_CHILDREN) {
             throw invalid(`${subject}.predicates requires 2 through ${CHARDB_SELECT_PLAN_MAX_CHILDREN} entries`);
         }
@@ -533,7 +593,12 @@ function decodePredicate(
     throw invalid(`${subject}.kind is invalid`);
 }
 
-/** Strictly validate and own one version-1 select plan. */
+/**
+ * Strictly validate and own one version-1 select plan.
+ *
+ * The 64 KiB limit is semantic post-RPC validation: Worker service-binding
+ * structured clone necessarily occurs before this application code runs.
+ */
 export function validateChardbSelectPlanV1(value: unknown): ChardbSelectPlanV1 {
     const entries = objectEntries(value, "plan");
     exactKeys(entries, "plan", ["version", "kind", "table", "selection", "cardinality"], ["where", "orderBy", "limit"]);
@@ -545,11 +610,11 @@ export function validateChardbSelectPlanV1(value: unknown): ChardbSelectPlanV1 {
     const cardinality = entries.get("cardinality");
     if (cardinality !== "many" && cardinality !== "one") throw invalid("cardinality is invalid");
     const where = entries.has("where")
-        ? decodePredicate(entries.get("where"), 1, { nodes: 0 }, "plan.where")
+        ? decodePredicate(entries.get("where"), 1, { nodes: 0, stringValueBytes: 0 }, "plan.where")
         : undefined;
     let orderBy: readonly { readonly column: string; readonly direction: "asc" | "desc" }[] | undefined;
     if (entries.has("orderBy")) {
-        const rawOrder = strictArray(entries.get("orderBy"), "plan.orderBy");
+        const rawOrder = strictArray(entries.get("orderBy"), "plan.orderBy", CHARDB_SELECT_PLAN_MAX_ORDER_BY);
         if (rawOrder.length === 0 || rawOrder.length > CHARDB_SELECT_PLAN_MAX_ORDER_BY) {
             throw invalid(`plan.orderBy requires 1 through ${CHARDB_SELECT_PLAN_MAX_ORDER_BY} entries`);
         }

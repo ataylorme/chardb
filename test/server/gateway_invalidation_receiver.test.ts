@@ -2,11 +2,10 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { SyncSql } from "../../src/oplog/wrapper.ts";
 import {
-    Gateway,
-    type GatewayEnv,
     type GatewayRegistrationInstall,
     installGatewayRegistration,
-} from "../../src/server/do/gateway.ts";
+} from "../../src/server/do/gateway-registration-store.ts";
+import { Gateway, type GatewayEnv } from "../../src/server/do/gateway.ts";
 import type { GatewayInvalidationRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 
@@ -111,6 +110,8 @@ describe("Gateway invalidation receiver", () => {
     let alarms: number[];
     let currentAlarm: number | null;
     let alarmFails: boolean;
+    let lifecycleEvents: string[];
+    let waitUntilTasks: Promise<unknown>[];
 
     beforeEach(async () => {
         db = new Database(":memory:");
@@ -118,6 +119,8 @@ describe("Gateway invalidation receiver", () => {
         alarms = [];
         currentAlarm = null;
         alarmFails = false;
+        lifecycleEvents = [];
+        waitUntilTasks = [];
         const state = {
             id: { toString: () => "gateway-do-1" },
             storage: {
@@ -128,7 +131,12 @@ describe("Gateway invalidation receiver", () => {
                     if (alarmFails) throw new Error("alarm unavailable");
                     currentAlarm = scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime;
                     alarms.push(currentAlarm);
+                    lifecycleEvents.push("alarm");
                 },
+            },
+            waitUntil: (task: Promise<unknown>): void => {
+                lifecycleEvents.push("eager");
+                waitUntilTasks.push(task);
             },
             blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
                 ready = callback();
@@ -139,7 +147,10 @@ describe("Gateway invalidation receiver", () => {
         sql = syncSql(db);
     });
 
-    afterEach(() => db.close());
+    afterEach(async () => {
+        await Promise.allSettled(waitUntilTasks);
+        db.close();
+    });
 
     function install(input: GatewayRegistrationInstall): void {
         db.transaction(() => installGatewayRegistration(sql, input))();
@@ -179,6 +190,8 @@ describe("Gateway invalidation receiver", () => {
         });
         expect(dirtyVersion(current.registrationId)).toBe(8);
         expect(alarms).toHaveLength(1);
+        expect(lifecycleEvents).toEqual(["alarm", "eager"]);
+        expect(waitUntilTasks).toHaveLength(1);
     });
 
     test("rejects current registrations whose socket, client, or sub identity conflicts", async () => {
@@ -330,6 +343,9 @@ describe("Gateway invalidation receiver", () => {
         });
         expect(dirtyVersion(current.registrationId)).toBe(9);
         expect(alarms).toHaveLength(1);
+        expect(waitUntilTasks).toHaveLength(3);
+        await Promise.allSettled(waitUntilTasks);
+        expect(dirtyVersion(current.registrationId)).toBe(9);
     });
 
     test("retains dirty state when alarm scheduling fails and safely retries", async () => {
@@ -341,6 +357,7 @@ describe("Gateway invalidation receiver", () => {
         await expect(gateway.invalidateSubscriptions(request)).rejects.toMatchObject({ code: "CDB_SHARD_UNAVAILABLE" });
         expect(dirtyVersion(current.registrationId)).toBe(11);
         expect(alarms).toEqual([]);
+        expect(waitUntilTasks).toEqual([]);
 
         alarmFails = false;
         await expect(gateway.invalidateSubscriptions(request)).resolves.toMatchObject({
@@ -348,5 +365,6 @@ describe("Gateway invalidation receiver", () => {
         });
         expect(dirtyVersion(current.registrationId)).toBe(11);
         expect(alarms).toHaveLength(1);
+        expect(lifecycleEvents).toEqual(["alarm", "eager"]);
     });
 });

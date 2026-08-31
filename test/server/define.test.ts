@@ -7,7 +7,6 @@ import { globalScope } from "../../src/server/cdb-tenant.ts";
 import {
     type MutationCtx,
     createApi,
-    defineCron,
     defineGsi,
     defineMutation,
     definePresenceKey,
@@ -24,11 +23,11 @@ describe("defineXxx — function-ref identity", () => {
         expect(fn.__chardbKind).toBe("mutation");
         expect(typeof fn.__chardbRef).toBe("string");
         expect(readRef(fn)).toBeDefined();
-        const out = await fn({ db: null, auth: { userId: "u", claims: {} } }, { x: 1 });
+        const out = await fn({ db: null, auth: { userId: "u", claims: {} } } as never, { x: 1 });
         expect(out).toBe(2);
     });
 
-    test("defineQuery / defineStream / defineGsi / definePresenceKey / defineLedger / defineCron all carry __chardbKind", () => {
+    test("defineQuery / defineStream / defineGsi / definePresenceKey / defineLedger all carry __chardbKind", () => {
         const q = defineQuery<unknown, { id: string }, number>(async () => 1);
         const s = defineStream<unknown, { p: string }, string, number>(async function* () {
             yield "x";
@@ -37,30 +36,34 @@ describe("defineXxx — function-ref identity", () => {
         const g = defineGsi("orders", ["status"]);
         const p = definePresenceKey<{ x: number; y: number }>("cursor");
         const l = defineLedger("events", { id: "text" });
-        const c = defineCron("0 3 * * *", async () => {});
 
         expect(q.__chardbKind).toBe("query");
         expect(s.__chardbKind).toBe("stream");
         expect(g.__chardbKind).toBe("gsi");
         expect(p.__chardbKind).toBe("presenceKey");
         expect((l as { __chardbKind: string }).__chardbKind).toBe("ledger");
-        expect(c.__chardbKind).toBe("cron");
-        expect(c.__chardbCron).toBe("0 3 * * *");
     });
 
-    test("planned query carries a runtime compiler and requires a stable ref", () => {
+    test("planned query carries a runtime compiler, is dispatch-only, and requires a stable ref", async () => {
         const { cdbTable } = globalScope();
         const rows = cdbTable(
             "define_planned_rows",
             { id: text("id").primaryKey(), scope: text("scope").notNull() },
             { partitionBy: "scope", roles: { user: { read: "*" } } }
         );
+        let compileRuns = 0;
         const planned = createApi({ rows }).query({
             ref: "api/define#planned",
-            query: (db, args: { scope: string }) =>
-                db.select().from(rows).where(eq(rows.scope, args.scope)).orderBy(rows.id).limit(10),
+            query: (db, args: { scope: string }) => {
+                compileRuns++;
+                return db.select().from(rows).where(eq(rows.scope, args.scope)).orderBy(rows.id).limit(10);
+            },
         });
         expect(planned.__chardbCompilePlan?.({ scope: "shared" }).partitionKey).toBe("shared");
+        await expect(
+            planned({ db: {}, auth: { userId: "user-1", claims: {} } } as never, { scope: "shared" })
+        ).rejects.toMatchObject({ code: "CDB_UNSUPPORTED_FEATURE" });
+        expect(compileRuns).toBe(1);
         expect(() => defineQuery({ query: (() => null) as never } as never)).toThrow(
             "planned queries require an explicit ref"
         );
@@ -272,7 +275,7 @@ describe("defineXxx — function-ref identity", () => {
         });
 
         try {
-            fn({ db: null, auth: { userId: "u", claims: {} } }, { id: 7 } as never);
+            fn({ db: null, auth: { userId: "u", claims: {} } } as never, { id: 7 } as never);
             throw new Error("expected validation failure");
         } catch (error) {
             expect(isCdbError(error)).toBe(true);

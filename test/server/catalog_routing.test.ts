@@ -1,8 +1,10 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { CatalogOrganizationDeletionStore } from "../../src/server/do/catalog-organization-deletion-store.ts";
 import { Catalog, configureCatalogRuntime } from "../../src/server/do/catalog.ts";
+import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { defineMigrations } from "../../src/server/schema-migrations.ts";
-import { ShardId } from "../../src/types.ts";
+import { PrincipalId, ShardId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -33,18 +35,46 @@ describe("Catalog routing inventory", () => {
     let bootstrap: Promise<unknown>;
     let failNextTransactionCommit: boolean;
     let state: DurableObjectState;
+    let alarmAt: number | null;
 
     beforeEach(async () => {
         db = new Database(":memory:");
         bootstrap = Promise.resolve();
         failNextTransactionCommit = false;
+        alarmAt = null;
+        const transactionSync = <T>(callback: () => T): T => {
+            db.exec("BEGIN IMMEDIATE");
+            try {
+                const result = callback();
+                if (failNextTransactionCommit) {
+                    failNextTransactionCommit = false;
+                    throw new Error("injected transaction commit failure");
+                }
+                db.exec("COMMIT");
+                return result;
+            } catch (error) {
+                db.exec("ROLLBACK");
+                throw error;
+            }
+        };
         state = {
             storage: {
                 sql: sqlStorage(db),
-                transactionSync: <T>(callback: () => T): T => {
+                transactionSync,
+                getAlarm: async () => alarmAt,
+                setAlarm: async (deadline: number) => {
+                    alarmAt = deadline;
+                },
+                transaction: async <T>(callback: (transaction: DurableObjectTransaction) => Promise<T>): Promise<T> => {
+                    const previousAlarm = alarmAt;
                     db.exec("BEGIN IMMEDIATE");
                     try {
-                        const result = callback();
+                        const result = await callback({
+                            getAlarm: async () => alarmAt,
+                            setAlarm: async (deadline: number) => {
+                                alarmAt = deadline;
+                            },
+                        } as DurableObjectTransaction);
                         if (failNextTransactionCommit) {
                             failNextTransactionCommit = false;
                             throw new Error("injected transaction commit failure");
@@ -53,6 +83,7 @@ describe("Catalog routing inventory", () => {
                         return result;
                     } catch (error) {
                         db.exec("ROLLBACK");
+                        alarmAt = previousAlarm;
                         throw error;
                     }
                 },
@@ -68,9 +99,12 @@ describe("Catalog routing inventory", () => {
     afterEach(() => db.close());
 
     test("lists narrow ranges, removes duplicate shard ids, and sorts the result", async () => {
-        await catalog.splitRange(1, 1, "ShardDO_z");
-        await catalog.splitRange(2, 2, "ShardDO_a");
-        await catalog.splitRange(3, 3, "ShardDO_z");
+        db.exec("DELETE FROM catalog_ranges");
+        db.run("INSERT INTO catalog_ranges VALUES (0, 0, 'ShardDO_0')");
+        db.run("INSERT INTO catalog_ranges VALUES (1, 1, 'ShardDO_z')");
+        db.run("INSERT INTO catalog_ranges VALUES (2, 2, 'ShardDO_a')");
+        db.run("INSERT INTO catalog_ranges VALUES (3, 3, 'ShardDO_z')");
+        db.run("INSERT INTO catalog_ranges VALUES (4, 16383, 'ShardDO_0')");
 
         expect(await catalog.route(1)).toMatchObject({ shardId: "ShardDO_z" });
         expect(await catalog.listShardIds()).toEqual([
@@ -78,6 +112,367 @@ describe("Catalog routing inventory", () => {
             ShardId("ShardDO_a"),
             ShardId("ShardDO_z"),
         ]);
+    });
+
+    test("sends only the scoped auth invalidation request across the Cdb RPC boundary", async () => {
+        const calls: Record<string, unknown>[] = [];
+        const shardNamespace = {
+            idFromName: (name: string) => ({ name }),
+            get: () => ({
+                async invalidateAuthScope(input: Record<string, unknown>) {
+                    calls.push(structuredClone(input));
+                    return { ...input, accepted: true, registrations: 0, changeSeq: 0 };
+                },
+            }),
+        } as unknown as DurableObjectNamespace;
+        catalog = new Catalog(state, { CDB_SHARD: shardNamespace });
+        await bootstrap;
+
+        await catalog.bumpAuthEpoch("tenant", "org-rpc-contract");
+        await catalog.alarm();
+
+        expect(calls).toHaveLength(1);
+        expect(Object.keys(calls[0] ?? {}).sort()).toEqual(["epoch", "scope", "scopeId"]);
+        expect(calls[0]).toEqual({ scope: "tenant", scopeId: "org-rpc-contract", epoch: 1 });
+    });
+
+    test("projects auth epochs to both topology participants through cutover, then only the destination", async () => {
+        const calls: Array<{ shardId: string; scope: string; scopeId: string; epoch: number }> = [];
+        const shardNamespace = {
+            idFromName: (name: string) => ({ name }),
+            get: (id: { name: string }) => ({
+                invalidateAuthScope(input: { scope: "tenant"; scopeId: string; epoch: number }) {
+                    calls.push({ shardId: id.name, ...input });
+                    return { ...input, accepted: true, registrations: 0, changeSeq: 0 };
+                },
+            }),
+        } as unknown as DurableObjectNamespace;
+        let ready: Promise<unknown> = Promise.resolve();
+        (
+            state as unknown as { blockConcurrencyWhile: (callback: () => Promise<unknown>) => void }
+        ).blockConcurrencyWhile = callback => {
+            ready = callback();
+        };
+        const projected = new Catalog(state, { CDB_SHARD: shardNamespace });
+        await ready;
+        const topology = {
+            migId: "auth-cutover-projection",
+            sourceShard: "ShardDO_0",
+            destinationShard: "ShardDO_1",
+            rangeLo: 0,
+            rangeHi: 16_383,
+            startEpoch: 1,
+        } as const;
+        projected.beginTopologyOperation(topology);
+
+        await projected.bumpAuthEpoch("tenant", "org-moving");
+        await projected.alarm();
+        expect(calls.splice(0)).toEqual([
+            { shardId: "ShardDO_0", scope: "tenant", scopeId: "org-moving", epoch: 1 },
+            { shardId: "ShardDO_1", scope: "tenant", scopeId: "org-moving", epoch: 1 },
+        ]);
+
+        await projected.cutover({
+            migId: topology.migId,
+            lo: topology.rangeLo,
+            hi: topology.rangeHi,
+            fromShard: topology.sourceShard,
+            toShard: topology.destinationShard,
+            startEpoch: topology.startEpoch,
+        });
+        await projected.bumpAuthEpoch("tenant", "org-moving");
+        await projected.alarm();
+        expect(calls.splice(0)).toEqual([
+            { shardId: "ShardDO_0", scope: "tenant", scopeId: "org-moving", epoch: 2 },
+            { shardId: "ShardDO_1", scope: "tenant", scopeId: "org-moving", epoch: 2 },
+        ]);
+
+        projected.completeTopologyOperation(topology);
+        await projected.bumpAuthEpoch("tenant", "org-moving");
+        await projected.alarm();
+        expect(calls).toEqual([{ shardId: "ShardDO_1", scope: "tenant", scopeId: "org-moving", epoch: 3 }]);
+    });
+
+    test("bounds a legacy persisted multi-shard deletion inventory and retries only its failed target", async () => {
+        const journal = defineMigrations([
+            {
+                version: 1,
+                name: "organization_files",
+                statements: ["SELECT 1"],
+                resources: [
+                    {
+                        kind: "file",
+                        version: 1,
+                        table: "messages",
+                        column: "attachment",
+                        primaryKey: "id",
+                        organizationColumn: "organization_id",
+                        maxSize: 8,
+                        contentTypes: ["image/png"],
+                    },
+                ],
+            },
+        ]);
+        const ConfiguredCatalog = configureCatalogRuntime({ migrations: () => journal });
+        const calls = new Map<string, number>();
+        const shardNamespace = {
+            idFromName: (name: string) => ({ name }),
+            get: (id: { name: string }) => ({
+                async deleteOrganizationFiles(input: { organizationId: string }) {
+                    const count = (calls.get(id.name) ?? 0) + 1;
+                    calls.set(id.name, count);
+                    if (id.name === "ShardDO_00" && count === 1) throw new Error("injected shard outage");
+                    return { organizationId: input.organizationId, accepted: true } as const;
+                },
+            }),
+        } as unknown as DurableObjectNamespace;
+        let ready: Promise<unknown> = Promise.resolve();
+        (
+            state as unknown as { blockConcurrencyWhile: (callback: () => Promise<unknown>) => void }
+        ).blockConcurrencyWhile = callback => {
+            ready = callback();
+        };
+        let configured = new ConfiguredCatalog(state, { CDB_SHARD: shardNamespace });
+        await ready;
+
+        const sql = adaptSqlStorage(state.storage.sql);
+        state.storage.transactionSync(() => {
+            sql.exec("DELETE FROM catalog_ranges");
+            for (let index = 0; index < 35; index++) {
+                sql.exec(
+                    "INSERT INTO catalog_ranges (lo, hi, shard_id) VALUES (?, ?, ?)",
+                    index,
+                    index === 34 ? 16_383 : index,
+                    `ShardDO_${String(index).padStart(2, "0")}`
+                );
+            }
+            sql.exec(
+                `UPDATE catalog_schema_state
+                 SET active_version = 1, active_epoch = 2, active_digest = ?
+                 WHERE singleton = 1`,
+                journal.digest
+            );
+            const deletions = new CatalogOrganizationDeletionStore(sql);
+            deletions.record("org-bounded", 0, 100);
+            // Rows written by the former all-shard design must still drain after upgrade.
+            deletions.recordShards(
+                "org-bounded",
+                Array.from({ length: 35 }, (_, index) => `ShardDO_${String(index).padStart(2, "0")}`),
+                100
+            );
+        });
+
+        const originalNow = Date.now;
+        try {
+            Date.now = () => 100;
+            await configured.alarm();
+            expect([...calls.values()].reduce((sum, count) => sum + count, 0)).toBe(32);
+            expect(new CatalogOrganizationDeletionStore(sql).shards("org-bounded")).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({ shardId: "ShardDO_00", status: "pending", attempts: 1 }),
+                    expect.objectContaining({ shardId: "ShardDO_01", status: "complete", attempts: 0 }),
+                    expect.objectContaining({ shardId: "ShardDO_34", status: "pending", attempts: 0 }),
+                ])
+            );
+
+            ready = Promise.resolve();
+            configured = new ConfiguredCatalog(state, { CDB_SHARD: shardNamespace });
+            await ready;
+            Date.now = () => 101;
+            await configured.alarm();
+            expect(calls.get("ShardDO_01")).toBe(1);
+            expect(calls.get("ShardDO_34")).toBe(1);
+
+            Date.now = () => 1_100;
+            await configured.alarm();
+            expect(calls.get("ShardDO_00")).toBe(2);
+            expect(
+                [...calls.entries()].filter(([shardId]) => shardId !== "ShardDO_00").every(([, count]) => count === 1)
+            ).toBe(true);
+            expect(new CatalogOrganizationDeletionStore(sql).read("org-bounded")).toMatchObject({
+                status: "complete",
+                completedAt: 1_100,
+            });
+        } finally {
+            Date.now = originalNow;
+        }
+    });
+
+    test("recovers a vector-backed deletion through the legacy shard cleanup RPC", async () => {
+        const journal = defineMigrations([
+            {
+                version: 1,
+                name: "organization_vectors",
+                statements: ["SELECT 1"],
+                resources: [
+                    {
+                        kind: "vector",
+                        version: 1,
+                        table: "messages",
+                        column: "embedding",
+                        primaryKey: "id",
+                        organizationColumn: "organization_id",
+                        binding: "CDB_MESSAGES",
+                        dimensions: 3,
+                        metric: "cosine",
+                    },
+                ],
+            },
+        ]);
+        const ConfiguredCatalog = configureCatalogRuntime({ migrations: () => journal });
+        const calls: Array<{ readonly shardId: string; readonly input: Record<string, unknown> }> = [];
+        const shardNamespace = {
+            idFromName: (name: string) => ({ name }),
+            get: (id: { name: string }) => ({
+                async deleteOrganizationFiles(input: Record<string, unknown>) {
+                    calls.push({ shardId: id.name, input: structuredClone(input) });
+                    return { organizationId: input.organizationId as string, accepted: true } as const;
+                },
+            }),
+        } as unknown as DurableObjectNamespace;
+        let ready: Promise<unknown> = Promise.resolve();
+        (
+            state as unknown as { blockConcurrencyWhile: (callback: () => Promise<unknown>) => void }
+        ).blockConcurrencyWhile = callback => {
+            ready = callback();
+        };
+        const configured = new ConfiguredCatalog(state, { CDB_SHARD: shardNamespace });
+        await ready;
+
+        const sql = adaptSqlStorage(state.storage.sql);
+        state.storage.transactionSync(() => {
+            sql.exec(
+                `UPDATE catalog_schema_state
+                 SET active_version = 1, active_epoch = 2, active_digest = ?
+                 WHERE singleton = 1`,
+                journal.digest
+            );
+            new CatalogOrganizationDeletionStore(sql).record("org-vector-cleanup", 0, 100);
+        });
+
+        const originalNow = Date.now;
+        try {
+            Date.now = () => 100;
+            await configured.alarm();
+        } finally {
+            Date.now = originalNow;
+        }
+
+        expect(calls).toEqual([
+            {
+                shardId: "ShardDO_0",
+                input: { organizationId: "org-vector-cleanup", nowMs: 100, domainSchemaEpoch: 2 },
+            },
+        ]);
+        expect(new CatalogOrganizationDeletionStore(sql).read("org-vector-cleanup")).toMatchObject({
+            status: "complete",
+            completedAt: 100,
+        });
+    });
+
+    test("returns file-only deletion status without opening vector tables on its Cdb", async () => {
+        const journal = defineMigrations([
+            {
+                version: 1,
+                name: "organization_files_status",
+                statements: ["SELECT 1"],
+                resources: [
+                    {
+                        kind: "file",
+                        version: 1,
+                        table: "messages",
+                        column: "attachment",
+                        primaryKey: "id",
+                        organizationColumn: "organization_id",
+                        maxSize: 8,
+                        contentTypes: ["image/png"],
+                    },
+                ],
+            },
+        ]);
+        const ConfiguredCatalog = configureCatalogRuntime({ migrations: () => journal });
+        let ready: Promise<unknown> = Promise.resolve();
+        (
+            state as unknown as { blockConcurrencyWhile: (callback: () => Promise<unknown>) => void }
+        ).blockConcurrencyWhile = callback => {
+            ready = callback();
+        };
+        const configured = new ConfiguredCatalog(state, {});
+        await ready;
+        const sql = adaptSqlStorage(state.storage.sql);
+        state.storage.transactionSync(() => {
+            sql.exec(
+                `UPDATE catalog_schema_state
+                 SET active_version = 1, active_epoch = 2, active_digest = ?
+                 WHERE singleton = 1`,
+                journal.digest
+            );
+            const deletions = new CatalogOrganizationDeletionStore(sql);
+            deletions.record("org-file-status", 0, 100);
+            deletions.recordShards("org-file-status", ["ShardDO_0"], 100);
+            deletions.completeShard("org-file-status", "ShardDO_0", 101);
+        });
+
+        expect(await configured.organizationDeletionPurgeStatus({ organizationId: "org-file-status" })).toEqual({
+            organizationId: "org-file-status",
+            authDeleted: true,
+            handoffComplete: true,
+            handoff: { state: "complete", attempts: 0, completedAt: 101, lastError: null },
+            vectorPurge: null,
+        });
+    });
+
+    test("fails closed when a completed vector handoff has no owner tombstone", async () => {
+        const journal = defineMigrations([
+            {
+                version: 1,
+                name: "organization_vectors_status",
+                statements: ["SELECT 1"],
+                resources: [
+                    {
+                        kind: "vector",
+                        version: 1,
+                        table: "messages",
+                        column: "embedding",
+                        primaryKey: "id",
+                        organizationColumn: "organization_id",
+                        binding: "CDB_MESSAGES",
+                        dimensions: 3,
+                        metric: "cosine",
+                    },
+                ],
+            },
+        ]);
+        const ConfiguredCatalog = configureCatalogRuntime({ migrations: () => journal });
+        const shardNamespace = {
+            idFromName: (name: string) => ({ name }),
+            get: () => ({ vectorOrganizationPurgeStatus: async () => null }),
+        } as unknown as DurableObjectNamespace;
+        let ready: Promise<unknown> = Promise.resolve();
+        (
+            state as unknown as { blockConcurrencyWhile: (callback: () => Promise<unknown>) => void }
+        ).blockConcurrencyWhile = callback => {
+            ready = callback();
+        };
+        const configured = new ConfiguredCatalog(state, { CDB_SHARD: shardNamespace });
+        await ready;
+        const sql = adaptSqlStorage(state.storage.sql);
+        state.storage.transactionSync(() => {
+            sql.exec(
+                `UPDATE catalog_schema_state
+                 SET active_version = 1, active_epoch = 2, active_digest = ?
+                 WHERE singleton = 1`,
+                journal.digest
+            );
+            const deletions = new CatalogOrganizationDeletionStore(sql);
+            deletions.record("org-vector-status", 0, 100);
+            deletions.recordShards("org-vector-status", ["ShardDO_0"], 100);
+            deletions.completeShard("org-vector-status", "ShardDO_0", 101);
+        });
+
+        await expect(
+            configured.organizationDeletionPurgeStatus({ organizationId: "org-vector-status" })
+        ).rejects.toThrow("CDB_INVARIANT: completed vector deletion handoff has no current-owner purge tombstone");
     });
 
     test("publishes a cutover map only after its durable transaction commits", async () => {
@@ -98,6 +493,43 @@ describe("Catalog routing inventory", () => {
             fromShard: "ShardDO_0",
             toShard: "ShardDO_1",
         };
+        await expect(catalog.cutover(request)).rejects.toMatchObject({
+            code: "CDB_STALE_EPOCH",
+            message: "topology operation lease is missing",
+        });
+        await expect(
+            catalog.beginOrganizationDeletionBarrier({
+                migId: request.migId,
+                rangeLo: request.lo,
+                rangeHi: request.hi,
+            })
+        ).rejects.toMatchObject({
+            code: "CDB_STALE_EPOCH",
+            message: "organization deletion barrier does not match an active topology operation",
+        });
+        expect(catalog.topologyOperation({ migrationId: request.migId })).toBeNull();
+        catalog.beginTopologyOperation({
+            migId: request.migId,
+            sourceShard: request.fromShard,
+            destinationShard: request.toShard,
+            rangeLo: request.lo,
+            rangeHi: request.hi,
+            startEpoch: epochBefore.epoch,
+        });
+        const deletions = new CatalogOrganizationDeletionStore(adaptSqlStorage(state.storage.sql));
+        deletions.record("pre-barrier-delete", request.lo, 10);
+        const deletionBarrierRequest = { migId: request.migId, rangeLo: request.lo, rangeHi: request.hi };
+        await expect(catalog.beginOrganizationDeletionBarrier(deletionBarrierRequest)).resolves.toMatchObject({
+            status: "active",
+        });
+        await expect(catalog.cutover(request)).rejects.toMatchObject({
+            code: "CDB_RESHARD_PHASE_MISMATCH",
+            message: expect.stringContaining("older organization deletions are still pending"),
+        });
+        expect(await catalog.route(0)).toMatchObject({ shardId: "ShardDO_0", schemaEpoch: epochBefore.epoch });
+        expect(db.query("SELECT v FROM catalog_meta WHERE k = ?").get(`cutover:${request.migId}`)).toBeNull();
+        deletions.complete("pre-barrier-delete", 11);
+        expect(catalog.organizationDeletionBarrierStatus(deletionBarrierRequest).olderDeletionsComplete).toBe(true);
         failNextTransactionCommit = true;
         await expect(catalog.cutover(request)).rejects.toThrow("injected transaction commit failure");
 
@@ -111,6 +543,10 @@ describe("Catalog routing inventory", () => {
             schemaEpoch: epochBefore.epoch,
             domainSchemaEpoch: 1,
         });
+        expect(catalog.organizationDeletionBarrierStatus(deletionBarrierRequest)).toMatchObject({
+            barrier: { status: "active", finishedAt: null },
+            olderDeletionsComplete: true,
+        });
 
         await expect(catalog.cutover(request)).resolves.toEqual({ applied: true, newEpoch: epochBefore.epoch + 1 });
         expect(await catalog.route(0)).toEqual({
@@ -118,10 +554,305 @@ describe("Catalog routing inventory", () => {
             schemaEpoch: epochBefore.epoch + 1,
             domainSchemaEpoch: 1,
         });
+        expect(catalog.organizationDeletionBarrierStatus(deletionBarrierRequest)).toMatchObject({
+            barrier: { status: "released", finishedAt: expect.any(Number) },
+            olderDeletionsComplete: true,
+        });
         await expect(catalog.cutover(request)).resolves.toEqual({ applied: false, newEpoch: epochBefore.epoch + 1 });
         expect(db.query("SELECT v FROM catalog_meta WHERE k = ?").get(`cutover:${request.migId}`)).toEqual({
             v: "ShardDO_0",
         });
+    });
+
+    test("reconstructs one exact topology lease and excludes schema migration until completion", async () => {
+        const request = {
+            migId: "durable-split-1",
+            sourceShard: "ShardDO_0",
+            destinationShard: "ShardDO_1",
+            rangeLo: 0,
+            rangeHi: 31,
+            startEpoch: 1,
+        };
+        expect(catalog.beginTopologyOperation(request)).toMatchObject({
+            migrationId: request.migId,
+            status: "active",
+            schemaVersion: 0,
+            schemaEpoch: 1,
+        });
+        expect(catalog.beginTopologyOperation(request)).toMatchObject({ status: "active" });
+        expect(catalog.topologyRoutingStatus(request)).toEqual({
+            owner: "source",
+            schemaEpoch: 1,
+            operationStatus: "active",
+        });
+        expect(() => catalog.beginTopologyOperation({ ...request, rangeHi: 32 })).toThrow(
+            expect.objectContaining({ code: "CDB_STALE_EPOCH", message: "topology operation identity changed" })
+        );
+
+        let reconstructedReady: Promise<unknown> = Promise.resolve();
+        (
+            state as unknown as { blockConcurrencyWhile: (callback: () => Promise<unknown>) => void }
+        ).blockConcurrencyWhile = callback => {
+            reconstructedReady = callback();
+        };
+        const reconstructed = new Catalog(state, {});
+        await reconstructedReady;
+        expect(reconstructed.topologyOperation({ migrationId: request.migId })).toMatchObject({
+            status: "active",
+            rangeLo: 0,
+            rangeHi: 31,
+        });
+
+        const future = defineMigrations([{ version: 1, name: "topology_exclusion", statements: ["SELECT 1"] }]);
+        const FutureCatalog = configureCatalogRuntime({ migrations: () => future });
+        let futureReady: Promise<unknown> = Promise.resolve();
+        (
+            state as unknown as { blockConcurrencyWhile: (callback: () => Promise<unknown>) => void }
+        ).blockConcurrencyWhile = callback => {
+            futureReady = callback();
+        };
+        const futureCatalog = new FutureCatalog(state, {});
+        await futureReady;
+        expect(() => futureCatalog.beginSchemaMigration({ migrationId: "schema-v1", targetVersion: 1 })).toThrow(
+            expect.objectContaining({
+                code: "CDB_STALE_EPOCH",
+                message: "topology operation durable-split-1 is in progress",
+            })
+        );
+
+        await expect(
+            futureCatalog.cutover({
+                migId: request.migId,
+                lo: request.rangeLo,
+                hi: request.rangeHi,
+                fromShard: request.sourceShard,
+                toShard: "ShardDO_wrong",
+                startEpoch: request.startEpoch,
+            })
+        ).rejects.toMatchObject({ code: "CDB_STALE_EPOCH", message: "topology operation identity changed" });
+        expect(await reconstructed.route(0)).toMatchObject({ shardId: "ShardDO_0", schemaEpoch: 1 });
+
+        await expect(
+            reconstructed.cutover({
+                migId: request.migId,
+                lo: request.rangeLo,
+                hi: request.rangeHi,
+                fromShard: request.sourceShard,
+                toShard: request.destinationShard,
+                startEpoch: request.startEpoch,
+            })
+        ).resolves.toEqual({ applied: true, newEpoch: 2 });
+        expect(reconstructed.topologyRoutingStatus(request)).toEqual({
+            owner: "destination",
+            schemaEpoch: 2,
+            operationStatus: "active",
+        });
+        expect(reconstructed.topologyOperation({ migrationId: request.migId })).toMatchObject({ status: "active" });
+        expect(reconstructed.beginTopologyOperation(request)).toMatchObject({ status: "active" });
+
+        expect(reconstructed.completeTopologyOperation(request)).toMatchObject({
+            status: "completed",
+            completedEpoch: 2,
+        });
+        expect(reconstructed.completeTopologyOperation(request)).toMatchObject({ status: "completed" });
+        expect(reconstructed.topologyRoutingStatus(request)).toEqual({
+            owner: "destination",
+            schemaEpoch: 2,
+            operationStatus: "completed",
+        });
+        expect(reconstructed.beginTopologyOperation(request)).toMatchObject({ status: "completed" });
+        await expect(
+            reconstructed.cutover({
+                migId: request.migId,
+                lo: request.rangeLo,
+                hi: request.rangeHi,
+                fromShard: request.sourceShard,
+                toShard: request.destinationShard,
+                startEpoch: request.startEpoch,
+            })
+        ).resolves.toEqual({ applied: false, newEpoch: 2 });
+        expect(futureCatalog.beginSchemaMigration({ migrationId: "schema-v1", targetVersion: 1 })).toMatchObject({
+            status: "migrating",
+        });
+    });
+
+    test("atomically derives and claims one exact current topology owner", () => {
+        expect(() =>
+            catalog.beginDerivedTopologyOperation({
+                migId: "invalid-range",
+                destinationShard: "ShardDO_1",
+                rangeLo: 15,
+                rangeHi: 8,
+            })
+        ).toThrow(expect.objectContaining({ code: "CDB_INVALID_ARGS", message: "topology vshard range is invalid" }));
+        expect(catalog.topologyOperation({ migrationId: "invalid-range" })).toBeNull();
+        expect(() =>
+            catalog.beginDerivedTopologyOperation({
+                migId: "invalid-destination",
+                destinationShard: "bad shard",
+                rangeLo: 8,
+                rangeHi: 15,
+            })
+        ).toThrow(
+            expect.objectContaining({ code: "CDB_INVALID_ARGS", message: "topology destination shard is invalid" })
+        );
+        expect(catalog.topologyOperation({ migrationId: "invalid-destination" })).toBeNull();
+
+        expect(() =>
+            catalog.beginDerivedTopologyOperation({
+                migId: "same-owner",
+                destinationShard: "ShardDO_0",
+                rangeLo: 8,
+                rangeHi: 15,
+            })
+        ).toThrow(
+            expect.objectContaining({
+                code: "CDB_INVALID_ARGS",
+                message: "topology source and destination must differ",
+            })
+        );
+        expect(catalog.topologyOperation({ migrationId: "same-owner" })).toBeNull();
+
+        failNextTransactionCommit = true;
+        expect(() =>
+            catalog.beginDerivedTopologyOperation({
+                migId: "derived-split",
+                destinationShard: "ShardDO_1",
+                rangeLo: 8,
+                rangeHi: 15,
+            })
+        ).toThrow(/injected transaction commit failure/);
+        expect(catalog.topologyOperation({ migrationId: "derived-split" })).toBeNull();
+
+        const claimed = catalog.beginDerivedTopologyOperation({
+            migId: "derived-split",
+            destinationShard: "ShardDO_1",
+            rangeLo: 8,
+            rangeHi: 15,
+        });
+        expect(claimed).toMatchObject({
+            migrationId: "derived-split",
+            sourceShard: "ShardDO_0",
+            destinationShard: "ShardDO_1",
+            rangeLo: 8,
+            rangeHi: 15,
+            startEpoch: 1,
+            schemaVersion: 0,
+            schemaEpoch: 1,
+            status: "active",
+        });
+        expect(
+            catalog.beginDerivedTopologyOperation({
+                migId: "derived-split",
+                destinationShard: "ShardDO_1",
+                rangeLo: 8,
+                rangeHi: 15,
+            })
+        ).toEqual(claimed);
+        expect(() =>
+            catalog.beginDerivedTopologyOperation({
+                migId: "derived-split",
+                destinationShard: "ShardDO_2",
+                rangeLo: 8,
+                rangeHi: 15,
+            })
+        ).toThrow(expect.objectContaining({ code: "CDB_STALE_EPOCH", message: "topology operation identity changed" }));
+        expect(() =>
+            catalog.beginDerivedTopologyOperation({
+                migId: "conflicting-split",
+                destinationShard: "ShardDO_2",
+                rangeLo: 16,
+                rangeHi: 31,
+            })
+        ).toThrow(
+            expect.objectContaining({
+                code: "CDB_STALE_EPOCH",
+                message: "topology operation derived-split is already active",
+            })
+        );
+    });
+
+    test("derived topology claim rejects a range crossing another owner", () => {
+        db.exec("DELETE FROM catalog_ranges");
+        db.run("INSERT INTO catalog_ranges VALUES (0, 7, 'ShardDO_0')");
+        db.run("INSERT INTO catalog_ranges VALUES (8, 15, 'ShardDO_middle')");
+        db.run("INSERT INTO catalog_ranges VALUES (16, 16383, 'ShardDO_0')");
+
+        expect(() =>
+            catalog.beginDerivedTopologyOperation({
+                migId: "derived-crossing-owner",
+                destinationShard: "ShardDO_1",
+                rangeLo: 0,
+                rangeHi: 31,
+            })
+        ).toThrow(
+            expect.objectContaining({
+                code: "CDB_STALE_EPOCH",
+                message: "topology range does not have one exact current owner",
+            })
+        );
+        expect(catalog.topologyOperation({ migrationId: "derived-crossing-owner" })).toBeNull();
+    });
+
+    test("aborts only a pre-cutover topology lease and releases the next lease", async () => {
+        const request = {
+            migId: "abort-split-1",
+            sourceShard: "ShardDO_0",
+            destinationShard: "ShardDO_1",
+            rangeLo: 8,
+            rangeHi: 15,
+            startEpoch: 1,
+        };
+        catalog.beginTopologyOperation(request);
+        const deletionBarrierRequest = {
+            migId: request.migId,
+            rangeLo: request.rangeLo,
+            rangeHi: request.rangeHi,
+        };
+        await expect(catalog.beginOrganizationDeletionBarrier(deletionBarrierRequest)).resolves.toMatchObject({
+            status: "active",
+        });
+        expect(catalog.abortTopologyOperation(request)).toMatchObject({ status: "aborted", completedEpoch: null });
+        expect(catalog.organizationDeletionBarrierStatus(deletionBarrierRequest)).toMatchObject({
+            barrier: { status: "aborted", finishedAt: expect.any(Number) },
+        });
+        expect(catalog.abortTopologyOperation(request)).toMatchObject({ status: "aborted" });
+        expect(
+            catalog.beginTopologyOperation({
+                migId: "after-abort",
+                sourceShard: "ShardDO_0",
+                destinationShard: "ShardDO_2",
+                rangeLo: 8,
+                rangeHi: 15,
+                startEpoch: 1,
+            })
+        ).toMatchObject({ status: "active" });
+        expect(await catalog.route(8)).toMatchObject({ shardId: "ShardDO_0", schemaEpoch: 1 });
+        expect(catalog.abortTopologyOperation(request)).toMatchObject({ status: "aborted" });
+    });
+
+    test("rejects a topology lease whose matching endpoints hide another range owner", async () => {
+        db.exec("DELETE FROM catalog_ranges");
+        db.run("INSERT INTO catalog_ranges VALUES (0, 7, 'ShardDO_0')");
+        db.run("INSERT INTO catalog_ranges VALUES (8, 15, 'ShardDO_middle')");
+        db.run("INSERT INTO catalog_ranges VALUES (16, 16383, 'ShardDO_0')");
+        db.run("UPDATE catalog_epoch SET epoch = 2 WHERE scope = 'schema' AND scope_id = 'global'");
+        expect(() =>
+            catalog.beginTopologyOperation({
+                migId: "crossing-owner",
+                sourceShard: "ShardDO_0",
+                destinationShard: "ShardDO_1",
+                rangeLo: 0,
+                rangeHi: 31,
+                startEpoch: 2,
+            })
+        ).toThrow(
+            expect.objectContaining({
+                code: "CDB_STALE_EPOCH",
+                message: "topology source identity does not match current routing",
+            })
+        );
+        expect(catalog.topologyOperation({ migrationId: "crossing-owner" })).toBeNull();
     });
 
     test("persists migration ownership, fences routes, and activates one exact journal version", async () => {
@@ -194,10 +925,33 @@ describe("Catalog routing inventory", () => {
             targetVersion: 1,
             targetEpoch: 2,
         });
+        expect(() =>
+            reconstructed.beginTopologyOperation({
+                migId: "topology-during-schema",
+                sourceShard: "ShardDO_0",
+                destinationShard: "ShardDO_1",
+                rangeLo: 0,
+                rangeHi: 31,
+                startEpoch: 1,
+            })
+        ).toThrow(
+            expect.objectContaining({
+                code: "CDB_STALE_EPOCH",
+                message: "schema migration blocks topology operation",
+            })
+        );
+        expect(reconstructed.topologyOperation({ migrationId: "topology-during-schema" })).toBeNull();
         expect(reconstructed.beginSchemaMigration({ migrationId: "deploy-3", targetVersion: 1 })).toMatchObject({
             status: "migrating",
         });
         await expect(reconstructed.route(0)).rejects.toMatchObject({ code: "CDB_STALE_EPOCH", retryable: true });
+        await expect(
+            reconstructed.resolveOrganizationAuthorityRoute({
+                principalId: PrincipalId("migration-user"),
+                organizationId: TenantId("migration-org"),
+                vshard: 0,
+            })
+        ).rejects.toMatchObject({ code: "CDB_STALE_EPOCH", retryable: true });
         expect(() => reconstructed.completeSchemaMigration({ migrationId: "deploy-3" })).toThrow(/incomplete/);
         failNextTransactionCommit = true;
         await expect(

@@ -104,6 +104,25 @@ describe("applyPoliciesToWhere", () => {
         expect(renderSql(allowed)?.params).toContain("admin-visible");
         expect(renderSql(denied)?.sql).toContain("1 = 0");
     });
+
+    test("uses withCheckSql for inserts but the existing-row predicate for updates", () => {
+        const checked = chardbPolicy<typeof documents, { ownerId: string }>("checked_write", {
+            for: "all",
+            to: "authenticated",
+            usingSql: (_auth, table) => eq(table.ownerId, "existing-owner"),
+            withCheckSql: (_auth, table) => eq(table.ownerId, "proposed-owner"),
+        });
+
+        expect(
+            renderSql(applyPoliciesToWhere({ op: "insert", auth: auth("u1"), table: documents, policies: [checked] }))
+                ?.params
+        ).toContain("proposed-owner");
+        const update = renderSql(
+            applyPoliciesToWhere({ op: "update", auth: auth("u1"), table: documents, policies: [checked] })
+        );
+        expect(update?.params).toContain("existing-owner");
+        expect(update?.params).not.toContain("proposed-owner");
+    });
 });
 
 describe("applyRowPolicies", () => {
@@ -118,6 +137,23 @@ describe("applyRowPolicies", () => {
         });
         expect(out).toHaveLength(2);
         expect(out.every(r => r.ownerId === "u1")).toBe(true);
+    });
+
+    test("uses withCheck for inserts but using for updates", () => {
+        const checked = chardbPolicy<typeof documents, { ownerId: string }>("checked_row_write", {
+            for: "all",
+            to: "authenticated",
+            using: (_auth, row) => row.ownerId === "existing-owner",
+            withCheck: (_auth, row) => row.ownerId === "proposed-owner",
+        });
+        const rows = [{ ownerId: "existing-owner" }, { ownerId: "proposed-owner" }];
+
+        expect(applyRowPolicies({ op: "insert", auth: auth("u1"), rows, policies: [checked] })).toEqual([
+            { ownerId: "proposed-owner" },
+        ]);
+        expect(applyRowPolicies({ op: "update", auth: auth("u1"), rows, policies: [checked] })).toEqual([
+            { ownerId: "existing-owner" },
+        ]);
     });
 });
 

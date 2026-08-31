@@ -3,9 +3,18 @@ import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { ChildProcessFailure, run } from "../scripts/test-correctness.mjs";
+import {
+    ChildProcessFailure,
+    compareWorkerdHarnesses,
+    isTransientWorkerdStartupFailure,
+    run,
+    runWithRetries,
+} from "../scripts/test-correctness.mjs";
 
 const temporaryDirectories: string[] = [];
+const SYNTHETIC_PROCESS_TIMEOUT_MS = 1_000;
+const SYNTHETIC_PROCESS_STARTUP_DEADLINE_MS = 5_000;
+const SYNTHETIC_TERMINATION_GRACE_MS = 1_000;
 
 afterEach(async () => {
     await Promise.all(temporaryDirectories.splice(0).map(directory => rm(directory, { recursive: true, force: true })));
@@ -37,7 +46,7 @@ async function processTreeCommand(
 }
 
 async function readPid(pidFile: string): Promise<number> {
-    const deadline = Date.now() + 2_000;
+    const deadline = Date.now() + SYNTHETIC_PROCESS_STARTUP_DEADLINE_MS;
     while (Date.now() < deadline) {
         try {
             const pid = Number(await readFile(pidFile, "utf8"));
@@ -67,13 +76,26 @@ async function expectProcessGone(pid: number): Promise<void> {
 const posixTest = process.platform === "win32" ? test.skip : test;
 
 describe("correctness runner process control", () => {
-    posixTest("an outer timeout terminates a signal-resistant grandchild", async () => {
+    test("runs the restart-in-place file store before actor-only Workerd harnesses", () => {
+        const files = [
+            "/repo/test/workerd/gateway.harness.test.ts",
+            "/repo/test/workerd/file-store.harness.test.ts",
+            "/repo/test/workerd/catalog.harness.test.ts",
+        ];
+        expect(files.sort(compareWorkerdHarnesses)).toEqual([
+            "/repo/test/workerd/file-store.harness.test.ts",
+            "/repo/test/workerd/catalog.harness.test.ts",
+            "/repo/test/workerd/gateway.harness.test.ts",
+        ]);
+    });
+
+    test("an outer timeout terminates a signal-resistant grandchild", async () => {
         const tree = await processTreeCommand();
-        const failure = run("synthetic timeout", tree.args, 100, {
+        const failure = run("synthetic timeout", tree.args, SYNTHETIC_PROCESS_TIMEOUT_MS, {
             stdin: "ignore",
             stdout: "ignore",
             stderr: "ignore",
-            terminationGraceMs: 50,
+            terminationGraceMs: SYNTHETIC_TERMINATION_GRACE_MS,
         }).catch((error: unknown) => error);
         const grandchildPid = await readPid(tree.pidFile);
 
@@ -81,14 +103,14 @@ describe("correctness runner process control", () => {
         await expectProcessGone(grandchildPid);
     });
 
-    posixTest("forwards a parent termination signal to the whole child group", async () => {
+    test("forwards a parent termination signal to the whole child tree", async () => {
         const tree = await processTreeCommand();
         const signals = new EventEmitter();
         const failure = run("synthetic signal", tree.args, undefined, {
             stdin: "ignore",
             stdout: "ignore",
             stderr: "ignore",
-            terminationGraceMs: 50,
+            terminationGraceMs: SYNTHETIC_TERMINATION_GRACE_MS,
             signalSource: signals,
         }).catch((error: unknown) => error);
         const grandchildPid = await readPid(tree.pidFile);
@@ -98,13 +120,13 @@ describe("correctness runner process control", () => {
         await expectProcessGone(grandchildPid);
     });
 
-    posixTest("cleans a resistant grandchild and preserves a nonzero child exit code", async () => {
+    test("cleans a leader-exits-first tree and preserves its nonzero exit code", async () => {
         const tree = await processTreeCommand("process.exit(23);");
         const failure = run("synthetic exit", tree.args, undefined, {
             stdin: "ignore",
             stdout: "ignore",
             stderr: "ignore",
-            terminationGraceMs: 50,
+            terminationGraceMs: SYNTHETIC_TERMINATION_GRACE_MS,
         }).catch((error: unknown) => error);
         const grandchildPid = await readPid(tree.pidFile);
 
@@ -121,7 +143,7 @@ describe("correctness runner process control", () => {
             stdin: "ignore",
             stdout: "ignore",
             stderr: "ignore",
-            terminationGraceMs: 50,
+            terminationGraceMs: SYNTHETIC_TERMINATION_GRACE_MS,
         }).catch((error: unknown) => error);
         const grandchildPid = await readPid(tree.pidFile);
 
@@ -130,13 +152,13 @@ describe("correctness runner process control", () => {
         await expectProcessGone(grandchildPid);
     });
 
-    posixTest("cleans a resistant grandchild after a successful leader exit", async () => {
+    test("does not report success before a leader-exits-first tree is gone", async () => {
         const tree = await processTreeCommand("process.exit(0);");
         const completion = run("synthetic success", tree.args, undefined, {
             stdin: "ignore",
             stdout: "ignore",
             stderr: "ignore",
-            terminationGraceMs: 50,
+            terminationGraceMs: SYNTHETIC_TERMINATION_GRACE_MS,
         });
         const grandchildPid = await readPid(tree.pidFile);
 
@@ -163,5 +185,81 @@ describe("correctness runner process control", () => {
         expect(failure).toMatchObject({ exitCode: 23, signalCode: null });
         expect(await readFile(stdoutPath, "utf8")).toBe("sample output\n");
         expect(await readFile(stderrPath, "utf8")).toBe("sample error\n");
+    });
+
+    test("retries one recognized startup failure without retrying a successful replacement", async () => {
+        const directory = await mkdtemp(path.join(tmpdir(), "chardb-correctness-retry-"));
+        temporaryDirectories.push(directory);
+        const countPath = path.join(directory, "attempts.txt");
+        const source = `
+            const path = ${JSON.stringify(countPath)};
+            const count = Number(await Bun.file(path).text().catch(() => "0")) + 1;
+            await Bun.write(path, String(count));
+            if (count === 1) console.error("Workers runtime failed to start");
+            process.exit(count === 1 ? 23 : 0);
+        `;
+
+        await expect(
+            runWithRetries("synthetic retry", [process.execPath, "-e", source], undefined, {
+                attempts: 2,
+                retryDelayMs: 0,
+                captureOutput: true,
+                shouldRetry: isTransientWorkerdStartupFailure,
+                stdin: "ignore",
+            })
+        ).resolves.toBeUndefined();
+        expect(await readFile(countPath, "utf8")).toBe("2");
+    });
+
+    test("does not retry an ordinary test failure", async () => {
+        const directory = await mkdtemp(path.join(tmpdir(), "chardb-correctness-no-retry-"));
+        temporaryDirectories.push(directory);
+        const countPath = path.join(directory, "attempts.txt");
+        const source = `
+            const path = ${JSON.stringify(countPath)};
+            const count = Number(await Bun.file(path).text().catch(() => "0")) + 1;
+            await Bun.write(path, String(count));
+            console.error("AssertionError: expected 1 to equal 2");
+            process.exit(1);
+        `;
+
+        const failure = runWithRetries("synthetic assertion failure", [process.execPath, "-e", source], undefined, {
+            attempts: 2,
+            retryDelayMs: 0,
+            captureOutput: true,
+            shouldRetry: isTransientWorkerdStartupFailure,
+            stdin: "ignore",
+        }).catch((error: unknown) => error);
+
+        await expect(failure).resolves.toMatchObject({ exitCode: 1, signalCode: null });
+        expect(await readFile(countPath, "utf8")).toBe("1");
+    });
+
+    test("does not retry a timed-out process", async () => {
+        const directory = await mkdtemp(path.join(tmpdir(), "chardb-correctness-timeout-retry-"));
+        temporaryDirectories.push(directory);
+        const countPath = path.join(directory, "attempts.txt");
+        const source = `
+            const path = ${JSON.stringify(countPath)};
+            const count = Number(await Bun.file(path).text().catch(() => "0")) + 1;
+            await Bun.write(path, String(count));
+            await new Promise(() => {});
+        `;
+        const failure = runWithRetries(
+            "synthetic retry timeout",
+            [process.execPath, "-e", source],
+            SYNTHETIC_PROCESS_TIMEOUT_MS,
+            {
+                attempts: 2,
+                retryDelayMs: 0,
+                terminationGraceMs: SYNTHETIC_TERMINATION_GRACE_MS,
+                stdin: "ignore",
+                stdout: "ignore",
+                stderr: "ignore",
+            }
+        ).catch((error: unknown) => error);
+
+        await expect(failure).resolves.toMatchObject({ timedOut: true });
+        expect(await readFile(countPath, "utf8")).toBe("1");
     });
 });

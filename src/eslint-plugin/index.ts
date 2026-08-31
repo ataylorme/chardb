@@ -12,7 +12,7 @@
  *   problem queries never reach a deploy.
  *
  * The plugin is published as a separate package; the source ships here so it
- * stays in lockstep with the helper signatures in `chardb/server`. The shape
+ * stays in lockstep with the helper signatures in `@chardb/core/server`. The shape
  * follows the standard ESLint flat-config plugin contract.
  */
 
@@ -156,7 +156,7 @@ const noRawSqliteTable: Rule.RuleModule = {
 
 /**
  * `chardb/no-direct-cdb-table-import` — flag `cdbTable` imported from
- * `chardb/server`. The cdbTable export does not exist; users must
+ * `@chardb/core/server`. The cdbTable export does not exist; users must
  * destructure it from a tenancy factory call. This rule catches the
  * mistake at editor time before it surfaces as a TypeScript error.
  */
@@ -171,7 +171,7 @@ const noDirectCdbTableImport: Rule.RuleModule = {
         schema: [],
         messages: {
             directImport:
-                "`cdbTable` is not exported from chardb/server. Obtain a tenancy-bound builder via `const { cdbTable } = forOrg()` (or forUser/globalScope).",
+                "`cdbTable` is not exported from @chardb/core/server. Obtain a tenancy-bound builder via `const { cdbTable } = forOrg()` (or forUser/globalScope).",
         },
     },
     create(context) {
@@ -180,7 +180,7 @@ const noDirectCdbTableImport: Rule.RuleModule = {
                 const node = raw as unknown as { source: { value?: unknown }; specifiers?: readonly unknown[] };
                 const src = node.source.value;
                 if (typeof src !== "string") return;
-                if (!src.startsWith("chardb")) return;
+                if (src !== "@chardb/core" && !src.startsWith("@chardb/core/")) return;
                 for (const spec of node.specifiers ?? []) {
                     if (!isNode(spec) || spec.type !== "ImportSpecifier") continue;
                     const imported = (spec as { imported?: { name?: string } }).imported;

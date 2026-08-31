@@ -2,13 +2,11 @@
  * `chardb({ … })` — the single Worker-entry factory.
  *
  * Returns the wrangler-ready module: a Hono app you can mount your own
- * routes on, with `.fetch`, `.scheduled`, the native `DB` entrypoint, the six chardb Durable Object
+ * routes on, with `.fetch`, the native `DB` entrypoint, the four chardb Durable Object
  * classes, the synthesized better-auth schema, and the chardb-managed
  * `auth` value all hanging off the same object. One call replaces
  * `defineAuth` + `defineChardb` + `new Hono()` + `mountChardb` + the DO
- * re-exports. The lower-level primitives remain public for advanced
- * split-worker setups (`chardb/server` still exports `defineAuth`,
- * `defineChardb`, `mountChardb`).
+ * re-exports. Runtime internals remain behind the factory.
  *
  * The shape:
  *
@@ -19,8 +17,11 @@
  *     refs: api,
  *   });
  *   app.get("/health", (c) => c.text("ok"));
+ *   app.get("/me", async (c) => c.json(
+ *     await c.var.auth.api.getSession({ headers: c.req.raw.headers })
+ *   ));
  *   export default app;
- *   export const { DB, Cdb, Catalog, Gateway, BlobMeta, Resharder, GsiShard } = app;
+ *   export const { DB, Cdb, Catalog, Gateway, Resharder } = app;
  *
  * Schema authors reach the synthesized auth tables via the live ESM
  * binding (`import { app } from "./worker.ts"`) — Drizzle's
@@ -33,27 +34,19 @@
  * domain` intersection).
  */
 
-import { type BetterAuthOptions, type BetterAuthPlugin, betterAuth } from "better-auth";
-import { admin } from "better-auth/plugins/admin";
-import { organization } from "better-auth/plugins/organization";
+import { type Auth, type BetterAuthOptions, type BetterAuthPlugin, betterAuth } from "better-auth";
 import { Hono } from "hono";
 import { type ChardbAuthAdapterEnv, chardbAuthAdapter } from "../auth/chardb_adapter.ts";
-import {
-    type AuthOptionsInput,
-    type ChardbAuth,
-    type InferPluginTables,
-    type SynthesizedAuthSchema,
-    defineAuth,
-} from "../auth/synthesize.ts";
+import { type AuthOptionsInput, type ChardbAuth, type SynthesizedAuthSchema, defineAuth } from "../auth/synthesize.ts";
 import type { ChardbBinding } from "../binding.ts";
+import { CdbError } from "../errors.ts";
 import { type DB, configureDbBindingRuntime } from "./binding.ts";
-import { buildAccessControl } from "./cdb-access.ts";
-import { BlobMeta } from "./do/blobmeta.ts";
+import { collectCdbTables } from "./cdb-table-registry.ts";
 import { type Catalog, configureCatalogRuntime } from "./do/catalog.ts";
 import { type Cdb, configureCdbRuntime } from "./do/cdb.ts";
-import { type Gateway, type GatewayJwtConfig, configureGatewayRuntime } from "./do/gateway.ts";
-import { GsiShard } from "./do/gsishard.ts";
-import { Resharder } from "./do/resharder.ts";
+import type { GatewayJwtConfig } from "./do/gateway-auth-dispatch.ts";
+import { type Gateway, configureGatewayRuntime } from "./do/gateway.ts";
+import { type Resharder, configureResharderRuntime } from "./do/resharder.ts";
 import {
     type ChardbEnv,
     type DefineChardbInput,
@@ -61,7 +54,10 @@ import {
     defineChardb,
     mountChardb,
 } from "./entrypoint.ts";
+import { cdbHttpErrorResponse, chardbHttpErrorHandler } from "./http-errors.ts";
 import { sourceChardbEnv } from "./loopback.ts";
+import { type OrganizationFileHttpAuth, handleOrganizationFileRequest } from "./organization-file-http.ts";
+import { assertSchemaResourceJournal, collectSchemaFileResourceDescriptors } from "./resource-descriptors.ts";
 import { type ChardbMigrationJournal, defineMigrations } from "./schema-migrations.ts";
 
 /**
@@ -85,13 +81,13 @@ import { type ChardbMigrationJournal, defineMigrations } from "./schema-migratio
  *
  * `routes?: (app) => void` lets the user wire Hono routes inline; if
  * omitted, they can chain `app.get/post/…` on the returned object.
- * `authHandler?` is for users who construct `betterAuth(options)` and
- * want chardb to auto-mount `/api/auth/*`.
+ * Every route receives the same per-env Better Auth instance that owns
+ * `/api/auth/*` as `c.var.auth`.
  */
 export interface ChardbFactoryInput<
     TPlugins extends readonly BetterAuthPlugin[],
     TSchema extends Record<string, unknown>,
-> extends Omit<DefineChardbInput<TSchema>, "auth" | "refs"> {
+> extends Omit<DefineChardbInput<TSchema>, "auth" | "refs" | "policy" | "manifest"> {
     /**
      * Either a pre-built bundle from `defineAuth({ plugins })` or
      * inline better-auth options (`{ plugins, appName, … }`). Omit to
@@ -103,9 +99,7 @@ export interface ChardbFactoryInput<
     /** Deprecated alias for `api` — supported for one minor cycle. */
     readonly refs?: DefineChardbInput<TSchema>["refs"];
     /** Inline-route hook so the whole config can read top-to-bottom. */
-    readonly routes?: (app: Hono<{ Bindings: ChardbAppEnv }>) => void;
-    /** Better-auth fetch handler from `betterAuth(options).handler`; auto-mounted at `/api/auth/*`. */
-    readonly authHandler?: MountChardbOptions["authHandler"];
+    readonly routes?: (app: Hono<ChardbHonoEnv<TPlugins>>) => void;
     readonly authBasePath?: MountChardbOptions["authBasePath"];
     /** Immutable migration journal packaged with every Worker and Durable Object class. */
     readonly migrations?: ChardbMigrationJournal;
@@ -126,19 +120,29 @@ export interface ChardbFactoryInput<
  */
 export type ChardbAppEnv = ChardbEnv & { readonly DB: ChardbBinding };
 
-export type ChardbApp<TPlugins extends readonly BetterAuthPlugin[], TSchema extends Record<string, unknown>> = Hono<{
+type MutablePluginTuple<TPlugins extends readonly BetterAuthPlugin[]> = [...TPlugins];
+
+/** The Better Auth server instance available to Hono routes as `c.var.auth`. */
+export type ChardbAuthRuntime<TPlugins extends readonly BetterAuthPlugin[]> = Auth<
+    Omit<BetterAuthOptions, "plugins"> & { plugins: MutablePluginTuple<TPlugins> }
+>;
+
+type ChardbHonoEnv<TPlugins extends readonly BetterAuthPlugin[]> = {
     Bindings: ChardbAppEnv;
-}> & {
+    Variables: { auth: ChardbAuthRuntime<TPlugins> };
+};
+
+export type ChardbApp<TPlugins extends readonly BetterAuthPlugin[], TSchema extends Record<string, unknown>> = Hono<
+    ChardbHonoEnv<TPlugins>
+> & {
     readonly fetch: (request: Request, env: ChardbEnv, ctx: ExecutionContext) => Promise<Response>;
     readonly auth: ChardbAuth<TPlugins>;
-    readonly schema: TSchema & SynthesizedAuthSchema<InferPluginTables<TPlugins>>;
+    readonly schema: TSchema & SynthesizedAuthSchema<TPlugins>;
     readonly DB: typeof DB;
     readonly Cdb: typeof Cdb;
     readonly Catalog: typeof Catalog;
     readonly Gateway: typeof Gateway;
-    readonly BlobMeta: typeof BlobMeta;
     readonly Resharder: typeof Resharder;
-    readonly GsiShard: typeof GsiShard;
 };
 
 /**
@@ -176,39 +180,60 @@ export function chardb<
 
     // `api` is the new field name; `refs` is the deprecated alias.
     const refsValue = input.api ?? input.refs;
+    const authBasePath = input.authBasePath ?? auth.options.basePath ?? "/api/auth";
+    const jwtConfig = gatewayJwtConfigFromAuthOptions(auth.options, authBasePath);
+    if (refsValue !== undefined && jwtConfig === null) {
+        throw new CdbError({
+            code: "CDB_AUTH_NOT_BOUND",
+            message: "chardb: authenticated DB transport requires Better Auth's jwt() plugin",
+            hint: "Add jwt() to defineAuth({ plugins: [...] }) before passing api/refs to chardb().",
+        });
+    }
 
     const Chardb = defineChardb({
         schema: input.schema,
         auth,
         ...(refsValue ? { refs: refsValue } : {}),
-        ...(input.policy ? { policy: input.policy } : {}),
-        ...(input.manifest ? { manifest: input.manifest } : {}),
     });
     const runtimeEntrypoint = Chardb as typeof Chardb & {
         readonly schema: Record<string, unknown>;
         readonly chardbManifest: import("./manifest.ts").ChardbManifest;
     };
     const migrationJournal = input.migrations ?? defineMigrations([]);
+    let validatedSchema: Record<string, unknown> | undefined;
+    const getValidatedSchema = (): Record<string, unknown> => {
+        if (validatedSchema) return validatedSchema;
+        const schema = runtimeEntrypoint.schema;
+        assertConfiguredAuthTargets(schema, auth.options);
+        assertSchemaResourceJournal(schema, migrationJournal.migrations);
+        validatedSchema = schema;
+        return schema;
+    };
     const ConfiguredCdb = configureCdbRuntime({
-        schema: () => runtimeEntrypoint.schema,
+        schema: getValidatedSchema,
         manifest: () => runtimeEntrypoint.chardbManifest,
         migrations: () => migrationJournal,
     });
     const ConfiguredCatalog = configureCatalogRuntime({ migrations: () => migrationJournal });
-    const authBasePath = input.authBasePath ?? auth.options.basePath ?? "/api/auth";
-    const jwtConfig = gatewayJwtConfigFromAuthOptions(auth.options, authBasePath);
     const ConfiguredGateway = configureGatewayRuntime({
-        schema: () => runtimeEntrypoint.schema,
+        schema: getValidatedSchema,
         manifest: () => runtimeEntrypoint.chardbManifest,
         auth: jwtConfig,
     });
+    const ConfiguredResharder = configureResharderRuntime({ schema: getValidatedSchema });
     const ConfiguredDB = configureDbBindingRuntime({
-        schema: () => runtimeEntrypoint.schema,
+        schema: getValidatedSchema,
         manifest: () => runtimeEntrypoint.chardbManifest,
         auth: jwtConfig,
     });
 
-    const hono = new Hono<{ Bindings: ChardbAppEnv }>();
+    const authRuntime = buildDefaultAuthRuntime<TPlugins>(auth.options as BetterAuthOptions);
+    const hono = new Hono<ChardbHonoEnv<TPlugins>>();
+    hono.onError(chardbHttpErrorHandler);
+    hono.use("*", async (c, next) => {
+        c.set("auth", authRuntime.get(c.env, c.req.raw));
+        await next();
+    });
     if (input.routes) input.routes(hono);
 
     // Snapshot Hono's own `.fetch` BEFORE handing the instance to
@@ -218,32 +243,42 @@ export function chardb<
     // non-reserved-prefix fall-through.
     const honoFetch = hono.fetch.bind(hono);
 
-    // Auto-mount better-auth at /api/auth/* unless the caller passed an
-    // explicit authHandler. The adapter has to be constructed per inbound
-    // env (the DO bindings live there), so we memoize a betterAuth
+    // Auto-mount Better Auth at /api/auth/*. The adapter has to be
+    // constructed per inbound env (the DO bindings live there), so we memoize a Better Auth
     // instance per env-identity to avoid re-running the adapter factory
     // on every request.
     //
-    // The cdbTable subsystem materializes a single AccessControl from
-    // the user's schema at first-request time (deferred so the
-    // worker.ts ↔ schema.ts ESM cycle has fully evaluated AND so the
-    // `.schema` getter stays lazy). The result is patched into the
-    // `organization()` and `admin()` plugin instances by
-    // re-constructing them with `{ ac, roles }` before handing the
-    // plugin list to betterAuth().
-    // The auth runtime was bound when defineChardb ran. Resolve the full
-    // schema lazily here only to build access-control metadata after the
-    // worker.ts ↔ schema.ts ESM cycle has completed.
-    const getMergedSchemaForAc = (): Record<string, unknown> => runtimeEntrypoint.schema;
-    const authHandler =
-        input.authHandler ?? buildDefaultAuthHandler(auth.options as BetterAuthOptions, getMergedSchemaForAc);
-
+    // The caller's plugin tuple and plugin options pass through unchanged.
+    // Better Auth owns organization and user-management permissions;
+    // Chardb enforces domain table policy independently.
     const mounted = mountChardb(
         Chardb,
         { fetch: honoFetch as Parameters<typeof mountChardb>[1]["fetch"] },
         {
-            ...(authHandler ? { authHandler } : {}),
+            authHandler: async (request, env, ctx) => {
+                const catalog = env.CDB_CATALOG.get(env.CDB_CATALOG.idFromName("global")) as unknown as {
+                    schemaState(): Promise<{ readonly activeVersion: number; readonly status: "active" | "migrating" }>;
+                };
+                const state = await catalog.schemaState();
+                if (state.status !== "active" || state.activeVersion !== migrationJournal.version) {
+                    return cdbHttpErrorResponse(
+                        new CdbError({
+                            code: "CDB_STALE_EPOCH",
+                            message: "Catalog auth schema migration is not active",
+                            hint: "retry after the schema migration activates",
+                        })
+                    );
+                }
+                return authRuntime.handler(request, env, ctx);
+            },
             authBasePath,
+            fileHandler: (request, env) =>
+                handleOrganizationFileRequest({
+                    request,
+                    env,
+                    auth: authRuntime.get(env, request) as unknown as OrganizationFileHttpAuth,
+                    resources: collectSchemaFileResourceDescriptors(getValidatedSchema()),
+                }),
         }
     );
 
@@ -258,7 +293,7 @@ export function chardb<
     Object.defineProperty(hono, "schema", {
         enumerable: true,
         configurable: false,
-        get: () => ({ ...auth, ...input.schema }) as TSchema & SynthesizedAuthSchema<InferPluginTables<TPlugins>>,
+        get: () => getValidatedSchema() as TSchema & SynthesizedAuthSchema<TPlugins>,
     });
     const merged = Object.assign(hono, {
         fetch: mounted.fetch,
@@ -267,11 +302,21 @@ export function chardb<
         Cdb: ConfiguredCdb,
         Catalog: ConfiguredCatalog,
         Gateway: ConfiguredGateway,
-        BlobMeta,
-        Resharder,
-        GsiShard,
+        Resharder: ConfiguredResharder,
     });
     return merged as ChardbApp<TPlugins, TSchema>;
+}
+
+function assertConfiguredAuthTargets(schema: Record<string, unknown>, authOptions: BetterAuthOptions): void {
+    const hasOrganizationPlugin = (authOptions.plugins ?? []).some(plugin => plugin.id === "organization");
+    if (hasOrganizationPlugin) return;
+    const orgTable = collectCdbTables(schema).find(({ meta }) => meta.authTarget === "organization");
+    if (!orgTable) return;
+    throw new CdbError({
+        code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+        message: `chardb: cdbTable "${orgTable.meta.name}" uses forOrg(), but defineAuth() did not configure Better Auth's organization() plugin`,
+        hint: "Add organization() to defineAuth({ plugins: [...] }).",
+    });
 }
 
 interface BetterAuthJwtPluginOptions {
@@ -308,7 +353,7 @@ export function gatewayJwtConfigFromAuthOptions(
 }
 
 /**
- * Build the per-env auth handler. Better-auth constructs its own router
+ * Build the per-env auth runtime. Better Auth constructs its own router
  * eagerly when called, so we defer the call until the first request
  * lands and capture the inbound `env` to wire the chardb adapter. The
  * resulting `betterAuth` instance is memoized per env-identity (one
@@ -317,72 +362,37 @@ export function gatewayJwtConfigFromAuthOptions(
  * is by-design avoided so each isolate's adapter holds its own DO
  * stubs).
  */
-function buildDefaultAuthHandler(
-    authOptions: BetterAuthOptions,
-    getSchema: () => Record<string, unknown>
-): MountChardbOptions["authHandler"] {
-    const cache = new WeakMap<object, (request: Request) => Response | Promise<Response>>();
-    let cachedAcOptions: BetterAuthOptions | undefined;
-    return (request, env) => {
+function buildDefaultAuthRuntime<TPlugins extends readonly BetterAuthPlugin[]>(
+    authOptions: BetterAuthOptions
+): {
+    get: (env: ChardbEnv, request: Request) => ChardbAuthRuntime<TPlugins>;
+    handler: NonNullable<MountChardbOptions["authHandler"]>;
+} {
+    const cache = new WeakMap<object, { key: string; instance: ChardbAuthRuntime<TPlugins> }>();
+    const get = (env: ChardbEnv, request: Request): ChardbAuthRuntime<TPlugins> => {
         const e = sourceChardbEnv(env as unknown as object);
-        let handler = cache.get(e);
-        if (!handler) {
-            if (!cachedAcOptions) cachedAcOptions = applyCdbAccessControl(authOptions, getSchema());
-            const instance = betterAuth({
-                ...cachedAcOptions,
+        const requestOrigin = new URL(request.url).origin;
+        const cacheKey = authOptions.baseURL === undefined ? requestOrigin : "configured";
+        const cached = cache.get(e);
+        let instance = cached?.key === cacheKey ? cached.instance : undefined;
+        if (!instance) {
+            instance = betterAuth({
+                ...authOptions,
+                // Workers can serve workers.dev, custom, preview, and local hosts.
+                // Pin an otherwise-unconfigured Better Auth instance to the
+                // canonical request origin instead of trusting an arbitrary
+                // Host header or forcing a wildcard allow-list.
+                ...(authOptions.baseURL === undefined ? { baseURL: requestOrigin } : {}),
                 database: chardbAuthAdapter({ env: env as unknown as ChardbAuthAdapterEnv }),
-            });
-            handler = instance.handler.bind(instance);
-            cache.set(e, handler);
+            }) as unknown as ChardbAuthRuntime<TPlugins>;
+            // Keep the cache bounded when one Worker serves many custom hosts.
+            // A host switch replaces the previous unconfigured instance.
+            cache.set(e, { key: cacheKey, instance });
         }
-        return handler(request);
+        return instance;
     };
-}
-
-/**
- * Patch the `organization()` and `admin()` plugin instances in the
- * options object with the chardb-built `{ ac, roles }` derived from
- * the schema. Returns a NEW options object (no mutation) — the
- * original `auth.options` stays referentially stable so callers
- * destructuring it elsewhere see the un-patched view.
- *
- * The user's plugin instance, if present, has its options preserved
- * via re-instantiation. If the user already passed `{ ac, roles }`,
- * those win (we only fill in the chardb defaults when the keys are
- * absent).
- */
-function applyCdbAccessControl(authOptions: BetterAuthOptions, schema: Record<string, unknown>): BetterAuthOptions {
-    const built = buildAccessControl(schema);
-    const plugins = (authOptions.plugins ?? []) as readonly BetterAuthPlugin[];
-    const next: BetterAuthPlugin[] = [];
-    let patchedOrg = false;
-    let patchedAdmin = false;
-    for (const p of plugins) {
-        const id = (p as { id?: string }).id;
-        if (id === "organization" && !patchedOrg) {
-            const opts = ((p as { options?: Record<string, unknown> }).options ?? {}) as Record<string, unknown>;
-            next.push(
-                organization({
-                    ...opts,
-                    ac: opts.ac ?? built.ac,
-                    roles: (opts.roles as Record<string, unknown> | undefined) ?? built.roles,
-                } as Parameters<typeof organization>[0])
-            );
-            patchedOrg = true;
-            continue;
-        }
-        if (id === "admin" && !patchedAdmin) {
-            const opts = ((p as { options?: Record<string, unknown> }).options ?? {}) as Record<string, unknown>;
-            next.push(
-                admin({
-                    ...opts,
-                    roles: (opts.roles as Record<string, unknown> | undefined) ?? built.userRoles,
-                } as Parameters<typeof admin>[0])
-            );
-            patchedAdmin = true;
-            continue;
-        }
-        next.push(p);
-    }
-    return { ...authOptions, plugins: next };
+    return {
+        get,
+        handler: (request, env) => get(env, request).handler(request),
+    };
 }

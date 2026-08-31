@@ -41,7 +41,7 @@ const TENANT_KEYED_MODELS = new Set([
     "teamMember",
     // `organizationRole` carries dynamic ACL rows for an org; a write here
     // must invalidate every tenant-scoped live query whose `authDependsOn`
-    // names this model (see `chardb/server/access`'s `TENANT_EPOCH_TABLES`).
+    // names this model (see the server access module's `TENANT_EPOCH_TABLES`).
     // Without this entry, a role assignment change would silently fail to
     // re-evaluate dependent subscriptions.
     "organizationRole",

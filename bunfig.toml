@@ -1,6 +1,6 @@
 [test]
 # Stub `cloudflare:workers` for bun:test loads so any module that
-# transitively imports the DO base classes (`chardb/server` does, via
+# transitively imports the DO base classes (`@chardb/core/server` does, via
 # its re-exports) can be evaluated outside workerd. Workerd-integration
 # tests under `test/workerd/` boot miniflare and bypass this.
 preload = ["test/preload.ts"]

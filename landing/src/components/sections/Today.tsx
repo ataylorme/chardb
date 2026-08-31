@@ -2,31 +2,33 @@ import { BulletList, PullQuote, Section, SectionHeading, SectionLead } from "../
 
 export function Today() {
     return (
-        <Section id="today" num="01" label="working today">
-            <SectionHeading>The tenant-shaped core works end to end.</SectionHeading>
+        <Section id="today" num="01" label="the database">
+            <SectionHeading>The whole organization path works end to end.</SectionHeading>
             <SectionLead>
-                A clean package can scaffold and build a Worker, apply a packaged migration, authenticate through Better
-                Auth, isolate organizations, commit mutations, and deliver live replacement snapshots. Workerd tests
-                then break connections, reconstruct Durable Objects, and require the same state to recover.
+                Scaffold a Worker, migrate it, sign in through Better Auth, create an organization, write and query
+                rows, attach files, search vectors, and receive live replacements through the same typed model.
             </SectionLead>
 
             <BulletList
                 items={[
                     "organization routing, membership, row policy, and column policy are enforced together",
                     "mutations are idempotent across reconnects and lost responses",
-                    "the native env.DB binding runs typed server queries and mutations without internal binding config",
+                    "the native env.DB binding runs the bounded select().from().where() path and registered operations",
+                    "planned query callbacks and mutation handlers are erased into ref-only browser handles",
                     "live queries survive Gateway and shard reconstruction with exact bounded snapshot replay",
                     "forward maintenance-mode migrations resume from durable progress",
-                    "frozen scale profiles prove convergence, isolation, replay, and counter invariants under churn",
+                    "files, vectors, and ordinary rows keep their identity when an organization range moves",
+                    "Wrangler, Miniflare, Workerd, and real Cloudflare services exercise the same runtime contract",
                 ]}
             />
 
             <p className="mt-8 max-w-2xl text-sm text-fg-muted">
-                This is still experimental software. Files, vectors, general query shapes, automatic resharding, and the
-                raw Drizzle-over-RPC builders are not supported product paths yet.
+                Chardb is experimental software. The first public query path is full-row, single-table, exact-partition,
+                and capped at 100 rows. Backup, restore, automatic balancing, and cross-partition transactions are not
+                part of this release.
             </p>
 
-            <PullQuote>the proof is real. the product is unfinished.</PullQuote>
+            <PullQuote>one model from sign-in to live data.</PullQuote>
         </Section>
     );
 }

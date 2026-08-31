@@ -10,6 +10,47 @@ export interface SqliteTableDdl {
     readonly signature: string;
 }
 
+export interface SqliteColumnDdlDescriptor {
+    readonly name: string;
+    readonly sql: string;
+}
+
+export type SqliteTableConstraintKind = "primary-key" | "unique" | "foreign-key" | "check";
+
+export interface SqliteTableConstraintDdlDescriptor {
+    readonly kind: SqliteTableConstraintKind;
+    readonly name: string | null;
+    readonly sql: string;
+}
+
+export interface SqliteIndexDdlDescriptor {
+    readonly name: string;
+    readonly unique: boolean;
+    readonly sql: string;
+}
+
+/** Static SQLite shape used by migration snapshots and by the executable DDL renderer. */
+export interface SqliteTableDdlDescriptor {
+    readonly tableName: string;
+    readonly columns: readonly SqliteColumnDdlDescriptor[];
+    readonly constraints: readonly SqliteTableConstraintDdlDescriptor[];
+    readonly indexes: readonly SqliteIndexDdlDescriptor[];
+}
+
+function compareText(left: string, right: string): number {
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/** Canonicalize set-like index members while preserving the exact CREATE TABLE definition order. */
+export function canonicalizeSqliteTableDdlDescriptor(descriptor: SqliteTableDdlDescriptor): SqliteTableDdlDescriptor {
+    return {
+        tableName: descriptor.tableName,
+        columns: [...descriptor.columns],
+        constraints: [...descriptor.constraints],
+        indexes: [...descriptor.indexes].sort((left, right) => compareText(left.name, right.name)),
+    };
+}
+
 export interface SqliteTableDdlOptions {
     readonly errorCode?: CdbErrorCode;
     readonly label?: string;
@@ -90,11 +131,15 @@ function renderIndexColumn(value: unknown, options: Required<SqliteTableDdlOptio
     return unsupported(options, "encountered an unsupported SQLite index expression");
 }
 
-/** Render deterministic, executable SQLite DDL from a Drizzle table. */
-export function renderSqliteTableDdl(table: AnySQLiteTable, inputOptions?: SqliteTableDdlOptions): SqliteTableDdl {
+/** Describe the exact static SQLite shape of a Drizzle table without retaining the Drizzle object graph. */
+export function describeSqliteTableDdl(
+    table: AnySQLiteTable,
+    inputOptions?: SqliteTableDdlOptions
+): SqliteTableDdlDescriptor {
     const options = normalizedOptions(inputOptions);
     const config = getTableConfig(table);
-    const definitions: string[] = [];
+    const columns: SqliteColumnDdlDescriptor[] = [];
+    const constraints: SqliteTableConstraintDdlDescriptor[] = [];
 
     for (const column of config.columns) {
         if (column.generated) {
@@ -109,22 +154,27 @@ export function renderSqliteTableDdl(table: AnySQLiteTable, inputOptions?: Sqlit
             parts.push("UNIQUE");
         }
         if (column.default !== undefined) parts.push("DEFAULT", renderDefault(column.default, options));
-        definitions.push(parts.join(" "));
+        columns.push({ name: column.name, sql: parts.join(" ") });
     }
 
     for (const primaryKey of config.primaryKeys) {
-        definitions.push(
-            `CONSTRAINT ${quoteIdentifier(primaryKey.getName())} PRIMARY KEY (${primaryKey.columns
+        const name = primaryKey.getName();
+        constraints.push({
+            kind: "primary-key",
+            name,
+            sql: `CONSTRAINT ${quoteIdentifier(name)} PRIMARY KEY (${primaryKey.columns
                 .map(column => quoteIdentifier(column.name))
-                .join(", ")})`
-        );
+                .join(", ")})`,
+        });
     }
     for (const constraint of config.uniqueConstraints) {
         const name = constraint.getName();
         const prefix = name ? `CONSTRAINT ${quoteIdentifier(name)} ` : "";
-        definitions.push(
-            `${prefix}UNIQUE (${constraint.columns.map(column => quoteIdentifier(column.name)).join(", ")})`
-        );
+        constraints.push({
+            kind: "unique",
+            name: name || null,
+            sql: `${prefix}UNIQUE (${constraint.columns.map(column => quoteIdentifier(column.name)).join(", ")})`,
+        });
     }
     for (const foreignKey of config.foreignKeys) {
         const reference = foreignKey.reference();
@@ -144,27 +194,47 @@ export function renderSqliteTableDdl(table: AnySQLiteTable, inputOptions?: Sqlit
         ];
         if (foreignKey.onUpdate) clauses.push(`ON UPDATE ${renderAction(foreignKey.onUpdate)}`);
         if (foreignKey.onDelete) clauses.push(`ON DELETE ${renderAction(foreignKey.onDelete)}`);
-        definitions.push(clauses.join(" "));
+        constraints.push({ kind: "foreign-key", name: foreignKey.getName(), sql: clauses.join(" ") });
     }
     for (const check of config.checks) {
-        definitions.push(
-            `CONSTRAINT ${quoteIdentifier(check.name)} CHECK (${renderSqlExpression(check.value, options)})`
-        );
+        constraints.push({
+            kind: "check",
+            name: check.name,
+            sql: `CONSTRAINT ${quoteIdentifier(check.name)} CHECK (${renderSqlExpression(check.value, options)})`,
+        });
     }
 
-    const createTable = `CREATE TABLE ${quoteIdentifier(config.name)} (${definitions.join(", ")})`;
-    const indexNames = config.indexes.map(index => index.config.name);
     const indexes = config.indexes.map(index => {
         const unique = index.config.unique ? "UNIQUE " : "";
         const columns = index.config.columns.map(column => renderIndexColumn(column, options)).join(", ");
         const where = index.config.where ? ` WHERE ${renderSqlExpression(index.config.where, options)}` : "";
-        return `CREATE ${unique}INDEX ${quoteIdentifier(index.config.name)} ON ${quoteIdentifier(config.name)} (${columns})${where}`;
+        return {
+            name: index.config.name,
+            unique: index.config.unique,
+            sql: `CREATE ${unique}INDEX ${quoteIdentifier(index.config.name)} ON ${quoteIdentifier(config.name)} (${columns})${where}`,
+        };
     });
+    return { tableName: config.name, columns, constraints, indexes };
+}
+
+/** Render deterministic, executable SQLite DDL from a static table descriptor. */
+export function renderSqliteTableDdlDescriptor(descriptor: SqliteTableDdlDescriptor): SqliteTableDdl {
+    const definitions = [
+        ...descriptor.columns.map(column => column.sql),
+        ...descriptor.constraints.map(constraint => constraint.sql),
+    ];
+    const createTable = `CREATE TABLE ${quoteIdentifier(descriptor.tableName)} (${definitions.join(", ")})`;
+    const indexes = descriptor.indexes.map(index => index.sql);
     return {
-        tableName: config.name,
+        tableName: descriptor.tableName,
         createTable,
         indexes,
-        indexNames,
+        indexNames: descriptor.indexes.map(index => index.name),
         signature: JSON.stringify([createTable, ...indexes]),
     };
+}
+
+/** Render deterministic, executable SQLite DDL from a Drizzle table. */
+export function renderSqliteTableDdl(table: AnySQLiteTable, inputOptions?: SqliteTableDdlOptions): SqliteTableDdl {
+    return renderSqliteTableDdlDescriptor(describeSqliteTableDdl(table, inputOptions));
 }

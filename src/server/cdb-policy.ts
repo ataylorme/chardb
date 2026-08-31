@@ -34,7 +34,7 @@ import { type PolicyDefinition, chardbPolicy } from "./policy.ts";
 
 /**
  * The four better-auth tables whose writes bump the tenant epoch.
- * Mirrors `TENANT_KEYED_MODELS` in `chardb/auth/adapter.ts`.
+ * Mirrors `TENANT_KEYED_MODELS` in `src/auth/adapter.ts`.
  */
 export const TENANT_EPOCH_TABLES: readonly string[] = Object.freeze([
     "organization",
@@ -47,7 +47,7 @@ export const TENANT_EPOCH_TABLES: readonly string[] = Object.freeze([
 
 /**
  * Tables whose writes bump the principal epoch (per-user invalidation).
- * Mirrors `PRINCIPAL_KEYED_MODELS` in `chardb/auth/adapter.ts`.
+ * Mirrors `PRINCIPAL_KEYED_MODELS` in `src/auth/adapter.ts`.
  */
 export const PRINCIPAL_EPOCH_TABLES: readonly string[] = Object.freeze([
     "user",
@@ -62,6 +62,12 @@ export const PRINCIPAL_EPOCH_TABLES: readonly string[] = Object.freeze([
 
 const SQL_FALSE: SQL = sql`1 = 0`;
 const SQL_TRUE: SQL = sql`1 = 1`;
+
+// Worker and Durable Object runtime schemas are stable after module
+// initialization. Registered refs also declare a stable table set, so avoid
+// rebuilding and hashing the same policy identity on every query refresh.
+// The outer WeakMap lets an isolate release entries with its schema object.
+const POLICY_DIGEST_CACHE = new WeakMap<Record<string, unknown>, Map<string, string>>();
 
 function epochTablesFor(meta: CdbTableMeta): readonly string[] {
     return meta.tenantKind === "org" ? TENANT_EPOCH_TABLES : PRINCIPAL_EPOCH_TABLES;
@@ -135,21 +141,19 @@ export function compileCdbPolicies(table: SQLiteTable): readonly PolicyDefinitio
                     for: opFor,
                     to: "authenticated",
                     effect: "grant",
-                    using: auth => callerHasRole(auth, role),
-                    usingSql: auth => (callerHasRole(auth, role) ? SQL_TRUE : SQL_FALSE),
+                    using: auth => callerHasRole(meta, auth, role),
+                    usingSql: auth => (callerHasRole(meta, auth, role) ? SQL_TRUE : SQL_FALSE),
                     authDependsOn: epochTables,
                 }) as PolicyDefinition<SQLiteTable, unknown>
             );
         }
     }
 
-    // 4) `self` row gate per verb. Bound to the `selfBy` column for org-
-    //    tenanted tables; on user-tenanted tables, the tenant predicate
-    //    already enforces self-equality so we omit a second policy unless
-    //    the user explicitly listed `self` (in which case it widens the
-    //    column matrix without altering the row predicate).
+    // 4) `self` row gate per verb. Organization tables bind it to `selfBy`.
+    //    User tables use a constant grant because the mandatory tenant floor
+    //    already restricts every surviving row to auth.userId.
     const selfRoles = meta.rawRoles.self;
-    if (selfRoles && meta.tenantKind === "org" && meta.selfBy) {
+    if (selfRoles && ((meta.tenantKind === "org" && meta.selfBy) || meta.tenantKind === "user")) {
         const selfBy = meta.selfBy;
         for (const verb of ["read", "create", "update", "delete"] as readonly Verb[]) {
             if (!roleGrantsRowVerb(selfRoles, verb)) continue;
@@ -160,8 +164,14 @@ export function compileCdbPolicies(table: SQLiteTable): readonly PolicyDefinitio
                     for: opFor,
                     to: "authenticated",
                     effect: "grant",
-                    using: (auth, row) => row[selfBy] === auth.userId,
-                    usingSql: (auth, t) => sqlEqColumn(t, selfBy, auth.userId),
+                    using: (auth, row) =>
+                        meta.tenantKind === "user" || (selfBy !== undefined && row[selfBy] === auth.userId),
+                    usingSql: (auth, t) =>
+                        meta.tenantKind === "user"
+                            ? SQL_TRUE
+                            : selfBy === undefined
+                              ? SQL_FALSE
+                              : sqlEqColumn(t, selfBy, auth.userId),
                     authDependsOn: PRINCIPAL_EPOCH_TABLES,
                 }) as PolicyDefinition<SQLiteTable, unknown>
             );
@@ -177,6 +187,12 @@ export function compileCdbPolicies(table: SQLiteTable): readonly PolicyDefinitio
  * compiled from this metadata and closure text is not stable across builds.
  */
 export function cdbPolicyDigest(schema: Record<string, unknown>, tableNames: readonly string[]): string {
+    const names = [...new Set(tableNames)].sort();
+    const cacheKey = JSON.stringify(names);
+    const schemaCache = POLICY_DIGEST_CACHE.get(schema);
+    const cached = schemaCache?.get(cacheKey);
+    if (cached !== undefined) return cached;
+
     const tablesByName = new Map<string, SQLiteTable>();
     for (const entry of collectCdbTables(schema)) {
         const name = resolveCdbMeta(entry.table).name;
@@ -189,7 +205,6 @@ export function cdbPolicyDigest(schema: Record<string, unknown>, tableNames: rea
         tablesByName.set(name, entry.table);
     }
 
-    const names = [...new Set(tableNames)].sort();
     const tables = names.map(name => {
         const table = tablesByName.get(name);
         if (!table) {
@@ -231,7 +246,11 @@ export function cdbPolicyDigest(schema: Record<string, unknown>, tableNames: rea
             policies,
         };
     });
-    return stableHashHex({ version: 1, tables });
+    const digest = stableHashHex({ version: 2, tables });
+    const digests = schemaCache ?? new Map<string, string>();
+    digests.set(cacheKey, digest);
+    if (!schemaCache) POLICY_DIGEST_CACHE.set(schema, digests);
+    return digest;
 }
 
 function compareCanonicalName(left: string, right: string): number {
@@ -265,25 +284,8 @@ function roleGrantsRowVerb(raw: unknown, verb: Verb): boolean {
     return false;
 }
 
-function callerHasRole(auth: AuthCtx, role: string): boolean {
-    const roles = splitCallerRoles(auth);
-    if (role.startsWith("user:")) {
-        // user:-prefixed names match against `user.role` regardless of
-        // tenancy. The chardb runtime is responsible for surfacing the
-        // user-level role in `auth.claims` (since `auth.role` is the
-        // member.role for the active org); we look there as a fallback.
-        const target = role.slice("user:".length);
-        if (roles.includes(target)) return true;
-        const userRole = (auth.claims as { readonly userRole?: unknown }).userRole;
-        if (typeof userRole === "string") {
-            return userRole
-                .split(",")
-                .map(s => s.trim())
-                .includes(target);
-        }
-        return false;
-    }
-    return roles.includes(role);
+function callerHasRole(meta: CdbTableMeta, auth: AuthCtx, role: string): boolean {
+    return callerPolicyRoles(meta, auth).includes(role);
 }
 
 function splitCallerRoles(auth: AuthCtx): readonly string[] {
@@ -294,6 +296,35 @@ function splitCallerRoles(auth: AuthCtx): readonly string[] {
             .map(s => s.trim())
             .filter(Boolean);
     return [];
+}
+
+function splitUserRoles(auth: AuthCtx): readonly string[] {
+    const userRole = (auth.claims as { readonly userRole?: unknown }).userRole;
+    if (typeof userRole !== "string") return [];
+    return userRole
+        .split(",")
+        .map(role => role.trim())
+        .filter(Boolean);
+}
+
+/**
+ * Resolve the policy role names this caller may use.
+ *
+ * Organization tables treat auth.role/auth.roles as member roles. Only
+ * claims.userRole can enter the reserved user: namespace. User and global
+ * tables use auth.role/auth.roles as their user-role lattice, so those roles
+ * also receive user: aliases. A role value that already starts with user:
+ * never crosses the namespace boundary.
+ */
+export function callerPolicyRoles(meta: CdbTableMeta, auth: AuthCtx): readonly string[] {
+    const latticeRoles = splitCallerRoles(auth).filter(role => !role.startsWith("user:"));
+    const roles = new Set(latticeRoles);
+    const userRoles = new Set(splitUserRoles(auth));
+    if (meta.tenantKind !== "org") {
+        for (const role of latticeRoles) userRoles.add(role);
+    }
+    for (const role of userRoles) roles.add(`user:${role}`);
+    return [...roles];
 }
 
 /** Used by the column-mask helper. */
@@ -316,7 +347,7 @@ export function isColumnAllowed(meta: CdbTableMeta, role: string, verb: ColVerb,
  */
 export function callerColumns(meta: CdbTableMeta, auth: AuthCtx, verb: ColVerb): ReadonlySet<string> {
     const allowed = new Set<string>();
-    const callerRoles = splitCallerRoles(auth);
+    const callerRoles = callerPolicyRoles(meta, auth);
     for (const role of callerRoles) {
         const byVerb = meta.matrix.allowed.get(role);
         if (!byVerb) continue;
@@ -342,6 +373,35 @@ export function selfColumns(meta: CdbTableMeta, verb: ColVerb): ReadonlySet<stri
     const cols = byVerb.get(verb);
     if (cols === undefined) return new Set();
     return cols;
+}
+
+/**
+ * Couple an update's column grants to its row predicate. Tenant-wide caller
+ * roles may combine their column grants. If any updated column needs `self`,
+ * the whole update receives the self row predicate so another user's row
+ * cannot inherit that column permission from a broader role grant.
+ */
+export function policiesForColumnUpdate(args: {
+    readonly table: SQLiteTable;
+    readonly auth: AuthCtx;
+    readonly columns: readonly string[];
+    readonly policies: readonly PolicyDefinition<SQLiteTable, unknown>[];
+}): readonly PolicyDefinition<SQLiteTable, unknown>[] {
+    const meta = resolveCdbMeta(args.table);
+    const roleGrantNames = new Set<string>();
+    const roleColumns = new Set<string>();
+    for (const role of callerPolicyRoles(meta, args.auth)) {
+        if (!Object.prototype.hasOwnProperty.call(meta.rawRoles, role)) continue;
+        const granted = args.columns.filter(column => isColumnAllowed(meta, role, "update", column));
+        if (granted.length === 0 && args.columns.length > 0) continue;
+        for (const column of granted) roleColumns.add(column);
+        roleGrantNames.add(`${meta.name}_role_${role}_update`);
+    }
+    const requiresSelf = args.columns.some(column => !roleColumns.has(column));
+    const permittedGrantNames = requiresSelf ? new Set([`${meta.name}_self_update`]) : roleGrantNames;
+    return Object.freeze(
+        args.policies.filter(policy => policy.effect === "floor" || permittedGrantNames.has(policy.name))
+    );
 }
 
 /** Re-exported for the column-mask + writability helpers. */

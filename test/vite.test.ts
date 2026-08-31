@@ -1,29 +1,50 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+import { build as viteBuild } from "vite";
 import { chardb } from "../src/vite/index.ts";
 
 interface PluginShape {
     name: string;
-    resolveId: (s: string) => string | null;
-    load: (id: string) => string | null;
-    transform: (code: string, id: string) => { code: string; map: null } | null;
+    transform: (code: string, id: string, options?: { readonly ssr?: boolean }) => { code: string; map: null } | null;
 }
 
 function makePlugin(): PluginShape {
-    return chardb({}) as unknown as PluginShape;
+    return chardb() as unknown as PluginShape;
 }
 
 function transform(p: PluginShape, code: string, id: string): { code: string; map: null } {
-    const out = p.transform(code, id);
+    const out = p.transform.call({ environment: { name: "ssr" } }, code, id, { ssr: true });
     expect(out).not.toBeNull();
     if (!out) throw new Error(`Expected ${id} to be transformed`);
     return out;
 }
 
-describe("@chardb/vite-plugin", () => {
+function transformServer(p: PluginShape, code: string, id: string): { code: string; map: null } {
+    const out = p.transform.call({ environment: { name: "ssr" } }, code, id, { ssr: true });
+    expect(out).not.toBeNull();
+    if (!out) throw new Error(`Expected ${id} to be transformed for SSR`);
+    return out;
+}
+
+function emittedCode(build: Awaited<ReturnType<typeof viteBuild>>): string {
+    const results = (Array.isArray(build) ? build : [build]) as unknown as readonly {
+        readonly output: readonly { readonly type: string; readonly code?: string }[];
+    }[];
+    return results
+        .flatMap(result => result.output)
+        .filter(output => output.type === "chunk")
+        .map(output => output.code ?? "")
+        .join("\n");
+}
+
+describe("@chardb/core/vite", () => {
     test("rewrites exported defineMutation to set __chardbRef", () => {
         const p = makePlugin();
         const code = `
-      import { defineMutation } from "chardb/server";
+      import { defineMutation } from "@chardb/core/server";
       export const createPost = defineMutation(async () => ({}));
     `;
         const out = transform(p, code, "/abs/proj/src/mutations/post.ts");
@@ -31,10 +52,31 @@ describe("@chardb/vite-plugin", () => {
         expect(out.code).toContain("src/mutations/post.ts#createPost");
     });
 
+    test("does not expose virtual modules or unfinished Vite hooks", () => {
+        const p = makePlugin();
+        const source = `
+          import {
+            defineGsi,
+            defineLedger,
+            definePresenceKey,
+            defineStream,
+          } from "@chardb/core/server";
+          export const changes = defineStream(async function* () {});
+          export const byStatus = defineGsi("orders", ["status"]);
+          export const audit = defineLedger("audit", { id: "text" });
+          export const cursors = definePresenceKey("cursor");
+        `;
+
+        expect(p.transform(source, "/abs/proj/src/unfinished.ts")).toBeNull();
+        expect("resolveId" in p).toBe(false);
+        expect("load" in p).toBe(false);
+        expect("handleHotUpdate" in p).toBe(false);
+    });
+
     test("AST mode picks up aliased imports", () => {
         const p = makePlugin();
         const code = `
-      import { defineMutation as dm } from "chardb/server";
+      import { defineMutation as dm } from "@chardb/core/server";
       export const fancy = dm(async () => ({}));
     `;
         const out = transform(p, code, "/abs/proj/src/aliased.ts");
@@ -42,10 +84,21 @@ describe("@chardb/vite-plugin", () => {
         expect(out.code).toContain("__chardbRef");
     });
 
+    test("ignores local helpers that only look like chardb definitions", () => {
+        const p = makePlugin();
+        const code = `
+          const defineMutation = (handler) => handler;
+          const api = { query: (config) => config };
+          export const localMutation = defineMutation(() => ({}));
+          export const localQuery = api.query({ query: () => [] });
+        `;
+        expect(p.transform(code, "/abs/proj/src/unrelated.ts")).toBeNull();
+    });
+
     test("stamps distinct module-and-export refs for config-form api mutations and queries", () => {
         const p = makePlugin();
         const code = `
-      import { createApi } from "chardb/server";
+      import { createApi } from "@chardb/core/server";
       const api = createApi();
       export const createPost = api.mutation({ handler: () => ({}) });
       export const deletePost = api.mutation({ handler: () => ({}) });
@@ -61,17 +114,12 @@ describe("@chardb/vite-plugin", () => {
             "src/routes/posts.ts#getPost",
         ]);
         expect(new Set(refs).size).toBe(4);
-
-        const registry = p.load("\0virtual:chardb/registry");
-        expect(registry).toContain('"kind": "defineMutation"');
-        expect(registry).toContain('"kind": "defineQuery"');
-        for (const ref of refs) expect(registry).toContain(`"ref": "${ref}"`);
     });
 
     test("requires a stable ref for planned queries without evaluating their query callbacks", () => {
         const p = makePlugin();
         const code = `
-      import { api } from "chardb/server";
+      import { api } from "@chardb/core/server";
       export const listPosts = api.query({
         args: {},
         query: (db, args) => db.select({ id: posts.id }).from(posts).where(eq(posts.id, args.id)),
@@ -84,10 +132,10 @@ describe("@chardb/vite-plugin", () => {
 
     test("preserves explicit refs for additive planned queries", () => {
         const p = makePlugin();
-        const out = transform(
+        const out = transformServer(
             p,
             `
-      import { defineQuery } from "chardb/server";
+      import { defineQuery } from "@chardb/core/server";
       export const listPosts = defineQuery({
         ref: "api/posts#planned-list",
         args: {},
@@ -106,7 +154,7 @@ describe("@chardb/vite-plugin", () => {
             expect(() =>
                 p.transform(
                     `
-            import { api } from "chardb/server";
+            import { api } from "@chardb/core/server";
             export const listPosts = api.query({
               ref: "api/posts#planned-list",
               args: {},
@@ -122,10 +170,10 @@ describe("@chardb/vite-plugin", () => {
 
     test("does not treat objects inside a planned callback as legacy metadata", () => {
         const p = makePlugin();
-        const out = transform(
+        const out = transformServer(
             p,
             `
-      import { api } from "chardb/server";
+      import { api } from "@chardb/core/server";
       export const listPosts = api.query({
         ref: "api/posts#planned-list",
         query: (db) => {
@@ -139,10 +187,364 @@ describe("@chardb/vite-plugin", () => {
         expect(out.code).toContain('value: "api/posts#planned-list"');
     });
 
+    test("erases planned query server dependencies from the final browser chunk and retains them in SSR", async () => {
+        const fixture = await mkdtemp(path.join(tmpdir(), "chardb-planned-query-vite-"));
+        const entry = path.join(fixture, "queries.ts");
+        const schema = path.join(fixture, "schema.ts");
+        try {
+            await writeFile(
+                schema,
+                `
+export const plannedSchema = "PLANNED_SCHEMA_IMPORT_SENTINEL";
+`
+            );
+            await writeFile(
+                entry,
+                `
+import { api } from "@chardb/core/server";
+import { plannedSchema } from "./schema.ts";
+
+const callbackSentinel = "PLANNED_QUERY_CALLBACK_SENTINEL";
+export const listPosts = api.query({
+  ref: "api/posts#planned-browser-list",
+  args: {},
+  query: (db) => db.select().from(plannedSchema).where(callbackSentinel).limit(1),
+});
+`
+            );
+            const browser = await viteBuild({
+                configFile: false,
+                logLevel: "silent",
+                plugins: [chardb()],
+                build: {
+                    write: false,
+                    minify: false,
+                    lib: { entry, formats: ["es"] },
+                    rollupOptions: { external: ["@chardb/core/server"] },
+                },
+            });
+            const browserCode = emittedCode(browser);
+            expect(browserCode).toContain("api/posts#planned-browser-list");
+            expect(browserCode).toContain("__chardbKind");
+            expect(browserCode).toContain("__chardbRef");
+            expect(browserCode).not.toContain("PLANNED_QUERY_CALLBACK_SENTINEL");
+            expect(browserCode).not.toContain("PLANNED_SCHEMA_IMPORT_SENTINEL");
+            expect(browserCode).not.toContain("@chardb/core/server");
+            const emittedBrowser = path.join(fixture, "browser-output.mjs");
+            await writeFile(emittedBrowser, browserCode);
+            const browserModule = (await import(pathToFileURL(emittedBrowser).href)) as {
+                readonly listPosts: {
+                    (): never;
+                    readonly __chardbKind: string;
+                    readonly __chardbRef: string;
+                };
+            };
+            expect(typeof browserModule.listPosts).toBe("function");
+            expect(browserModule.listPosts.__chardbKind).toBe("query");
+            expect(browserModule.listPosts.__chardbRef).toBe("api/posts#planned-browser-list");
+            expect(() => browserModule.listPosts()).toThrow("cannot execute in the browser");
+
+            const server = await viteBuild({
+                configFile: false,
+                logLevel: "silent",
+                plugins: [chardb()],
+                build: {
+                    write: false,
+                    minify: false,
+                    ssr: entry,
+                    rollupOptions: { external: ["@chardb/core/server"] },
+                },
+            });
+            const serverCode = emittedCode(server);
+            expect(serverCode).toContain("api/posts#planned-browser-list");
+            expect(serverCode).toContain("PLANNED_QUERY_CALLBACK_SENTINEL");
+            expect(serverCode).toContain("PLANNED_SCHEMA_IMPORT_SENTINEL");
+            expect(serverCode).toContain("@chardb/core/server");
+        } finally {
+            await rm(fixture, { recursive: true, force: true });
+        }
+    });
+
+    test("erases api mutation server dependencies from the final browser chunk and retains them in SSR", async () => {
+        const fixture = await mkdtemp(path.join(tmpdir(), "chardb-mutation-vite-"));
+        const entry = path.join(fixture, "mutations.ts");
+        const schema = path.join(fixture, "schema.ts");
+        try {
+            await writeFile(
+                schema,
+                `
+export const mutationTable = "MUTATION_SCHEMA_IMPORT_SENTINEL";
+`
+            );
+            await writeFile(
+                entry,
+                `
+import { api } from "@chardb/core/server";
+import { mutationTable } from "./schema.ts";
+
+const handlerSentinel = "MUTATION_HANDLER_SENTINEL";
+export const savePost = api.mutation({
+  ref: "api/posts#save-browser",
+  args: { "~standard": { version: 1, vendor: "fixture", validate: value => ({ value }) } },
+  handler: (ctx, args) => {
+    ctx.db.insert(mutationTable).values({ ...args, handlerSentinel }).run();
+    return { ok: true };
+  },
+});
+`
+            );
+            const browser = await viteBuild({
+                configFile: false,
+                logLevel: "silent",
+                plugins: [chardb()],
+                build: {
+                    write: false,
+                    minify: false,
+                    lib: { entry, formats: ["es"] },
+                    rollupOptions: { external: ["@chardb/core/server"] },
+                },
+            });
+            const browserCode = emittedCode(browser);
+            expect(browserCode).toContain("api/posts#save-browser");
+            expect(browserCode).toContain("__chardbKind");
+            expect(browserCode).toContain("__chardbRef");
+            expect(browserCode).not.toContain("MUTATION_HANDLER_SENTINEL");
+            expect(browserCode).not.toContain("MUTATION_SCHEMA_IMPORT_SENTINEL");
+            expect(browserCode).not.toContain("@chardb/core/server");
+            const emittedBrowser = path.join(fixture, "browser-output.mjs");
+            await writeFile(emittedBrowser, browserCode);
+            const browserModule = (await import(pathToFileURL(emittedBrowser).href)) as {
+                readonly savePost: {
+                    (): never;
+                    readonly __chardbKind: string;
+                    readonly __chardbRef: string;
+                };
+            };
+            expect(typeof browserModule.savePost).toBe("function");
+            expect(browserModule.savePost.__chardbKind).toBe("mutation");
+            expect(browserModule.savePost.__chardbRef).toBe("api/posts#save-browser");
+            expect(() => browserModule.savePost()).toThrow("cannot execute in the browser");
+
+            const server = await viteBuild({
+                configFile: false,
+                logLevel: "silent",
+                plugins: [chardb()],
+                build: {
+                    write: false,
+                    minify: false,
+                    ssr: entry,
+                    rollupOptions: { external: ["@chardb/core/server"] },
+                },
+            });
+            const serverCode = emittedCode(server);
+            expect(serverCode).toContain("api/posts#save-browser");
+            expect(serverCode).toContain("MUTATION_HANDLER_SENTINEL");
+            expect(serverCode).toContain("MUTATION_SCHEMA_IMPORT_SENTINEL");
+            expect(serverCode).toContain("@chardb/core/server");
+        } finally {
+            await rm(fixture, { recursive: true, force: true });
+        }
+    });
+
+    test("keeps a generated-style browser entry free of schema, handlers, and server constants", async () => {
+        const fixture = await mkdtemp(path.join(tmpdir(), "chardb-generated-vite-"));
+        const entry = path.join(fixture, "entry.ts");
+        try {
+            await Promise.all([
+                writeFile(path.join(fixture, "schema.ts"), 'export const messages = "GENERATED_SCHEMA_SENTINEL";\n'),
+                writeFile(
+                    path.join(fixture, "api.ts"),
+                    `
+import { api } from "@chardb/core/server";
+import { messages } from "./schema.ts";
+const serverSecret = "GENERATED_MUTATION_SECRET";
+export const postMessage = api.mutation({
+  ref: "src/api.ts#postMessage",
+  handler: ctx => ctx.db.insert(messages).values({ body: serverSecret }).run(),
+});
+`
+                ),
+                writeFile(
+                    path.join(fixture, "queries.ts"),
+                    `
+import { api } from "@chardb/core/server";
+import { messages } from "./schema.ts";
+const queryImplementation = "GENERATED_QUERY_IMPLEMENTATION";
+export const listMessages = api.query({
+  ref: "src/queries.ts#listMessages",
+  query: db => db.select().from(messages).where(queryImplementation),
+});
+`
+                ),
+                writeFile(
+                    entry,
+                    `
+export { postMessage } from "./api.ts";
+export { listMessages } from "./queries.ts";
+`
+                ),
+            ]);
+
+            const browser = await viteBuild({
+                configFile: false,
+                logLevel: "silent",
+                plugins: [chardb()],
+                build: {
+                    write: false,
+                    minify: false,
+                    lib: { entry, formats: ["es"] },
+                    rollupOptions: { external: ["@chardb/core/server"] },
+                },
+            });
+            const browserCode = emittedCode(browser);
+            expect(browserCode).toContain("src/api.ts#postMessage");
+            expect(browserCode).toContain("src/queries.ts#listMessages");
+            expect(browserCode).not.toContain("GENERATED_SCHEMA_SENTINEL");
+            expect(browserCode).not.toContain("GENERATED_MUTATION_SECRET");
+            expect(browserCode).not.toContain("GENERATED_QUERY_IMPLEMENTATION");
+            expect(browserCode).not.toContain("@chardb/core/server");
+
+            const server = await viteBuild({
+                configFile: false,
+                logLevel: "silent",
+                plugins: [chardb()],
+                build: {
+                    write: false,
+                    minify: false,
+                    ssr: entry,
+                    rollupOptions: { external: ["@chardb/core/server"] },
+                },
+            });
+            const serverCode = emittedCode(server);
+            expect(serverCode).toContain("GENERATED_SCHEMA_SENTINEL");
+            expect(serverCode).toContain("GENERATED_MUTATION_SECRET");
+            expect(serverCode).toContain("GENERATED_QUERY_IMPLEMENTATION");
+            expect(serverCode).toContain("@chardb/core/server");
+        } finally {
+            await rm(fixture, { recursive: true, force: true });
+        }
+    });
+
+    test("browser mutation erasure fails closed for unknown targets, mixed exports, and positional calls", () => {
+        const source = `
+import { api } from "@chardb/core/server";
+export const savePost = api.mutation({ ref: "api/posts#save", handler: () => null });
+`;
+        const unknownTarget = makePlugin();
+        expect(() => unknownTarget.transform(source, "/abs/proj/src/routes/mutation.ts", { ssr: false })).toThrow(
+            "Cannot determine the Vite environment for api.mutation module"
+        );
+
+        const mixed = makePlugin();
+        expect(() =>
+            mixed.transform.call(
+                { environment: { name: "client" } },
+                `${source}\nexport const runtimeValue = 1;`,
+                "/abs/proj/src/routes/mixed-mutation.ts",
+                { ssr: false }
+            )
+        ).toThrow("may export only erased handles and types");
+
+        const positional = makePlugin();
+        expect(() =>
+            positional.transform.call(
+                { environment: { name: "client" } },
+                `
+import { api } from "@chardb/core/server";
+export const savePost = api.mutation((_ctx, args) => args, { ref: "api/posts#save" });
+`,
+                "/abs/proj/src/routes/positional-mutation.ts",
+                { ssr: false }
+            )
+        ).toThrow("supports only inline api.mutation({ ... }) exports");
+
+        const implicitRef = makePlugin();
+        expect(() =>
+            implicitRef.transform.call(
+                { environment: { name: "client" } },
+                `
+import { api } from "@chardb/core/server";
+export const savePost = api.mutation({ handler: () => null });
+`,
+                "/abs/proj/src/routes/implicit-ref.ts",
+                { ssr: false }
+            )
+        ).toThrow("requires a literal ref because Wrangler builds the Worker separately from Vite");
+    });
+
+    test("erases planned queries and api mutations together without changing either handle kind", async () => {
+        const p = makePlugin();
+        const output = p.transform.call(
+            { environment: { name: "client" } },
+            `
+import { api } from "@chardb/core/server";
+export type SaveArgs = { id: string };
+export const save = api.mutation({ ref: "api/items#save", handler: () => null });
+export const list = api.query({ ref: "api/items#list", query: db => db.select().from(items) });
+`,
+            "/abs/proj/src/routes/handles.ts",
+            { ssr: false }
+        );
+        expect(output?.code).toContain('__chardbBrowserHandle("mutation", "api/items#save")');
+        expect(output?.code).toContain('__chardbBrowserHandle("query", "api/items#list")');
+        expect(output?.code).not.toContain("@chardb/core/server");
+        expect(output?.code).not.toContain("db.select");
+    });
+
+    test("browser erasure fails closed for mixed runtime exports and leaves legacy queries intact", () => {
+        const unknownTarget = makePlugin();
+        expect(() =>
+            unknownTarget.transform(
+                `
+import { api } from "@chardb/core/server";
+export const listPosts = api.query({
+  ref: "api/posts#unknown-target",
+  query: (db) => db.select().from(posts).limit(1),
+});
+`,
+                "/abs/proj/src/routes/unknown-target.ts",
+                { ssr: false }
+            )
+        ).toThrow("Cannot determine the Vite environment for planned-query module");
+
+        const planned = makePlugin();
+        expect(() =>
+            planned.transform.call(
+                { environment: { name: "client" } },
+                `
+import { api } from "@chardb/core/server";
+export const listPosts = api.query({
+  ref: "api/posts#planned-list",
+  query: (db) => db.select().from(posts).limit(1),
+});
+export const browserConstant = 1;
+`,
+                "/abs/proj/src/routes/mixed.ts",
+                { ssr: false }
+            )
+        ).toThrow("may export only planned queries and types");
+
+        const legacy = makePlugin();
+        const output = legacy.transform.call(
+            { environment: { name: "client" } },
+            `
+import { api } from "@chardb/core/server";
+export const listPosts = api.query({
+  ref: "api/posts#legacy-list",
+  handler: async () => "LEGACY_HANDLER_SENTINEL",
+});
+`,
+            "/abs/proj/src/routes/legacy.ts",
+            { ssr: false }
+        );
+        expect(output?.code).toContain("LEGACY_HANDLER_SENTINEL");
+        expect(output?.code).toContain('value: "api/posts#legacy-list"');
+    });
+
     test("preserves explicit config refs for two mutations and a query", () => {
         const p = makePlugin();
         const code = `
-      import { api } from "chardb/server";
+      import { api } from "@chardb/core/server";
       export const createPost = api.mutation({ ref: "api/posts#create", handler: () => ({}) });
       export const deletePost = api.mutation({ ref: "api/posts#delete", handler: () => ({}) });
       export const listPosts = api.query({ ref: "api/posts#list", handler: async () => [] });
@@ -158,7 +560,7 @@ describe("@chardb/vite-plugin", () => {
         const out = transform(
             p,
             `
-      import { defineMutation } from "chardb/server";
+      import { defineMutation } from "@chardb/core/server";
       export const save = defineMutation((_ctx, args) => args, { ref: "api/items#save" });
     `,
             "/abs/proj/src/items.ts"
@@ -172,7 +574,7 @@ describe("@chardb/vite-plugin", () => {
         const out = transform(
             p,
             `
-      import { api } from "chardb/server";
+      import { api } from "@chardb/core/server";
       export const save = api.mutation((_ctx, args) => args, {
         authority: "organization",
         ref: "api/items#save",
@@ -189,7 +591,7 @@ describe("@chardb/vite-plugin", () => {
         expect(() =>
             p.transform(
                 `
-          import { api } from "chardb/server";
+          import { api } from "@chardb/core/server";
           export const save = api.mutation({
             authority: "organization",
             partitionKey: "organizationId",
@@ -206,7 +608,7 @@ describe("@chardb/vite-plugin", () => {
         expect(() =>
             p.transform(
                 `
-          import { api } from "chardb/server";
+          import { api } from "@chardb/core/server";
           export const list = api.query({
             authority: "organization",
             partitionKey: "organizationId",
@@ -224,7 +626,7 @@ describe("@chardb/vite-plugin", () => {
         const out = transform(
             p,
             `
-      import { api } from "chardb/server";
+      import { api } from "@chardb/core/server";
       export const save = api.mutation({
         ref: "api/settings#save",
         authority: "global",
@@ -269,7 +671,7 @@ describe("@chardb/vite-plugin", () => {
         for (const testCase of cases) {
             const p = makePlugin();
             expect(() =>
-                p.transform(`import { api } from "chardb/server"; ${testCase.source}`, "/abs/proj/src/global.ts")
+                p.transform(`import { api } from "@chardb/core/server"; ${testCase.source}`, "/abs/proj/src/global.ts")
             ).toThrow(testCase.message);
         }
     });
@@ -279,7 +681,7 @@ describe("@chardb/vite-plugin", () => {
         expect(() =>
             duplicate.transform(
                 `
-          import { api } from "chardb/server";
+          import { api } from "@chardb/core/server";
           export const first = api.mutation({ ref: "api/posts#same", handler: () => null });
           export const second = api.mutation({ ref: "api/posts#same", handler: () => null });
         `,
@@ -291,7 +693,7 @@ describe("@chardb/vite-plugin", () => {
         expect(() =>
             dynamic.transform(
                 `
-          import { api } from "chardb/server";
+          import { api } from "@chardb/core/server";
           const ref = "api/posts#dynamic";
           export const save = api.mutation({ ref, handler: () => null });
         `,
@@ -302,7 +704,7 @@ describe("@chardb/vite-plugin", () => {
 
     test("explicit refs survive moving the source module", () => {
         const code = `
-      import { api } from "chardb/server";
+      import { api } from "@chardb/core/server";
       export const save = api.mutation({ ref: "api/items#save", handler: () => null });
     `;
         const first = transform(makePlugin(), code, "/first/src/items.ts");
@@ -321,7 +723,7 @@ describe("@chardb/vite-plugin", () => {
         for (const source of cases) {
             const p = makePlugin();
             expect(() =>
-                p.transform(`import { api } from "chardb/server"; ${source}`, "/abs/proj/src/rejected.ts")
+                p.transform(`import { api } from "@chardb/core/server"; ${source}`, "/abs/proj/src/rejected.ts")
             ).toThrow();
         }
     });
@@ -329,51 +731,23 @@ describe("@chardb/vite-plugin", () => {
     test("fails clearly when two modules produce the same stable ref", () => {
         const p = makePlugin();
         const code = `
-      import { api } from "chardb/server";
+      import { api } from "@chardb/core/server";
       export const save = api.mutation({ ref: "src/shared.ts#save", handler: () => ({}) });
     `;
-        p.transform(code, "/workspace/first/src/shared.ts");
+        transform(p, code, "/workspace/first/src/shared.ts");
         expect(() => p.transform(code, "/workspace/second/src/shared.ts")).toThrow(
             'Duplicate stable ref "src/shared.ts#save"'
         );
     });
 
-    test("removes stale registry and manifest entries when a module drops all Chardb exports", () => {
+    test("releases a stable ref when its module stops exporting the handle", () => {
         const p = makePlugin();
-        const id = "/abs/proj/src/removed.ts";
-        transform(p, "export const save = defineMutation({ handler: () => ({}) });", id);
-        expect(p.load("\0virtual:chardb/registry")).toContain("src/removed.ts#save");
-        expect(p.load("\0virtual:chardb/manifest")).toContain(`from "${id}"`);
-
-        expect(p.transform("export const ordinary = 1;", id)).toBeNull();
-        expect(p.load("\0virtual:chardb/registry")).not.toContain("src/removed.ts#save");
-        expect(p.load("\0virtual:chardb/manifest")).not.toContain(`from "${id}"`);
-    });
-
-    test("emits virtual:chardb/manifest with imports per registered module", () => {
-        const p = makePlugin();
-        p.transform("export const a = defineMutation(async () => ({}));", "/abs/proj/src/m1.ts");
-        p.transform("export const b = defineQuery(async () => ({}));", "/abs/proj/src/m2.ts");
-        const id = p.resolveId("virtual:chardb/manifest");
-        expect(id).toBe("\0virtual:chardb/manifest");
-        if (!id) throw new Error("Expected virtual manifest id");
-        const src = p.load(id);
-        expect(src).not.toBeNull();
-        expect(src).toContain("manifestFromExports");
-        expect(src).toContain('from "/abs/proj/src/m1.ts"');
-        expect(src).toContain('from "/abs/proj/src/m2.ts"');
-    });
-
-    test("packages the configured migration journal through the virtual module", () => {
-        const configured = chardb({ migrations: "./src/server/migrations.ts" }) as unknown as PluginShape;
-        const id = configured.resolveId("virtual:chardb/migrations");
-        expect(id).toBe("\0virtual:chardb/migrations");
-        if (!id) throw new Error("Expected migrations virtual module id");
-        expect(configured.load(id)).toBe('export { migrations } from "./src/server/migrations.ts";');
-
-        const fallback = makePlugin();
-        const fallbackId = fallback.resolveId("virtual:chardb/migrations");
-        if (!fallbackId) throw new Error("Expected migrations fallback module id");
-        expect(fallback.load(fallbackId)).toContain("defineMigrations([])");
+        const source = `
+import { api } from "@chardb/core/server";
+export const save = api.mutation({ ref: "api/items#save", handler: () => null });
+`;
+        transform(p, source, "/workspace/src/old.ts");
+        expect(p.transform("export const ordinary = 1;", "/workspace/src/old.ts")).toBeNull();
+        expect(() => transform(p, source, "/workspace/src/new.ts")).not.toThrow();
     });
 });

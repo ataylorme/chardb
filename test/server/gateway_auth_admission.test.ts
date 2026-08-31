@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { Gateway, type GatewayEnv, type VerifiedGwAttachment } from "../../src/server/do/gateway.ts";
+import type { VerifiedGwAttachment } from "../../src/server/do/gateway-auth-dispatch.ts";
+import { Gateway, type GatewayEnv } from "../../src/server/do/gateway.ts";
 import { ClientId, Cookie, PrincipalId } from "../../src/types.ts";
 import { PROTOCOL_V } from "../../src/wire.ts";
 
@@ -121,12 +122,14 @@ describe("Gateway authentication single-flight admission", () => {
     let ready: Promise<unknown>;
     let currentAlarm: number | null;
     let transactionSyncCalls: number;
+    let clock: number;
 
     beforeEach(async () => {
         db = new Database(":memory:");
         ready = Promise.resolve();
         currentAlarm = null;
         transactionSyncCalls = 0;
+        clock = Date.now();
         const state = {
             id: { toString: () => "gateway-auth-admission" },
             storage: {
@@ -165,7 +168,12 @@ describe("Gateway authentication single-flight admission", () => {
                 ready = callback();
             },
         } as unknown as DurableObjectState;
-        gateway = new Gateway(state, {
+        class TestGateway extends Gateway {
+            protected override gatewayNowMs(): number {
+                return clock;
+            }
+        }
+        gateway = new TestGateway(state, {
             CDB_CATALOG: {} as DurableObjectNamespace,
             CDB_SHARD: {} as DurableObjectNamespace,
         } satisfies GatewayEnv);
@@ -173,6 +181,64 @@ describe("Gateway authentication single-flight admission", () => {
     });
 
     afterEach(() => db.close());
+
+    test("rejects wrong-direction wire messages before dispatch", async () => {
+        const socket = new FakeSocket(pendingAttachment());
+
+        await gateway.webSocketMessage(
+            socket as unknown as WebSocket,
+            JSON.stringify({ t: "welcome", protocolV: PROTOCOL_V, baseCookie: "cookie-0", region: "test" })
+        );
+
+        expect(socket.sent.map(message => JSON.parse(message))).toEqual([
+            expect.objectContaining({ t: "error", code: "CDB_UNSUPPORTED_FEATURE" }),
+        ]);
+    });
+
+    test("keeps an unsupported stream error scoped to its request", async () => {
+        const socket = new FakeSocket(verifiedAttachment());
+
+        await gateway.webSocketMessage(
+            socket as unknown as WebSocket,
+            JSON.stringify({
+                t: "streamReq",
+                streamReqId: 7,
+                ref: "api.ts#exportRows",
+                args: {},
+                mutId: "stream-mut-1",
+            })
+        );
+
+        expect(socket.sent.map(message => JSON.parse(message))).toEqual([
+            expect.objectContaining({
+                t: "error",
+                code: "CDB_UNSUPPORTED_FEATURE",
+                streamReqId: 7,
+            }),
+        ]);
+        expect(socket.closed).toEqual([]);
+    });
+
+    test("distinguishes unauthenticated presence from an authenticated but unbound feature", async () => {
+        const pending = new FakeSocket(pendingAttachment());
+        await gateway.webSocketMessage(
+            pending as unknown as WebSocket,
+            JSON.stringify({ t: "presenceSub", key: "room-1" })
+        );
+
+        const verified = new FakeSocket(verifiedAttachment());
+        await gateway.webSocketMessage(
+            verified as unknown as WebSocket,
+            JSON.stringify({ t: "presenceSub", key: "room-1" })
+        );
+
+        expect(pending.sent.map(message => JSON.parse(message))).toEqual([
+            expect.objectContaining({ t: "error", code: "CDB_FORBIDDEN" }),
+        ]);
+        expect(verified.sent.map(message => JSON.parse(message))).toEqual([
+            expect.objectContaining({ t: "error", code: "CDB_AUTH_NOT_BOUND" }),
+        ]);
+    });
 
     test("admits one held hello, rate-limits duplicates, and commits only the owner", async () => {
         const socket = new FakeSocket(pendingAttachment());
@@ -201,6 +267,29 @@ describe("Gateway authentication single-flight admission", () => {
             expect.objectContaining({ t: "welcome", protocolV: PROTOCOL_V })
         );
         expect(internals.authOperationClaims.size).toBe(0);
+    });
+
+    test("binds a fresh verified socket to the same base cookie sent in welcome", async () => {
+        const socket = new FakeSocket(pendingAttachment());
+        const internals = gateway as unknown as GatewayInternals;
+        internals.verifyAttachment = async () => {
+            const { lastCookie: _omitted, ...verified } = verifiedAttachment();
+            return verified;
+        };
+
+        await hello(gateway, socket, "fresh-token");
+
+        expect(socket.attachment).toMatchObject({
+            kind: "verified",
+            clientId: "client-1",
+            lastCookie: "client-1:0",
+        });
+        expect(socket.sent.map(message => JSON.parse(message))).toContainEqual(
+            expect.objectContaining({
+                t: "welcome",
+                baseCookie: "client-1:0",
+            })
+        );
     });
 
     test("releases a thrown hello claim and admits a later verification", async () => {
@@ -417,6 +506,60 @@ describe("Gateway authentication single-flight admission", () => {
         ]);
         expect(socket.sendCalls).toBe(1);
         expect(socket.serializeCalls).toBe(1);
+        expect(socket.closed).toEqual([{ code: 1008, reason: "CDB_FORBIDDEN" }]);
+        expect(internals.authOperationClaims.size).toBe(0);
+        expect(internals.authRefreshBarriers.size).toBe(0);
+    });
+
+    test("rejects updateAuth after the attached token's refresh grace has ended", async () => {
+        const socket = new FakeSocket({ ...verifiedAttachment(), jwtExp: 1 });
+        const internals = gateway as unknown as GatewayInternals;
+        let updateCalls = 0;
+        internals.performUpdateAuth = async () => {
+            updateCalls += 1;
+            return true;
+        };
+        clock = 61_000;
+
+        await updateAuth(gateway, socket, "late-token");
+
+        expect(updateCalls).toBe(0);
+        expect(socket.attachment).toEqual({
+            kind: "rejected",
+            connectionId: "connection-1",
+            authOrigin: "https://app.example",
+        });
+        expect(socket.sent.map(message => JSON.parse(message))).toEqual([
+            expect.objectContaining({ t: "error", code: "CDB_FORBIDDEN", retryable: false }),
+        ]);
+        expect(socket.closed).toEqual([{ code: 1008, reason: "CDB_FORBIDDEN" }]);
+        expect(internals.authOperationClaims.size).toBe(0);
+        expect(internals.authRefreshBarriers.size).toBe(0);
+    });
+
+    test("an updateAuth started during grace cannot commit after the grace deadline", async () => {
+        const socket = new FakeSocket({ ...verifiedAttachment(), jwtExp: 1 });
+        const internals = gateway as unknown as GatewayInternals;
+        let finishVerification: (attachment: VerifiedGwAttachment) => void = () => {};
+        internals.verifyAttachment = () =>
+            new Promise(resolve => {
+                finishVerification = resolve;
+            });
+        clock = 60_999;
+
+        const refresh = updateAuth(gateway, socket, "just-in-time-token");
+        clock = 61_000;
+        finishVerification({ ...verifiedAttachment(), jwtExp: 1_000 });
+        await refresh;
+
+        expect(socket.attachment).toEqual({
+            kind: "rejected",
+            connectionId: "connection-1",
+            authOrigin: "https://app.example",
+        });
+        expect(socket.sent.map(message => JSON.parse(message))).toEqual([
+            expect.objectContaining({ t: "error", code: "CDB_FORBIDDEN", retryable: false }),
+        ]);
         expect(socket.closed).toEqual([{ code: 1008, reason: "CDB_FORBIDDEN" }]);
         expect(internals.authOperationClaims.size).toBe(0);
         expect(internals.authRefreshBarriers.size).toBe(0);

@@ -4,39 +4,29 @@
  * Owns:
  *   - WS reconnect with cookie carryover (G24, RECONNECT_RYW_WINDOW_MS = 30s)
  *   - per-sub state machine (pending → live → live → refetching → live)
- *   - optimistic mutation queue with cookie-aligned drop (an optimistic patch
- *     is dropped on the first server poke whose cookie >= the patch's
- *     `appliedAtCookie`, never on a wall-clock timer)
- *   - cross-tab BroadcastChannel default-on
  *   - mutId allocation (UUIDv7)
  */
 
 import { uuidv7 } from "uuidv7";
 import { CdbError, type CdbErrorCode, isCdbError } from "../errors.ts";
 import { ChardbRef, ClientId, type Cookie, type CorrelationId, MutId, type RawJson, SubId } from "../types.ts";
-import {
-    type Down,
-    type MustRefetchReason,
-    PROTOCOL_V,
-    type RowPatch,
-    type Up,
-    checkProtocolV,
-    decodeWire,
-    encodeWire,
-} from "../wire.ts";
+import { PROTOCOL_V, type RowPatch, type Up, checkProtocolV, decodeDown, encodeWire } from "../wire.ts";
 import { assertSerializedSize, snapshotMutationArguments, snapshotSubscriptionArguments } from "./serialized-json.ts";
 
 export const RECONNECT_RYW_WINDOW_MS = 30_000;
 const DEFAULT_MUTATION_TIMEOUT_MS = 60_000;
 const RECONNECT_INITIAL_BACKOFF_MS = 250;
 const RECONNECT_MAX_BACKOFF_MS = 10_000;
+const SUBSCRIPTION_RETRY_INITIAL_BACKOFF_MS = 100;
+const SUBSCRIPTION_RETRY_MAX_BACKOFF_MS = 2_000;
+const JWT_REFRESH_LEAD_MS = 60_000;
+const JWT_REFRESH_READ_INITIAL_BACKOFF_MS = 1_000;
+const JWT_REFRESH_READ_MAX_BACKOFF_MS = 10_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_INBOUND_WEBSOCKET_BYTES = 1_024 * 1_024;
 const MAX_ACTIVE_SUBSCRIPTIONS = 64;
 const MAX_SUBSCRIPTION_ROWS = 4_096;
 const MAX_SUBSCRIPTION_BYTES = 512 * 1_024;
-const MAX_OPTIMISTIC_PATCHES = 4_096;
-const MAX_OPTIMISTIC_PATCH_BYTES = 512 * 1_024;
 const MAX_PATCHES_PER_BATCH = 4_096;
 const MAX_PATCH_BATCH_BYTES = 512 * 1_024;
 const MAX_PENDING_MUTATIONS = 32;
@@ -47,11 +37,34 @@ export interface ChardbClientOptions {
     readonly endpoint: string;
     readonly getJwt: () => Promise<string>;
     readonly clientId?: string;
-    readonly logicalDb?: string;
-    readonly crossTab?: boolean;
-    readonly persistMutations?: "memory" | "indexeddb";
     /** Maximum time to wait for a mutation result, including reconnects. Defaults to 60 seconds. */
     readonly mutationTimeoutMs?: number;
+    /** Receives bounded terminal-session diagnostics. Listener failures are ignored. */
+    readonly onSessionError?: (diagnostic: ChardbClientSessionErrorDiagnostic) => void;
+}
+
+export type ChardbClientSessionFailureReason =
+    | "auth-refresh-read"
+    | "auth-refresh-invalid-token"
+    | "auth-refresh-principal-changed"
+    | "auth-refresh-expiry-not-extended"
+    | "auth-refresh-send"
+    | "connect"
+    | "subscription-retry-send"
+    | "reconnect-refetch-listener"
+    | "auth-refresh-close"
+    | "invalid-handshake-frame"
+    | "invalid-session-frame"
+    | "protocol-selection"
+    | "protocol-rejection"
+    | "auth-refresh-rejection"
+    | "session-rejection"
+    | "unsubscribe-send"
+    | "client-close";
+
+export interface ChardbClientSessionErrorDiagnostic {
+    readonly code: CdbErrorCode;
+    readonly reason: ChardbClientSessionFailureReason;
 }
 
 type SubState = "pending" | "live" | "refetching" | "error" | "closed";
@@ -71,13 +84,13 @@ interface SubRecord {
     state: SubState;
     rows: RawJson[];
     listeners: Set<(rows: RawJson[], state: SubState) => void>;
-    optimisticPatches: RowPatch[];
     lastSnapshotCookie: Cookie | undefined;
+    retryTimer: ReturnType<typeof setTimeout> | null;
+    retryBackoffMs: number;
 }
 
 interface PlannedSubState {
     rows: RawJson[];
-    optimisticPatches: RowPatch[];
 }
 
 interface PendingMutation {
@@ -89,6 +102,47 @@ interface PendingMutation {
     /** Set after first send so reconnect doesn't double-resolve. */
     inFlight: boolean;
     timeout: ReturnType<typeof setTimeout> | null;
+}
+
+interface JwtRefreshClaims {
+    readonly subject: string;
+    readonly expiresAtMs: number;
+}
+
+interface PendingAuthRefresh {
+    readonly attempt: number;
+    readonly socket: WebSocket;
+    readonly claims: JwtRefreshClaims;
+    readonly generation: number;
+}
+
+function decodeJwtRefreshClaims(jwt: string): JwtRefreshClaims | null {
+    const parts = jwt.split(".");
+    const payload = parts[1];
+    if (parts.length !== 3 || payload === undefined || payload.length === 0) return null;
+    try {
+        const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+        const binary = atob(padded);
+        const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+        const value = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+        if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+        const claims = value as { readonly sub?: unknown; readonly exp?: unknown };
+        if (
+            typeof claims.sub !== "string" ||
+            claims.sub.length === 0 ||
+            typeof claims.exp !== "number" ||
+            !Number.isSafeInteger(claims.exp) ||
+            claims.exp <= 0
+        ) {
+            return null;
+        }
+        const expiresAtMs = claims.exp * 1_000;
+        if (!Number.isSafeInteger(expiresAtMs)) return null;
+        return { subject: claims.sub, expiresAtMs };
+    } catch {
+        return null;
+    }
 }
 
 export interface ChardbClient {
@@ -111,11 +165,20 @@ export function createChardbClient(opts: ChardbClientOptions): ChardbClient {
     return controller.client;
 }
 
+interface DeferredChardbClientControllerOptions {
+    /** @internal Let an auth-aware owner decide when queued work may connect. */
+    readonly autoStartOnOperation?: boolean;
+}
+
 /** @internal Used by the React provider to keep connection startup out of render. */
-export function createDeferredChardbClientController(opts: ChardbClientOptions): {
+export function createDeferredChardbClientController(
+    opts: ChardbClientOptions,
+    controllerOpts: DeferredChardbClientControllerOptions = {}
+): {
     readonly client: ChardbClient;
     readonly start: () => void;
 } {
+    const autoStartOnOperation = controllerOpts.autoStartOnOperation ?? true;
     const mutationTimeoutMs = opts.mutationTimeoutMs ?? DEFAULT_MUTATION_TIMEOUT_MS;
     if (!Number.isSafeInteger(mutationTimeoutMs) || mutationTimeoutMs <= 0 || mutationTimeoutMs > MAX_TIMER_DELAY_MS) {
         throw new RangeError(`mutationTimeoutMs must be an integer between 1 and ${MAX_TIMER_DELAY_MS}`);
@@ -135,37 +198,165 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
     let resumeExpiryCookie: Cookie | undefined;
     let started = false;
     let connectionAttempt = 0;
+    let authRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let authRefreshDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    let authRefreshGeneration = 0;
+    let authRefreshReadBackoffMs = JWT_REFRESH_READ_INITIAL_BACKOFF_MS;
+    let pendingAuthRefresh: PendingAuthRefresh | null = null;
+    let openedSession = false;
 
-    // BroadcastChannel
-    // (https://developer.mozilla.org/en-US/docs/Web/API/BroadcastChannel)
-    // propagates optimistic patches and authoritative cookie advances across
-    // tabs that share an origin so a single mutation in one tab settles every
-    // other tab's `useQuery` cache without an extra round-trip.
-    const enableCrossTab = opts.crossTab !== false && typeof BroadcastChannel !== "undefined";
-    let bc: BroadcastChannel | null = null;
+    function clearAuthRefreshTimer(): void {
+        if (authRefreshTimer === null) return;
+        clearTimeout(authRefreshTimer);
+        authRefreshTimer = null;
+    }
 
-    function onCrossTab(value: unknown): void {
-        try {
-            if (value === null || typeof value !== "object" || Array.isArray(value)) {
-                throw new TypeError("malformed Chardb cross-tab message");
+    function clearAuthRefreshDeadline(): void {
+        authRefreshGeneration += 1;
+        if (authRefreshDeadlineTimer === null) return;
+        clearTimeout(authRefreshDeadlineTimer);
+        authRefreshDeadlineTimer = null;
+    }
+
+    function beginAuthRefresh(attempt: number, socket: WebSocket, claims: JwtRefreshClaims): void {
+        clearAuthRefreshDeadline();
+        if (terminated || attempt !== connectionAttempt || ws !== socket || state !== "open") return;
+        const generation = authRefreshGeneration;
+        const delayMs = Math.max(0, claims.expiresAtMs - Date.now());
+        const deadlineTimer = setTimeout(() => {
+            if (
+                authRefreshDeadlineTimer !== deadlineTimer ||
+                terminated ||
+                generation !== authRefreshGeneration ||
+                attempt !== connectionAttempt ||
+                ws !== socket ||
+                state !== "open"
+            ) {
+                return;
             }
-            const message = value as { readonly kind?: unknown; readonly patches?: unknown };
-            if (message.kind !== "optimistic") return;
-            assertPatchBatchLimits(message.patches);
-            const decoded = decodeWire(JSON.stringify({ t: "poke", cookie: "cross-tab", patches: message.patches }));
-            if (decoded.t !== "poke") throw new TypeError("malformed Chardb optimistic patch message");
-            applyPatches(decoded.patches, true);
-            // Canonical patches arrive via the server poke, deduped on cookie.
+            authRefreshDeadlineTimer = null;
+            const awaitingGateway = pendingAuthRefresh?.generation === generation;
+            pendingAuthRefresh = null;
+            failSession(
+                "CDB_FORBIDDEN",
+                "authentication expired before refresh completed",
+                awaitingGateway ? "auth-refresh-close" : "auth-refresh-read"
+            );
+        }, delayMs);
+        authRefreshDeadlineTimer = deadlineTimer;
+        void refreshAuth(attempt, socket, claims, generation);
+    }
+
+    function scheduleAuthRefresh(attempt: number, socket: WebSocket, claims: JwtRefreshClaims): void {
+        clearAuthRefreshTimer();
+        if (terminated || attempt !== connectionAttempt || ws !== socket || state !== "open") return;
+        if (authRefreshDeadlineTimer !== null) return;
+        const remainingMs = claims.expiresAtMs - JWT_REFRESH_LEAD_MS - Date.now();
+        const delayMs = Math.max(0, Math.min(remainingMs, MAX_TIMER_DELAY_MS));
+        const refreshTimer = setTimeout(() => {
+            if (authRefreshTimer !== refreshTimer) return;
+            authRefreshTimer = null;
+            if (remainingMs > MAX_TIMER_DELAY_MS) {
+                scheduleAuthRefresh(attempt, socket, claims);
+                return;
+            }
+            beginAuthRefresh(attempt, socket, claims);
+        }, delayMs);
+        authRefreshTimer = refreshTimer;
+    }
+
+    async function refreshAuth(
+        attempt: number,
+        socket: WebSocket,
+        current: JwtRefreshClaims,
+        generation: number
+    ): Promise<void> {
+        let jwt: string;
+        try {
+            jwt = await opts.getJwt();
         } catch {
-            failSession("CDB_INVARIANT", "received invalid cross-tab subscription state");
+            if (
+                terminated ||
+                generation !== authRefreshGeneration ||
+                attempt !== connectionAttempt ||
+                ws !== socket ||
+                state !== "open"
+            ) {
+                return;
+            }
+            const validForMs = current.expiresAtMs - Date.now();
+            if (validForMs <= 0) {
+                failSession("CDB_FORBIDDEN", "failed to refresh Chardb authentication", "auth-refresh-read");
+                return;
+            }
+            const delayMs = Math.min(authRefreshReadBackoffMs, validForMs);
+            authRefreshReadBackoffMs = Math.min(authRefreshReadBackoffMs * 2, JWT_REFRESH_READ_MAX_BACKOFF_MS);
+            const retryTimer = setTimeout(() => {
+                if (authRefreshTimer !== retryTimer) return;
+                authRefreshTimer = null;
+                void refreshAuth(attempt, socket, current, generation);
+            }, delayMs);
+            authRefreshTimer = retryTimer;
+            return;
+        }
+        if (
+            terminated ||
+            generation !== authRefreshGeneration ||
+            attempt !== connectionAttempt ||
+            ws !== socket ||
+            state !== "open"
+        ) {
+            return;
+        }
+        const refreshed = decodeJwtRefreshClaims(jwt);
+        if (!refreshed) {
+            failSession(
+                "CDB_FORBIDDEN",
+                "authentication refresh returned an invalid JWT",
+                "auth-refresh-invalid-token"
+            );
+            return;
+        }
+        // Decoded claims only decide whether this client can retain its
+        // socket. The Gateway still verifies the token before it admits work.
+        if (refreshed.subject !== current.subject) {
+            failSession("CDB_FORBIDDEN", "authentication refresh changed principal", "auth-refresh-principal-changed");
+            return;
+        }
+        if (refreshed.expiresAtMs <= current.expiresAtMs || refreshed.expiresAtMs <= Date.now()) {
+            failSession(
+                "CDB_FORBIDDEN",
+                "authentication refresh did not extend the JWT expiry",
+                "auth-refresh-expiry-not-extended"
+            );
+            return;
+        }
+        authRefreshReadBackoffMs = JWT_REFRESH_READ_INITIAL_BACKOFF_MS;
+        try {
+            const update: Up = { t: "updateAuth", jwt };
+            pendingAuthRefresh = { attempt, socket, claims: refreshed, generation };
+            socket.send(encodeWire(update));
+        } catch {
+            pendingAuthRefresh = null;
+            failSession("CDB_STREAM_ABORTED", "failed to send refreshed Chardb authentication", "auth-refresh-send");
         }
     }
 
     async function connect(attempt: number): Promise<void> {
         if (terminated || attempt !== connectionAttempt) return;
         state = "connecting";
-        const jwt = await opts.getJwt();
+        let jwt: string;
+        try {
+            jwt = await opts.getJwt();
+        } catch (error) {
+            if (!openedSession) throw error;
+            if (terminated || attempt !== connectionAttempt) return;
+            scheduleReconnect();
+            return;
+        }
+        const jwtRefreshClaims = decodeJwtRefreshClaims(jwt);
         if (terminated || attempt !== connectionAttempt) return;
+        authRefreshReadBackoffMs = JWT_REFRESH_READ_INITIAL_BACKOFF_MS;
         const url = new URL(opts.endpoint);
         url.searchParams.set("clientId", clientId);
         const socket = new WebSocket(url.toString());
@@ -187,7 +378,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         };
         socket.onmessage = ev => {
             if (terminated || attempt !== connectionAttempt || ws !== socket) return;
-            receiveWire(ev.data);
+            receiveWire(ev.data, attempt, socket, jwtRefreshClaims);
         };
         socket.onclose = () => {
             if (!revokeSocket(attempt, socket)) return;
@@ -210,25 +401,35 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
     function revokeSocket(attempt: number, socket: WebSocket): boolean {
         if (terminated || attempt !== connectionAttempt || ws !== socket) return false;
         connectionAttempt += 1;
+        clearAuthRefreshTimer();
+        clearAuthRefreshDeadline();
+        if (pendingAuthRefresh?.socket === socket) pendingAuthRefresh = null;
         ws = null;
         return true;
+    }
+
+    function scheduleReconnect(): void {
+        if (terminated) return;
+        state = "reconnecting";
+        if (reconnectTimer !== null) return;
+        reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            reconnectBackoff = Math.min(reconnectBackoff * 2, RECONNECT_MAX_BACKOFF_MS);
+            startConnect();
+        }, reconnectBackoff);
     }
 
     function startConnect(): void {
         const attempt = ++connectionAttempt;
         void connect(attempt).catch(() => {
             if (terminated || attempt !== connectionAttempt) return;
-            failSession("CDB_INVARIANT", "failed to establish Chardb client session");
+            failSession("CDB_INVARIANT", "failed to establish Chardb client session", "connect");
         });
     }
 
     function start(): void {
         if (started || terminated) return;
         started = true;
-        if (enableCrossTab && opts.logicalDb) {
-            bc = new BroadcastChannel(`chardb:${opts.logicalDb}:${"todo-principal"}`);
-            bc.onmessage = ev => onCrossTab(ev.data);
-        }
         startConnect();
     }
 
@@ -236,6 +437,8 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         // The Gateway verifies hello asynchronously. Do not send protected
         // operations until its welcome proves the auth boundary opened.
         for (const sub of subs.values()) {
+            if (sub.state === "error" || sub.state === "closed") continue;
+            clearSubscriptionRetryTimer(sub);
             const upSub: Up = {
                 t: "sub",
                 subId: sub.subId,
@@ -263,6 +466,51 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         }
     }
 
+    function clearSubscriptionRetryTimer(sub: SubRecord, resetBackoff = false): void {
+        if (sub.retryTimer !== null) {
+            clearTimeout(sub.retryTimer);
+            sub.retryTimer = null;
+        }
+        if (resetBackoff) sub.retryBackoffMs = SUBSCRIPTION_RETRY_INITIAL_BACKOFF_MS;
+    }
+
+    function clearAllSubscriptionRetryTimers(): void {
+        for (const sub of subs.values()) clearSubscriptionRetryTimer(sub);
+    }
+
+    function sendSubscription(sub: SubRecord, socket: WebSocket): void {
+        const up: Up = {
+            t: "sub",
+            subId: sub.subId,
+            ref: sub.ref,
+            args: sub.args,
+        };
+        socket.send(encodeWire(up));
+    }
+
+    function scheduleSubscriptionRetry(sub: SubRecord): void {
+        if (sub.retryTimer !== null) return;
+        const delayMs = sub.retryBackoffMs;
+        sub.retryTimer = setTimeout(() => {
+            sub.retryTimer = null;
+            if (terminated || subs.get(sub.subId) !== sub || sub.state === "error" || sub.state === "closed") {
+                return;
+            }
+            const socket = ws;
+            if (!socket || state !== "open" || socket.readyState !== WebSocket.OPEN) return;
+            try {
+                sendSubscription(sub, socket);
+                sub.retryBackoffMs = Math.min(delayMs * 2, SUBSCRIPTION_RETRY_MAX_BACKOFF_MS);
+            } catch {
+                failSession(
+                    "CDB_STREAM_ABORTED",
+                    `failed to retry subscription ${sub.subId}`,
+                    "subscription-retry-send"
+                );
+            }
+        }, delayMs);
+    }
+
     function releaseResumeRetainedSub(subId: SubId, sub: SubRecord): void {
         if (resumeRetainedSubs.get(subId) !== sub) return;
         resumeRetainedSubs.delete(subId);
@@ -276,12 +524,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
     function beginResumeExpiry(): void {
         if (lastCookie === undefined || resumeExpiryTimer !== null) return;
         for (const [subId, sub] of subs) {
-            if (
-                sub.rows.length > 0 ||
-                sub.optimisticPatches.length > 0 ||
-                sub.lastSnapshotCookie !== undefined ||
-                sub.state === "live"
-            ) {
+            if (sub.rows.length > 0 || sub.lastSnapshotCookie !== undefined || sub.state === "live") {
                 resumeRetainedSubs.set(subId, sub);
             }
         }
@@ -307,32 +550,25 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
             if (subs.get(subId) !== sub) continue;
             sub.state = "refetching";
             sub.rows = [];
-            sub.optimisticPatches = [];
             sub.lastSnapshotCookie = undefined;
-            try {
-                notify(sub);
-            } catch {
-                failSession("CDB_INVARIANT", "subscription listener failed during reconnect refetch");
-                return;
-            }
+            notify(sub);
         }
     }
 
     function onClose(): void {
         if (state === "closed") return;
-        state = "reconnecting";
+        clearAllSubscriptionRetryTimers();
         beginResumeExpiry();
         for (const m of pending.values()) m.inFlight = false;
-        if (reconnectTimer === null) {
-            reconnectTimer = setTimeout(() => {
-                reconnectTimer = null;
-                reconnectBackoff = Math.min(reconnectBackoff * 2, RECONNECT_MAX_BACKOFF_MS);
-                startConnect();
-            }, reconnectBackoff);
-        }
+        scheduleReconnect();
     }
 
-    function receiveWire(raw: unknown): void {
+    function receiveWire(
+        raw: unknown,
+        attempt: number,
+        socket: WebSocket,
+        jwtRefreshClaims: JwtRefreshClaims | null
+    ): void {
         if (terminated) return;
         try {
             if (typeof raw !== "string") throw new TypeError("server sent a non-text WebSocket message");
@@ -345,31 +581,41 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
             ) {
                 throw new TypeError("server WebSocket message exceeds the client transport limit");
             }
-            onWire(raw);
+            onWire(raw, attempt, socket, jwtRefreshClaims);
         } catch {
             const message =
                 state === "connecting"
                     ? "server sent an invalid Chardb handshake message"
                     : "server sent an invalid Chardb session message";
-            failSession("CDB_INVARIANT", message);
+            failSession(
+                "CDB_INVARIANT",
+                message,
+                state === "connecting" ? "invalid-handshake-frame" : "invalid-session-frame"
+            );
         }
     }
 
-    function onWire(raw: string): void {
-        const msg = decodeWire(raw) as Down;
+    function onWire(raw: string, attempt: number, socket: WebSocket, jwtRefreshClaims: JwtRefreshClaims | null): void {
+        const msg = decodeDown(raw);
         switch (msg.t) {
             case "welcome":
                 if (checkProtocolV(msg.protocolV)) {
-                    failSession("CDB_UNSUPPORTED_FEATURE", "server selected an unsupported Chardb protocol version");
+                    failSession(
+                        "CDB_UNSUPPORTED_FEATURE",
+                        "server selected an unsupported Chardb protocol version",
+                        "protocol-selection"
+                    );
                     return;
                 }
                 lastCookie = msg.resumedFromCookie ?? msg.baseCookie;
                 state = "open";
+                openedSession = true;
                 reconnectBackoff = RECONNECT_INITIAL_BACKOFF_MS;
+                if (jwtRefreshClaims) scheduleAuthRefresh(attempt, socket, jwtRefreshClaims);
                 sendSessionState();
                 return;
             case "poke":
-                applyPatches(msg.patches, false);
+                applyPatches(msg.patches);
                 lastCookie = msg.cookie;
                 if (msg.mutResults) {
                     for (const r of msg.mutResults) {
@@ -390,7 +636,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                 return;
             case "snapshot": {
                 const sub = subs.get(msg.subId);
-                if (!sub) return;
+                if (!sub || sub.state === "error" || sub.state === "closed") return;
                 if (sub.lastSnapshotCookie === msg.cookie) {
                     releaseResumeRetainedSub(msg.subId, sub);
                     acknowledgeSnapshot(msg.cookie);
@@ -399,12 +645,11 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                 assertSubscriptionRows(msg.rows, "snapshot");
                 const next: PlannedSubState = {
                     rows: cloneRawJson(msg.rows) as RawJson[],
-                    optimisticPatches: [],
                 };
                 assertAggregateQueryState(new Map([[sub, next]]));
+                clearSubscriptionRetryTimer(sub, true);
                 lastCookie = msg.cookie;
                 sub.rows = next.rows;
-                sub.optimisticPatches = next.optimisticPatches;
                 sub.lastSnapshotCookie = msg.cookie;
                 sub.state = "live";
                 releaseResumeRetainedSub(msg.subId, sub);
@@ -414,54 +659,74 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
             }
             case "mustRefetch":
                 if (state === "connecting" && msg.reason === "protocolMismatch") {
-                    failSession("CDB_UNSUPPORTED_FEATURE", "server rejected the Chardb protocol version");
+                    failSession(
+                        "CDB_UNSUPPORTED_FEATURE",
+                        "server rejected the Chardb protocol version",
+                        "protocol-rejection"
+                    );
                     return;
+                }
+                if (msg.reason === "authChanged" && pendingAuthRefresh !== null) {
+                    const completed = pendingAuthRefresh;
+                    pendingAuthRefresh = null;
+                    clearAuthRefreshDeadline();
+                    scheduleAuthRefresh(completed.attempt, completed.socket, completed.claims);
                 }
                 for (const subId of msg.subIds) {
                     const sub = subs.get(subId);
-                    if (!sub) continue;
-                    sub.state = msg.reason === "authChanged" ? "refetching" : "refetching";
+                    if (!sub || sub.state === "error" || sub.state === "closed") continue;
+                    if (msg.reason === "shardsChanged" && sub.retryTimer !== null) continue;
+                    if (msg.reason !== "shardsChanged") clearSubscriptionRetryTimer(sub);
+                    const notifyRefetch =
+                        sub.state !== "refetching" || sub.rows.length > 0 || sub.lastSnapshotCookie !== undefined;
+                    sub.state = "refetching";
                     sub.rows = [];
-                    sub.optimisticPatches = [];
                     sub.lastSnapshotCookie = undefined;
                     releaseResumeRetainedSub(subId, sub);
-                    notify(sub);
+                    if (notifyRefetch || msg.reason !== "shardsChanged") notify(sub);
                     if (terminated || subs.get(subId) !== sub) continue;
                     const socket = ws;
                     if (!socket || state !== "open" || socket.readyState !== WebSocket.OPEN) continue;
-                    const up: Up = {
-                        t: "sub",
-                        subId: sub.subId,
-                        ref: sub.ref,
-                        args: sub.args,
-                    };
-                    socket.send(encodeWire(up));
+                    if (msg.reason === "shardsChanged") scheduleSubscriptionRetry(sub);
+                    else sendSubscription(sub, socket);
                 }
                 return;
             case "error":
-                if (state === "connecting" && !msg.retryable) {
-                    failSession(msg.code, `authentication failed: ${msg.code}`);
+                if (pendingAuthRefresh !== null && msg.subId === undefined && msg.streamReqId === undefined) {
+                    pendingAuthRefresh = null;
+                    clearAuthRefreshDeadline();
+                    failSession(msg.code, `authentication refresh failed: ${msg.code}`, "auth-refresh-rejection");
                     return;
                 }
-                applyError(msg.code, msg.subId, msg.correlationId);
+                if (msg.subId !== undefined) {
+                    applySubscriptionError(msg.code, msg.retryable, msg.subId, msg.correlationId);
+                    return;
+                }
+                if (msg.streamReqId !== undefined) return;
+                if (msg.retryable) {
+                    disconnectSocket(attempt, socket);
+                    return;
+                }
+                failSession(msg.code, `Chardb session failed: ${msg.code}`, "session-rejection");
                 return;
             case "presence":
             case "streamChunk":
             case "streamEnd":
                 return;
         }
+        msg satisfies never;
     }
 
-    function applyPatches(patches: readonly RowPatch[], optimistic: boolean): void {
+    function applyPatches(patches: readonly RowPatch[]): void {
         assertPatchBatchLimits(patches);
         for (const patch of patches) assertPatchRowShape(patch);
         const planned = new Map<SubRecord, PlannedSubState>();
         for (const p of patches) {
             const sub = subs.get(p.subId);
-            if (!sub) continue;
+            if (!sub || sub.state === "error" || sub.state === "closed") continue;
             let next = planned.get(sub);
             if (!next) {
-                next = { rows: [...sub.rows], optimisticPatches: [...sub.optimisticPatches] };
+                next = { rows: [...sub.rows] };
                 planned.set(sub, next);
             }
             const idx = next.rows.findIndex(r => (r as { __key?: string }).__key === p.rowKey);
@@ -475,23 +740,13 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                 if (idx >= 0) next.rows[idx] = row;
                 else next.rows.push(row);
             }
-            if (optimistic) {
-                next.optimisticPatches.push({
-                    op: p.op,
-                    subId: p.subId,
-                    rowKey: p.rowKey,
-                    ...(p.row === undefined ? {} : { row: cloneRawJson(p.row) }),
-                });
-            } else next.optimisticPatches = next.optimisticPatches.filter(op => op.rowKey !== p.rowKey);
         }
         for (const next of planned.values()) {
-            assertSubscriptionRows(next.rows, optimistic ? "optimistic patch result" : "patch result");
-            assertOptimisticPatchHistory(next.optimisticPatches);
+            assertSubscriptionRows(next.rows, "patch result");
         }
         assertAggregateQueryState(planned);
         for (const [sub, next] of planned) {
             sub.rows = next.rows;
-            sub.optimisticPatches = next.optimisticPatches;
         }
         for (const sub of planned.keys()) {
             notify(sub);
@@ -554,12 +809,6 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
             bytes += assertSerializedSize(state.rows, MAX_RETAINED_QUERY_STATE_BYTES, "retained query state", {
                 errorCode,
             });
-            bytes += assertSerializedSize(
-                state.optimisticPatches,
-                MAX_RETAINED_QUERY_STATE_BYTES,
-                "retained query state",
-                { errorCode }
-            );
             if (bytes > MAX_RETAINED_QUERY_STATE_BYTES) {
                 throw new CdbError({
                     code: errorCode,
@@ -583,28 +832,22 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         assertSerializedSize(rows, MAX_SUBSCRIPTION_BYTES, subject);
     }
 
-    function assertOptimisticPatchHistory(patches: readonly RowPatch[]): void {
-        if (patches.length > MAX_OPTIMISTIC_PATCHES) {
-            throw new CdbError({
-                code: "CDB_INVARIANT",
-                message: "optimistic patch history exceeds the client limit",
-            });
-        }
-        assertSerializedSize(patches, MAX_OPTIMISTIC_PATCH_BYTES, "optimistic patch history");
-    }
-
-    function applyError(code: CdbErrorCode, subId: SubId | undefined, correlationId: CorrelationId): void {
-        if (subId !== undefined) {
-            const sub = subs.get(subId);
-            if (sub) {
-                sub.state = "error";
-                sub.rows = [];
-                sub.optimisticPatches = [];
-                sub.lastSnapshotCookie = undefined;
-                releaseResumeRetainedSub(subId, sub);
-                notify(sub);
-            }
-        }
+    function applySubscriptionError(
+        code: CdbErrorCode,
+        retryable: boolean,
+        subId: SubId,
+        correlationId: CorrelationId
+    ): void {
+        const sub = subs.get(subId);
+        if (!sub || sub.state === "error" || sub.state === "closed") return;
+        const notifyRefetch = sub.state !== "refetching" || sub.rows.length > 0 || sub.lastSnapshotCookie !== undefined;
+        if (!retryable) clearSubscriptionRetryTimer(sub);
+        sub.state = retryable ? "refetching" : "error";
+        sub.rows = [];
+        sub.lastSnapshotCookie = undefined;
+        releaseResumeRetainedSub(subId, sub);
+        if (!retryable || notifyRefetch) notify(sub);
+        if (retryable && !terminated && subs.get(subId) === sub) scheduleSubscriptionRetry(sub);
         void correlationId;
         void code;
     }
@@ -623,7 +866,12 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         return mutation;
     }
 
-    function failSession(code: CdbErrorCode, message: string, subState: TerminalSubState = "error"): void {
+    function failSession(
+        code: CdbErrorCode,
+        message: string,
+        reason: ChardbClientSessionFailureReason,
+        subState: TerminalSubState = "error"
+    ): void {
         if (terminated) return;
         terminated = true;
         state = "closed";
@@ -635,14 +883,24 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
             clearTimeout(resumeExpiryTimer);
             resumeExpiryTimer = null;
         }
+        clearAuthRefreshTimer();
+        clearAuthRefreshDeadline();
+        pendingAuthRefresh = null;
         resumeExpiryCookie = undefined;
         resumeRetainedSubs.clear();
+        if (subState === "error") {
+            try {
+                opts.onSessionError?.(Object.freeze({ code, reason }));
+            } catch {
+                // Diagnostic listeners cannot interrupt terminal resource cleanup.
+            }
+        }
         const subscriptions = [...subs.values()];
         subs.clear();
         for (const sub of subscriptions) {
+            clearSubscriptionRetryTimer(sub);
             sub.state = subState;
             sub.rows = [];
-            sub.optimisticPatches = [];
             for (const listener of sub.listeners) {
                 try {
                     listener(cloneRawJson(sub.rows) as RawJson[], sub.state);
@@ -658,15 +916,17 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
             clearMutationTimeout(mutation);
             mutation.reject(error);
         }
-        try {
-            ws?.close();
-        } finally {
-            bc?.close();
-        }
+        ws?.close();
     }
 
     function notify(sub: SubRecord): void {
-        for (const fn of sub.listeners) fn(cloneRawJson(sub.rows) as RawJson[], sub.state);
+        for (const fn of sub.listeners) {
+            try {
+                fn(cloneRawJson(sub.rows) as RawJson[], sub.state);
+            } catch {
+                // Subscription listeners do not own session liveness.
+            }
+        }
     }
 
     function subscribe<TRow = RawJson>(
@@ -688,7 +948,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                 message: `cannot open more than ${MAX_ACTIVE_SUBSCRIPTIONS} active subscriptions`,
             });
         }
-        assertAggregateQueryState(new Map(), { rows: [], optimisticPatches: [] }, "CDB_RATE_LIMITED");
+        assertAggregateQueryState(new Map(), { rows: [] }, "CDB_RATE_LIMITED");
         const subId = SubId(nextSubId++);
         const widenedListener: (rows: RawJson[], state: SubState) => void = (rows, state) =>
             onChange(rows as readonly RawJson[] as TRow[], state);
@@ -699,11 +959,12 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
             state: "pending",
             rows: [],
             listeners: new Set([widenedListener]),
-            optimisticPatches: [],
             lastSnapshotCookie: undefined,
+            retryTimer: null,
+            retryBackoffMs: SUBSCRIPTION_RETRY_INITIAL_BACKOFF_MS,
         };
         subs.set(subId, rec);
-        start();
+        if (autoStartOnOperation) start();
         if (ws && state === "open") {
             const up: Up = { t: "sub", subId, ref: queryRef, args: rec.args };
             try {
@@ -720,6 +981,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
         return {
             unsubscribe() {
                 if (!subs.delete(subId)) return;
+                clearSubscriptionRetryTimer(rec);
                 releaseResumeRetainedSub(subId, rec);
                 if (ws && state === "open") {
                     const up: Up = { t: "unsub", subId };
@@ -728,7 +990,8 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                     } catch (cause) {
                         failSession(
                             "CDB_STREAM_ABORTED",
-                            `failed to send unsubscription ${subId}; client session closed`
+                            `failed to send unsubscription ${subId}; client session closed`,
+                            "unsubscribe-send"
                         );
                         throw new CdbError({
                             code: "CDB_STREAM_ABORTED",
@@ -789,7 +1052,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
                     })
                 );
             }, mutationTimeoutMs);
-            start();
+            if (autoStartOnOperation) start();
             if (ws && state === "open") {
                 const up: Up = { t: "mut", mutId, ref: rec.ref, args: rec.args };
                 try {
@@ -810,7 +1073,7 @@ export function createDeferredChardbClientController(opts: ChardbClientOptions):
     }
 
     function close(): void {
-        failSession("CDB_STREAM_ABORTED", "Chardb client closed before pending work settled", "closed");
+        failSession("CDB_STREAM_ABORTED", "Chardb client closed before pending work settled", "client-close", "closed");
     }
 
     void isCdbError;

@@ -3,8 +3,8 @@
  *
  * Two complementary surfaces:
  *
- *   - `using` / `withCheck` accept a per-row predicate; Drizzle evaluates it
- *     after the row is materialized. Convenient for one-off rules.
+ *   - `using` accepts an existing-row predicate. `withCheck` accepts the row
+ *     proposed by an insert.
  *   - `usingSql` / `withCheckSql` accept a Drizzle `SQL` builder. Floors are
  *     AND-ed and alternative grants are OR-ed before the policy expression is
  *     AND-ed into the query, shrinking the planner's row scan.
@@ -81,7 +81,7 @@ export function applyPoliciesToWhere<TTable, TRow>(args: {
     const grants: SQL[] = [];
     for (const p of args.policies) {
         if (!appliesTo(p, args.op, args.auth)) continue;
-        const build = args.op === "select" || args.op === "delete" ? p.usingSql : (p.withCheckSql ?? p.usingSql);
+        const build = args.op === "insert" ? (p.withCheckSql ?? p.usingSql) : p.usingSql;
         const fragment = build?.(args.auth, args.table) ?? SQL_FALSE;
         if ((p.effect ?? "grant") === "floor") floors.push(fragment);
         else grants.push(fragment);
@@ -108,7 +108,7 @@ export function applyRowPolicies<TTable, TRow>(args: {
 
     return args.rows.filter(row => {
         const evaluate = (p: PolicyDefinition<TTable, TRow>): boolean => {
-            const fn = args.op === "select" || args.op === "delete" ? p.using : (p.withCheck ?? p.using);
+            const fn = args.op === "insert" ? (p.withCheck ?? p.using) : p.using;
             return fn?.(args.auth, row) ?? false;
         };
         return floors.every(evaluate) && grants.some(evaluate);

@@ -1,13 +1,16 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type {
+    ChardbBindingAuth,
     ChardbBindingMutationRequest,
     ChardbBindingMutationResponse,
+    ChardbBindingPlanRequest,
     ChardbBindingQueryRequest,
     ChardbBindingQueryResponse,
 } from "../binding.ts";
 import { CdbError } from "../errors.ts";
 import { ClientId, type PrincipalId } from "../types.ts";
 import { vshardOf } from "../vshard.ts";
+import { dispatchTrustedBindingPlan } from "./binding-plan-server.ts";
 import { cdbPolicyDigest } from "./cdb-policy.ts";
 import {
     type GatewayJwtConfig,
@@ -17,13 +20,14 @@ import {
     dispatchTrustedQuery,
     isCurrentVerifiedAttachment,
     verifyGatewayJwt,
-} from "./do/gateway.ts";
+} from "./do/gateway-auth-dispatch.ts";
 import { withChardbLoopbacks } from "./loopback.ts";
 import { type ChardbManifest, emptyManifest, routeMutation, routeQuery } from "./manifest.ts";
 import type {
     CatalogMutationRpc,
     CatalogOrganizationAuthorityRpc,
     CatalogUserAuthorityRpc,
+    CdbBindingPlanRpc,
     CdbMutationRpc,
     CdbQueryRpc,
 } from "./rpc.ts";
@@ -107,6 +111,22 @@ export class DB extends WorkerEntrypoint<DbBindingEnv> {
         return dispatchTrustedQuery(deps, { principalId: principalId.value, ref: request.ref, args: request.args });
     }
 
+    async executePlan(request: ChardbBindingPlanRequest): Promise<ChardbBindingQueryResponse> {
+        const validated = this.validateAuthRequest(request);
+        if (!validated.ok) return validated;
+        const principalId = await this.verifyPrincipal(request);
+        if (!principalId.ok) return principalId;
+        return dispatchTrustedBindingPlan(
+            {
+                schema: this.runtimeSchema(),
+                catalog: this.catalog(),
+                cdb: shardId => this.cdb(shardId),
+            },
+            principalId.value,
+            request.plan
+        );
+    }
+
     async executeMutation(request: ChardbBindingMutationRequest): Promise<ChardbBindingMutationResponse> {
         const validated = this.validateRequest(request);
         if (!validated.ok) return validated;
@@ -129,6 +149,15 @@ export class DB extends WorkerEntrypoint<DbBindingEnv> {
     }
 
     private validateRequest(request: ChardbBindingQueryRequest): { readonly ok: true } | ReturnType<typeof failure> {
+        const auth = this.validateAuthRequest(request);
+        if (!auth.ok) return auth;
+        if (!boundedText(request.ref, DB_BINDING_REF_MAX_BYTES) || !request.ref.includes("#")) {
+            return failure("CDB_INVALID_ARGS", "DB binding ref is invalid");
+        }
+        return { ok: true };
+    }
+
+    private validateAuthRequest(request: ChardbBindingAuth): { readonly ok: true } | ReturnType<typeof failure> {
         if (typeof request !== "object" || request === null || Array.isArray(request)) {
             return failure("CDB_INVALID_ARGS", "DB binding request is malformed");
         }
@@ -138,14 +167,11 @@ export class DB extends WorkerEntrypoint<DbBindingEnv> {
         if (!validOrigin(request.authOrigin)) {
             return failure("CDB_INVALID_ARGS", "DB binding auth origin must be an exact HTTP origin");
         }
-        if (!boundedText(request.ref, DB_BINDING_REF_MAX_BYTES) || !request.ref.includes("#")) {
-            return failure("CDB_INVALID_ARGS", "DB binding ref is invalid");
-        }
         return { ok: true };
     }
 
     private async verifyPrincipal(
-        request: ChardbBindingQueryRequest
+        request: ChardbBindingAuth
     ): Promise<{ readonly ok: true; readonly value: PrincipalId } | ReturnType<typeof failure>> {
         const config = this.jwtConfig();
         if (!config) return failure("CDB_AUTH_NOT_BOUND", "DB binding requires the Better Auth JWT plugin");
@@ -179,9 +205,9 @@ export class DB extends WorkerEntrypoint<DbBindingEnv> {
             Parameters<typeof verifyGatewayJwt>[0]["catalog"];
     }
 
-    private cdb(shardId: string): CdbMutationRpc & CdbQueryRpc {
+    private cdb(shardId: string): CdbMutationRpc & CdbQueryRpc & CdbBindingPlanRpc {
         const id = this.env.CDB_SHARD.idFromName(shardId);
-        return this.env.CDB_SHARD.get(id) as unknown as CdbMutationRpc & CdbQueryRpc;
+        return this.env.CDB_SHARD.get(id) as unknown as CdbMutationRpc & CdbQueryRpc & CdbBindingPlanRpc;
     }
 }
 

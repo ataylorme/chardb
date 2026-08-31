@@ -22,10 +22,11 @@ import { type SQL, asc, desc, eq, sql } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import type { BaseSQLiteDatabase, SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../../src/errors.ts";
-import { type QueryReadRangeObservation, wrapMutationDb, wrapQueryDb } from "../../src/server/cdb-db-proxy.ts";
+import { type QueryReadRangeObservation, wrapDb, wrapMutationDb, wrapQueryDb } from "../../src/server/cdb-db-proxy.ts";
 import type { RoleValue } from "../../src/server/cdb-table-types.ts";
+import { forOrg, forOrgUser, forUser, globalScope } from "../../src/server/cdb-tenant.ts";
 import type { AuthCtx } from "../../src/server/define.ts";
-import { forOrg, forUser, globalScope, wrapDb } from "../../src/server/index.ts";
+import type { VectorMutationApi } from "../../src/vector.ts";
 
 /**
  * The stub satisfies the surface chardb's proxy actually inspects
@@ -184,6 +185,15 @@ const baseAuth: AuthCtx = Object.freeze({
     claims: {},
 });
 
+const unavailableVector: VectorMutationApi = Object.freeze({
+    set(): never {
+        throw new Error("vector mutation was not expected in this proxy test");
+    },
+    delete(): never {
+        throw new Error("vector mutation was not expected in this proxy test");
+    },
+});
+
 function expectForbidden(run: () => unknown): void {
     let caught: unknown;
     try {
@@ -309,6 +319,97 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
         wrapDb(db, baseAuth).insert(channels).values({ id: "c1", name: "general" });
 
         expect(captured[0]?.rows).toEqual({ id: "c1", name: "general", organizationId: "org-acme" });
+    });
+
+    test("forOrgUser() fills both authoritative ownership columns", () => {
+        const { cdbTable } = forOrgUser();
+        const drafts = cdbTable(
+            "drafts_org_user",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
+                body: text("body").notNull(),
+            },
+            { roles: { self: { create: "*" } } }
+        );
+
+        const { db, captured } = makeStubDb();
+        wrapDb(db, baseAuth).insert(drafts).values({ id: "d1", body: "private" });
+
+        expect(captured[0]?.rows).toEqual({
+            id: "d1",
+            body: "private",
+            organizationId: "org-acme",
+            userId: "u-alice",
+        });
+    });
+
+    test("forOrgUser() rejects either forged ownership value", () => {
+        const { cdbTable } = forOrgUser();
+        const drafts = cdbTable(
+            "drafts_org_user_conflict",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { roles: { self: { create: "*" } } }
+        );
+
+        const forgedOrg = makeStubDb();
+        expectForbidden(() =>
+            wrapDb(forgedOrg.db, baseAuth).insert(drafts).values({ id: "d1", organizationId: "org-other" })
+        );
+        expect(forgedOrg.captured[0]?.rows).toBeUndefined();
+
+        const forgedUser = makeStubDb();
+        expectForbidden(() => wrapDb(forgedUser.db, baseAuth).insert(drafts).values({ id: "d2", userId: "u-mallory" }));
+        expect(forgedUser.captured[0]?.rows).toBeUndefined();
+    });
+
+    test("binds an org-user wrapper to the verified auth generation", () => {
+        const { cdbTable } = forOrgUser();
+        const drafts = cdbTable(
+            "drafts_org_user_generation",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { roles: { self: { create: "*" } } }
+        );
+        const auth = {
+            userId: "u-original",
+            tenantId: "org-original",
+            role: "member",
+            roles: ["member"],
+            claims: {},
+        };
+        const { db, captured } = makeStubDb();
+        const wrapped = wrapDb(db, auth);
+
+        auth.userId = "u-switched";
+        auth.tenantId = "org-switched";
+        wrapped.insert(drafts).values({ id: "d1" });
+
+        expect(captured[0]?.rows).toEqual({
+            id: "d1",
+            organizationId: "org-original",
+            userId: "u-original",
+        });
     });
 
     test("explicit tenantBy override is filled from auth.tenantId", () => {
@@ -569,7 +670,7 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
     });
 
     test("api.mutation handler receives a wrapped ctx.db (auto-fill happens end-to-end)", async () => {
-        const { api } = await import("../../src/server/index.ts");
+        const { api } = await import("../../src/server/define.ts");
         const { cdbTable } = forOrg();
         const channels = cdbTable(
             "channels_e2e",
@@ -590,7 +691,10 @@ describe("wrapDb / cdbTable insert auto-fill", () => {
                 return args.id;
             },
         });
-        const result = create({ db: db as never, auth: baseAuth }, { id: "c-e2e", name: "general" });
+        const result = create(
+            { db: db as never, auth: baseAuth, vector: unavailableVector },
+            { id: "c-e2e", name: "general" }
+        );
         expect(result).toBe("c-e2e");
         expect(captured[0]?.rows).toEqual({ id: "c-e2e", name: "general", organizationId: "org-acme" });
     });
@@ -664,6 +768,7 @@ describe("wrapDb / cdbTable update authorization", () => {
         name: string,
         roles: {
             readonly admin?: RoleValue<ProfileColumns>;
+            readonly editor?: RoleValue<ProfileColumns>;
             readonly member?: RoleValue<ProfileColumns>;
         }
     ) {
@@ -730,7 +835,7 @@ describe("wrapDb / cdbTable update authorization", () => {
         expect(capturedUpdates[0]?.values).toBeUndefined();
     });
 
-    test("ORs alternative role grants for update", () => {
+    test("keeps only the caller's column-authorizing role grant for update", () => {
         const profiles = profileTable("profiles_update_roles", {
             admin: { update: ["secretNote"] },
             member: { update: ["displayName"] },
@@ -738,6 +843,21 @@ describe("wrapDb / cdbTable update authorization", () => {
         const { db, capturedUpdates } = makeStubDb();
         wrapDb(db, baseAuth).update(profiles).set({ displayName: "Member edit" }).run();
         expect(capturedUpdates[0]?.values).toEqual({ displayName: "Member edit" });
+        expect(renderSql(capturedUpdates[0]?.where).sql.toLowerCase()).not.toContain(" or ");
+    });
+
+    test("combines column grants from multiple tenant-wide caller roles", () => {
+        const profiles = profileTable("profiles_update_role_union", {
+            editor: { update: ["secretNote"] },
+            member: { update: ["displayName"] },
+        });
+        const { db, capturedUpdates } = makeStubDb();
+        wrapDb(db, { ...baseAuth, roles: ["member", "editor"] })
+            .update(profiles)
+            .set({ displayName: "Member edit", secretNote: "Editor edit" })
+            .run();
+
+        expect(capturedUpdates[0]?.values).toEqual({ displayName: "Member edit", secretNote: "Editor edit" });
         expect(renderSql(capturedUpdates[0]?.where).sql.toLowerCase()).toContain(" or ");
     });
 
@@ -780,6 +900,46 @@ describe("wrapDb / cdbTable update authorization", () => {
         const error = forbiddenError(() => wrapDb(denied.db, baseAuth).update(profiles).set({ ownerId: "u-alice" }));
         expect(error.message).toBe('cannot update managed self column "ownerId"');
         expect(denied.capturedUpdates[0]?.values).toBeUndefined();
+    });
+
+    test("a tenant-wide role cannot borrow a self-only column grant", () => {
+        const { cdbTable } = forOrg();
+        const profiles = cdbTable(
+            "profiles_update_mixed_self",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                ownerId: text("owner_id")
+                    .notNull()
+                    .references(() => userTable.id),
+                displayName: text("display_name").notNull(),
+                privateNote: text("private_note"),
+            },
+            {
+                selfBy: "ownerId",
+                roles: {
+                    member: { update: ["displayName"] },
+                    self: { update: ["privateNote"] },
+                },
+            }
+        );
+
+        const selfEdit = makeStubDb();
+        wrapDb(selfEdit.db, baseAuth).update(profiles).set({ privateNote: "mine" }).run();
+        const selfScoped = renderSql(selfEdit.capturedUpdates[0]?.where);
+        expect(selfScoped.params).toContain("org-acme");
+        expect(selfScoped.params).toContain("u-alice");
+        expect(selfScoped.sql).toContain("owner_id");
+        expect(selfScoped.sql).not.toContain("1 = 1");
+
+        const tenantEdit = makeStubDb();
+        wrapDb(tenantEdit.db, baseAuth).update(profiles).set({ displayName: "tenant-wide" }).run();
+        const tenantScoped = renderSql(tenantEdit.capturedUpdates[0]?.where);
+        expect(tenantScoped.params).toContain("org-acme");
+        expect(tenantScoped.params).not.toContain("u-alice");
+        expect(tenantScoped.sql).not.toContain("owner_id");
     });
 
     test("blocks returning and non-cdbTable updates", () => {
@@ -1074,7 +1234,7 @@ describe("wrapQueryDb / read observation", () => {
         expect(new Set(observations.map(observation => observation.token)).size).toBe(6);
     });
 
-    test("shares the observer with transaction callback wrappers", () => {
+    test("rejects transaction callbacks at the read-only query boundary", () => {
         const nested = selectDb();
         const raw = {
             transaction(callback: (tx: typeof nested) => unknown) {
@@ -1083,11 +1243,14 @@ describe("wrapQueryDb / read observation", () => {
         };
         const readTables: string[] = [];
 
-        wrapQueryDb(raw, baseAuth, tableName => readTables.push(tableName)).transaction(tx => {
-            tx.select().from(records).all();
+        const error = forbiddenFeature(() => {
+            wrapQueryDb(raw, baseAuth, tableName => readTables.push(tableName)).transaction(tx => {
+                tx.select().from(records).all();
+            });
         });
 
-        expect(readTables).toEqual(["observed_reads"]);
+        expect(error.message).toBe('query database property "transaction" is unavailable in read-only handlers');
+        expect(readTables).toEqual([]);
     });
 
     test("accepts typed ascending and descending column order", () => {

@@ -4,9 +4,7 @@ const LOOPBACK_BINDINGS = {
     CDB_CATALOG: "Catalog",
     CDB_SHARD: "Cdb",
     CDB_GATEWAY: "Gateway",
-    CDB_BLOBMETA: "BlobMeta",
-    CDB_RESHARDER: "Resharder",
-    CDB_GSI: "GsiShard",
+    CDB_RESHARD: "Resharder",
 } as const;
 
 const PUBLIC_BINDINGS = { DB: "DB" } as const;
@@ -41,10 +39,9 @@ function isDbBinding(value: unknown): boolean {
 }
 
 /**
- * Add same-Worker Durable Object namespaces from Cloudflare's native
- * `ctx.exports` collection. Miniflare's programmatic API provisions the same
- * classes as exported-name environment bindings, so those are accepted too.
- * Explicit Wrangler bindings still win for split-Worker deployments.
+ * Resolve Chardb's generated same-Worker Durable Object bindings. Native
+ * `ctx.exports` and Miniflare's exported-name bindings remain fallbacks for
+ * embedded runtimes and older fixtures. Explicit Wrangler bindings win.
  */
 export function withChardbLoopbacks<TEnv extends object>(env: TEnv, context: unknown): TEnv {
     const exports = (context as ContextWithExports | null | undefined)?.exports ?? {};

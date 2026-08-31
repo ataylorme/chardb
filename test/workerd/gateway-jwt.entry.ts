@@ -1,8 +1,12 @@
+import { admin } from "better-auth/plugins/admin";
 import { jwt } from "better-auth/plugins/jwt";
+import { organization } from "better-auth/plugins/organization";
 import { and, eq } from "drizzle-orm";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
-import { api, chardb, defineAuth, forOrg } from "../../src/server/index.ts";
+import { api } from "../../src/server/define.ts";
+import { gatewayBucketName } from "../../src/server/gateway-bucket.ts";
+import { chardb, defineAuth, forOrgUser } from "../../src/server/index.ts";
 import { vshardOf } from "../../src/vshard.ts";
 
 const ISSUER = "https://issuer.example";
@@ -21,6 +25,8 @@ const auth = defineAuth({
     appName: "gateway-workerd-test",
     baseURL: ISSUER,
     plugins: [
+        organization(),
+        admin(),
         jwt({
             jwt: { issuer: ISSUER, audience: AUDIENCE },
             jwks: {
@@ -31,7 +37,7 @@ const auth = defineAuth({
     ],
 });
 
-const { cdbTable } = forOrg();
+const { cdbTable } = forOrgUser();
 const gatewayWrites = cdbTable(
     "gateway_writes",
     {
@@ -47,7 +53,10 @@ const gatewayWrites = cdbTable(
     },
     {
         selfBy: "authorId",
-        roles: { member: { create: ["id", "body", "createdAt"], read: "*" } },
+        roles: {
+            member: { read: "*" },
+            "user:admin": { create: ["id", "body", "createdAt"] },
+        },
     }
 );
 
@@ -156,7 +165,15 @@ const app = chardb({
 });
 export const { Cdb, Gateway } = app;
 
-type AuthorityFault = "none" | "throw" | "malformed" | "hold" | "hold-throw" | "route-throw" | "route-malformed";
+type AuthorityFault =
+    | "none"
+    | "throw"
+    | "malformed"
+    | "hold"
+    | "hold-throw"
+    | "route-throw"
+    | "route-malformed"
+    | "legacy-throw";
 
 export class Catalog extends app.Catalog {
     private authorityFault: AuthorityFault = "none";
@@ -234,7 +251,9 @@ export class Catalog extends app.Catalog {
     override async resolveOrganizationAuthority(
         request: Parameters<InstanceType<typeof app.Catalog>["resolveOrganizationAuthority"]>[0]
     ): ReturnType<InstanceType<typeof app.Catalog>["resolveOrganizationAuthority"]> {
-        if (this.authorityFault === "throw") throw new Error("forced authority failure");
+        if (this.authorityFault === "throw" || this.authorityFault === "legacy-throw") {
+            throw new Error("forced authority failure");
+        }
         if (this.authorityFault === "malformed") return { principalId: 7 } as never;
         if (this.authorityFault === "hold" || this.authorityFault === "hold-throw") {
             const heldFault = this.authorityFault;
@@ -246,10 +265,32 @@ export class Catalog extends app.Catalog {
         return super.resolveOrganizationAuthority(request);
     }
 
+    override async resolveOrganizationAuthorityRoute(
+        request: Parameters<InstanceType<typeof app.Catalog>["resolveOrganizationAuthorityRoute"]>[0]
+    ): ReturnType<InstanceType<typeof app.Catalog>["resolveOrganizationAuthorityRoute"]> {
+        if (this.authorityFault === "throw") throw new Error("forced authority failure");
+        if (this.authorityFault === "malformed") return { authority: { principalId: 7 } } as never;
+        if (this.authorityFault === "hold" || this.authorityFault === "hold-throw") {
+            const heldFault = this.authorityFault;
+            this.markAuthorityEntered?.();
+            this.markAuthorityEntered = undefined;
+            await this.authorityHold;
+            if (heldFault === "hold-throw") throw new Error("forced held authority failure");
+        }
+        if (this.authorityFault === "route-throw") throw new Error("forced route failure");
+        const resolved = await super.resolveOrganizationAuthorityRoute(request);
+        if (this.authorityFault === "route-malformed" && resolved.authority) {
+            return { authority: resolved.authority, route: { shardId: 7 } } as never;
+        }
+        return resolved;
+    }
+
     override async route(
         vshard: Parameters<InstanceType<typeof app.Catalog>["route"]>[0]
     ): ReturnType<InstanceType<typeof app.Catalog>["route"]> {
-        if (this.authorityFault === "route-throw") throw new Error("forced route failure");
+        if (this.authorityFault === "route-throw" || this.authorityFault === "legacy-throw") {
+            throw new Error("forced route failure");
+        }
         if (this.authorityFault === "route-malformed") return { shardId: 7 } as never;
         return super.route(vshard);
     }
@@ -290,6 +331,7 @@ export default {
                     name: "Workerd User",
                     email: "workerd@example.com",
                     emailVerified: true,
+                    role: "admin",
                     createdAt: now,
                     updatedAt: now,
                 },
@@ -328,6 +370,7 @@ export default {
                     name: "Workerd User B",
                     email: "workerd-b@example.com",
                     emailVerified: true,
+                    role: "admin",
                     createdAt: now,
                     updatedAt: now,
                 },
@@ -362,6 +405,30 @@ export default {
                     id: "workerd-member-2",
                     organizationId: ORGANIZATION_ID,
                     userId: "workerd-user-2",
+                    role: "admin",
+                    createdAt: now,
+                },
+            });
+            await catalog.mutateAuth({
+                model: "user",
+                op: "create",
+                payload: {
+                    id: "workerd-writer",
+                    name: "Workerd Writer",
+                    email: "workerd-writer@example.com",
+                    emailVerified: true,
+                    role: "admin",
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+            await catalog.mutateAuth({
+                model: "member",
+                op: "create",
+                payload: {
+                    id: "workerd-writer-member",
+                    organizationId: ORGANIZATION_ID,
+                    userId: "workerd-writer",
                     role: "member",
                     createdAt: now,
                 },
@@ -422,7 +489,7 @@ export default {
         }
         if (url.pathname === "/ws") {
             const routedClientId = url.searchParams.get("clientId");
-            const id = env.CDB_GATEWAY.idFromName((routedClientId ?? "missing-client-route").slice(0, 12));
+            const id = env.CDB_GATEWAY.idFromName(gatewayBucketName(routedClientId ?? "missing-client-route"));
             return env.CDB_GATEWAY.get(id).fetch(request);
         }
         return new Response("not found", { status: 404 });

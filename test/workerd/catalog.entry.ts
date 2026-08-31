@@ -1,3 +1,4 @@
+import { organization } from "better-auth/plugins/organization";
 /**
  * Test worker entry for the workerd Catalog harness. It configures auth
  * before Catalog construction and proxies the RPCs under test over HTTP.
@@ -6,7 +7,7 @@ import { bindAuthRuntime } from "../../src/auth/runtime.ts";
 import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import { Catalog as ProductionCatalog } from "../../src/server/do/catalog.ts";
 
-const auth = defineAuth({ appName: "catalog-workerd-test" });
+const auth = defineAuth({ appName: "catalog-workerd-test", plugins: [organization()] });
 bindAuthRuntime({
     schema: synthesizeAuthSchema(auth.options as never) as never,
     options: auth.options as { readonly [key: string]: unknown },
@@ -28,12 +29,13 @@ type Op =
     | "openBarrier"
     | "ackBarrier"
     | "openBarriers"
+    | "beginTopologyOperation"
     | "cutover"
     | "route"
-    | "splitRange"
     | "mutateAuth"
     | "queryAuth"
     | "resolveOrganizationAuthority"
+    | "resolveOrganizationAuthorityRoute"
     | "fixtureInstanceId";
 
 export default {
@@ -51,12 +53,14 @@ export default {
             let result: unknown;
             if (op === "openBarrier") {
                 result = await stubAny.openBarrier((body ?? { now: Date.now() }).now as number);
+            } else if (op === "route") {
+                result = await stubAny.route(body?.vshard);
             } else if (op === "fixtureInstanceId") {
                 result = await stubAny.fixtureInstanceId();
             } else {
                 result = await stubAny[op](body);
             }
-            return Response.json(result ?? { ok: true });
+            return Response.json(result === undefined ? { ok: true } : result);
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             return Response.json({ error: message }, { status: 500 });

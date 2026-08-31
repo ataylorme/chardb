@@ -5,8 +5,8 @@ export function License() {
         <Section id="license" num="07" label="license">
             <SectionHeading>Yours to inspect and run.</SectionHeading>
             <SectionLead>
-                The code is MIT-licensed. It targets <InlineCode>wrangler</InlineCode> and Cloudflare Durable Objects,
-                but it is not ready for production data.
+                The code is MIT-licensed and runs in your Cloudflare account through <InlineCode>wrangler</InlineCode>,
+                Durable Objects, R2, and Vectorize.
             </SectionLead>
             <BulletList items={["read the implementation", "run the tests", "challenge the tenant-boundary model"]} />
             <PullQuote>your account. your data. your code.</PullQuote>

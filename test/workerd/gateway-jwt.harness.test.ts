@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { type JWK, SignJWT, exportJWK, generateKeyPair } from "jose";
 import { Miniflare } from "miniflare";
 import { build as viteBuild } from "vite";
+import { disposeMiniflareBounded } from "../../scripts/miniflare-lifecycle.mjs";
 import { ChardbRef, ClientId, Cookie, MutId, SubId } from "../../src/types.ts";
 import { chardb as chardbVite } from "../../src/vite/index.ts";
 import { type Down, PROTOCOL_V, type Up, decodeWire, encodeWire } from "../../src/wire.ts";
@@ -122,41 +123,56 @@ async function buildWorker(): Promise<string> {
 
 async function buildBrowserRefs(): Promise<readonly [ChardbRef, ChardbRef, ChardbRef]> {
     const fixture = await mkdtemp(path.join(tmpdir(), "chardb-vite-browser-"));
-    const entry = path.join(fixture, "api.ts");
+    const mutationEntry = path.join(fixture, "mutations.ts");
+    const queryEntry = path.join(fixture, "queries.ts");
     const serverModule = path.join(HERE, "../../src/server/define.ts");
     try {
         await writeFile(
-            entry,
+            mutationEntry,
             `
-import { api } from "chardb/server";
+import { api } from "@chardb/core/server";
 export const writeOrganizationRow = api.mutation({ ref: "${WRITE_REF}", handler: () => null });
 export const closedOrganizationWrite = api.mutation({ ref: "${CLOSED_REF}", handler: () => null });
-export const listOrganizationRows = api.query({ ref: "${LIST_REF}", handler: async () => [] });
 `
         );
-        const built = await viteBuild({
-            configFile: false,
-            logLevel: "silent",
-            plugins: [chardbVite()],
-            resolve: { alias: { "chardb/server": serverModule } },
-            build: { write: false, lib: { entry, formats: ["es"] } },
-        });
-        const results = (Array.isArray(built) ? built : [built]) as unknown as readonly {
-            readonly output: readonly { readonly type: string; readonly code?: string }[];
-        }[];
-        const chunk = results.flatMap(result => result.output).find(output => output.type === "chunk");
-        if (!chunk?.code) throw new Error("Vite did not emit the browser client chunk");
-        const emittedPath = path.join(fixture, "browser-client.mjs");
-        await writeFile(emittedPath, chunk.code);
-        const emitted = (await import(pathToFileURL(emittedPath).href)) as {
+        await writeFile(
+            queryEntry,
+            `
+import { api } from "@chardb/core/server";
+export const listOrganizationRows = api.query({
+  ref: "${LIST_REF}",
+  query: db => db.select().from(organizationRows),
+});
+`
+        );
+        const buildEntry = async (entry: string, emittedName: string): Promise<Record<string, unknown>> => {
+            const built = await viteBuild({
+                configFile: false,
+                logLevel: "silent",
+                plugins: [chardbVite()],
+                resolve: { alias: { "@chardb/core/server": serverModule } },
+                build: { write: false, lib: { entry, formats: ["es"] } },
+            });
+            const results = (Array.isArray(built) ? built : [built]) as unknown as readonly {
+                readonly output: readonly { readonly type: string; readonly code?: string }[];
+            }[];
+            const chunk = results.flatMap(result => result.output).find(output => output.type === "chunk");
+            if (!chunk?.code) throw new Error("Vite did not emit the browser client chunk");
+            const emittedPath = path.join(fixture, emittedName);
+            await writeFile(emittedPath, chunk.code);
+            return (await import(pathToFileURL(emittedPath).href)) as Record<string, unknown>;
+        };
+        const mutations = (await buildEntry(mutationEntry, "browser-mutations.mjs")) as {
             readonly writeOrganizationRow: { readonly __chardbRef?: unknown };
             readonly closedOrganizationWrite: { readonly __chardbRef?: unknown };
+        };
+        const queries = (await buildEntry(queryEntry, "browser-queries.mjs")) as {
             readonly listOrganizationRows: { readonly __chardbRef?: unknown };
         };
         return [
-            ChardbRef(String(emitted.writeOrganizationRow.__chardbRef)),
-            ChardbRef(String(emitted.closedOrganizationWrite.__chardbRef)),
-            ChardbRef(String(emitted.listOrganizationRows.__chardbRef)),
+            ChardbRef(String(mutations.writeOrganizationRow.__chardbRef)),
+            ChardbRef(String(mutations.closedOrganizationWrite.__chardbRef)),
+            ChardbRef(String(queries.listOrganizationRows.__chardbRef)),
         ];
     } finally {
         await rm(fixture, { recursive: true, force: true });
@@ -242,7 +258,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-    await mf?.dispose();
+    await disposeMiniflareBounded(mf, { label: "Gateway JWT fixture final teardown" });
+    mf = undefined;
 });
 
 interface OpenedSocket {
@@ -334,6 +351,17 @@ async function signedRotated(overrides?: TokenOverrides): Promise<string> {
 async function signedUnknown(overrides?: TokenOverrides): Promise<string> {
     if (!signUnknownToken) throw new Error("unknown signer not initialized");
     return signUnknownToken(overrides);
+}
+
+function tamperJwtSignature(jwt: string): string {
+    const parts = jwt.split(".");
+    if (parts.length !== 3 || !parts[2]) throw new Error("expected a signed JWT");
+    const signature = parts[2];
+    // Mutate the first encoded signature character, which always carries data
+    // bits. A tail rewrite can accidentally preserve the penultimate data
+    // character and change only ignored padding bits in the final character.
+    const first = signature[0] === "A" ? "B" : "A";
+    return `${parts[0]}.${parts[1]}.${first}${signature.slice(1)}`;
 }
 
 async function jwksStats(): Promise<{
@@ -437,7 +465,7 @@ async function expectNoDown(socket: WebSocket): Promise<void> {
 }
 
 async function setAuthorityFault(
-    fault: "none" | "throw" | "malformed" | "hold" | "hold-throw" | "route-throw" | "route-malformed"
+    fault: "none" | "throw" | "malformed" | "hold" | "hold-throw" | "route-throw" | "route-malformed" | "legacy-throw"
 ): Promise<void> {
     if (!mf) throw new Error("miniflare not initialized");
     const response = await mf.dispatchFetch("http://example.com/authority-fault", {
@@ -511,6 +539,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
             ref: mutationRef,
             args: { id: "workerd-row", organizationId: "workerd-org", body: "written", createdAt: 1 },
         });
+        const exactMutation = structuredClone(mutation);
         expect(mutation).toMatchObject({
             t: "poke",
             mutResults: [
@@ -523,12 +552,49 @@ describe("configured Gateway JWT handshake in real workerd", () => {
                         tenantId: "workerd-org",
                         role: "member",
                         roles: ["member"],
-                        claims: {},
+                        authEpochs: {
+                            global: expect.any(Number),
+                            tenant: expect.any(Number),
+                            principal: expect.any(Number),
+                        },
+                        claims: { userRole: "admin" },
                     },
                 },
             ],
         });
         if (mutation.t !== "poke") throw new Error("expected mutation poke");
+        if (exactMutation.t !== "poke") throw new Error("expected exact mutation poke");
+        const mutationResult = exactMutation.mutResults?.[0];
+        if (!mutationResult?.ok || typeof mutationResult.result !== "object" || mutationResult.result === null) {
+            throw new Error("expected successful organization mutation result");
+        }
+        const authEpochs = (mutationResult.result as { readonly authEpochs?: Record<string, unknown> }).authEpochs;
+        expect(authEpochs).toBeDefined();
+        expect(Number(authEpochs?.global)).toBeGreaterThanOrEqual(0);
+        expect(Number(authEpochs?.tenant)).toBeGreaterThan(0);
+        expect(Number(authEpochs?.principal)).toBeGreaterThan(0);
+
+        const orgAdmin = await openSocket(await signed({ subject: "workerd-user-2" }), {
+            clientId: "workerd-org-admin-without-user-admin",
+        });
+        await expect(orgAdmin.first).resolves.toMatchObject({ t: "welcome" });
+        const deniedUserAdminGrant = await sendAndReceive(orgAdmin.socket, {
+            t: "mut",
+            mutId: MutId("workerd-org-admin-user-admin-denied"),
+            ref: mutationRef,
+            args: {
+                id: "workerd-org-admin-user-admin-denied",
+                organizationId: "workerd-org",
+                body: "must-not-write",
+                createdAt: 2,
+            },
+        });
+        expect(deniedUserAdminGrant).toMatchObject({
+            t: "poke",
+            mutResults: [{ ok: false, error: { code: "CDB_FORBIDDEN" } }],
+        });
+        orgAdmin.socket.close();
+        await orgAdmin.closed;
 
         if (!closedMutationRef) throw new Error("closed mutation ref was not seeded");
         const undeclared = await sendAndReceive(socket, {
@@ -570,6 +636,71 @@ describe("configured Gateway JWT handshake in real workerd", () => {
             resumedFromCookie: mutation.cookie,
         });
         resumed.socket.close();
+    });
+
+    test("organization dispatch does not call the legacy authority and route RPCs", async () => {
+        if (!mutationRef || !queryRef) throw new Error("public refs were not seeded");
+        const { socket, first } = await openSocket(await signed(), { clientId: "combined-catalog-rpc" });
+        await first;
+        await setAuthorityFault("legacy-throw");
+
+        const mutation = await sendAndReceive(socket, {
+            t: "mut",
+            mutId: MutId("combined-catalog-rpc-mutation"),
+            ref: mutationRef,
+            args: {
+                id: "combined-catalog-rpc-row",
+                organizationId: "workerd-org",
+                body: "combined-catalog-rpc",
+                createdAt: 8,
+            },
+        });
+        expect(mutation).toMatchObject({ t: "poke", mutResults: [{ ok: true }] });
+
+        const snapshot = await sendAndReceive(socket, {
+            t: "sub",
+            subId: SubId(8),
+            ref: queryRef,
+            args: { organizationId: "workerd-org", body: "combined-catalog-rpc" },
+        });
+        expect(snapshot).toMatchObject({
+            t: "snapshot",
+            subId: 8,
+            rows: [{ id: "combined-catalog-rpc-row", organizationId: "workerd-org" }],
+        });
+        if (snapshot.t !== "snapshot") throw new Error("expected combined Catalog RPC snapshot");
+        socket.send(encodeWire({ t: "ack", cookie: snapshot.cookie }));
+
+        const replacement = nextDowns(socket, 2);
+        socket.send(
+            encodeWire({
+                t: "mut",
+                mutId: MutId("combined-catalog-rpc-live"),
+                ref: mutationRef,
+                args: {
+                    id: "combined-catalog-rpc-live-row",
+                    organizationId: "workerd-org",
+                    body: "combined-catalog-rpc",
+                    createdAt: 9,
+                },
+            })
+        );
+        const replacementMessages = await replacement;
+        expect(replacementMessages.find(message => message.t === "poke")).toMatchObject({
+            t: "poke",
+            mutResults: [{ ok: true }],
+        });
+        expect(replacementMessages.find(message => message.t === "snapshot")).toMatchObject({
+            t: "snapshot",
+            subId: 8,
+            rows: expect.arrayContaining([
+                expect.objectContaining({ id: "combined-catalog-rpc-row", organizationId: "workerd-org" }),
+                expect.objectContaining({ id: "combined-catalog-rpc-live-row", organizationId: "workerd-org" }),
+            ]),
+        });
+
+        await setAuthorityFault("none");
+        socket.close();
     });
 
     test("organization queries return initial and empty snapshots while other tenants stay closed", async () => {
@@ -786,9 +917,9 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         await expectNoDown(socket);
         const refresh = await sendAndReceive(socket, {
             t: "updateAuth",
-            jwt: await signed({ subject: "workerd-user-2" }),
+            jwt: await signed(),
         });
-        expect(refresh).toMatchObject({ t: "mustRefetch", subIds: [50], reason: "authChanged" });
+        expect(refresh).toMatchObject({ t: "mustRefetch", subIds: [], reason: "authChanged" });
         socket.close();
     });
 
@@ -860,7 +991,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         socket.send(encodeWire({ t: "unsub", subId: SubId(80) }));
         const refresh = await sendAndReceive(socket, {
             t: "updateAuth",
-            jwt: await signed({ subject: "workerd-user-2" }),
+            jwt: await signed(),
         });
         expect(refresh).toMatchObject({ t: "mustRefetch", subIds: [], reason: "authChanged" });
         socket.close();
@@ -899,7 +1030,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         socket.close();
     });
 
-    test("updateAuth retires an admitted query before switching identity and gates the next query", async () => {
+    test("same-principal updateAuth drains an admitted query, preserves it, and gates the next query", async () => {
         if (!mutationRef || !queryRef) throw new Error("public refs were not seeded");
         const { socket, first } = await openSocket(await signed());
         await first;
@@ -917,7 +1048,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         expect(seeded).toMatchObject({ t: "poke", mutResults: [{ ok: true }] });
 
         await setAuthorityFault("hold");
-        const ordered = nextDowns(socket, 2);
+        const ordered = nextDowns(socket, 3);
         socket.send(
             encodeWire({
                 t: "sub",
@@ -927,7 +1058,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
             })
         );
         await authorityControl("/authority-waiting");
-        socket.send(encodeWire({ t: "updateAuth", jwt: await signed({ subject: "workerd-user-2" }) }));
+        socket.send(encodeWire({ t: "updateAuth", jwt: await signed() }));
         socket.send(
             encodeWire({
                 t: "sub",
@@ -939,12 +1070,17 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         await expectNoDown(socket);
         await authorityControl("/authority-release");
 
-        const [refresh, after] = await ordered;
-        expect(refresh).toMatchObject({ t: "mustRefetch", subIds: [40], reason: "authChanged" });
+        const [before, refresh, after] = await ordered;
+        expect(before).toMatchObject({
+            t: "snapshot",
+            subId: 40,
+            rows: [{ id: "query-refresh-row", viewerId: "workerd-user" }],
+        });
+        expect(refresh).toMatchObject({ t: "mustRefetch", subIds: [], reason: "authChanged" });
         expect(after).toMatchObject({
             t: "snapshot",
             subId: 41,
-            rows: [{ id: "query-refresh-row", viewerId: "workerd-user-2" }],
+            rows: [{ id: "query-refresh-row", viewerId: "workerd-user" }],
         });
         await expectNoDown(socket);
         socket.close();
@@ -1028,7 +1164,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
             })
         );
         await authorityControl("/authority-waiting");
-        socket.send(encodeWire({ t: "updateAuth", jwt: await signed({ subject: "workerd-user-2" }) }));
+        socket.send(encodeWire({ t: "updateAuth", jwt: await signed() }));
         socket.send(
             encodeWire({
                 t: "mut",
@@ -1048,7 +1184,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         expect(refresh).toMatchObject({ t: "mustRefetch", reason: "authChanged" });
         expect(after).toMatchObject({
             t: "poke",
-            mutResults: [{ mutId: "refresh-after", ok: true, result: { userId: "workerd-user-2" } }],
+            mutResults: [{ mutId: "refresh-after", ok: true, result: { userId: "workerd-user" } }],
         });
         if (!before || before.t !== "poke" || !after || after.t !== "poke") {
             throw new Error("expected ordered mutation pokes around refresh");
@@ -1071,35 +1207,35 @@ describe("configured Gateway JWT handshake in real workerd", () => {
     test("malformed, tampered, expired, wrong-issuer, and wrong-audience tokens receive a terminal error and no welcome", async () => {
         const now = Math.floor(Date.now() / 1000);
         const valid = await signed();
-        const tokens = [
-            "not-a-jwt",
-            `${valid.slice(0, -2)}xx`,
-            await signed({ expirationTime: now - 60 }),
-            await signed({ issuer: "https://attacker.example" }),
-            await signed({ audience: "other-app" }),
+        const cases = [
+            { name: "malformed", token: "not-a-jwt" },
+            { name: "tampered", token: tamperJwtSignature(valid) },
+            { name: "expired", token: await signed({ expirationTime: now - 60 }) },
+            { name: "wrong-issuer", token: await signed({ issuer: "https://attacker.example" }) },
+            { name: "wrong-audience", token: await signed({ audience: "other-app" }) },
         ];
-        for (const token of tokens) {
-            const { first, closed } = await openSocket(token);
+        for (const invalid of cases) {
+            const { first, closed } = await openSocket(invalid.token, { clientId: `invalid-${invalid.name}` });
             const message = await first;
-            expect(message).toMatchObject({ t: "error", code: "CDB_FORBIDDEN", retryable: false });
-            expect(message.t).not.toBe("welcome");
-            await closed;
+            expect({ case: invalid.name, message }).toMatchObject({
+                case: invalid.name,
+                message: { t: "error", code: "CDB_FORBIDDEN", retryable: false },
+            });
+            expect({ case: invalid.name, type: message.t }).not.toMatchObject({ type: "welcome" });
+            expect({ case: invalid.name, close: await closed }).toMatchObject({
+                case: invalid.name,
+                close: { code: 1008, reason: "CDB_FORBIDDEN" },
+            });
         }
     });
 
-    test("updateAuth accepts a valid subject switch, invalidates identity state, and closes on a failed refresh", async () => {
+    test("updateAuth rejects a valid token that changes subject", async () => {
         const { socket, first, closed } = await openSocket(await signed());
         await expect(first).resolves.toMatchObject({ t: "welcome" });
 
         await expect(
             sendAndReceive(socket, { t: "updateAuth", jwt: await signed({ subject: "workerd-user-2" }) })
-        ).resolves.toEqual({
-            t: "mustRefetch",
-            subIds: [],
-            reason: "authChanged",
-        });
-
-        await expect(sendAndReceive(socket, { t: "updateAuth", jwt: "invalid.refresh.token" })).resolves.toMatchObject({
+        ).resolves.toMatchObject({
             t: "error",
             code: "CDB_FORBIDDEN",
             retryable: false,
@@ -1113,7 +1249,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         await first;
         const firstRefresh = await sendAndReceive(socket, {
             t: "updateAuth",
-            jwt: await signed({ subject: "workerd-user-2" }),
+            jwt: await signed(),
         });
         expect(firstRefresh).toMatchObject({ t: "mustRefetch", reason: "authChanged" });
         const secondRefresh = await sendAndReceive(socket, {
@@ -1248,7 +1384,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
                         tenantId: "workerd-org",
                         role: "member",
                         roles: ["member"],
-                        claims: {},
+                        claims: { userRole: "admin" },
                     },
                 },
             ],

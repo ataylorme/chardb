@@ -13,39 +13,6 @@
  * the integrated `fetch` boundary.
  */
 import { describe, expect, test } from "bun:test";
-import type { ChardbManifest, CronDescriptor } from "../../src/server/manifest.ts";
-import { emptyManifest } from "../../src/server/manifest.ts";
-import { selectMatchingCrons } from "../../src/server/observability_helpers.ts";
-import { ChardbRef } from "../../src/types.ts";
-
-function manifestWithCrons(crons: readonly CronDescriptor[]): ChardbManifest {
-    return { ...emptyManifest(), crons };
-}
-
-function cron(ref: string, cronExpr: string, invoke: () => void | Promise<void> = () => {}): CronDescriptor {
-    return { ref: ChardbRef(ref), cronExpr, invoke };
-}
-
-describe("selectMatchingCrons", () => {
-    test("empty cron expr returns nothing (the runtime fired without a cron string)", () => {
-        expect(selectMatchingCrons(manifestWithCrons([cron("c#a", "*/5 * * * *")]), undefined)).toEqual([]);
-        expect(selectMatchingCrons(manifestWithCrons([cron("c#a", "*/5 * * * *")]), "")).toEqual([]);
-    });
-
-    test("dispatches every cron whose expression equals event.cron, ignoring others", () => {
-        const a = cron("c#a", "*/5 * * * *");
-        const b = cron("c#b", "*/5 * * * *");
-        const c = cron("c#c", "0 * * * *");
-        const matched = selectMatchingCrons(manifestWithCrons([a, b, c]), "*/5 * * * *");
-        expect(matched.map(m => m.ref)).toEqual([a.ref, b.ref]);
-    });
-
-    test("equality is exact-string — wrangler-normalised expressions only match themselves", () => {
-        const matched = selectMatchingCrons(manifestWithCrons([cron("c#a", "*/5 * * * *")]), "* * * * *");
-        expect(matched).toEqual([]);
-    });
-});
-
 import { decorateResponse, extractCorrelationId } from "../../src/server/observability_helpers.ts";
 
 describe("extractCorrelationId", () => {

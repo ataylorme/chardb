@@ -2,9 +2,22 @@ import { eq } from "drizzle-orm";
 import { text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
+import { forUser, globalScope } from "../../src/server/cdb-tenant.ts";
+import { api } from "../../src/server/define.ts";
+import type {
+    CdbAuthInvalidationRequest,
+    CdbAuthInvalidationResult,
+} from "../../src/server/do/cdb-auth-invalidation-store.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
-import { type ChardbManifest, api, forOrg, forUser, globalScope, manifestFromExports } from "../../src/server/index.ts";
-import baseWorker, { Catalog, Cdb as ProductionCdb, Gateway as ProductionGateway } from "./gateway-jwt.entry.ts";
+import { gatewayBucketName } from "../../src/server/gateway-bucket.ts";
+import { forOrg } from "../../src/server/index.ts";
+import { type ChardbManifest, manifestFromExports } from "../../src/server/manifest.ts";
+import { vshardOf } from "../../src/vshard.ts";
+import baseWorker, {
+    Catalog as ProductionCatalog,
+    Cdb as ProductionCdb,
+    Gateway as ProductionGateway,
+} from "./gateway-jwt.entry.ts";
 
 const PUBLIC_QUERY_REF = "test/workerd/gateway-live.entry.ts#listPublicOrganizationRows";
 const USER_MUTATION_REF = "test/workerd/gateway-live.entry.ts#writeUserRow";
@@ -38,7 +51,10 @@ const userRows = userTable(
     {
         tenantBy: "userId",
         partitionBy: "userId",
-        roles: { user: { create: ["id", "value"], read: "*" } },
+        roles: {
+            user: { create: ["id", "value"], read: "*" },
+            "user:admin": { create: ["id", "value"], read: "*" },
+        },
     }
 );
 
@@ -55,6 +71,9 @@ const globalRows = globalTable(
         roles: { user: { create: "*", read: "*" }, admin: "*" },
     }
 );
+
+const LIVE_QUERY_SCHEMA = Object.freeze({ publicOrganizationRows, userRows, globalRows });
+let liveCdbSchema: Record<string, unknown> | undefined;
 
 const writeUserRow = api.mutation({
     ref: USER_MUTATION_REF,
@@ -162,7 +181,6 @@ function withPublicQuery(base: ChardbManifest): ChardbManifest {
     return {
         mutations: new Map([...base.mutations, ...publicManifest.mutations]),
         queries: new Map([...base.queries, ...publicManifest.queries]),
-        crons: base.crons,
         ledgers: base.ledgers,
     };
 }
@@ -215,7 +233,65 @@ interface CdbLiveState {
     }[];
 }
 
-export { Catalog };
+export class Catalog extends ProductionCatalog {
+    fixtureDrain(): Promise<void> {
+        return super.alarm();
+    }
+
+    fixtureRouteOrganization(input: { readonly organizationId: string; readonly shardId: string }): void {
+        const routing = (
+            this as unknown as {
+                readonly routingStore: {
+                    splitRange(lo: number, hi: number, shardId: string): void;
+                };
+            }
+        ).routingStore;
+        const vshard = Number(vshardOf([input.organizationId]));
+        routing.splitRange(vshard, vshard, input.shardId);
+    }
+
+    fixtureMakePrincipalInvalidationDue(input: { readonly principalId: string }): void {
+        adaptSqlStorage(this.ctx.storage.sql).exec(
+            "UPDATE catalog_auth_invalidation_principals SET next_attempt_at = 0 WHERE scope_id = ?",
+            input.principalId
+        );
+    }
+
+    fixturePrincipalInvalidationState(input: { readonly principalId: string }): Record<string, unknown> | null {
+        return adaptSqlStorage(this.ctx.storage.sql).one<Record<string, unknown>>(
+            `SELECT scope_id AS scopeId, epoch, cursor_shard_id AS cursorShardId, attempts, last_error AS lastError
+             FROM catalog_auth_invalidation_principals WHERE scope_id = ?`,
+            input.principalId
+        );
+    }
+
+    fixtureAuthInvalidationState(): {
+        readonly targets: number;
+        readonly principals: number;
+        readonly global: number;
+        readonly nextTargetAt: number | null;
+        readonly lastTargetError: string | null;
+    } {
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        const nextTarget = sql.one<{ next_attempt_at: number; last_error: string | null }>(
+            `SELECT next_attempt_at, last_error FROM catalog_auth_invalidation_targets
+             ORDER BY next_attempt_at, shard_id, scope, scope_id LIMIT 1`
+        );
+        return {
+            targets:
+                sql.one<{ count: number }>("SELECT COUNT(*) AS count FROM catalog_auth_invalidation_targets")?.count ??
+                0,
+            principals:
+                sql.one<{ count: number }>("SELECT COUNT(*) AS count FROM catalog_auth_invalidation_principals")
+                    ?.count ?? 0,
+            global:
+                sql.one<{ count: number }>("SELECT COUNT(*) AS count FROM catalog_auth_invalidation_global")?.count ??
+                0,
+            nextTargetAt: nextTarget?.next_attempt_at ?? null,
+            lastTargetError: nextTarget?.last_error ?? null,
+        };
+    }
+}
 
 export class Gateway extends ProductionGateway {
     private readonly fixtureInstanceId = crypto.randomUUID();
@@ -232,7 +308,7 @@ export class Gateway extends ProductionGateway {
                     table === "gateway_public_rows" || table === "gateway_user_rows" || table === "gateway_global_rows"
             )
         ) {
-            return cdbPolicyDigest({ publicOrganizationRows, userRows, globalRows }, tableNames);
+            return cdbPolicyDigest(LIVE_QUERY_SCHEMA, tableNames);
         }
         return super.runtimePolicyDigest(tableNames);
     }
@@ -316,13 +392,32 @@ export class Gateway extends ProductionGateway {
 
 export class Cdb extends ProductionCdb {
     private readonly fixtureInstanceId = crypto.randomUUID();
+    private fixtureLoseNextAuthInvalidationResponse = false;
 
     protected override mutationSchema(): Record<string, unknown> {
-        return { ...super.mutationSchema(), publicOrganizationRows, userRows, globalRows };
+        liveCdbSchema ??= Object.freeze({ ...super.mutationSchema(), ...LIVE_QUERY_SCHEMA });
+        return liveCdbSchema;
     }
 
     protected override mutationManifest(): ChardbManifest {
         return withPublicQuery(super.mutationManifest());
+    }
+
+    fixtureDrain(): Promise<void> {
+        return super.alarm();
+    }
+
+    fixtureLoseNextAuthInvalidation(): void {
+        this.fixtureLoseNextAuthInvalidationResponse = true;
+    }
+
+    override async invalidateAuthScope(args: CdbAuthInvalidationRequest): Promise<CdbAuthInvalidationResult> {
+        const result = await super.invalidateAuthScope(args);
+        if (this.fixtureLoseNextAuthInvalidationResponse) {
+            this.fixtureLoseNextAuthInvalidationResponse = false;
+            throw new Error("injected auth invalidation response loss");
+        }
+        return result;
     }
 
     fixtureSeedPublicRows(): void {
@@ -396,8 +491,10 @@ interface GatewayFixtureRpc {
 }
 
 interface CdbFixtureRpc {
+    fixtureDrain(): Promise<void>;
     fixtureLiveState(): Promise<CdbLiveState>;
     fixtureSeedPublicRows(): Promise<void>;
+    fixtureLoseNextAuthInvalidation(): Promise<void>;
 }
 
 type MembershipMutation =
@@ -410,6 +507,19 @@ type MembershipMutation =
       };
 
 interface CatalogFixtureRpc {
+    fixtureDrain(): Promise<void>;
+    fixtureRouteOrganization(input: { readonly organizationId: string; readonly shardId: string }): Promise<void>;
+    fixtureMakePrincipalInvalidationDue(input: { readonly principalId: string }): Promise<void>;
+    fixturePrincipalInvalidationState(input: {
+        readonly principalId: string;
+    }): Promise<Record<string, unknown> | null>;
+    fixtureAuthInvalidationState(): Promise<{
+        readonly targets: number;
+        readonly principals: number;
+        readonly global: number;
+        readonly nextTargetAt: number | null;
+        readonly lastTargetError: string | null;
+    }>;
     mutateAuth(args: {
         readonly model: string;
         readonly op: "create" | "update" | "delete";
@@ -509,6 +619,37 @@ export default {
                 })
             );
         }
+        if (url.pathname === "/live-organization") {
+            const organization = (await request.json()) as {
+                readonly id: string;
+                readonly action: "create" | "delete";
+            };
+            const id = env.CDB_CATALOG.idFromName("global");
+            const catalog = env.CDB_CATALOG.get(id) as unknown as CatalogFixtureRpc;
+            if (organization.action === "delete") {
+                return Response.json(
+                    await catalog.mutateAuth({ model: "organization", op: "delete", where: { id: organization.id } })
+                );
+            }
+            return Response.json(
+                await catalog.mutateAuth({
+                    model: "organization",
+                    op: "create",
+                    payload: {
+                        id: organization.id,
+                        name: organization.id,
+                        slug: organization.id,
+                        createdAt: Date.parse("2026-08-28T00:00:00Z"),
+                    },
+                })
+            );
+        }
+        if (url.pathname === "/live-route-organization") {
+            const route = (await request.json()) as { readonly organizationId: string; readonly shardId: string };
+            const id = env.CDB_CATALOG.idFromName("global");
+            await (env.CDB_CATALOG.get(id) as unknown as CatalogFixtureRpc).fixtureRouteOrganization(route);
+            return Response.json({ ok: true });
+        }
         if (
             url.pathname === "/live-gateway-drain" ||
             url.pathname === "/live-gateway-stage" ||
@@ -516,7 +657,7 @@ export default {
         ) {
             const clientId = url.searchParams.get("clientId");
             if (!clientId) return new Response("missing clientId", { status: 400 });
-            const id = env.CDB_GATEWAY.idFromName(clientId.slice(0, 12));
+            const id = env.CDB_GATEWAY.idFromName(gatewayBucketName(clientId));
             const gateway = env.CDB_GATEWAY.get(id) as unknown as GatewayFixtureRpc;
             if (url.pathname === "/live-gateway-drain") {
                 await gateway.fixtureDrain();
@@ -534,6 +675,49 @@ export default {
             const id = env.CDB_SHARD.idFromName(shardId);
             const cdb = env.CDB_SHARD.get(id) as unknown as CdbFixtureRpc;
             return Response.json(await cdb.fixtureLiveState());
+        }
+        if (url.pathname === "/live-catalog-drain") {
+            const id = env.CDB_CATALOG.idFromName("global");
+            await (env.CDB_CATALOG.get(id) as unknown as CatalogFixtureRpc).fixtureDrain();
+            return Response.json({ ok: true });
+        }
+        if (url.pathname === "/live-cdb-drain") {
+            const shardId = url.searchParams.get("shardId");
+            if (!shardId) return new Response("missing shardId", { status: 400 });
+            const id = env.CDB_SHARD.idFromName(shardId);
+            await (env.CDB_SHARD.get(id) as unknown as CdbFixtureRpc).fixtureDrain();
+            return Response.json({ ok: true });
+        }
+        if (url.pathname === "/live-cdb-lose-auth-response") {
+            const shardId = url.searchParams.get("shardId");
+            if (!shardId) return new Response("missing shardId", { status: 400 });
+            const id = env.CDB_SHARD.idFromName(shardId);
+            await (env.CDB_SHARD.get(id) as unknown as CdbFixtureRpc).fixtureLoseNextAuthInvalidation();
+            return Response.json({ ok: true });
+        }
+        if (url.pathname === "/live-principal-invalidation-due") {
+            const principalId = url.searchParams.get("principalId");
+            if (!principalId) return new Response("missing principalId", { status: 400 });
+            const id = env.CDB_CATALOG.idFromName("global");
+            await (env.CDB_CATALOG.get(id) as unknown as CatalogFixtureRpc).fixtureMakePrincipalInvalidationDue({
+                principalId,
+            });
+            return Response.json({ ok: true });
+        }
+        if (url.pathname === "/live-principal-invalidation-state") {
+            const principalId = url.searchParams.get("principalId");
+            if (!principalId) return new Response("missing principalId", { status: 400 });
+            const id = env.CDB_CATALOG.idFromName("global");
+            const state = await (
+                env.CDB_CATALOG.get(id) as unknown as CatalogFixtureRpc
+            ).fixturePrincipalInvalidationState({ principalId });
+            return Response.json({ state });
+        }
+        if (url.pathname === "/live-auth-invalidation-state") {
+            const id = env.CDB_CATALOG.idFromName("global");
+            return Response.json(
+                await (env.CDB_CATALOG.get(id) as unknown as CatalogFixtureRpc).fixtureAuthInvalidationState()
+            );
         }
         return baseWorker.fetch(request, env);
     },

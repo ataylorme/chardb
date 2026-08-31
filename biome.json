@@ -5,7 +5,9 @@
         "ignore": [
             "node_modules",
             "dist",
+            "artifacts",
             ".chardb",
+            "**/.wrangler",
             "bun.lockb",
             "*.md",
             "landing/.tsbuild",

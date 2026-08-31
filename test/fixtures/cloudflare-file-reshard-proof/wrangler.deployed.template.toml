@@ -1,0 +1,51 @@
+name = "__WORKER_NAME__"
+main = "src/worker.ts"
+compatibility_date = "2026-08-27"
+compatibility_flags = ["nodejs_compat"]
+
+[[migrations]]
+tag = "init"
+new_sqlite_classes = ["Cdb", "Catalog", "Gateway", "Resharder", "VectorIndexProbe"]
+
+[[durable_objects.bindings]]
+name = "CDB_CATALOG"
+class_name = "Catalog"
+
+[[durable_objects.bindings]]
+name = "CDB_SHARD"
+class_name = "Cdb"
+
+[[durable_objects.bindings]]
+name = "CDB_GATEWAY"
+class_name = "Gateway"
+
+[[durable_objects.bindings]]
+name = "CDB_RESHARD"
+class_name = "Resharder"
+
+[[r2_buckets]]
+binding = "CDB_FILES"
+bucket_name = "__BUCKET_NAME__"
+
+[[vectorize]]
+binding = "CDB_PROOF_VECTORS"
+index_name = "__VECTORIZE_INDEX_NAME__"
+remote = true
+
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+[vars]
+CDB_PROOF_TARGET_KIND = "deployed"
+CDB_PROOF_RUNTIME = "cloudflare-workers"
+CDB_PROOF_CONFIGURATION_SHA256 = "__CONFIGURATION_SHA256__"
+CDB_RELEASE_SHA256 = "__RELEASE_SHA256__"
+CDB_PROOF_RUN_ID = "__RUN_ID__"
+CDB_PROOF_R2_BUCKET = "__BUCKET_NAME__"
+CDB_PROOF_VECTORIZE_INDEX = "__VECTORIZE_INDEX_NAME__"
+
+[observability.logs]
+enabled = true
+
+[observability.traces]
+enabled = true

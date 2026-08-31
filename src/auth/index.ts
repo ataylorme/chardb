@@ -1,5 +1,5 @@
 /**
- * `chardb/auth` — `withChardb()` and the chardb-specific better-auth helpers.
+ * Internal Better Auth synthesis helpers.
  *
  * `withChardb()` composes with the user's `withCloudflare()`; verified safe
  * since `withCloudflare` only overrides `database` if `{d1,d1Native,postgres,

@@ -1,178 +1,62 @@
-import { anonymous } from "better-auth/plugins/anonymous";
-import { jwt } from "better-auth/plugins/jwt";
-import type { DBAdapter, Session } from "better-auth/types";
-import { client } from "chardb";
-import { chardb, defineAuth, defineMigrations, defineSchemaBaseline } from "chardb/server";
+import { client } from "@chardb/core";
+import { chardb } from "@chardb/core/server";
+import { desc, eq } from "drizzle-orm";
 import * as api from "./api.ts";
+import { auth } from "./auth.ts";
+import { migrations } from "./migrations.ts";
 import * as queries from "./queries.ts";
-import * as domain from "./schema.ts";
+import * as schema from "./schema.ts";
 
-const DEMO_ORG_ID = "demo-org" as const;
+export const app = chardb({
+    auth,
+    authBasePath: "/api/auth",
+    schema,
+    api: { ...api, ...queries },
+    migrations,
+});
 
-type DemoSession = Pick<Session, "id" | "userId">;
-type DemoAdapter = Pick<DBAdapter, "create" | "findOne" | "update">;
+function bearer(request: { header(name: string): string | undefined }): string | null {
+    return request.header("authorization")?.replace(/^Bearer\s+/i, "") ?? null;
+}
 
-async function createOrganizationIfMissing(adapter: DemoAdapter): Promise<void> {
-    const findOrganization = () =>
-        adapter.findOne<{ id: string }>({
-            model: "organization",
-            where: [{ field: "id", operator: "eq", value: DEMO_ORG_ID, connector: "AND" }],
-        });
-    if (await findOrganization()) return;
-    try {
-        await adapter.create({
-            model: "organization",
-            data: {
-                id: DEMO_ORG_ID,
-                name: "Demo",
-                slug: "demo",
-                createdAt: new Date(),
-            },
-            forceAllowId: true,
-        });
-    } catch (error) {
-        // Another session may have created the singleton after our read.
-        if (!(await findOrganization())) throw error;
+app.get("/health", c =>
+    c.json({
+        ok: true,
+        schemaVersion: migrations.version,
+        releaseSha256: (c.env as unknown as { readonly CDB_RELEASE_SHA256?: string }).CDB_RELEASE_SHA256 ?? null,
+    })
+);
+
+app.get("/api/messages", async c => {
+    const jwt = bearer(c.req);
+    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
+    const url = new URL(c.req.url);
+    const organizationId = url.searchParams.get("organizationId") ?? "";
+    const requestedLimit = Number(url.searchParams.get("limit") ?? "50");
+    if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) {
+        return c.json({ error: "limit must be an integer from 1 through 100" }, 400);
     }
-}
-
-async function createMembershipIfMissing(adapter: DemoAdapter, userId: string): Promise<void> {
-    const findMembership = () =>
-        adapter.findOne<{ id: string }>({
-            model: "member",
-            where: [
-                { field: "organizationId", operator: "eq", value: DEMO_ORG_ID, connector: "AND" },
-                { field: "userId", operator: "eq", value: userId, connector: "AND" },
-            ],
-        });
-    if (await findMembership()) return;
-    try {
-        await adapter.create({
-            model: "member",
-            data: {
-                id: `${DEMO_ORG_ID}-${userId}`,
-                organizationId: DEMO_ORG_ID,
-                userId,
-                role: "member",
-                createdAt: new Date(),
-            },
-            forceAllowId: true,
-        });
-    } catch (error) {
-        // Treat only a confirmed concurrent create as success.
-        if (!(await findMembership())) throw error;
-    }
-}
-
-export async function bootstrapDemoSession(adapter: DemoAdapter, session: DemoSession): Promise<void> {
-    await createOrganizationIfMissing(adapter);
-    await createMembershipIfMissing(adapter, session.userId);
-    await adapter.update({
-        model: "session",
-        where: [{ field: "id", operator: "eq", value: session.id, connector: "AND" }],
-        update: { activeOrganizationId: DEMO_ORG_ID },
-    });
-}
-
-// `defineAuth` bakes `organization()` and `admin()` into the plugin
-// list automatically — schema files reference `auth.organization` /
-// `auth.member` / etc without the user listing the plugin, and
-// cdbTable's role lattice (member.role for org tenants, user.role for
-// user/global tenants) is wired up the same way.
-export const auth = defineAuth({
-    appName: "chardb-chat-example",
-    plugins: [anonymous(), jwt()],
-    databaseHooks: {
-        session: {
-            create: {
-                after: async (session, ctx) => {
-                    if (!ctx?.context.adapter) return;
-                    await bootstrapDemoSession(ctx.context.adapter, session);
-                },
-            },
-        },
-    },
-});
-
-export const migrations = defineMigrations([
-    defineSchemaBaseline({
-        version: 1,
-        name: "initial_schema",
-        domainSchema: domain,
-        authOptions: auth.options,
-    }),
-]);
-
-export const app = chardb({ auth, schema: domain, api: { ...api, ...queries }, migrations });
-
-app.get("/health", c => c.text("ok"));
-app.get("/api/version", c => c.json({ name: "chardb-chat-example", version: "0.1.0" }));
-app.get("/api/db/messages", async c => {
-    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
-    const url = new URL(c.req.url);
-    const rows = await client(c.env.DB, { jwt, authOrigin: url.origin }).query(queries.listMessages, {
-        organizationId: url.searchParams.get("organizationId") ?? "",
-        channelId: url.searchParams.get("channelId") ?? "",
-        limit: Number(url.searchParams.get("limit") ?? 50),
-    });
+    const db = client(c.env.DB, { jwt, authOrigin: url.origin });
+    const rows = await db
+        .select()
+        .from(schema.messages)
+        .where(eq(schema.messages.organizationId, organizationId))
+        .orderBy(desc(schema.messages.createdAt), desc(schema.messages.id))
+        .limit(requestedLimit);
     return c.json(rows);
 });
-app.post("/api/db/messages", async c => {
-    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
+
+app.post("/api/messages", async c => {
+    const jwt = bearer(c.req);
     if (!jwt) return c.json({ error: "missing bearer token" }, 401);
     const url = new URL(c.req.url);
-    const body = await c.req.json<{
-        id: string;
-        organizationId: string;
-        channelId: string;
-        body: string;
-        clientCreatedAt: number;
-        mutId?: string;
-    }>();
-    const result = await client(c.env.DB, { jwt, authOrigin: url.origin }).mutate(api.postMessage, body, {
-        ...(body.mutId ? { mutId: body.mutId } : {}),
-    });
-    return c.json(result);
-});
-app.get("/api/db/preferences", async c => {
-    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
-    const url = new URL(c.req.url);
-    const rows = await client(c.env.DB, { jwt, authOrigin: url.origin }).query(queries.listUserPreferences, {
-        userId: url.searchParams.get("userId") ?? "",
-    });
-    return c.json(rows);
-});
-app.post("/api/db/preferences", async c => {
-    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
-    const url = new URL(c.req.url);
-    const body = await c.req.json<{ id: string; userId: string; theme: string; mutId?: string }>();
-    const result = await client(c.env.DB, { jwt, authOrigin: url.origin }).mutate(api.createUserPreference, body, {
-        ...(body.mutId ? { mutId: body.mutId } : {}),
-    });
-    return c.json(result);
-});
-app.get("/api/db/notices", async c => {
-    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
-    const url = new URL(c.req.url);
-    const rows = await client(c.env.DB, { jwt, authOrigin: url.origin }).query(queries.listGlobalNotices, {
-        namespace: url.searchParams.get("namespace") ?? "",
-    });
-    return c.json(rows);
-});
-app.post("/api/db/notices", async c => {
-    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
-    const url = new URL(c.req.url);
-    const body = await c.req.json<{ id: string; namespace: string; body: string; mutId?: string }>();
-    const result = await client(c.env.DB, { jwt, authOrigin: url.origin }).mutate(api.createGlobalNotice, body, {
-        ...(body.mutId ? { mutId: body.mutId } : {}),
-    });
-    return c.json(result);
+    const body = await c.req.json<Parameters<typeof api.postMessage>[1] & { readonly mutId?: string }>();
+    return c.json(
+        await client(c.env.DB, { jwt, authOrigin: url.origin }).mutate(api.postMessage, body, {
+            ...(body.mutId ? { mutId: body.mutId } : {}),
+        })
+    );
 });
 
 export default app;
-export const { DB, BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;
+export const { DB, Catalog, Cdb, Gateway, Resharder } = app;

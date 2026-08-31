@@ -3,9 +3,10 @@
  *
  * A schema file declares its tenancy axis once at the top:
  *
- *   const { cdbTable } = forOrg();   // every table is org-tenanted
- *   const { cdbTable } = forUser();  // every table is user-tenanted
- *   const { cdbTable } = global();   // no tenant; partitionBy: required
+ *   const { cdbTable } = forOrg();      // rows belong to an organization
+ *   const { cdbTable } = forOrgUser();  // rows belong to a user in an organization
+ *   const { cdbTable } = forUser();     // rows belong to a user across organizations
+ *   const { cdbTable } = global();      // no tenant; partitionBy: required
  *
  * Lifting the declaration out of every per-table config eliminates a
  * footgun (writing `tenant: "organizationId"` on six tables and
@@ -27,7 +28,7 @@
 
 import type { SQLiteTableWithColumns } from "drizzle-orm/sqlite-core";
 import type { sqliteTable } from "drizzle-orm/sqlite-core";
-import type { AuthTargetKind, CdbTableConfig, TenantKind } from "./cdb-table-types.ts";
+import type { AuthTargetKind, CdbScopeKind, CdbTableConfig, TenantKind } from "./cdb-table-types.ts";
 import { type CdbColumnsInput, createCdbTable } from "./cdb-table.ts";
 
 /** The Drizzle table type `sqliteTable(name, cols)` produces, with column inference preserved. */
@@ -52,11 +53,11 @@ type BuiltTable<TName extends string, TCols extends CdbColumnsInput> = SQLiteTab
  * covers the standard chat / SaaS naming and `tenantBy: "..."` covers
  * everything else.
  */
-type AutoFillKeys<K extends TenantKind, TCols, TConfig> =
+type AutoFillKeys<K extends CdbScopeKind, TCols, TConfig> =
     | (TConfig extends { readonly selfBy: infer S extends string } ? S & keyof TCols & string : never)
     | (TConfig extends { readonly tenantBy: infer T extends string }
           ? T & keyof TCols & string
-          : K extends "org"
+          : K extends "org" | "orgUser"
             ? "organizationId" extends keyof TCols
                 ? "organizationId"
                 : never
@@ -64,7 +65,14 @@ type AutoFillKeys<K extends TenantKind, TCols, TConfig> =
               ? "userId" extends keyof TCols
                   ? "userId"
                   : never
-              : never);
+              : never)
+    | (K extends "orgUser"
+          ? TConfig extends { readonly selfBy: string }
+              ? never
+              : "userId" extends keyof TCols
+                ? "userId"
+                : never
+          : never);
 
 /**
  * Override `$inferInsert` on the underlying Drizzle table type so the
@@ -86,7 +94,7 @@ type CdbBuiltTable<TName extends string, TCols extends CdbColumnsInput, TAutoFil
         : T
     : never;
 
-export interface BoundCdbTable<K extends TenantKind> {
+export interface BoundCdbTable<K extends CdbScopeKind> {
     /**
      * Construct a tenancy-bound table. The tenant column is auto-
      * discovered from the FK to the factory's auth target on first
@@ -107,9 +115,10 @@ export interface BoundCdbTable<K extends TenantKind> {
     ): CdbBuiltTable<TName, TCols, AutoFillKeys<K, TCols, TConfig>>;
 }
 
-const ORG_FACTORY: BoundCdbTable<"org"> = makeBound<"org">("org", "organization");
+const ORG_FACTORY: BoundCdbTable<"org"> = makeBound<"org">("organization", "org");
+const ORG_USER_FACTORY: BoundCdbTable<"orgUser"> = makeBound<"orgUser">("organization", "org", "user");
 const USER_FACTORY: BoundCdbTable<"user"> = makeBound<"user">("user", "user");
-const GLOBAL_FACTORY: BoundCdbTable<"none"> = makeBound<"none">("none", null);
+const GLOBAL_FACTORY: BoundCdbTable<"none"> = makeBound<"none">(null, "none");
 
 /**
  * Org-tenanted schema file. Every `cdbTable` returned has its tenant
@@ -120,6 +129,16 @@ const GLOBAL_FACTORY: BoundCdbTable<"none"> = makeBound<"none">("none", null);
  */
 export function forOrg(): BoundCdbTable<"org"> {
     return ORG_FACTORY;
+}
+
+/**
+ * Organization-routed rows owned by the active user. The organization and
+ * user columns are auto-discovered from their Better Auth foreign keys and
+ * both are filled from the verified operation authority. Organization roles
+ * can grant org-wide access while `self` grants apply only to the owning user.
+ */
+export function forOrgUser(): BoundCdbTable<"orgUser"> {
+    return ORG_USER_FACTORY;
 }
 
 /**
@@ -145,7 +164,11 @@ export function globalScope(): BoundCdbTable<"none"> {
     return GLOBAL_FACTORY;
 }
 
-function makeBound<K extends TenantKind>(kind: K, target: AuthTargetKind): BoundCdbTable<K> {
+function makeBound<K extends CdbScopeKind>(
+    target: AuthTargetKind,
+    tenantKind: TenantKind,
+    selfTarget?: "user"
+): BoundCdbTable<K> {
     return Object.freeze({
         cdbTable<TName extends string, TCols extends CdbColumnsInput, const TConfig extends CdbTableConfig<TCols, K>>(
             name: TName,
@@ -156,8 +179,9 @@ function makeBound<K extends TenantKind>(kind: K, target: AuthTargetKind): Bound
                 name,
                 columns,
                 config: (config ?? ({} as CdbTableConfig<TCols, K>)) as CdbTableConfig<TCols, K>,
-                tenantKind: kind,
+                tenantKind,
                 authTarget: target,
+                ...(selfTarget ? { selfTarget } : {}),
             }) as CdbBuiltTable<TName, TCols, AutoFillKeys<K, TCols, TConfig>>;
         },
     });

@@ -4,7 +4,7 @@ const origin = new URL(process.env.CHARDB_URL ?? "http://127.0.0.1:8787");
 const adminToken = process.env.CHARDB_ADMIN_TOKEN ?? "local-chardb-admin";
 const authSecret = process.env.BETTER_AUTH_SECRET ?? "local-chardb-auth-secret-that-is-at-least-32-characters";
 const wranglerBin = join(process.cwd(), "node_modules", ".bin", "wrangler");
-const chardbBin = join(process.cwd(), "node_modules", "chardb", "dist", "cli", "bin.mjs");
+const chardbBin = join(process.cwd(), "node_modules", "@chardb", "core", "dist", "cli", "bin.mjs");
 
 const worker = Bun.spawn(
     [
@@ -24,15 +24,22 @@ const worker = Bun.spawn(
     { stdin: "inherit", stdout: "inherit", stderr: "inherit", detached: process.platform !== "win32" }
 );
 
-function processGroupExists() {
-    if (process.platform === "win32") return worker.exitCode === null;
+function processGroupExists(pid) {
+    if (process.platform === "win32") return false;
     try {
-        process.kill(-worker.pid, 0);
+        process.kill(-pid, 0);
         return true;
     } catch (error) {
         if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") return false;
+        if (error && typeof error === "object" && "code" in error && error.code === "EPERM") return true;
         throw error;
     }
+}
+
+async function waitForProcessGroupExit(pid, waitMs) {
+    const deadline = performance.now() + waitMs;
+    while (processGroupExists(pid) && performance.now() < deadline) await Bun.sleep(10);
+    return !processGroupExists(pid);
 }
 
 async function terminateProcessGroup(signal) {
@@ -48,10 +55,19 @@ async function terminateProcessGroup(signal) {
         if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") return;
         throw error;
     }
-    const deadline = Date.now() + 2_000;
-    while (processGroupExists() && Date.now() < deadline) await Bun.sleep(10);
-    if (!processGroupExists()) return;
-    process.kill(-worker.pid, "SIGKILL");
+    if (await waitForProcessGroupExit(worker.pid, 2_000)) {
+        await worker.exited;
+        return;
+    }
+    try {
+        process.kill(-worker.pid, "SIGKILL");
+    } catch (error) {
+        if (!(error && typeof error === "object" && "code" in error && error.code === "ESRCH")) throw error;
+    }
+    if (!(await waitForProcessGroupExit(worker.pid, 2_000))) {
+        throw new Error(`process group ${worker.pid} survived SIGKILL`);
+    }
+    await worker.exited;
 }
 
 let termination;
@@ -67,18 +83,38 @@ async function waitForWorker() {
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
         if (worker.exitCode !== null) throw new Error(`wrangler exited with status ${worker.exitCode}`);
+        let response;
         try {
-            const response = await fetch(new URL("/health", origin));
-            if (response.ok) return;
+            response = await fetch(new URL("/health", origin));
         } catch {
             // Wrangler has not opened its local listener yet.
+            await Bun.sleep(100);
+            continue;
+        }
+        if (response.ok) {
+            let body;
+            try {
+                body = await response.json();
+            } catch {
+                throw new Error("/health returned invalid JSON");
+            }
+            if (
+                body &&
+                typeof body === "object" &&
+                body.ok === true &&
+                Number.isSafeInteger(body.schemaVersion) &&
+                body.schemaVersion >= 1
+            ) {
+                return body.schemaVersion;
+            }
+            throw new Error("/health returned an invalid schema version");
         }
         await Bun.sleep(100);
     }
     throw new Error(`timed out waiting for ${origin.origin}/health`);
 }
 
-async function applyMigrations() {
+async function applyMigrations(targetVersion) {
     const migration = Bun.spawn(
         [
             "bun",
@@ -87,9 +123,9 @@ async function applyMigrations() {
             "--url",
             origin.origin,
             "--id",
-            "chat-local-initial-schema",
+            `chat-local-schema-v${targetVersion}`,
             "--target",
-            "1",
+            String(targetVersion),
             "--concurrency",
             "4",
         ],
@@ -104,9 +140,9 @@ async function applyMigrations() {
 }
 
 try {
-    await waitForWorker();
-    await applyMigrations();
-    console.log(`chat Worker ready at ${origin.origin}`);
+    const targetVersion = await waitForWorker();
+    await applyMigrations(targetVersion);
+    console.log(`chat Worker ready at ${origin.origin} with schema version ${targetVersion}`);
     process.exitCode = await worker.exited;
     await stop("SIGTERM");
 } catch (error) {

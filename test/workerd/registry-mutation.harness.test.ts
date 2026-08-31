@@ -2,6 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rm } from "node:fs/promises";
 import * as path from "node:path";
 import { Miniflare } from "miniflare";
+import { disposeMiniflareBounded } from "../../scripts/miniflare-lifecycle.mjs";
+import { vshardOf } from "../../src/vshard.ts";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ENTRY = path.join(HERE, "registry-mutation.entry.ts");
@@ -63,13 +65,15 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-    await mf?.dispose();
+    await disposeMiniflareBounded(mf, { label: "registry mutation fixture final teardown" });
+    mf = undefined;
 });
 
 async function mutate(body: {
-    readonly operation: "put" | "inspect" | "raw" | "unknown";
+    readonly operation: "put" | "routed" | "inspect" | "raw" | "unknown";
     readonly mutId: string;
     readonly args: unknown;
+    readonly schemaEpoch?: number;
 }): Promise<{ readonly status: number; readonly body: Record<string, unknown> }> {
     if (!mf) throw new Error("miniflare not initialized");
     const response = await mf.dispatchFetch("http://example.com/mutate", {
@@ -78,6 +82,25 @@ async function mutate(body: {
         body: JSON.stringify(body),
     });
     return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+}
+
+async function routingFence(
+    phase: "prepare" | "activate" | "cleanup",
+    body: {
+        readonly migrationId: string;
+        readonly rangeLo: number;
+        readonly rangeHi: number;
+        readonly sourceGeneration: number;
+        readonly destinationGeneration: number;
+    }
+): Promise<Record<string, unknown>> {
+    if (!mf) throw new Error("miniflare not initialized");
+    const response = await mf.dispatchFetch(`http://example.com/routing-fence/${phase}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+    });
+    return (await response.json()) as Record<string, unknown>;
 }
 
 async function inspectAtomicState(): Promise<{
@@ -349,5 +372,98 @@ describe("configured Cdb local mutation registry", () => {
             ok: false,
             error: { code: "CDB_INVARIANT" },
         });
+    });
+
+    test("fences routed mutations in native SqlStorage before the op-log and domain write", async () => {
+        const ownerId = "native-routing-fence-owner";
+        const vshard = vshardOf([ownerId]);
+        const fence = {
+            migrationId: "native-routing-fence",
+            rangeLo: vshard,
+            rangeHi: vshard,
+            sourceGeneration: 1,
+            destinationGeneration: 2,
+        } as const;
+        expect(await routingFence("prepare", fence)).toMatchObject({ status: "prepared" });
+        const before = await inspectAtomicState();
+
+        expect(
+            await mutate({
+                operation: "routed",
+                mutId: "native-fence-wrong-prepared",
+                args: { id: "native-fence-wrong-prepared", ownerId, value: 1 },
+                schemaEpoch: 2,
+            })
+        ).toMatchObject({ body: { ok: false, error: { code: "CDB_STALE_EPOCH", retryable: true } } });
+        expect(
+            await mutate({
+                operation: "routed",
+                mutId: "native-fence-source",
+                args: { id: "native-fence-source", ownerId, value: 2 },
+                schemaEpoch: 1,
+            })
+        ).toMatchObject({ body: { ok: true, ran: true, result: "native-fence-source" } });
+        expect(await routingFence("activate", fence)).toMatchObject({ status: "active" });
+
+        for (const schemaEpoch of [1, 2, 3]) {
+            expect(
+                await mutate({
+                    operation: "routed",
+                    mutId: `native-fence-blocked-${schemaEpoch}`,
+                    args: { id: `native-fence-blocked-${schemaEpoch}`, ownerId, value: schemaEpoch },
+                    schemaEpoch,
+                })
+            ).toMatchObject({ body: { ok: false, error: { code: "CDB_STALE_EPOCH", retryable: true } } });
+        }
+        expect(await routingFence("cleanup", fence)).toMatchObject({ status: "cleaned" });
+
+        const after = await inspectAtomicState();
+        expect(after.entries.filter(row => row.owner_id === ownerId)).toEqual([
+            { id: "native-fence-source", owner_id: ownerId, value: 2 },
+        ]);
+        expect(after.opLogRows).toBe(before.opLogRows + 1);
+    });
+
+    test("native fence activation wakes an idle registered query and rejects its stale rerun", async () => {
+        const registrationId = "query-idle-routing-fence";
+        expect(await registeredProof("subscribe", { registrationId })).toMatchObject({ ok: true });
+        const vshard = vshardOf(["registry-user"]);
+        const fence = {
+            migrationId: "native-idle-live-fence",
+            rangeLo: vshard,
+            rangeHi: vshard,
+            sourceGeneration: 1,
+            destinationGeneration: 2,
+        } as const;
+
+        expect(await routingFence("prepare", fence)).toMatchObject({ status: "prepared" });
+        expect(await routingFence("activate", fence)).toMatchObject({ status: "active" });
+        expect(await registeredProof("query", { registrationId })).toMatchObject({
+            ok: false,
+            error: { code: "CDB_STALE_EPOCH", retryable: true },
+        });
+
+        let delivered: readonly Record<string, unknown>[] = [];
+        for (let attempt = 0; attempt < 100; attempt++) {
+            delivered = await inspectGateway();
+            const registrations = delivered.flatMap(request =>
+                Array.isArray(request.invalidations)
+                    ? request.invalidations.map(item =>
+                          typeof item === "object" && item !== null
+                              ? (item as { subscription?: { registrationId?: string } }).subscription?.registrationId
+                              : undefined
+                      )
+                    : []
+            );
+            if (registrations.includes(registrationId)) break;
+            await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        expect(delivered).toContainEqual(
+            expect.objectContaining({
+                invalidations: expect.arrayContaining([
+                    expect.objectContaining({ subscription: expect.objectContaining({ registrationId }) }),
+                ]),
+            })
+        );
     });
 });

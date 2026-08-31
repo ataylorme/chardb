@@ -154,3 +154,69 @@ body {
 .eyebrow .num {
     color: #ec5713;
 }
+
+.file-stack {
+    display: grid;
+    min-height: 440px;
+    align-content: center;
+}
+
+.file-card {
+    --offset: calc(var(--file-index) * 34px);
+    grid-area: 1 / 1;
+    width: min(100%, 580px);
+    min-height: 205px;
+    margin-left: auto;
+    transform: translate(calc(var(--file-index) * -18px), var(--offset));
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 14px;
+    overflow: hidden;
+    background: #111111;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.42);
+}
+
+.file-card header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 42px;
+    padding: 0 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.file-card header code {
+    margin-left: 8px;
+    color: #9a9a9a;
+    font-size: 11px;
+}
+
+.file-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: rgba(237, 237, 237, 0.15);
+}
+
+.file-card pre {
+    padding: 18px;
+    overflow: hidden;
+    color: #d9d9d9;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 12px;
+    line-height: 1.65;
+}
+
+@media (max-width: 1023px) {
+    .file-stack {
+        min-height: auto;
+        gap: 12px;
+    }
+
+    .file-card {
+        grid-area: auto;
+        width: 100%;
+        min-height: 0;
+        transform: none;
+    }
+}

@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rm } from "node:fs/promises";
 import * as path from "node:path";
 import { Miniflare } from "miniflare";
+import { disposeMiniflareBounded } from "../../scripts/miniflare-lifecycle.mjs";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ENTRY = path.join(HERE, "atomic-mutation.entry.ts");
@@ -47,7 +48,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-    await mf?.dispose();
+    await disposeMiniflareBounded(mf, { label: "atomic mutation fixture final teardown" });
+    mf = undefined;
 });
 
 async function execute(body: {

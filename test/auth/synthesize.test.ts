@@ -144,7 +144,13 @@ describe("synthesizeAuthSchema", () => {
 
 describe("defineAuth", () => {
     test("bundles options + synthesized tables in a single value (plugin tables inferred)", () => {
-        const auth = defineAuth({ appName: "x", plugins: [organization()] });
+        const organizationPlugin = organization();
+        const plugins = [organizationPlugin] as const;
+        const options = { appName: "x", plugins };
+        const auth = defineAuth(options);
+        expect(auth.options as unknown).toBe(options);
+        expect(auth.options.plugins as unknown).toBe(plugins);
+        expect(auth.options.plugins).toEqual([organizationPlugin]);
         expect(auth.options.appName).toBe("x");
         expect(typeof getTableName(auth.user)).toBe("string");
         expect(typeof getTableName(auth.organization)).toBe("string");
@@ -168,20 +174,19 @@ describe("defineAuth", () => {
         expect(invitationTable.email).toBeDefined();
     });
 
-    test("no plugins → core four + bundled organization/admin tables are present", () => {
-        // chardb's `defineAuth` bakes `organization()` and `admin()` into the
-        // plugin list by default so cdbTable's role-lattice (member.role for
-        // org-tenanted files, user.role for user/global files) is always
-        // available without per-app re-declaration.
-        const auth = defineAuth({});
+    test("no plugins means exactly the core four tables", () => {
+        const plugins = [] as const;
+        const options = { plugins };
+        const auth = defineAuth(options);
+        expect(auth.options as unknown).toBe(options);
+        expect(auth.options.plugins as unknown).toBe(plugins);
         expect(auth.user.id).toBeDefined();
         expect(auth.session.token).toBeDefined();
         expect(auth.account.providerId).toBeDefined();
         expect(auth.verification.identifier).toBeDefined();
-        // organization() plugin's tables come along for the ride:
-        expect((auth as { organization?: { id?: unknown } }).organization?.id).toBeDefined();
-        expect((auth as { member?: { id?: unknown } }).member?.id).toBeDefined();
-        expect((auth as { invitation?: { id?: unknown } }).invitation?.id).toBeDefined();
+        expect("organization" in auth).toBe(false);
+        expect("member" in auth).toBe(false);
+        expect("invitation" in auth).toBe(false);
     });
 
     test("extraTables escape hatch raises when a requested table is absent", () => {

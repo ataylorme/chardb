@@ -1,0 +1,37 @@
+{
+    "name": "chardb-file-reshard-proof-local",
+    "main": "src/worker.ts",
+    "compatibility_date": "2026-08-27",
+    "compatibility_flags": ["nodejs_compat"],
+    "migrations": [
+        {
+            "tag": "init",
+            "new_sqlite_classes": ["Cdb", "Catalog", "Gateway", "Resharder", "VectorIndexProbe"]
+        }
+    ],
+    "durable_objects": {
+        "bindings": [
+            { "name": "CDB_CATALOG", "class_name": "Catalog" },
+            { "name": "CDB_SHARD", "class_name": "Cdb" },
+            { "name": "CDB_GATEWAY", "class_name": "Gateway" },
+            { "name": "CDB_RESHARD", "class_name": "Resharder" },
+            { "name": "CDB_VECTOR_PROBE", "class_name": "VectorIndexProbe" }
+        ]
+    },
+    "r2_buckets": [{ "binding": "CDB_FILES", "bucket_name": "chardb-file-reshard-proof-local" }],
+    "version_metadata": { "binding": "CF_VERSION_METADATA" },
+    "vars": {
+        "CDB_PROOF_TARGET_KIND": "local",
+        "CDB_PROOF_RUNTIME": "wrangler-miniflare-workerd",
+        "CDB_PROOF_LOCAL_VERSION": "local-dev",
+        "CDB_PROOF_CONFIGURATION_SHA256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "CDB_RELEASE_SHA256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "CDB_PROOF_RUN_ID": "local_file_reshard_proof",
+        "CDB_PROOF_R2_BUCKET": "chardb-file-reshard-proof-local",
+        "CDB_PROOF_VECTORIZE_INDEX": "chardb-file-reshard-proof-local-vector-probe"
+    },
+    "observability": {
+        "logs": { "enabled": true },
+        "traces": { "enabled": true }
+    }
+}

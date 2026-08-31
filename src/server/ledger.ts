@@ -39,7 +39,7 @@ export type LedgerTable<TName extends string, TColumns> = TColumns & {
  *
  * NB: this skeleton uses the column map directly to keep the foundation
  * layer free of a hard dependency on Drizzle's table builder; the
- * `chardb/drizzle` package adapts it to `sqliteTable` at build time.
+ * The internal Drizzle adapter converts it to `sqliteTable` at build time.
  */
 export function defineLedger<TName extends string, TColumns extends Record<string, unknown>>(
     name: TName,

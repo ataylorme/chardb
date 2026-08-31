@@ -50,7 +50,7 @@ import {
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../errors.ts";
 import { applyColumnMask, assertColumnsWritable } from "./cdb-cls.ts";
-import { compileCdbPolicies } from "./cdb-policy.ts";
+import { compileCdbPolicies, policiesForColumnUpdate } from "./cdb-policy.ts";
 import { getCdbMeta } from "./cdb-table-registry.ts";
 import type { CdbTableMeta } from "./cdb-table-types.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
@@ -193,11 +193,12 @@ function buildPlan(
 ): AutoFillPlan {
     const bindings: Array<{ jsKey: string; value: string; authority: "tenant" | "self" }> = [];
     const sqlToJs = sqlToJsMap(table);
+    const resolvedMeta = resolveCdbMeta(table);
 
     // selfBy → verified user id. Caller-supplied ownership is never authority.
-    if (meta.selfBy) {
+    if (resolvedMeta.selfBy) {
         if (!auth.userId) throw missingAuthority("self", operation);
-        const jsKey = sqlToJs.get(meta.selfBy);
+        const jsKey = sqlToJs.get(resolvedMeta.selfBy);
         if (jsKey !== undefined) bindings.push({ jsKey, value: auth.userId, authority: "self" });
     }
 
@@ -208,18 +209,7 @@ function buildPlan(
     if (meta.tenantKind !== "none") {
         const value = meta.tenantKind === "org" ? auth.tenantId : auth.userId;
         if (!value) throw missingAuthority("tenant", operation);
-        let tenantSqlCol: string | undefined = meta.tenantBy;
-        if (!tenantSqlCol) {
-            try {
-                tenantSqlCol = resolveCdbMeta(table).tenantBy;
-            } catch {
-                // FK auto-discovery throws when the schema is mid-build
-                // (a test injects a cdbTable without an FK chain). Treat
-                // that as "no fill possible" — the row either supplies
-                // the value or Drizzle/SQLite errors at NOT NULL time.
-                tenantSqlCol = undefined;
-            }
-        }
+        const tenantSqlCol = resolvedMeta.tenantBy;
         if (tenantSqlCol) {
             const jsKey = sqlToJs.get(tenantSqlCol);
             if (jsKey !== undefined) bindings.push({ jsKey, value, authority: "tenant" });
@@ -366,7 +356,7 @@ function buildWritePlan(
     return plan;
 }
 
-function assertUpdateAuthorized(plan: AutoFillPlan, values: Readonly<Record<string, unknown>>): void {
+function assertUpdateAuthorized(plan: AutoFillPlan, values: Readonly<Record<string, unknown>>): AutoFillPlan {
     for (const binding of plan.bindings) {
         if (Object.prototype.hasOwnProperty.call(values, binding.jsKey)) {
             throw new CdbError({
@@ -383,8 +373,8 @@ function assertUpdateAuthorized(plan: AutoFillPlan, values: Readonly<Record<stri
     }
 
     const policyValues = toSqlColumnNames(values, jsToSqlMap(plan.table));
-    const meta = getCdbMeta(plan.table);
-    const valuesForCls = meta?.selfBy ? { ...policyValues, [meta.selfBy]: plan.auth.userId } : policyValues;
+    const meta = resolveCdbMeta(plan.table);
+    const valuesForCls = meta.selfBy ? { ...policyValues, [meta.selfBy]: plan.auth.userId } : policyValues;
     try {
         assertColumnsWritable({
             values: valuesForCls,
@@ -395,6 +385,15 @@ function assertUpdateAuthorized(plan: AutoFillPlan, values: Readonly<Record<stri
     } catch (error) {
         rethrowForbiddenColumn(error);
     }
+    return {
+        ...plan,
+        policies: policiesForColumnUpdate({
+            table: plan.table,
+            auth: plan.auth,
+            columns: Object.keys(policyValues),
+            policies: plan.policies,
+        }),
+    };
 }
 
 function wrapUpdateBuilder(builder: unknown, plan: AutoFillPlan): unknown {
@@ -405,9 +404,9 @@ function wrapUpdateBuilder(builder: unknown, plan: AutoFillPlan): unknown {
             const value = Reflect.get(target, prop, receiver);
             if (typeof value !== "function") throw unsupportedWrite("update", prop);
             return (values: Readonly<Record<string, unknown>>) => {
-                assertUpdateAuthorized(plan, values);
+                const scopedPlan = assertUpdateAuthorized(plan, values);
                 const afterSet = (value as (input: unknown) => unknown).call(target, values);
-                return scopePolicyBuilder(afterSet, plan, "update");
+                return scopePolicyBuilder(afterSet, scopedPlan, "update");
             };
         },
     });
@@ -902,8 +901,15 @@ function wrapDbInternal<TDb extends object>(
     transactionGuard?: MutationDbTransactionGuard,
     placement?: CdbDbPlacement
 ): TDb {
+    const boundAuth = snapshotAuth(auth);
     return new Proxy(db, {
         get(target, prop, receiver) {
+            if (queryBoundary && prop !== "select") {
+                throw new CdbError({
+                    code: "CDB_UNSUPPORTED_FEATURE",
+                    message: `query database property "${String(prop)}" is unavailable in read-only handlers`,
+                });
+            }
             if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
             if (!SAFE_DB_METHODS.has(prop)) {
                 throw new CdbError({
@@ -922,7 +928,7 @@ function wrapDbInternal<TDb extends object>(
                 return (...args: readonly unknown[]) => {
                     const builder = (v as (...args: readonly unknown[]) => unknown).call(target, ...args);
                     return wrapSelectFromBuilder(builder, {
-                        auth,
+                        auth: boundAuth,
                         fullRow: prop === "select" && args.length === 0,
                         queryBoundary,
                         onRead,
@@ -940,7 +946,7 @@ function wrapDbInternal<TDb extends object>(
                     const plan = buildPlan(
                         table,
                         meta,
-                        auth,
+                        boundAuth,
                         "insert",
                         onWrite,
                         beforeWrite,
@@ -959,7 +965,7 @@ function wrapDbInternal<TDb extends object>(
                     const plan = buildWritePlan(
                         table,
                         meta,
-                        auth,
+                        boundAuth,
                         "update",
                         onWrite,
                         beforeWrite,
@@ -978,7 +984,7 @@ function wrapDbInternal<TDb extends object>(
                     const plan = buildWritePlan(
                         table,
                         meta,
-                        auth,
+                        boundAuth,
                         "delete",
                         onWrite,
                         beforeWrite,
@@ -996,7 +1002,7 @@ function wrapDbInternal<TDb extends object>(
                         callback(
                             wrapDbInternal(
                                 tx,
-                                auth,
+                                boundAuth,
                                 queryBoundary,
                                 onWrite,
                                 onRead,
@@ -1015,5 +1021,14 @@ function wrapDbInternal<TDb extends object>(
             }
             return v.bind(target);
         },
+    });
+}
+
+function snapshotAuth(auth: AuthCtx): AuthCtx {
+    return Object.freeze({
+        ...auth,
+        roles: auth.roles ? Object.freeze([...auth.roles]) : undefined,
+        authEpochs: auth.authEpochs ? Object.freeze({ ...auth.authEpochs }) : undefined,
+        claims: Object.freeze({ ...auth.claims }),
     });
 }

@@ -1,29 +1,50 @@
-import { Column, Param, SQL, StringChunk, getTableColumns, getTableName, is } from "drizzle-orm";
+import { type Column, type SQL, getTableColumns, getTableName, is } from "drizzle-orm";
 import { QueryBuilder, type SQLiteSelectConfig, SQLiteTable, getTableConfig } from "drizzle-orm/sqlite-core";
+import {
+    CHARDB_SELECT_PLAN_MAX_LIMIT,
+    type ChardbSelectPlanV1,
+    compileChardbSelectPlanOrder,
+    compileChardbSelectPlanPredicate,
+    validateChardbSelectPlanV1,
+} from "../binding-plan.ts";
 import { StaticIntentExtractor, intervalsForColumnPredicate } from "../drizzle/walker.ts";
 import { CdbError } from "../errors.ts";
 import type { RawJson } from "../types.ts";
 import { stableHashHex } from "../util/canonical.ts";
+import { isChardbVectorSearchBuilder, normalizeChardbVectorSearchBuilder } from "../vector.ts";
 import type { CdbIntent } from "../wire.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
 import type { MutationAuthority } from "./define.ts";
+import { type VectorResourceV1, resolveOrganizationVectorResourceDescriptor } from "./resource-descriptors.ts";
 
-export const CDB_PLANNED_QUERY_MAX_ROWS = 100;
-export const CDB_PLANNED_QUERY_MAX_IN_VALUES = 100;
-export const CDB_PLANNED_QUERY_MAX_PREDICATES = 128;
-export const CDB_PLANNED_QUERY_MAX_PREDICATE_DEPTH = 16;
-export const CDB_PLANNED_QUERY_MAX_BOOLEAN_CHILDREN = 16;
-
-export interface RegisteredQueryPlan {
+interface RegisteredQueryPlanBase {
     readonly version: 1;
     readonly authority: MutationAuthority;
     readonly partitionKey: string;
     readonly intent: CdbIntent;
-    readonly projection: readonly { readonly key: string; readonly column: string }[];
-    readonly orderBy: readonly { readonly column: string; readonly direction: "asc" | "desc" }[];
     readonly limit: number;
     readonly planHash: string;
 }
+
+export interface RegisteredSelectQueryPlan extends RegisteredQueryPlanBase {
+    readonly kind: "select";
+    /** Canonical executable plan. Legacy routing metadata remains alongside it during migration. */
+    readonly plan: ChardbSelectPlanV1;
+    readonly projection: readonly { readonly key: string; readonly column: string }[];
+    readonly orderBy: readonly { readonly column: string; readonly direction: "asc" | "desc" }[];
+}
+
+export interface RegisteredVectorQueryPlan extends RegisteredQueryPlanBase {
+    readonly kind: "searchVector";
+    readonly authority: "organization";
+    readonly resource: VectorResourceV1;
+    readonly values: readonly number[];
+    readonly plan?: never;
+    readonly projection?: never;
+    readonly orderBy?: never;
+}
+
+export type RegisteredQueryPlan = RegisteredSelectQueryPlan | RegisteredVectorQueryPlan;
 
 interface PlannedSelectBuilder {
     readonly config: SQLiteSelectConfig;
@@ -40,85 +61,33 @@ function isPlannedSelectBuilder(value: unknown): value is PlannedSelectBuilder {
     return typeof candidate.config === "object" && candidate.config !== null && typeof candidate.toSQL === "function";
 }
 
-function compactSqlChunks(sql: SQL): readonly unknown[] {
-    return sql.queryChunks.filter(chunk => !(is(chunk, StringChunk) && chunk.value.join("") === ""));
-}
-
-function assertSafePredicate(value: unknown, table: SQLiteTable): void {
-    let nodes = 0;
-    const text = (chunk: unknown) => (is(chunk, StringChunk) ? chunk.value.join("") : undefined);
-    const column = (chunk: unknown): boolean => {
-        if (!is(chunk, Column)) return false;
-        if (chunk.table !== table) unsupported("predicate references a different table");
-        return true;
-    };
-    const admitNode = (): void => {
-        nodes++;
-        if (nodes > CDB_PLANNED_QUERY_MAX_PREDICATES) {
-            unsupported(`predicate count exceeds ${CDB_PLANNED_QUERY_MAX_PREDICATES}`);
-        }
-    };
-    const validate = (expression: unknown, depth = 1): void => {
-        if (depth > CDB_PLANNED_QUERY_MAX_PREDICATE_DEPTH) {
-            unsupported(`predicate depth exceeds ${CDB_PLANNED_QUERY_MAX_PREDICATE_DEPTH}`);
-        }
-        if (!is(expression, SQL)) unsupported("where() requires a recognized Drizzle predicate");
-        const chunks = compactSqlChunks(expression);
-        if (chunks.length === 1 && is(chunks[0], SQL)) {
-            validate(chunks[0], depth);
-            return;
-        }
-        if (chunks.length === 3 && text(chunks[0]) === "(" && is(chunks[1], SQL) && text(chunks[2]) === ")") {
-            const inner = compactSqlChunks(chunks[1]);
-            const separator = text(inner[1]);
-            if ((separator === " and " || separator === " or ") && inner.length >= 3 && inner.length % 2 === 1) {
-                const childCount = (inner.length + 1) / 2;
-                if (childCount > CDB_PLANNED_QUERY_MAX_BOOLEAN_CHILDREN) {
-                    unsupported(`boolean predicate accepts at most ${CDB_PLANNED_QUERY_MAX_BOOLEAN_CHILDREN} children`);
-                }
-                admitNode();
-                for (let index = 0; index < inner.length; index++) {
-                    const item = inner[index];
-                    if (index % 2 === 0) validate(item, depth + 1);
-                    else if (text(item) !== separator) unsupported("predicate boolean expression is malformed");
-                }
-                return;
-            }
-        }
-        if (chunks.length === 3 && column(chunks[0])) {
-            const operator = text(chunks[1]);
-            if ([" = ", " > ", " >= ", " < ", " <= "].includes(operator ?? "") && is(chunks[2], Param)) {
-                admitNode();
-                return;
-            }
-            if (
-                operator === " in " &&
-                Array.isArray(chunks[2]) &&
-                chunks[2].length > 0 &&
-                chunks[2].every(item => is(item, Param))
-            ) {
-                if (chunks[2].length > CDB_PLANNED_QUERY_MAX_IN_VALUES) {
-                    unsupported(`inArray accepts at most ${CDB_PLANNED_QUERY_MAX_IN_VALUES} values`);
-                }
-                admitNode();
-                return;
-            }
-        }
-        if (
-            chunks.length === 5 &&
-            column(chunks[0]) &&
-            text(chunks[1]) === " between " &&
-            is(chunks[2], Param) &&
-            text(chunks[3]) === " and " &&
-            is(chunks[4], Param)
-        ) {
-            admitNode();
-            return;
-        }
-        unsupported("raw or unrecognized predicates are unavailable");
-    };
-
-    validate(value);
+function compileRegisteredVectorQueryPlan(value: unknown): RegisteredVectorQueryPlan {
+    const search = normalizeChardbVectorSearchBuilder(value);
+    const resource = resolveOrganizationVectorResourceDescriptor(search.column);
+    const values = Object.freeze(search.values.map(item => (Object.is(item, -0) ? 0 : item)));
+    const intent: CdbIntent = Object.freeze({
+        kind: "select",
+        tables: Object.freeze([resource.table]),
+        partitionKey: Object.freeze({
+            table: resource.table,
+            column: resource.organizationColumn,
+            values: Object.freeze([search.organizationId]),
+        }),
+    });
+    const hashInput = {
+        version: 1,
+        kind: "searchVector",
+        authority: "organization",
+        partitionKey: search.organizationId,
+        intent,
+        resource,
+        values,
+        limit: search.limit,
+    } as const;
+    return Object.freeze({
+        ...hashInput,
+        planHash: stableHashHex(hashInput),
+    });
 }
 
 function projectionFor(config: SQLiteSelectConfig, table: SQLiteTable) {
@@ -129,26 +98,6 @@ function projectionFor(config: SQLiteSelectConfig, table: SQLiteTable) {
         unsupported("explicit projections are unavailable in the first planned-query version");
     }
     return fields.map(([key, field]) => ({ key, column: (field as Column).name }));
-}
-
-function orderItem(
-    value: unknown,
-    table: SQLiteTable
-): { readonly column: string; readonly direction: "asc" | "desc" } {
-    if (is(value, Column)) {
-        if (value.table !== table) unsupported("ORDER BY references a different table");
-        return { column: value.name, direction: "asc" };
-    }
-    if (!is(value, SQL)) unsupported("ORDER BY accepts only direct columns");
-    const chunks = compactSqlChunks(value);
-    if (chunks.length !== 2 || !is(chunks[0], Column) || !is(chunks[1], StringChunk)) {
-        unsupported("ORDER BY accepts only asc(column) or desc(column)");
-    }
-    const column = chunks[0];
-    if (column.table !== table) unsupported("ORDER BY references a different table");
-    const suffix = chunks[1].value.join("").trim().toLowerCase();
-    if (suffix !== "asc" && suffix !== "desc") unsupported("ORDER BY direction is unsupported");
-    return { column: column.name, direction: suffix };
 }
 
 function primaryKeyColumns(table: SQLiteTable): readonly string[] {
@@ -185,6 +134,7 @@ export function compileRegisteredQueryPlan<TDb, TArgs>(
 ): RegisteredQueryPlan {
     const planningDb = new QueryBuilder();
     const built = query(planningDb as TDb, args);
+    if (isChardbVectorSearchBuilder(built)) return compileRegisteredVectorQueryPlan(built);
     if (!isPlannedSelectBuilder(built)) {
         if (built && typeof built === "object" && typeof (built as { then?: unknown }).then === "function") {
             unsupported("query callback must return a builder synchronously");
@@ -204,9 +154,9 @@ export function compileRegisteredQueryPlan<TDb, TArgs>(
     if (
         !Number.isSafeInteger(config.limit) ||
         (config.limit as number) < 1 ||
-        (config.limit as number) > CDB_PLANNED_QUERY_MAX_ROWS
+        (config.limit as number) > CHARDB_SELECT_PLAN_MAX_LIMIT
     ) {
-        unsupported(`limit must be an integer from 1 through ${CDB_PLANNED_QUERY_MAX_ROWS}`);
+        unsupported(`limit must be an integer from 1 through ${CHARDB_SELECT_PLAN_MAX_LIMIT}`);
     }
     if (!config.where) {
         throw new CdbError({
@@ -214,7 +164,7 @@ export function compileRegisteredQueryPlan<TDb, TArgs>(
             message: "planned query requires an exact placement predicate",
         });
     }
-    assertSafePredicate(config.where, table);
+    const where = compileChardbSelectPlanPredicate(config.where, table);
 
     const { authority, column: partitionColumn } = authorityAndPartitionColumn(table);
     const tableName = getTableName(table);
@@ -246,7 +196,20 @@ export function compileRegisteredQueryPlan<TDb, TArgs>(
         ...(intervals.length > 0 ? { intervals } : {}),
     };
     const projection = projectionFor(config, table);
-    const orderBy = (config.orderBy ?? []).map(item => orderItem(item, table));
+    const compiledOrderBy = (config.orderBy ?? []).map(item => compileChardbSelectPlanOrder(item, table));
+    const plan = validateChardbSelectPlanV1({
+        version: 1,
+        kind: "select",
+        table: tableName,
+        selection: { kind: "all" },
+        where,
+        orderBy: compiledOrderBy,
+        limit: config.limit,
+        cardinality: "many",
+    });
+    const orderBy = plan.orderBy ?? [];
+    const limit = plan.limit;
+    if (limit === undefined) throw new CdbError({ code: "CDB_INVARIANT", message: "planned query lost its limit" });
     const primaryKeys = primaryKeyColumns(table);
     if (primaryKeys.length === 0) unsupported("table must declare a primary key");
     const suffix = orderBy.slice(-primaryKeys.length).map(item => item.column);
@@ -255,7 +218,6 @@ export function compileRegisteredQueryPlan<TDb, TArgs>(
             `ORDER BY must end with primary key column${primaryKeys.length === 1 ? "" : "s"} ${primaryKeys.join(", ")}`
         );
     }
-
     const compiled = built.toSQL();
     const hashInput = {
         version: 1,
@@ -264,7 +226,7 @@ export function compileRegisteredQueryPlan<TDb, TArgs>(
         intent,
         projection,
         orderBy,
-        limit: config.limit as number,
+        limit,
         sql: compiled.sql,
         params: compiled.params as readonly RawJson[],
     } as const;
@@ -280,12 +242,14 @@ export function compileRegisteredQueryPlan<TDb, TArgs>(
     }
     return {
         version: 1,
+        kind: "select",
+        plan,
         authority,
         partitionKey: partitionValues[0],
         intent,
         projection,
         orderBy,
-        limit: config.limit as number,
+        limit,
         planHash,
     };
 }

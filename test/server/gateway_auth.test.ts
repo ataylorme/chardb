@@ -6,10 +6,10 @@ import { gatewayJwtConfigFromAuthOptions } from "../../src/server/chardb.ts";
 import {
     type GatewayJwtConfig,
     isCurrentVerifiedAttachment,
-    routedClientIdFromUrl,
     trustedMutationAuthFromAttachment,
     verifyGatewayJwt,
-} from "../../src/server/do/gateway.ts";
+} from "../../src/server/do/gateway-auth-dispatch.ts";
+import { routedClientIdFromUrl } from "../../src/server/do/gateway.ts";
 import { ClientId, PrincipalId } from "../../src/types.ts";
 
 const ORIGIN = "https://app.example";
@@ -37,21 +37,23 @@ async function signingFixture() {
     };
     const sign = async (
         overrides: {
-            subject?: string;
+            subject?: string | null;
             issuer?: string;
-            audience?: string;
-            expirationTime?: number;
+            audience?: string | string[];
+            expirationTime?: number | null;
             notBefore?: number;
         } = {}
     ) => {
         const now = Math.floor(Date.now() / 1000);
         let builder = new SignJWT({ plan: "pro" })
             .setProtectedHeader({ alg: "ES256", kid: KID })
-            .setSubject(overrides.subject ?? "user-1")
             .setIssuer(overrides.issuer ?? ISSUER)
             .setAudience(overrides.audience ?? AUDIENCE)
-            .setIssuedAt(now)
-            .setExpirationTime(overrides.expirationTime ?? now + 300);
+            .setIssuedAt(now);
+        if (overrides.subject !== null) builder = builder.setSubject(overrides.subject ?? "user-1");
+        if (overrides.expirationTime !== null) {
+            builder = builder.setExpirationTime(overrides.expirationTime ?? now + 300);
+        }
         if (overrides.notBefore !== undefined) builder = builder.setNotBefore(overrides.notBefore);
         return builder.sign(privateKey);
     };
@@ -143,6 +145,50 @@ describe("Gateway verified JWT boundary", () => {
                 clientId: ClientId("client-1"),
             })
         ).rejects.toMatchObject({ code: "CDB_FORBIDDEN" });
+    });
+
+    test("rejects signed tokens that omit subject or expiry", async () => {
+        const { catalog, sign } = await signingFixture();
+        for (const jwt of [await sign({ subject: null }), await sign({ expirationTime: null })]) {
+            await expect(
+                verifyGatewayJwt({
+                    config: config(),
+                    authOrigin: ORIGIN,
+                    connectionId: CONNECTION_ID,
+                    catalog,
+                    jwt,
+                    clientId: ClientId("client-1"),
+                })
+            ).rejects.toMatchObject({ code: "CDB_FORBIDDEN" });
+        }
+    });
+
+    test("accepts a token audience array when one value matches", async () => {
+        const { catalog, sign } = await signingFixture();
+        await expect(
+            verifyGatewayJwt({
+                config: config(),
+                authOrigin: ORIGIN,
+                connectionId: CONNECTION_ID,
+                catalog,
+                jwt: await sign({ audience: ["another-service", AUDIENCE] }),
+                clientId: ClientId("client-1"),
+            })
+        ).resolves.toMatchObject({ principalId: "user-1" });
+    });
+
+    test("accepts configured audience arrays when one expected value matches", async () => {
+        const { catalog, sign } = await signingFixture();
+        await expect(
+            verifyGatewayJwt({
+                config: config({ audience: ["chardb-admin", AUDIENCE] }),
+                authOrigin: ORIGIN,
+                connectionId: CONNECTION_ID,
+                catalog,
+                jwt: await sign(),
+                clientId: ClientId("client-1"),
+            })
+        ).resolves.toMatchObject({ principalId: "user-1" });
     });
 
     test("rechecks expiry and projects only the verified subject for mutation dispatch", async () => {

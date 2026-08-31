@@ -8,20 +8,8 @@
  */
 
 import { uuidv7 } from "uuidv7";
-import type { ChardbManifest } from "./manifest.ts";
 
-/**
- * Selects the manifest cron entries whose expression equals `cronExpr`.
- *
- * Cloudflare's `ScheduledEvent.cron` field is the literal cron string
- * the user wrote in Wrangler config, so the entrypoint dispatch is
- * exact-string equality. Cron-grammar normalisation (`* * * * *` vs
- * `0 * * * *`) is the bundler's job, not the runtime's.
- */
-export function selectMatchingCrons(manifest: ChardbManifest, cronExpr: string | undefined): ChardbManifest["crons"] {
-    if (!cronExpr) return [];
-    return manifest.crons.filter(c => c.cronExpr === cronExpr);
-}
+export const CHARDB_SERVER_VERSION = "0.1.0";
 
 /** Resolve the inbound correlation id, minting a UUIDv7 when absent. */
 export function extractCorrelationId(request: Request): string {

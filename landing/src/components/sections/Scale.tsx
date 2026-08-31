@@ -10,15 +10,16 @@ export function Scale() {
                     </p>
                     <SectionHeading>Scale should not become an app migration.</SectionHeading>
                     <SectionLead>
-                        Application code should keep addressing a tenant while Chardb moves physical ranges underneath
-                        it. Deterministic placement and the split machinery exist today. Automatic online coordination
-                        and recovery are still destination work.
+                        Application code keeps addressing an organization while Chardb moves physical ranges underneath
+                        it. The range protocol copies rows, file ownership, and vector state, converges its tail, cuts
+                        over, and drains the source without changing application keys.
                     </SectionLead>
                     <BulletList
                         items={[
-                            "today: 16,384 virtual shards with deterministic organization routing",
-                            "today: Catalog stores current physical range ownership",
-                            "target: split, copy, tail, cut over, and recover without changing application code",
+                            "16,384 virtual shards with deterministic organization routing",
+                            "Catalog stores current physical range ownership",
+                            "bounded split, status, recover, and abort checkpoints",
+                            "idempotent movement across response loss and restart",
                         ]}
                     />
                     <PullQuote>scale should be an operational event, not a rewrite.</PullQuote>
@@ -121,7 +122,7 @@ export function Scale() {
                                 fontSize="10"
                                 fill="#5A5A5A"
                             >
-                                target: split a range and move ownership online
+                                operator-driven online range movement
                             </text>
                         </svg>
                     </div>

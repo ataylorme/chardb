@@ -2,18 +2,17 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { CdbError } from "../../src/errors.ts";
 import type { SyncSql } from "../../src/oplog/wrapper.ts";
+import type { VerifiedGwAttachment } from "../../src/server/do/gateway-auth-dispatch.ts";
 import {
     GATEWAY_MAX_DURABLE_PAYLOAD_BYTES,
-    Gateway,
     type GatewayDirtyRun,
-    type GatewayEnv,
     type GatewayRegistrationInstall,
-    type VerifiedGwAttachment,
     claimDirtyGatewayRegistration,
     gatewayDurablePayloadUsage,
     installGatewayRegistration,
     stageGatewaySnapshot,
-} from "../../src/server/do/gateway.ts";
+} from "../../src/server/do/gateway-registration-store.ts";
+import { GATEWAY_AUTH_REFRESH_GRACE_MS, Gateway, type GatewayEnv } from "../../src/server/do/gateway.ts";
 import type { LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, type RawJson, ShardId, SubId, TenantId } from "../../src/types.ts";
 
@@ -120,6 +119,7 @@ describe("Gateway active snapshot runner", () => {
     let queryBehavior: () => unknown | Promise<unknown>;
     let authorityBehavior: () => unknown | Promise<unknown>;
     let routePhysicalId: string;
+    let routeSchemaEpoch: number;
     let routeDomainSchemaEpoch: number;
     let currentPolicyDigest: string;
     let failAlarmAt: number | null;
@@ -146,6 +146,7 @@ describe("Gateway active snapshot runner", () => {
             authEpochs: { global: 10, tenant: 11, principal: 12 },
         });
         routePhysicalId = "physical-cdb-1";
+        routeSchemaEpoch = 1;
         routeDomainSchemaEpoch = 1;
         currentPolicyDigest = "policy-digest-1";
         failAlarmAt = null;
@@ -153,15 +154,22 @@ describe("Gateway active snapshot runner", () => {
 
         const catalog = {
             async resolveOrganizationAuthority() {
-                events.push("authority");
-                return await authorityBehavior();
+                throw new Error("legacy authority RPC must not run");
             },
             async route() {
-                events.push("route");
+                throw new Error("legacy route RPC must not run");
+            },
+            async resolveOrganizationAuthorityRoute() {
+                events.push("authority");
+                const authority = await authorityBehavior();
+                if (authority === null) return { authority: null };
                 return {
-                    shardId: ShardId("logical-shard-1"),
-                    schemaEpoch: 1,
-                    domainSchemaEpoch: routeDomainSchemaEpoch,
+                    authority,
+                    route: {
+                        shardId: ShardId("logical-shard-1"),
+                        schemaEpoch: routeSchemaEpoch,
+                        domainSchemaEpoch: routeDomainSchemaEpoch,
+                    },
                 };
             },
             async listShardIds() {
@@ -215,6 +223,7 @@ describe("Gateway active snapshot runner", () => {
         } as unknown as DurableObjectState;
         class TestGateway extends Gateway {
             override async routeQuery(request: { readonly ref: string; readonly args: RawJson }) {
+                events.push("route-query");
                 return {
                     ok: true as const,
                     args: request.args,
@@ -286,6 +295,50 @@ describe("Gateway active snapshot runner", () => {
             .get(registrationId) as Record<string, unknown> | null;
     }
 
+    test("connection-scoped candidate lookup excludes another connection's earlier registration", () => {
+        const other = registration({
+            registrationId: "a-other",
+            clientId: ClientId("client-other"),
+            connectionId: "connection-other",
+        });
+        const target = registration({
+            registrationId: "z-target",
+            clientId: ClientId("client-target"),
+            connectionId: "connection-target",
+        });
+        installActive(other);
+        installActive(target);
+        const materializer = (
+            gateway as unknown as {
+                snapshotMaterializer: {
+                    dueCandidates(
+                        nowMs: number,
+                        connectionId?: string,
+                        excludedConnectionIds?: readonly string[]
+                    ): readonly {
+                        registration_id: string;
+                        connection_id: string;
+                    }[];
+                };
+            }
+        ).snapshotMaterializer;
+
+        expect(() => materializer.dueCandidates(clock, "")).toThrow("connectionId must be nonempty");
+        expect(() => materializer.dueCandidates(clock, undefined, [""])).toThrow(
+            "excluded connection IDs must be nonempty"
+        );
+        expect(materializer.dueCandidates(clock, target.connectionId)).toEqual([
+            expect.objectContaining({ registration_id: target.registrationId, connection_id: target.connectionId }),
+        ]);
+        expect(materializer.dueCandidates(clock, undefined, [other.connectionId, other.connectionId])).toEqual([
+            expect.objectContaining({ registration_id: target.registrationId, connection_id: target.connectionId }),
+        ]);
+        expect(materializer.dueCandidates(clock)).toEqual([
+            expect.objectContaining({ registration_id: other.registrationId }),
+            expect.objectContaining({ registration_id: target.registrationId }),
+        ]);
+    });
+
     test("pre-arms recovery, preserves newer dirtiness, sends, and acks without regressing a later socket cookie", async () => {
         const input = registration();
         installActive(input);
@@ -300,6 +353,9 @@ describe("Gateway active snapshot runner", () => {
         await fireAlarm();
 
         expect(events.indexOf("alarm:30100")).toBeLessThan(events.indexOf("authority"));
+        expect(events.filter(event => event === "authority")).toHaveLength(3);
+        expect(events.indexOf("authority")).toBeLessThan(events.indexOf("query"));
+        expect(events.lastIndexOf("authority")).toBeGreaterThan(events.indexOf("query"));
         expect(queryCalls).toHaveLength(1);
         expect(socket.sent).toHaveLength(1);
         const snapshot = JSON.parse(socket.sent[0] as string) as { cookie: Cookie; rows: unknown[]; subId: number };
@@ -372,7 +428,7 @@ describe("Gateway active snapshot runner", () => {
                         targetVersion: run.targetVersion,
                         cookie: Cookie(`snapshot-cookie-${input.subId}`),
                         rows: [],
-                        authEpochs: input.authEpochs,
+                        authEpochs: { global: 10, tenant: 11, principal: 12 },
                         nowMs: 30,
                     })
                 )()
@@ -458,15 +514,15 @@ describe("Gateway active snapshot runner", () => {
         });
     });
 
-    test("retires before authority lookup when the declared table policy changed", async () => {
+    test("retires same-epoch declared table policy drift after fresh authority and routing checks", async () => {
         installActive();
         const socket = attach();
         currentPolicyDigest = "policy-digest-2";
 
         await fireAlarm();
 
-        expect(events).not.toContain("authority");
-        expect(queryCalls).toEqual([]);
+        expect(events).toContain("authority");
+        expect(queryCalls).toHaveLength(1);
         expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
         expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
         expect(socket.attachment.snapshotSubIds).toEqual([]);
@@ -514,8 +570,16 @@ describe("Gateway active snapshot runner", () => {
 
         await fireAlarm();
 
-        expect(events).not.toContain("authority");
+        expect(events).toContain("authority");
         expect(queryCalls).toEqual([]);
+        expect(socket.sent).toEqual([]);
+        expect(db.query("SELECT * FROM _gw_snapshot_outbox").get()).toBeNull();
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).not.toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "active", run_token: null });
+
+        await fireAlarm();
+
+        expect(queryCalls).toHaveLength(1);
         expect(socket.sent).toHaveLength(1);
         expect(JSON.parse(socket.sent[0] as string)).toMatchObject({
             t: "error",
@@ -565,6 +629,13 @@ describe("Gateway active snapshot runner", () => {
         await fireAlarm();
 
         expect(alarmFailures).toBe(1);
+        expect(socket.sent).toEqual([]);
+        expect(db.query("SELECT * FROM _gw_snapshot_outbox").get()).toBeNull();
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).not.toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "active", run_token: null });
+
+        await fireAlarm();
+
         expect(socket.sent).toHaveLength(1);
         expect(JSON.parse(socket.sent[0] as string)).toMatchObject({
             t: "error",
@@ -595,6 +666,55 @@ describe("Gateway active snapshot runner", () => {
         });
     });
 
+    test("discards query rows when authority is revoked during the Cdb await", async () => {
+        installActive();
+        const socket = attach();
+        queryBehavior = () => {
+            authorityBehavior = () => null;
+            return { ok: true, result: [{ id: 1, secret: "revoked-during-query" }] };
+        };
+
+        await fireAlarm();
+
+        expect(queryCalls).toHaveLength(1);
+        expect(events.filter(event => event === "authority")).toHaveLength(2);
+        expect(db.query("SELECT * FROM _gw_snapshot_outbox").get()).toBeNull();
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
+        expect(JSON.parse(socket.sent[0] as string)).toMatchObject({
+            t: "error",
+            code: "CDB_FORBIDDEN",
+            subId: 1,
+        });
+        expect(socket.sent).toHaveLength(1);
+    });
+
+    test("refetches when schema and policy change together during the Cdb await", async () => {
+        installActive();
+        const socket = attach();
+        queryBehavior = () => {
+            routeDomainSchemaEpoch = 2;
+            currentPolicyDigest = "policy-digest-2";
+            return { ok: true, result: [{ id: 1, secret: "superseded-schema" }] };
+        };
+
+        await fireAlarm();
+
+        expect(queryCalls).toHaveLength(1);
+        expect(events.filter(event => event === "authority")).toHaveLength(2);
+        expect(db.query("SELECT * FROM _gw_snapshot_outbox").get()).toBeNull();
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
+        expect(JSON.parse(socket.sent[0] as string)).toEqual({
+            t: "mustRefetch",
+            subIds: [1],
+            reason: "shardsChanged",
+        });
+        expect(socket.sent).toHaveLength(1);
+    });
+
     test("requests a refetch after the physical shard route changes", async () => {
         installActive();
         const socket = attach();
@@ -613,16 +733,75 @@ describe("Gateway active snapshot runner", () => {
         });
     });
 
-    test("retires an old schema generation before calling Cdb", async () => {
+    test("refetches an old schema generation before evaluating its stale policy metadata", async () => {
         installActive();
         const socket = attach();
         routeDomainSchemaEpoch = 2;
+        currentPolicyDigest = "policy-digest-2";
 
         await fireAlarm();
 
         expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
         expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
         expect(queryCalls).toEqual([]);
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
+        expect(JSON.parse(socket.sent[0] as string)).toEqual({
+            t: "mustRefetch",
+            subIds: [1],
+            reason: "shardsChanged",
+        });
+    });
+
+    test("retires and refetches when Catalog advances the routing generation on the same Cdb", async () => {
+        installActive();
+        const socket = attach();
+        routeSchemaEpoch = 2;
+
+        await fireAlarm();
+
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
+        expect(queryCalls).toEqual([]);
+        expect(socket.attachment.snapshotSubIds).toEqual([]);
+        expect(JSON.parse(socket.sent[0] as string)).toEqual({
+            t: "mustRefetch",
+            subIds: [1],
+            reason: "shardsChanged",
+        });
+    });
+
+    test("preserves a Cdb-ahead wake until Catalog advances, then refetches", async () => {
+        installActive();
+        const socket = attach();
+        currentPolicyDigest = "policy-digest-2";
+        queryBehavior = () => ({
+            ok: false,
+            error: new CdbError({
+                code: "CDB_STALE_EPOCH",
+                message: "routing generation is no longer admitted by this source",
+            }).toJSON(),
+        });
+
+        await fireAlarm();
+
+        expect(queryCalls).toHaveLength(1);
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).not.toBeNull();
+        expect(generationState()).toMatchObject({
+            lifecycle: "active",
+            dirty_version: 5,
+            delivered_version: 2,
+            run_token: null,
+            retry_count: 1,
+            retry_at: 1_100,
+        });
+        expect(socket.sent).toEqual([]);
+
+        clock = 1_100;
+        routeDomainSchemaEpoch = 2;
+        await fireAlarm();
+
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toMatchObject({ lifecycle: "retiring", run_token: null });
         expect(socket.attachment.snapshotSubIds).toEqual([]);
         expect(JSON.parse(socket.sent[0] as string)).toEqual({
             t: "mustRefetch",
@@ -763,7 +942,7 @@ describe("Gateway active snapshot runner", () => {
         expect(currentAlarm).toBeNull();
     });
 
-    test("rechecks JWT time after a held query and retires before staging or send", async () => {
+    test("bounds expired-socket retries at the auth-refresh deadline, then retires", async () => {
         installActive();
         attach(registration(), { jwtExp: 1 });
         let release: (value: unknown) => void = () => {};
@@ -778,9 +957,36 @@ describe("Gateway active snapshot runner", () => {
         release({ ok: true, result: [{ id: 3 }] });
         await alarm;
 
-        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).not.toBeNull();
+        expect(generationState()).toMatchObject({
+            lifecycle: "active",
+            retry_at: 1_000 + GATEWAY_AUTH_REFRESH_GRACE_MS,
+            retry_error: "authentication refresh is in flight",
+        });
         expect(db.query("SELECT * FROM _gw_snapshot_outbox").get()).toBeNull();
         expect(socketMessages()).toEqual([]);
+
+        clock = 10_100;
+        await fireAlarm();
+        expect(queryCalls).toHaveLength(1);
+        expect(currentAlarm).toBe(1_000 + GATEWAY_AUTH_REFRESH_GRACE_MS);
+        expect(generationState()).toMatchObject({
+            lifecycle: "active",
+            retry_at: 1_000 + GATEWAY_AUTH_REFRESH_GRACE_MS,
+        });
+
+        clock = 20_000;
+        await fireAlarm();
+        expect(queryCalls).toHaveLength(1);
+        expect(currentAlarm).toBe(1_000 + GATEWAY_AUTH_REFRESH_GRACE_MS);
+
+        clock = 1_000 + GATEWAY_AUTH_REFRESH_GRACE_MS;
+        await fireAlarm();
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toBeNull();
+        expect(unsubscribeCalls).toHaveLength(1);
+        expect(finalizeCalls).toEqual(unsubscribeCalls);
+        expect(currentAlarm).toBeNull();
     });
 
     function socketMessages(): string[] {

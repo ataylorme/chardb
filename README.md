@@ -1,310 +1,425 @@
 # chardb
 
-Experimental tenant-sharded SQLite for Cloudflare Durable Objects.
+Experimental organization-tenanted SQLite for Cloudflare Durable Objects.
 
-Chardb explores one idea: declare an application data boundary in a Drizzle schema, then derive placement, single-partition transactions, authorization, and live-query routing from it.
+Chardb derives placement, authorization, and live-query routing from a Drizzle schema. The supported product path is small: one organization boundary, one physical Cdb transaction per operation, registered mutations, planned live queries, bounded direct selects, and opt-in organization files and vectors.
 
-This is engineering work intended for public review, not a database you should deploy yet. Focused workerd tests drive a narrow live path through WebSocket, Gateway, Catalog, and Cdb. Same-socket hibernation can redeliver an unacknowledged exact snapshot after object reconstruction. After transport loss, a replacement SDK connection can replay the exact unacknowledged cookie and rows before current rematerialization. A missing, expired, corrupt, or identity-mismatched replay falls back to explicit per-subscription refetch. The packed smoke gives two independent same-organization browser connections the same live replacement before its restart, replay, and isolation checks.
+Do not deploy this as a production database yet. Clean-tarball and Workerd tests cover the organization path, but backup, restore, failover, and longer failure runs do not exist.
 
-## Current state
+## Start here
 
-Implemented and tested in isolation:
+Let Chardb create the project directory and write the Worker, React app, Better Auth setup, migration journal, and `wrangler.toml`:
 
-- Deterministic foreign-key colocation
-- 16,384 virtual-shard range routing
-- SQLite mutation deduplication through an operation log
-- Fresh-shard domain DDL bootstrap with signature checks
-- Versioned Catalog and Cdb schema migrations with durable restart recovery and exact schema-epoch fencing
-- Catalog routing, snapshot barriers, and resharding state machines
-- Hibernated WebSocket bookkeeping
-- Strict protocol-v3 decoding and server-owned query routing metadata
-- Better Auth schema synthesis with all auth rows stored in Catalog
-- Constraint-complete Catalog auth DDL with exact `auth_ddl_v1` compatibility checks
-- Configured Catalog reconstruction with stored auth rows and organization and user authority preserved
-- Atomic Catalog auth mutations with directly derivable old and new epoch bumps
-- Gateway JWT signature and registered-claim verification
-- Public organization-, user-, and narrowly partitioned global mutations with explicit stable refs
-- Catalog-derived organization membership or current user system authority, roles, and auth epochs for each declared operation
-- Single-pass mutation schema transformation before partition routing, with bounded argument checks at every trust boundary
-- Client mutation settlement bounded by a configurable timeout across reconnects
-- Schema-first insert, update, delete, and full-row select authorization, including writable-column checks and readable-column masks
-- A fail-closed database wrapper that rejects raw, session, client, plain-table, insert-select, conflict, returning, and unsupported builder paths
-- Read-only shard-local query execution with JSON result validation
-- A native same-Worker `env.DB` RPC binding with typed stable-handle queries and mutations
-- Protocol-v3 snapshot decoding and client replacement handling
-- Durable public registrations and live replacement snapshots for explicit, exact-partition organization, user, and global queries
-- Conservative `cdbTable` dependency checks against each live query's declared table intent
-- Static `cdbTable` policy digests in Gateway and Cdb registered-query identity
-- Transactional Cdb invalidation outbox delivery with durable retries
-- Durable Gateway query reruns, immutable snapshot staging, and acknowledgement tracking
-- Bounded exact replacement-socket snapshot replay with authoritative fallback
-- Client acknowledgement and same-cookie snapshot deduplication
-- Catalog-backed scatter enumeration without sampled virtual-shard probes
-- Persistent composite Gateway, client, and subscription identities on Cdb shards
-- TLA+ models for snapshot barriers and resharding
-- Packed-package import checks and a standalone `chardb init` scaffold
-- A clean-tarball packed chat smoke from anonymous sign-in through native `env.DB` query and mutation RPC, live invalidation, persistent Miniflare restart, exact mutation replay, and organization, user, and global partition isolation
+```sh
+bunx @chardb/core init my-chardb-app
+cd my-chardb-app
+bun install
+bun run typecheck
+bun run dev
+```
 
-Still missing from the application path:
+`chardb init` refuses to write if any generated target already exists or if the directory contains anything except
+`.git` and `.DS_Store`. A failed preflight writes nothing.
 
-- Exposing a public mutation retry handle and defining an automatic retry policy
-- Composite or replicated global operations
+The development command starts Wrangler and Miniflare, applies the packaged schema version, starts Vite, and prints the local URL. Sign in through Better Auth, create an organization, write a message, receive the live update, and reload the persisted row. The generated tutorial also includes an optional image attachment backed by local R2. Range-movement controls stay in conformance fixtures, not onboarding.
 
-Files, vectors, presence, streams, scheduling, cross-partition transactions, PITR, and automatic resharding remain experiments. They are not supported product features.
+## Define auth and schema
 
-The WebSocket protocol does not trust client routing or authority metadata. Gateway verifies the JWT signature and registered claims, then keeps only the verified subject and time bounds in the socket attachment. A mutation or query becomes public only when its server definition declares `authority: "organization"`, `authority: "user"`, or `authority: "global"` and an explicit stable `ref`. Every definition extracts one exact nonempty partition from validated arguments. Queries also declare server-side intent. Gateway requires the declared partition and intent to resolve to one virtual shard. Catalog then re-derives current authority and auth epochs. A user partition must equal the verified JWT subject. A global partition is an application key, but the caller must still have a current Catalog user row. Token tenant, role, and custom claims never become authority. Undeclared, mismatched, scatter, composite-global, replicated-global, and cross-partition queries remain closed. Presence remains closed.
-
-The narrow global contract does not create a database-wide transaction. It routes one application partition to one physical Cdb transaction. Public global tables must use one colocated partition column. Cdb requires that exact key on insert, forbids changing it, and ANDs it into every select, update, and delete. This prevents a handler from reaching a neighboring global partition even when the handler omits its own predicate. Cross-boundary and cross-partition work remains closed.
-
-The configured `gateway-live` suite passes 11 of 11 cases. Its global case gives two principals the same application partition, denies a wrong routed key, keeps a neighboring partition empty, reconstructs Gateway and Cdb, and retires a deleted user's dirty rerun. The frozen global profile uses one principal, eight partitions, eight registrations, eight writes, and eight exact isolated snapshots. The clean-tarball Miniflare proof repeats shared cross-principal reads, neighbor isolation, stable mutation replay, and restart persistence through native `env.DB`. Its 32-query, concurrency-eight global profile measured 375.15 queries per second in this local run. That number is regression telemetry, not a capacity or latency target.
-
-Subjectless Gateway queries remain closed. Better Auth anonymous sign-in creates an authenticated account. After JWT issuance and organization membership, that account is a principal like any other. A table's `publicRead` flag removes the table-role requirement for selects only. It does not remove JWT verification, Catalog membership, the tenant predicate, write grants, or cross-organization isolation. A four-case workerd proof covers an allowed same-organization read, a denied cross-organization read, a missing JWT, and an invalid JWT.
-
-Catalog's authority read is the authorization linearization point. A revocation blocks the next dispatch, but it does not cancel a Cdb call that Catalog already authorized. Each dirty live-query rerun reads current authority again. A workerd test keeps one socket open while its membership changes from `member` to `viewer`, back to `member`, then to deleted. The reruns return an empty snapshot after the downgrade, restore rows after the role returns, and retire the registration with `CDB_FORBIDDEN` after deletion. Cdb treats its mutation RPC as a trusted post-validation internal seam. It invokes the validated handler under the database policy wrapper and commits domain SQL with the provisional op-log row in one transaction.
-
-The JWT tests use real signatures and the Catalog resolver contract. Miniflare workerd tests drive the configured Gateway Durable Object and WebSocket with ES256 tokens, a real Catalog SQLite cache, Catalog membership resolution, and configured Cdb mutation and query handlers. The live test gives two org-A clients initial snapshots and acknowledgements, commits a public mutation, drains the Cdb invalidation outbox, delivers replacement snapshots and acknowledgements, keeps an org-B query empty under policy, then reconnects and subscribes again. One snapshot durability case evicts Gateway and Cdb before sending a staged replacement and completes delivery after reconstruction. A second sends a replacement without receiving its acknowledgement, hibernates the same open socket, reconstructs both objects, redelivers the exact cookie and rows, accepts one acknowledgement, and delivers a later mutation normally. A third drops the acknowledgement and socket, holds the replacement before `hello`, reconstructs Gateway with that pending socket hibernated, then proves the released connection receives the exact old cookie before a distinct current snapshot without entering `refetching`. An unknown resume cookie separately proves the bounded `mustRefetch{lagged}` fallback. Another test imports refs from a real emitted Vite browser chunk and compares them with the independently bundled workerd Worker. A configured Catalog workerd test creates a user, session, organization, and member, evicts the Catalog Durable Object, proves a new instance started, and reads identical stored auth rows and canonical organization authority after reconstruction. Catalog now owns JWKS refresh and scopes cache entries, leases, and cooldowns by URL. It enforces a 5-second fetch and read deadline, a 256 KiB document limit, at most 32 keys, a 256-byte `kid`, and a 2,048-byte URL. A durable 10-second lease coordinates refresh. A successful document caches absent keys for 5 seconds, while failures cool down exponentially from 1 to 60 seconds. Refresh never returns an expired key or falls back to the unscoped legacy cache, and it atomically removes keys absent from the new document. The configured workerd test proves fail-closed outbound errors, cooldown suppression, recovery, retired and unknown key rejection, rotated-key acceptance, and Catalog-derived authority despite forged tenant and role claims. Other focused tests seed JWK and auth rows through test-only routes. The separate packed chat smoke runs actual Better Auth anonymous sign-ins and token issue for two principals. Catalog auth DDL preserves constraints and indexes for new storage. Versioned Catalog migration statements upgrade existing auth layouts under the same maintenance protocol used for Cdb shards.
-
-A real-workerd compatibility run requires a host that permits local listeners. The current counts are `gateway-live` 11/11, `gateway-jwt` 22/22, and `gateway-snapshot` 6/6. The JWT suite proves protocol mismatch closes before JWT or JWKS verification. The snapshot cases cover reconstruction, same-socket redelivery, exact replacement-socket replay, unknown-cookie fallback, legacy over-limit retirement, and slow-ack coalescing. They have 15-second budgets. This is test budget, not a product latency promise. Focused passes do not make Chardb production-ready.
-
-Each server-generated connection id owns at most one in-flight `hello` or `updateAuth` operation. A duplicate receives retryable `CDB_RATE_LIMITED` before JWT verification, Catalog access, attachment mutation, or refresh chaining. Every outcome releases only the exact owning claim. An admitted `updateAuth` barrier remains visible to mutation and subscription admission while Gateway drains prior work, retires that connection's current durable registrations, and reports affected subscription ids through `mustRefetch`. It does not replay those subscriptions.
-
-Socket close or a hibernatable socket error stores a rejected attachment, releases in-memory admission state, and drives the same exact durable retirement and fallback reconciliation path. Every post-await authentication, drain, alarm, retirement, invalidation, attachment mutation, and send step is fenced. Late continuations cannot dispatch queued work or replace the rejected state. Failed refreshes also store a terminal rejected attachment before closing the socket.
-
-If a verified `hello` cannot send `welcome`, Gateway marks that exact connection rejected and attempts a 1011 close with reason `welcome delivery failed`. An unsupported protocol is rejected before verification; Gateway attempts the mismatch frame, then closes with 1002 and reason `unsupported chardb protocol <version>` even if that send fails.
-
-The client option `mutationTimeoutMs` defaults to 60 seconds and covers the full pending lifetime, including reconnects. A reconnect resends a pending mutation with its original `mutId` without resetting the deadline. If that deadline expires, the promise rejects with nonretryable `CDB_MUTATION_OUTCOME_UNKNOWN` because the server may already have committed the mutation. A synchronous send failure, client close, session failure, or terminal server result clears the timer. `ChardbProvider` forwards the same option. The client does not expose a retry handle or automatically retry terminal errors.
-
-A transient transport disconnect retains pending mutations for reconnect under the original id and deadline. Explicit `client.close()` and terminal session failure instead reject every remaining mutation once with `CDB_STREAM_ABORTED`. The client never reports those cases as a confirmed server rollback.
-
-Pre-welcome closes advance reconnect delay through 250 ms, 500 ms, 1 second, 2 seconds, 4 seconds, 8 seconds, and a repeating 10-second cap. A WebSocket opening does not reset the delay. Only an accepted `welcome` restores the initial 250 ms delay.
-
-Pending JWT continuations and all socket callbacks check terminal state, connection-attempt number, and exact socket identity. Error and close revoke the current socket before reconnect processing. A stale JWT or callback therefore cannot send, apply rows, settle work, schedule another reconnect, or change the replacement socket. The existing backoff sequence and welcome-only reset remain unchanged.
-
-If the initial `hello` send throws, the client revokes and closes that socket and enters the same reconnect path. Queued subscriptions and mutations remain admitted. A replacement socket sends each once after `welcome`, with the original mutation ids and deadlines.
-
-The same pending-mutation map caps queued, in-flight, and reconnecting client work at 32 records. Mutation refs validate before admission. A valid 33rd request rejects immediately with retryable `CDB_RATE_LIMITED` before UUID allocation, timer creation, map insertion, or send. Reconnect preserves admitted ids and deadlines. Success, typed failure, timeout, synchronous send failure, client close, and session failure remove records and release capacity.
-
-Client subscription and mutation arguments must be strict JSON primitives, dense arrays, or plain or null-prototype objects with enumerable data properties. Validation rejects accessors without invoking getters, plus cycles, sparse or decorated arrays, unsupported prototypes, symbols, nonfinite numbers, negative zero, and other non-JSON values. Arguments accept the exact 512 KiB serialized UTF-8 boundary, at most 4,096 aggregate array elements and object properties, and 99 nested argument levels because the request envelope consumes one level of the wire decoder's 100-level budget. Client violations return nonretryable `CDB_INVALID_ARGS`; the public wire decoder rejects a deeper envelope before Gateway mutation admission.
-
-After ref validation, the client enforces the limits and constructs an owned copy in one descriptor traversal. It does not invoke getters or enumerate and read a proxy again, so later caller mutation cannot change the admitted request. Both subscribe and mutate complete this work before capacity checks, id allocation, record insertion, or send; mutate also does so before timer creation. Immediate sends, the first welcome flush, and reconnect reuse the stored owned payload and original subscription or mutation id.
-
-Direct `createChardbClient` calls remain eager. `ChardbProvider` uses an internal deferred controller only for clients it creates, so connection work begins after the provider commits. Aborted renders start no WebSocket, JWT, or broadcast work. StrictMode rehearsal keeps the committed client alive, replacement closes an old owned client once, and a transfer of that same object to the `client` prop cancels its pending close. The provider never closes a borrowed client. `useQuery` validates and owns arguments before canonical identity using the exact 512 KiB UTF-8, 4,096-member, and 99-level strict JSON limits. Invalid arguments fail with `CDB_INVALID_ARGS` without a subscription. Valid queries return `pending` as soon as their client, ref, or canonical owned arguments change and ignore late listener calls from the prior subscription.
-
-With an explicit stable `getJwt`, changing only the provider's `auth` object updates `useSession` context without replacing the owned client, socket, subscriptions, or pending mutations. If the provider derives JWTs from `auth`, an auth-object change replaces the client and closes the old one once.
-
-For mutations, Gateway checks the same contract before admission or auth-refresh waiting. Trusted dispatch snapshots raw arguments before local routing. Built-in routing owns validator output, gives partition extraction a separate copy, and owns the forwarded arguments again. Custom route arguments are bounded and copied before Catalog or Cdb work. Gateway captures its authority, partition key, and valid vshard. It then captures the Catalog-derived principal, authority fields, role, copied roles, and epochs across later awaits. Cdb owns the request primitives, arguments, claims, roles, epochs, and routed placement before awaiting its recovery alarm, and checks them before descriptor, handler, op-log, or domain work.
-
-Keyless mutation routing uses stable canonical JSON, so nested object insertion order does not change its shard. Canonical JSON and op-log request hashing preserve an own `__proto__` data property without prototype mutation; changing that value changes replay identity and produces a mutation-id collision for the same `mutId`.
-
-Server query and subscription arguments use the same exact 512 KiB UTF-8, 4,096-member, and 99-level strict JSON contract. Gateway owns raw subscription arguments before pending capacity or routing. Built-in routing takes separate owned snapshots around validation and declared intent and partition callbacks, including the callback-mutated arguments and returned intent. Gateway rechecks the arguments from an overridden route before Catalog, Cdb, or durable installation. Each snapshot is built from data descriptors in one traversal without invoking getters or enumerating and reading a proxy again, so later caller, validator, or callback mutation cannot alter downstream work.
-
-`Cdb.subscribe` enforces the contract before interval or durable registration work. Direct `Cdb.query` enforces it before descriptor lookup or handler invocation, and registered execution checks persisted arguments before routing callbacks or the handler. Cdb bootstrap streams the active-registration cursor and rebuilds each table and interval mapping as its row arrives, including a full 4,096-row set. A legacy active row with over-limit arguments stays mapped and invalidatable but returns terminal `CDB_INVALID_ARGS` when executed; valid sibling registrations still run. The configured snapshot suite reconstructs that legacy row, invalidates it through a real mutation, observes terminal Gateway settlement, and completes exact Cdb cleanup.
-
-Query handlers return ordered JSON arrays. Cdb preserves that order, so handlers must use a deterministic SQL `orderBy` when consumers depend on it. The supported live path sends full replacement snapshots. It does not require or infer a protocol row key, and incremental row patches remain unsupported.
-
-Mutation results accept the exact 512 KiB serialized JSON boundary. A fresh result is copied from data descriptors inside the transaction before op-log finalization or the write-set hook, without invoking getters or rereading a proxy. The fresh response and replay therefore remain equal if the handler later mutates its retained object. A fresh oversized result returns `CDB_INVARIANT`; its domain SQL and provisional op-log row roll back. Replay applies the same limit to the stored result. An oversized legacy row is rejected without running the handler or hook and without changing the stored row. The error guidance directs larger reads to a paginated query.
-
-A newly executed atomic mutation accepts at most 256 successful typed write statements and 4,096 affected rows. The executor uses each statement's `total_changes()` delta so direct writes, trigger fanout, and foreign-key actions share the row cap. Either overflow is terminal `CDB_INVARIANT`: even if the handler catches it, later writes stay blocked and the stored violation aborts commit. Domain SQL and the provisional op-log row roll back, and the write-set hook does not run. The mutation database remains usable only during its owning `transactionSync`; retained reads, writes, and nested transaction entry fail with `CDB_INVARIANT` before late SQL. Supported nested wrappers share the active guard. Async handlers, returned thenables, and async write-set hooks remain unsupported. An accepted replay bypasses the handler and these write counters.
-
-Gateway admits at most 32 unsettled mutations per connection and 256 per Gateway object. Excess mutations receive retryable `CDB_RATE_LIMITED` before dispatch. Inbound WebSocket text frames are measured as UTF-8 before wire decoding. Gateway accepts the exact 1 MiB boundary and closes larger frames with code 1009.
-
-After routed mutation work settles, Gateway requires the socket's exact verified `connectionId`, `clientId`, and `principalId` before updating `lastCookie` on success or sending either success or failure. Socket close or attachment replacement suppresses stale delivery. This does not undo a commit or change the Cdb op-log's replay and collision semantics.
-
-The client independently accepts inbound WebSocket data only as text through the exact 1 MiB UTF-8 boundary before decoding. A non-text or larger frame terminally closes the session with `CDB_INVARIANT`, clears subscriptions and pending mutations, cancels mutation and reconnect timers, and closes the socket and broadcast channel. Frames that pass still use the existing semantic caps: 4,096 rows and 512 KiB for snapshots and caches, 4,096 items and 512 KiB for patch batches and optimistic history, and 8 MiB across retained query state.
-
-The client keeps at most 64 active subscription records. It validates the ref and owns the arguments before checking this cap. A valid subscription over the cap throws retryable `CDB_RATE_LIMITED` synchronously before it consumes an id, changes state, or sends. Reconnect resends the same records, ids, and owned argument snapshots. Unsubscribe releases one slot, and terminal session failure clears all records. A synchronous subscribe-send failure removes the new record so reconnect cannot revive it. A failed unsubscribe send closes the client session.
-
-Nonduplicate snapshots accept up to 4,096 rows and the exact 512 KiB serialized JSON boundary. Canonical and cross-tab optimistic patch batches accept up to 4,096 items and 512 KiB. The client preflights a whole batch and every patch row before subscription lookup, and before cross-tab stringify. Every resulting row cache uses the snapshot row and byte caps. Optimistic history accepts up to 4,096 patches and 512 KiB. The client validates every affected subscription plan, commits all planned caches and histories, then invokes listeners. Malformed or oversized input closes the session with `CDB_INVARIANT` and no partial application. A same-cookie snapshot is re-acknowledged and ignored before sizing, so it cannot replace current rows or clear optimistic state.
-
-Terminal cleanup clears every subscription's rows and optimistic history before its final empty listener notification. A listener exception cannot stop cleanup of later listeners, pending mutations, timers, the socket, or the broadcast channel. Stale socket callbacks are fenced and cannot run terminal cleanup again.
-
-Across all subscriptions, serialized retained rows plus optimistic history accept the exact 8 MiB boundary. Snapshots and optimistic patches are deep-cloned into private state, and each listener receives another deep clone. Listener mutation cannot change later query state. Cloning preserves an own `__proto__` data property without mutating the object's prototype. Multi-subscription patch batches validate every planned state and aggregate bytes before any commit. Unsubscribe, refetch clearing, and terminal cleanup release retained state. Inbound overflow fail-closes without partial application; a new subscription that cannot retain its empty state receives retryable `CDB_RATE_LIMITED` before id allocation or send.
-
-For each Gateway connection and subscription id, one subscription attempt can be active and one replacement can wait behind it. Further duplicates receive retryable `CDB_RATE_LIMITED` before capacity SQL, query routing, Catalog reads, Cdb calls, or installation. Later duplicates cannot replace the accepted replacement payload. Route rejection and final scheduler errors are sent only while the attempt still owns the pending slot and its exact verified socket remains current, so replacement, unsubscribe, and close fence stale errors.
-
-After durable unsubscribe retirement settles, Gateway rereads the socket attachment. It removes the subscription id only from the exact current verified connection, client, and principal, and spreads that current attachment so newer auth timing, cookie, presence, and other subscription fields survive. A close-rejected attachment or replacement identity remains untouched.
-
-Each Gateway admits at most 256 aggregate current and pending logical registrations. It counts durable heads after restart, permits a same-key replacement without consuming another slot, and rejects a duplicate pending race. Excess work receives retryable `CDB_RATE_LIMITED` before query routing, Catalog reads, Cdb calls, or registration installation. A configured workerd case fills one Gateway with four real SDK clients and 256 active Gateway and Cdb registrations, rejects a raw 257th subscription without installing it in Cdb, releases one exact slot, admits one replacement, and drains both objects to zero.
-
-Gateway also charges the exact stored UTF-8 bytes of durable registration, staged snapshots, and replay rows, ignoring advisory size columns, plus bounded headroom for mutable claim tokens, retry errors, and cookies. Registration charge accepts the exact 15 MiB boundary inside an exact 16 MiB total, leaving 1 MiB for snapshot delivery and replay. Replay keeps at most one sent, unacknowledged snapshot per logical subscription for 30 seconds, at most 256 rows per Gateway, and evicts oldest rows to remain inside the same 16 MiB total. Registration install or replacement, snapshot staging, and acknowledgement enforce quota atomically. Before snapshot send, Gateway atomically binds the exact claimed row to the socket's arbitrary resume cookie and retires that claim with retryable `CDB_RATE_LIMITED` if it would cross 16 MiB. Retirement scrubs query and snapshot payload while retaining exact Cdb cleanup identity. Restart compacts legacy retired rows and deletes their outboxes; successful cleanup releases the remaining bytes.
-
-Cdb accepts at most 8,192 total live-subscription rows and 4,096 active registrations. Each subscription identity field accepts at most 256 UTF-8 bytes, and retired identity storage is capped at 16 MiB. Unsubscribe keeps the exact retired fence until Gateway completes durable generation cleanup. Gateway then finalizes that exact tombstone. If unsubscribe or finalization fails, the durable Gateway cleanup row retries. Presence and other experimental queues remain outside the supported path and still need their own retention limits.
-
-Better Auth counts use a Catalog scalar `COUNT(*)` RPC instead of materializing matching rows. They keep the same `eq` and `AND` where validation, model and column checks, and bound equality predicates as row lookup. `findMany` forwards offset and sort through Catalog. Model sort fields map through the synthesized schema, direction accepts validated `ASC` or `DESC`, and `id ASC` breaks ties or supplies the default paging order. Limit and offset accept only non-negative safe integers and go to SQL as bindings. Each auth mutation commits with every directly derivable old and new global, tenant, or principal epoch bump.
-
-Single Better Auth `update` and `delete` select the lowest matching schema-mapped id and mutate only that row. An empty predicate or no match is a no-op. `updateMany` and `deleteMany` retain all-match behavior, including for an empty predicate, and keep their existing bulk bounds.
-
-Better Auth `incrementOne` is native rather than a read-then-update fallback. Catalog maps customized model and field names in both directions, deterministically selects one row, repeats its guards in the exact update, applies increment and set values atomically, and bumps auth epochs only when the update succeeds. Invalid mappings, guards, fields, deltas, or projected write volume fail before base or epoch writes.
-
-Bulk auth update and delete preflight accepts exactly 4,096 matched rows and 512 KiB of projected old and replacement scope values. Update also accepts exactly 512 KiB of schema-mapped replacement values after multiplying their SQL byte cost by the matched row count. Catalog loads only placement, organization, and user scope columns. Overflow returns retryable `CDB_RATE_LIMITED` before the base write or epoch bump, and `updateMany` performs no full-row preload or reread. Better Auth workflows that make several adapter calls remain sequential because the adapter reports `transaction: false`. Indirect plugin relationships without placement metadata or conventional `organizationId` or `userId` fields may lack a secondary scope. These cases have Bun fake-Durable-Object coverage, not workerd coverage.
-
-Fresh Cdb objects render domain tables and indexes from the configured Drizzle schema, record signatures, and reject drift when no migration journal is configured. With a nonempty journal, fresh and existing storage starts at version zero and remains closed until `chardb migrate` activates the exact packaged version. Inserts, updates, deletes, and full-row selects require schema-declared grants. Inserts and updates check writable columns; updates forbid authority-column changes. Updates, deletes, and selects AND tenant and self predicates with the caller's filter, including operations with no filter. Select results receive readable-column masks. Projections, joins, and other shapes that cannot yet be masked safely fail closed.
-
-`defineMigrations` packages an immutable, contiguous journal through `virtual:chardb/migrations`. Each version can contain ordered Cdb SQL and ordered Catalog auth SQL. Catalog durably records the target version, digest, migration id, shard set, phase, and completed Catalog steps. Each Cdb records its active or migrating version, epoch, digest, and completed steps. `chardb migrate --url <origin> --id <id> --target <version>` resumes the exact migration, prepares and upgrades every routed shard with bounded concurrency, applies Catalog steps, verifies final rendered domain and auth DDL, then publishes the new domain epoch. Routing and auth access fail with `CDB_STALE_EPOCH` while maintenance is active. Mutation, direct query, subscription, and registered-query RPCs require the exact active domain epoch; query paths check again after handlers that may yield.
-
-Existing version-zero storage can use `chardb migrate ... --baseline`. Baseline mode executes no packaged SQL. It verifies that every Cdb and Catalog already matches the final rendered schema, records the packaged version and digest, and activates one new epoch without rewriting rows or op-log entries. The protocol is forward-only and maintenance-mode: it has no down migration and does not claim online reads or writes during an upgrade.
-
-Application handlers can use only typed builders against registered `cdbTable` definitions. The wrapper rejects raw SQL, Drizzle session and client access, relational and count shortcuts, plain-table CRUD, insert-select, conflict methods, `returning`, and unsupported properties before or after policy attachment. For a supported full-row live query, Cdb conservatively records every `cdbTable` used at a `FROM` boundary and in tracked predicates or ordering. Every terminal execution records its actual typed predicate after the row-policy floor is applied. Each declared interval bundle's union must contain every observed range for its table and index, including executions whose rows the handler later discards.
-
-Direct and registered query execution build owned results from data descriptors before returning them, without invoking property getters, and apply the 4,096 top-level row and exact 512 KiB serialized JSON limits to those values. Later handler mutation cannot change a response. Direct execution checks its observed reads and ranges after the snapshot. Registered execution snapshots first, checks reads and ranges next, then rereads and fences the durable generation. A Proxy `ownKeys` trap that performs an undeclared read or changes generation identity therefore returns `CDB_INVARIANT`. Oversized results receive the same code with guidance to limit rows or columns, or paginate. Raw or untracked predicates, embedded subqueries, and callback predicates or ordering fail closed. Projections, joins, grouping, and richer query shapes remain closed.
-
-The first single-source query form is `api.query({ ref, args, query: (db, args) => db.select()... })`. Gateway compiles the synchronous Drizzle builder before Catalog and derives authority, exact placement, table dependencies, recognized predicate intervals, full-row projection, ordering, and limit. Cdb compiles it again before execution. The query hash includes the compiled plan hash, so different Gateway and Cdb builds fail closed instead of running different reads. This version requires one `cdbTable`, one exact string partition, ordering that ends in the primary key, and a limit from 1 through 100. It sends refs and JSON arguments over RPC, never SQL text. Legacy handler plus intent queries still work during migration.
-
-`bun run bench:planned-query` runs the real Workerd page profile. Its default seeds 800 rows across eight channels, installs 32 registrations, and checks the exact ordered 25-row result for every snapshot. Four `CDB_PLANNED_QUERY_BENCH_*` variables scale channels, rows, registrations, and page size. Timing is local regression telemetry, not a hosted-service target.
-
-Gateway and Cdb derive the same static digest from the row and column policy metadata of the `cdbTable` names in the declared intent. The digest excludes arbitrary function source because closure text is not stable across builds. Both objects persist it as part of registered-query identity and mix it into the query hash. Gateway checks it before a dirty rerun and again before sending a staged snapshot. Cdb checks it before registered execution. A mismatch retires the generation instead of returning or sending rows under an old policy. Bootstrap retires legacy Gateway and Cdb registrations that have no digest. A quiet registration has no background policy scan, so it detects drift on its next invalidation, snapshot-send attempt, or other work trigger.
-
-The clean-tarball smoke signs in two distinct principals that initially share `demo-org` and verifies both membership records through the configured organization plugin. It runs the packed CLI migration before auth traffic. Both browser connections acknowledge empty initial snapshots, then receive and acknowledge the same live replacement after `postMessage`. Native `env.DB` also gives both principals the same routed global row, keeps a neighboring partition empty, and returns the exact stored result on mutation replay. After closing both sockets, the smoke restarts Miniflare, reconstructs both sessions, organization rows, user preference, and global row, moves the second principal to an isolated organization, proves cross-organization denial, and signs out both sessions. This does not prove exact resume replay or a multi-version production upgrade.
-
-Scatter routing asks Catalog for the distinct physical shards that own current ranges, but public scatter queries remain closed. The narrow organization path persists the exact Gateway generation, client and subscription identity, principal, organization, auth epochs, static table-policy digest, logical shard, physical Cdb, query identity, retry state, and delivery state. Each Cdb admits 4,096 active registrations. An exact active replay succeeds without another slot, unsubscribe releases the slot, and Cdb returns either success for the exact requested identity or a matching typed `registrationState: "absent"` capacity failure. Gateway deletes only that proven-absent pending generation without creating a Cdb tombstone. Cancellation while the call is pending preserves its recovery record; lost, malformed, or identity-mismatched outcomes trigger exact unsubscribe compensation. A pre-armed 30-second durable deadline performs the same cleanup after restart.
-
-Each Cdb also caps its coalesced invalidation outbox at 4,096 rows. Existing exact rows can coalesce at capacity, and acknowledged delivery releases them. A mutation selects at most 4,097 distinct registration targets with `LIMIT 4097`, accepts exactly 4,096, and rejects overflow with retryable `CDB_RATE_LIMITED`. That rejection rolls back the domain write, provisional op-log, change clock, and outbox work. Cdb invalidations and Gateway cleanup and retry work survive Durable Object reconstruction.
-
-Catalog publishes a range-cutover map to its in-memory routing cache only after the range update, schema epoch, and migration guard commit. A failed commit rolls back durable state and keeps the old cached route; retry can commit the new shard and epoch, then publish the new route once. Full Resharder orchestration and recovery remain experimental.
-
-The dependency audit is not clean. Compatible updates removed the reported `nanoid`, PostCSS, Sharp, SVGO, and `ws` advisories. Bun still reports five advisories on `miniflare@4.20260730.0 -> undici@7.28.0`; Miniflare 4 pins that version, while the fixed `undici@7.29.0` is currently available only through Miniflare 5 alpha.
-
-Placeholder `/q`, `/f`, `/p`, and `/s` handlers were removed, and those paths fall through to the application. Placeholder React presence, upload, stream, and vector hooks are not exported.
-
-See [STATUS.md](./STATUS.md) for current capability boundaries, [ARCHITECTURE.md](./ARCHITECTURE.md) for the runtime design, and [PLAN.md](./PLAN.md) for the ordered implementation work.
-
-## The schema idea
+Better Auth owns identity, sessions, and organizations. Configure it once with the plugins your application uses:
 
 ```ts
-import { forOrg } from "chardb/server";
-import { integer, text } from "drizzle-orm/sqlite-core";
-import { auth } from "./worker";
+// src/auth.ts
+import { anonymous } from "better-auth/plugins/anonymous";
+import { jwt } from "better-auth/plugins/jwt";
+import { organization } from "better-auth/plugins/organization";
+import { defineAuth } from "@chardb/core/server";
+
+export const auth = defineAuth({
+    plugins: [anonymous(), organization(), jwt()],
+});
+```
+
+Reference those synthesized Better Auth tables from the Drizzle schema:
+
+```ts
+// src/schema.ts
+import { text } from "drizzle-orm/sqlite-core";
+import { forOrg } from "@chardb/core/server";
+import { auth } from "./auth.ts";
 
 const { cdbTable } = forOrg();
 
 export const messages = cdbTable(
-  "messages",
-  {
-    id: text("id").primaryKey(),
-    organizationId: text("organization_id")
-      .notNull()
-      .references(() => auth.organization.id),
-    authorId: text("author_id")
-      .notNull()
-      .references(() => auth.user.id),
-    body: text("body").notNull(),
-    createdAt: integer("created_at").notNull(),
-  },
-  {
-    selfBy: "authorId",
-    roles: {
-      admin: "*",
-      member: { read: "*", create: ["body"] },
-      self: { read: "*", update: ["body"], delete: true },
+    "messages",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => auth.organization.id, { onDelete: "cascade" }),
+        body: text("body").notNull(),
     },
-  },
+    {
+        roles: {
+            owner: "*",
+            admin: "*",
+            member: { read: "*", create: ["id", "body"] },
+        },
+    }
 );
 ```
 
-The organization foreign key identifies the intended transaction and placement boundary. Related rows colocate through their foreign-key chain. Declared organization mutations enforce that boundary by checking the extracted organization against Catalog membership. An explicit organization query crosses the same authority boundary only when its declared partition and developer-declared server-side intent identify that exact organization and one virtual shard. That narrow path registers the query and sends replacement snapshots after matching commits.
+The foreign key identifies organization ownership. The role policy decides which members may read or write each column. Application code does not maintain a second organization or session model.
 
-## Worker binding
+The `roles` block is Chardb's policy for domain rows. It does not add roles or permissions to Better Auth's organization or admin plugins. Configure those plugins in `defineAuth()` and manage their roles through Better Auth. Chardb reads the current Better Auth organization role at request time, then applies the matching domain-row grant above.
 
-`chardb({ schema, api, auth })` returns the configured public `DB` WorkerEntrypoint beside its internal Durable Object classes. Export it with the app. The generated `wrangler.toml` needs only the standard Durable Object migrations; same-Worker bindings come from Cloudflare's native `ctx.exports`.
+Some organization data belongs to one user. Put those tables behind `forOrgUser()` so Chardb fills and checks both foreign keys. Keep organization-wide tables behind `forOrg()`, in a separate schema module:
 
 ```ts
-export const app = chardb({ auth, schema: domain, api });
+// src/project-schema.ts
+import { text } from "drizzle-orm/sqlite-core";
+import { forOrg } from "@chardb/core/server";
+import { auth } from "./auth.ts";
+
+const { cdbTable: orgTable } = forOrg();
+export const projects = orgTable(
+    "projects",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => auth.organization.id),
+        name: text("name").notNull(),
+    },
+    { roles: { owner: "*", admin: "*", member: { read: "*" } } }
+);
+
+// src/draft-schema.ts
+import { text } from "drizzle-orm/sqlite-core";
+import { forOrgUser } from "@chardb/core/server";
+import { auth } from "./auth.ts";
+
+const { cdbTable: orgUserTable } = forOrgUser();
+export const drafts = orgUserTable(
+    "drafts",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => auth.organization.id),
+        userId: text("user_id")
+            .notNull()
+            .references(() => auth.user.id),
+        title: text("title").notNull(),
+    },
+    {
+        roles: {
+            admin: { read: "*" },
+            self: { create: ["id", "title"], read: "*", update: ["title"], delete: true },
+        },
+    }
+);
+```
+
+`projects` is shared across the organization. Each `drafts` row belongs to its organization and its author. The mutation handler inserts `{ id, title }`; Chardb takes `organizationId` and `userId` from verified Better Auth state. An organization admin can read every draft here, while members can only read and edit their own.
+
+## Define queries
+
+Define a stable server handle. The ref is the wire identity shared by Worker and browser builds:
+
+```ts
+import { api } from "@chardb/core/server";
+import { asc, eq } from "drizzle-orm";
+import { z } from "zod";
+import { messages } from "./schema.ts";
+
+export const listMessages = api.query({
+    ref: "src/queries.ts#listMessages",
+    args: z.object({ organizationId: z.string() }),
+    query: (db, args) =>
+        db
+            .select()
+            .from(messages)
+            .where(eq(messages.organizationId, args.organizationId))
+            .orderBy(asc(messages.id))
+            .limit(100),
+});
+```
+
+A mutation uses the same organization routing field and writes through the policy-wrapped Drizzle database:
+
+```ts
+// src/api.ts
+import { api } from "@chardb/core/server";
+import { z } from "zod";
+import { messages } from "./schema.ts";
+
+export const postMessage = api.mutation({
+    ref: "src/api.ts#postMessage",
+    authority: "organization",
+    partitionKey: "organizationId",
+    args: z.object({
+        organizationId: z.string(),
+        id: z.string(),
+        body: z.string().trim().min(1).max(2_000),
+    }),
+    handler: (ctx, args) => {
+        ctx.db.insert(messages).values({ id: args.id, body: args.body }).run();
+        return { id: args.id };
+    },
+});
+```
+
+`organizationId` routes each operation to one organization shard. It does not grant access. Chardb verifies the Better Auth JWT, refreshes current membership, and applies the schema policy before executing the handle. Inserts fill the managed organization column from that verified authority, so handlers do not trust a caller-supplied owner.
+
+## Add files or vectors
+
+Organization files and vectors are opt-in public experiments. Ordinary organization rows do not require either feature. The generated app includes a working R2-backed file example using `@chardb/core/files`; rows store an opaque file ID, while upload and download still use the active Better Auth organization and row policy.
+
+Vectors require an explicit column, Vectorize binding, and metadata index. Add the vector import and column to the table above, and grant only the roles that may write it:
+
+```ts
+import { vector } from "@chardb/core/server";
+
+// Inside the messages column definition:
+embedding: vector("embedding", {
+    dim: 768,
+    binding: "VECTORS",
+    metric: "cosine",
+}),
+
+// Replace the member role entry with:
+member: { read: "*", create: ["id", "body", "embedding"] },
+```
+
+Chardb can generate the immutable initial journal from conventional `src/auth.ts` and `src/schema.ts` files:
+
+```sh
+bunx @chardb/core migrations generate --name initial_schema
+```
+
+The command inspects the schema twice in separate Bun processes and rejects different output. The first run writes static `src/migrations/v1.json`, `src/migrations/v1.ts`, and `src/migrations.ts` files without importing the mutable application schema. Run it after each additive schema change to append the next sequential version. Every later run verifies the complete canonical JSON digest chain, the generated TypeScript for each version, and the exact journal before it writes. The additive diff accepts new tables, nonunique indexes, and nullable unconstrained columns. It rejects gaps, edits to old history, drops, renames, type or constraint changes, new unique indexes, and mutation of an existing file or vector resource.
+
+Vector writes use the same organization mutation and SQLite transaction as the owning row. Search uses the existing registered-query and live-query path:
+
+```ts
+import { api, searchVector } from "@chardb/core/server";
+import { eq } from "drizzle-orm";
+import { z } from "zod";
+import { messages } from "./schema.ts";
+
+export const putMessage = api.mutation({
+    ref: "src/api.ts#putMessage",
+    args: z.object({
+        organizationId: z.string(),
+        id: z.string(),
+        body: z.string(),
+        values: z.array(z.number()).length(768),
+    }),
+    authority: "organization",
+    partitionKey: "organizationId",
+    handler: (ctx, args) => {
+        const embedding = ctx.vector.set(messages.embedding, args.id, args.values);
+        ctx.db.insert(messages).values({ id: args.id, body: args.body, embedding }).run();
+        return { id: args.id };
+    },
+});
+
+export const deleteMessage = api.mutation({
+    ref: "src/api.ts#deleteMessage",
+    args: z.object({ organizationId: z.string(), id: z.string() }),
+    authority: "organization",
+    partitionKey: "organizationId",
+    handler: (ctx, args) => {
+        ctx.vector.delete(messages.embedding, args.id);
+        ctx.db.delete(messages).where(eq(messages.id, args.id)).run();
+        return { id: args.id };
+    },
+});
+
+export const searchMessages = api.query({
+    ref: "src/queries.ts#searchMessages",
+    args: z.object({
+        organizationId: z.string(),
+        values: z.array(z.number()).length(768),
+        limit: z.number().int().min(1).max(100),
+    }),
+    query: (_db, args) => searchVector(messages.embedding, args),
+});
+```
+
+`ctx.vector.set()` returns the opaque handle stored in the Drizzle column. `ctx.vector.delete()` and the row delete belong in the same mutation. Both operations stage domain SQL, the current vector head, and delivery intent atomically. Vectorize delivery happens after commit, so search is eventually consistent. Once an upsert or delete settles, Chardb invalidates subscriptions for that exact vector resource and the existing `useQuery(searchMessages, args)` hook refetches it.
+
+Every vector mutation and search uses the same organization authority as ordinary rows. Chardb verifies the Better Auth JWT, refreshes membership and placement, and applies the table policy and authoritative vector head. The `organizationId` in `searchVector()` is a checked routing input, not a client-controlled filter for another organization.
+
+Search returns only `{ rowPk, score }`. Chardb asks Vectorize for the requested limit plus at most 16 extra candidates, then rejects stale, cross-organization, and policy-hidden candidates against SQLite. That bounded filtering can return fewer than `limit`; continuation is not implemented because Vectorize does not provide the cursor contract Chardb needs.
+
+Bind the descriptor to a native Vectorize index in `wrangler.toml`:
+
+```toml
+[[vectorize]]
+binding = "VECTORS"
+index_name = "my-app-vectors"
+```
+
+Search filters every candidate by Chardb's exact resource identity. Create the configured Vectorize index, then prepare its required string metadata index:
+
+```sh
+bunx wrangler vectorize create my-app-vectors --dimensions 768 --metric cosine
+bunx @chardb/core vectorize prepare
+```
+
+TOML is the generated default. `bunx @chardb/core doctor` also accepts `wrangler.json` and `wrangler.jsonc` and checks configured Vectorize bindings. `bunx @chardb/core vectorize prepare` reads TOML first, then JSON, then JSONC, and uses the project's installed Wrangler CLI. It creates a missing `cdb_resource:string` metadata index, accepts an already-correct one, waits for bounded readiness, and refuses conflicting or malformed remote state.
+
+The logical head and delivery outbox follow the organization's normal virtual-shard route. Proven vector-aware movement transfers the SQLite heads, outbox rows, delivery attempts, and deletion tombstones without calling Vectorize during the move. Vectorize remains an external, eventually consistent index; application code never chooses a physical shard or rewrites an index record during resharding.
+
+Organization deletion has a finite fail-closed contract. Chardb records accepted-delete evidence before removing local state and never treats a different opaque Vectorize watermark as proof of order or absence. An unproven external result stops for operator intervention after the bounded settlement and retry budget is exhausted.
+
+## Compose the Worker
+
+One `chardb()` call mounts Better Auth, the database routes, your API handles, and the Durable Object exports required by Wrangler. The generated project supplies the migration journal used here:
+
+```ts
+// src/worker.ts
+import { chardb } from "@chardb/core/server";
+import * as api from "./api.ts";
+import * as queries from "./queries.ts";
+import { auth } from "./auth.ts";
+import { migrations } from "./migrations.ts";
+import * as schema from "./schema.ts";
+
+export const app = chardb({
+    auth,
+    schema,
+    api: { ...api, ...queries },
+    migrations,
+});
+
+app.get("/me", async c =>
+    c.json(await c.var.auth.api.getSession({ headers: c.req.raw.headers }))
+);
 
 export default app;
-export const { DB, BlobMeta, Catalog, Cdb, Gateway, GsiShard, Resharder } = app;
+export const { DB, Catalog, Cdb, Gateway, Resharder } = app;
 ```
 
-Application routes receive the typed binding as `c.env.DB`. The local `client` wrapper keeps function objects inside the Worker and sends only stable refs and bounded JSON over RPC. It requires a Better Auth JWT and the exact issuing origin. The binding verifies the token, resolves current Catalog membership and roles, derives placement from server-owned intent, and executes through the same Cdb mutation or query path used by live traffic.
+Custom Worker routes can query the same schema through the native `DB` binding. They pass the request JWT back through the same Better Auth and policy checks:
 
 ```ts
-import { client } from "chardb";
-import { postMessage } from "./api.ts";
+import { client } from "@chardb/core";
+import { eq } from "drizzle-orm";
+import { messages } from "./schema.ts";
+
+app.get("/api/messages", async c => {
+    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
+    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
+
+    const url = new URL(c.req.url);
+    const organizationId = url.searchParams.get("organizationId") ?? "";
+    if (!organizationId) return c.json({ error: "missing organizationId" }, 400);
+    const rows = await client(c.env.DB, { jwt, authOrigin: url.origin })
+        .select()
+        .from(messages)
+        .where(eq(messages.organizationId, organizationId))
+        .limit(100);
+    return c.json(rows);
+});
+```
+
+The planned live query and direct select compile to the same versioned select plan. Both execute through one policy-wrapped runner. No SQL string crosses RPC.
+
+In React, Better Auth remains the only session and organization store. Pass that same client to Chardb so the database hooks can request a JWT:
+
+```tsx
+import { createAuthClient } from "better-auth/react";
+import { anonymousClient, jwtClient, organizationClient } from "better-auth/client/plugins";
+import { ChardbProvider, useQuery } from "@chardb/core/react";
 import { listMessages } from "./queries.ts";
 
-app.get("/messages", async c => {
-  const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-  if (!jwt) return c.text("unauthorized", 401);
-
-  const db = client(c.env.DB, {
-    jwt,
-    authOrigin: new URL(c.req.url).origin,
-  });
-  return c.json(await db.query(listMessages, {
-    organizationId: "org-1",
-    channelId: "general",
-    limit: 50,
-  }));
+const authClient = createAuthClient({
+    baseURL: window.location.origin,
+    plugins: [anonymousClient(), organizationClient(), jwtClient()],
 });
 
-await client(c.env.DB, { jwt, authOrigin }).mutate(postMessage, args, {
-  mutId: requestId,
-});
+const socketProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+const chardbEndpoint = `${socketProtocol}://${window.location.host}/ws`;
+
+function Messages({ organizationId }: { readonly organizationId: string }) {
+    const { data = [] } = useQuery(listMessages, { organizationId });
+    return <ul>{data.map(message => <li key={message.id}>{message.body}</li>)}</ul>;
+}
+
+export function App() {
+    const session = authClient.useSession();
+    const organizations = authClient.useListOrganizations();
+    if (!session.data) return <p>Sign in to continue.</p>;
+
+    const activeOrganizationId = session.data.session.activeOrganizationId;
+    return (
+        <>
+            <select
+                value={activeOrganizationId ?? ""}
+                onChange={event =>
+                    void authClient.organization.setActive({ organizationId: event.target.value || null })
+                }
+            >
+                <option value="">Choose an organization</option>
+                {(organizations.data ?? []).map(org => (
+                    <option key={org.id} value={org.id}>{org.name}</option>
+                ))}
+            </select>
+            <ChardbProvider
+                endpoint={chardbEndpoint}
+                auth={authClient}
+            >
+                {activeOrganizationId ? <Messages organizationId={activeOrganizationId} /> : null}
+            </ChardbProvider>
+        </>
+    );
+}
 ```
 
-Pass a stable `mutId` when an outer request may be retried. If omitted, `client` creates a UUID for that invocation. Binding failures throw `CdbError` with the same locked code and retryability contract as the WebSocket client. The current binding accepts registered organization-, user-, and narrow global-scoped handles. Global handles name one exact application partition in their server definition and still require a verified JWT with current Catalog user authority. The binding does not expose raw Drizzle builders, caller-supplied authority, scatter queries, composite or replicated global operations, or cross-partition work.
+## Public package entries
 
-## Repository development
+The package publishes five import paths:
 
-Install Bun, then run:
+| Import | Purpose |
+| --- | --- |
+| `@chardb/core` | Browser client, native binding client, and shared errors |
+| `@chardb/core/server` | Organization tables, API handles, auth, migrations, vectors, and `chardb()` |
+| `@chardb/core/react` | `ChardbProvider`, query, and mutation hooks for a Better Auth client |
+| `@chardb/core/files` | Branded file columns, browser-safe locators, and the same-origin file client |
+| `@chardb/core/vite` | Ref-only browser handles for queries and mutations |
 
-```bash
-bun install --frozen-lockfile
-bun run typecheck
-bun run test:correctness
-bun run build
-```
+The preview binary ships `init`, `doctor`, `migrations generate`, `migrate`, and `vectorize prepare`. Range movement is available only under `chardb experimental shards` and is absent from primary help and generated onboarding. Doctor validates Wrangler configuration. Schema and auth doctor targets are not shipped. Durable Object classes, RPC types, policy compilers, presence, streams, distributed transactions, and runtime configuration are not public package exports.
 
-`test:correctness` runs ordinary tests together, then starts each workerd harness in a separate process. The workerd tests open local ports. Individual harnesses remain available for focused diagnosis:
+## Cloudflare runtime
 
-```bash
-bun test test/workerd/catalog.harness.test.ts
-bun test test/workerd/reshard.harness.test.ts
-bun test test/workerd/gateway-live.harness.test.ts
-bun test test/workerd/gateway-jwt.harness.test.ts
-bun test test/workerd/gateway-snapshot.harness.test.ts
-```
+Generated projects run through Wrangler and Miniflare with native Durable Objects, SQLite, and four explicit same-Worker namespace bindings. The scaffold includes a native R2-backed file example. Vector columns use a native Vectorize binding after the application configures one. The generated default is `wrangler.toml`; `chardb doctor` and resource preparation also accept `wrangler.json` and `wrangler.jsonc`. Application code uses the exported `DB` entrypoint. Runtime-provided `ctx.exports` remains a fallback, but internal Durable Object calls in generated deployments do not depend on it. [ARCHITECTURE.md](ARCHITECTURE.md) documents the internal ownership and routing model.
 
-The `gateway-live` harness also contains two default-small SDK scale scenarios. They assert tenant isolation, exact filtered rows, durable convergence, outbox drain, and cleanup. They emit JSON timing telemetry but impose no latency or throughput threshold. Run just the raw scenarios with:
+Migration execution is resumable and fail-closed. Generation is deterministic and writes static, digest-chained JSON and TypeScript snapshots, so deployed history does not import mutable schema or auth modules. Versions after the initial snapshot deliberately support only SQLite changes that do not require a table rewrite or data cleanup.
 
-```bash
-bun run test:scale
-```
+## Release proof
 
-For repeated, comparison-ready evidence, run one of the frozen profiles:
+Every release starts from one packed npm tarball. The same bytes must pass package-boundary checks, the generated app, Better Auth organization isolation, live queries, restart recovery, R2 files, Vectorize vectors, combined row/file/vector movement, and the Linux, macOS, and Windows CI matrix. Reports identify the tarball by SHA-256, keep correctness separate from timing, and reject evidence from any other package.
 
-```bash
-bun run bench:live -- --profile ci-smoke --samples 3 --output-dir .chardb/benchmarks/ci-smoke
-bun run bench:live -- --profile client-max-accepted --samples 3 --output-dir .chardb/benchmarks/client-max
-bun run bench:live -- --profile throughput --samples 5 --output-dir .chardb/benchmarks/throughput
-```
+Cloudflare proofs use disposable Workers, R2 buckets, and Vectorize indexes. They retain no credentials, delete only resources recorded in their ownership ledger, and fail unless independent checks confirm cleanup. These are release-engineering controls, not a durability or production-readiness claim.
 
-The profiles fix the accepted workload and test budgets. `ci-smoke` uses one client per tenant, four mutations per tenant, four selective subscriptions, and two refresh rounds. `client-max-accepted` uses one client per tenant, 32 mutations per tenant in a batch of 32, 64 selective subscriptions, and two rounds. `throughput` uses eight clients per tenant, 1,024 mutations per tenant, 32 subscriptions, and eight rounds. The fanout case commits half its writes, converges every client, closes and recreates half the clients, rematerializes their tenant rows, then finishes the workload. It then drops up to one mutation batch of committed SDK responses. For each lost response, the test holds the replacement connection before `hello`, checks that the first attempt added one domain row, op-log row, and clock step, releases reconnect, and requires the same `mutId` and stored result without another counter change. Every selective-refresh sample reconstructs Cdb with all subscriptions active, verifies the exact registration identities and unchanged Gateway state, closes and recreates the SDK connection, proves that every new Gateway head has the same new identity as its active Cdb registration, then performs the measured writes and materializations. Both scenarios require every successful mutation to add exactly one domain row, one op-log row, and one change-clock step. Connection churn, reconstruction, and mutation replay must leave those counters unchanged. The CLI parses 1 to 20 samples but rejects any profile and sample combination that exceeds the conservative workflow allowance. The output directory must be absent or empty. `run.json` is written before the first sample and keeps structured running, completed, or failed state. Each sample keeps stdout and stderr and writes two `chardb.scale.sample.v1` NDJSON records. The `chardb.scale.report.v1` report records exact workload, Git revision, Bun, OS, CPU, and runner metadata, then summarizes timing and rate fields with min, p50, p95, max, and mean. The manual `Live scale benchmark` workflow accepts a profile and sample count and uploads the full result directory for 14 days.
+## Benchmarks
 
-The clean-tarball chat smoke also runs frozen `env.DB` query workloads after proving binding mutation replay and two-client live convergence. `CDB_BINDING_BENCH_PROFILE=ci-smoke` runs 32 queries at concurrency eight for each supported authority axis; `throughput` runs 256 at concurrency 32. Each global query must return the exact shared row for its routed partition and no neighboring row. The local global `ci-smoke` run measured 375.15 queries per second. The smoke emits `chardb-binding-benchmark` records with elapsed time, queries per second, and min, p50, p95, and max call latency. These are Miniflare regression measurements, not service targets.
+Benchmarks use named, versioned workloads. Warmups are excluded from latency summaries, fresh processes are explicit, and each sample carries correctness flags. Comparison tools reject mismatched candidates, runtimes, profiles, scenarios, and metrics. The caller chooses the regression budget. Repository reports do not turn one laptop, region, or short run into an SLA.
 
-A three-sample clean-HEAD local `throughput` run at `2c936fe` on Bun 1.2.22 and an Apple M4 Pro executed 6,144 fanout mutations, 96 response-loss mutations, and 768 selective mutations. The 7,008 first commits produced exact deltas of 7,008 domain rows, 7,008 op-log rows, and 7,008 change-clock steps. All 96 lost responses replayed with the same mutation id and exact stored result while those counters stayed fixed and no duplicate row appeared. The run replaced 24 live clients midway, verified 86,016 logical row deliveries, reconstructed 96 live Cdb registrations across three evictions, and replaced them with 96 exact new SDK/Gateway registrations. Per-sample fanout throughput ranged from 158.65 to 163.89 mutations/s, client churn took 176.87 to 184.77 ms for eight clients, logical delivery throughput ranged from 29,880.85 to 32,929.17 rows/s, response-loss recovery ranged from 3.61 to 3.68 replays/s, selective recovery took 253.94 to 263.18 ms for 32 registrations, writes ranged from 291.60 to 303.20/s, and materializations from 270.62 to 281.68/s. This Miniflare run is regression telemetry, not a benchmark baseline, capacity claim, or performance target. The repository still requires repeated runs on a declared platform before setting targets.
+Local fake-index vector results measure Worker, SQLite, routing, and live-query work. They do not measure Vectorize or Cloudflare network cost. A local and deployed comparison is valid only when both tracks use the same packed candidate and workload.
 
-The landing page is a separate workspace:
+[COST.md](COST.md) maps Chardb operations to Cloudflare's published meters. Timings are not CPU, Durable Object duration, or an invoice estimate.
 
-```bash
-cd landing
-bun run build
-```
+## Deliberately out of scope
 
-## Repository layout
+User-tenanted and global-table paths remain inside internal conformance fixtures. They are useful implementation evidence, but they are not supported product modes and no public builder exposes them.
 
-- `src/server` contains the Worker entrypoint, Durable Objects, schema helpers, policies, and routing code.
-- `src/client` and `src/react` contain the WebSocket client and React hooks.
-- `src/oplog`, `src/colocation`, `src/reshard`, and `src/drizzle` contain the lower-level database experiments.
-- `test/workerd` exercises selected Durable Object behavior through Miniflare.
-- `spec` contains the TLA+ models.
-- `example/chat` is a concept application. It does not yet prove the complete runtime path.
-- `landing` contains the project site.
+User-owned and global files, user-owned and global vectors, vector-search continuation, presence, streams, scheduling, cross-partition transactions, PITR, export, restore, and automatic resharding are unsupported. Organization files and organization vectors are public and experimental within the narrow lifecycles documented above. Lower-level barrier and operator-driven range-movement code remains internal. Scheduled requests no longer create PITR barriers automatically because retention, export, and restore do not exist.
 
-The npm tarball contains built `dist` files and the public documents. It does not contain `src`. CI runs `chardb init` from that tarball in a temporary project, installs its pinned dependencies without workspace aliases, verifies the TOML migration set has no internal Durable Object bindings, typechecks it, and runs a Wrangler dry-run build. It then starts Wrangler locally and reaches Catalog through the migration-provisioned `ctx.exports` namespace. CI also runs the packed chat smoke, which installs version 0.1.0 into another clean temporary consumer, provisions Miniflare by exported class name, applies the packaged schema with the packed CLI, and proves sign-in, native `env.DB` query and mutation RPC, binding mutation replay, two-client live convergence, persistent restart, session reconstruction, WebSocket op-log replay, two-row readback, organization isolation, and logout. Down migrations and online traffic during migration remain unfinished.
-
-Repository tooling and the `chardb` CLI support Bun 1.2.22. The package does not claim Node runtime support. CI also fetches complete Git history and runs `bun run security:history`, which scans every reachable text blob for high-confidence private-key and provider-token formats without printing matched secret values.
+See [OPERATIONS.md](OPERATIONS.md) for the threat model and recovery limits, [COST.md](COST.md) for the measured-cost boundary, and [ARCHITECTURE.md](ARCHITECTURE.md) for runtime ownership.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

@@ -12,7 +12,118 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  candidate:
+    name: Build exact candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.22
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build and pack candidate once
+        shell: bash
+        run: |
+          bun run build
+          mkdir .ci-pack
+          tarball="$(npm pack --ignore-scripts --pack-destination .ci-pack)"
+          bun scripts/ci-candidate-artifact.mjs --stage ".ci-pack/${tarball}" --directory ci-candidate
+
+      - name: Upload exact candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-${{ github.sha }}-${{ github.run_attempt }}
+          path: ci-candidate
+          if-no-files-found: error
+
+  generated-macos:
+    name: Generated macOS app
+    needs: candidate
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.22
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download exact candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: candidate-${{ github.sha }}-${{ github.run_attempt }}
+          path: ci-candidate
+
+      - name: Verify exact candidate handoff
+        run: bun scripts/ci-candidate-artifact.mjs --verify --directory ci-candidate
+
+      - name: Exercise generated app
+        shell: bash
+        env:
+          CDB_GENERATED_E2E_PLATFORM_NAME: macos-latest
+        run: |
+          bun scripts/smoke-packed-package.mjs ci-candidate/candidate.tgz
+          bun scripts/smoke-generated-project.mjs ci-candidate/candidate.tgz --report generated-macos-report.json
+
+      - name: Upload generated app evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-macos-${{ github.sha }}-${{ github.run_attempt }}
+          path: generated-macos-report.json
+          if-no-files-found: error
+
+  generated-windows-dev-tree:
+    name: Generated Windows dev tree
+    needs: candidate
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.22
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download exact candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: candidate-${{ github.sha }}-${{ github.run_attempt }}
+          path: ci-candidate
+
+      - name: Verify exact candidate handoff
+        run: bun scripts/ci-candidate-artifact.mjs --verify --directory ci-candidate
+
+      - name: Exercise generated dev shutdown
+        shell: pwsh
+        run: |
+          bun test/windows-dev-tree.mjs --tarball ci-candidate/candidate.tgz --report generated-windows-report.json
+
+      - name: Upload generated app evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-windows-${{ github.sha }}-${{ github.run_attempt }}
+          path: generated-windows-report.json
+          if-no-files-found: error
+
   verify:
+    needs: candidate
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -29,6 +140,15 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Download exact candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: candidate-${{ github.sha }}-${{ github.run_attempt }}
+          path: ci-candidate
+
+      - name: Verify exact candidate handoff
+        run: bun scripts/ci-candidate-artifact.mjs --verify --directory ci-candidate
+
       - name: Typecheck
         run: bun run typecheck
 
@@ -41,23 +161,30 @@ jobs:
       - name: Test correctness suite
         run: bun run test:correctness
 
-      - name: Build package
-        run: bun run build
-
       - name: Build landing page
         run: bun run --cwd landing build
 
-      - name: Pack and smoke-test package
+      - name: Smoke-test exact candidate
         shell: bash
+        env:
+          CDB_GENERATED_E2E_PLATFORM_NAME: ubuntu-latest
         run: |
-          tarball="$(npm pack --ignore-scripts)"
-          bun scripts/smoke-packed-package.mjs "${tarball}"
-          bun scripts/smoke-generated-project.mjs "${tarball}"
-          bun scripts/smoke-packed-chat.mjs "${tarball}"
+          bun scripts/smoke-packed-package.mjs ci-candidate/candidate.tgz
+          bun scripts/smoke-generated-project.mjs ci-candidate/candidate.tgz --report generated-linux-report.json
+          bun scripts/smoke-packed-chat.mjs ci-candidate/candidate.tgz
+
+      - name: Upload generated app evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-linux-${{ github.sha }}-${{ github.run_attempt }}
+          path: generated-linux-report.json
+          if-no-files-found: error
 
       - name: Install packed chat consumer
         working-directory: example/chat
-        run: npm ci
+        run: |
+          npm ci
+          npm install --ignore-scripts --no-audit --no-fund --no-save ../../ci-candidate/candidate.tgz
 
       - name: Typecheck chat consumer
         working-directory: example/chat
@@ -70,3 +197,34 @@ jobs:
       - name: Test chat consumer
         working-directory: example/chat
         run: npm run test:e2e
+
+  os-ci-evidence:
+    name: Bind Linux, macOS, and Windows evidence
+    needs: [generated-macos, generated-windows-dev-tree, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.22
+
+      - name: Download this run's platform reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: generated-*-${{ github.sha }}-${{ github.run_attempt }}
+          path: os-ci
+          merge-multiple: true
+
+      - name: Validate one run and checksum all reports
+        run: bun scripts/os-ci-evidence.mjs --directory os-ci
+
+      - name: Upload combined OS evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: os-ci-${{ github.sha }}-${{ github.run_attempt }}
+          path: os-ci
+          if-no-files-found: error

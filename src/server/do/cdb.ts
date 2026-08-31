@@ -13,40 +13,53 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { drizzle } from "drizzle-orm/durable-sqlite";
 import { renderSqliteTableDdl } from "../../auth/ddl.ts";
-import { intervalsForColumnPredicate } from "../../drizzle/walker.ts";
-import { CdbError, isCdbError, isCdbErrorCode } from "../../errors.ts";
-import { type IntervalKey, IntervalMap, type IntervalSet } from "../../intervals.ts";
-import { intervalSetFromWire, wireIntervalsCover } from "../../intervals_wire.ts";
-import { SHARD_BOOTSTRAP_DDL } from "../../oplog/schema.ts";
+import { synthesizedAuthTableNames } from "../../auth/synthesize.ts";
+import { CdbError, isCdbError, isCdbErrorCode, throwCdbRpcError } from "../../errors.ts";
+import { intervalSetFromWire } from "../../intervals_wire.ts";
+import {
+    CDB_SPLIT_LOG_MAX_BYTES,
+    CDB_SPLIT_LOG_MAX_ROWS,
+    SHARD_BOOTSTRAP_DDL,
+    SPLIT_LOG_ACCOUNTED_BYTES_SQL,
+    initializeOpLogPlacement,
+    initializeSplitLogAccounting,
+} from "../../oplog/schema.ts";
 import { type JsonText, type SyncSql, parseJsonColumn } from "../../oplog/wrapper.ts";
 import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/range.ts";
-import { type TableSpec, renderRowApply, renderTableTriggers } from "../../reshard/triggers.ts";
-import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId, TenantId } from "../../types.ts";
-import { stableHashHex } from "../../util/canonical.ts";
-import type { CdbIntent } from "../../wire.ts";
-import { executeAtomicMutation } from "../atomic-mutation.ts";
-import { type QueryReadRangeObservation, wrapQueryDb } from "../cdb-db-proxy.ts";
+import { type TableSpec, renderTableTriggers } from "../../reshard/triggers.ts";
+import { type ChardbRef, ClientId, type RawJson, SubId } from "../../types.ts";
+import { stableJson } from "../../util/canonical.ts";
+import { vshardOf } from "../../vshard.ts";
 import { cdbPolicyDigest } from "../cdb-policy.ts";
 import { collectCdbTables } from "../cdb-table-registry.ts";
 import { resolveCdbMeta } from "../cdb-table.ts";
-import type { AuthCtx } from "../define.ts";
-import { withChardbLoopbacks } from "../loopback.ts";
-import { type ChardbManifest, emptyManifest, resolveMutation, resolveQuery, routeValidatedQuery } from "../manifest.ts";
+import { initializeExternalReshardCapture, withExternalReshardCapture } from "../external-reshard-capture.ts";
+import { renderFileReshardTriggers } from "../file-reshard-triggers.ts";
+import { renderFileAttachmentTriggerSet } from "../file-triggers.ts";
+import { sourceChardbEnv, withChardbLoopbacks } from "../loopback.ts";
 import {
-    CDB_JSON_MAX_AGGREGATE_MEMBERS,
-    CDB_MUTATION_ARGS_MAX_BYTES,
-    CDB_MUTATION_ARGS_MAX_DEPTH,
-    CDB_QUERY_RESULT_MAX_ROWS,
-    snapshotCdbJsonByteLimit,
-    snapshotCdbMutationArgs,
-    snapshotCdbQueryArgs,
-    snapshotCdbResultByteLimit,
-} from "../result_limits.ts";
+    type ChardbManifest,
+    type QueryRouteResponse,
+    emptyManifest,
+    resolveQuery,
+    routeValidatedQuery,
+} from "../manifest.ts";
+import {
+    type VectorResourceV1,
+    assertSchemaResourceJournal,
+    cdbVectorResourceId,
+    chardbResourceDescriptorsAt,
+    collectSchemaFileResourceDescriptors,
+    collectSchemaResourceDescriptors,
+    isChardbVectorResourceDescriptor,
+} from "../resource-descriptors.ts";
+import { snapshotCdbQueryArgs } from "../result_limits.ts";
 import type {
+    CdbBindingPlanRequest,
     CdbMutationRequest,
     CdbMutationResponse,
+    CdbPlacement,
     CdbQueryRequest,
     CdbQueryResponse,
     CdbRegisteredQueryRequest,
@@ -58,660 +71,192 @@ import type {
     GatewayInvalidationRpc,
     LiveSubscriptionId,
 } from "../rpc.ts";
+import { type ChardbMigrationJournal, defineMigrations } from "../schema-migrations.ts";
+import { assertVectorReshardCaptureForeignKeys, renderVectorReshardTriggers } from "../vector-reshard-triggers.ts";
+import type { OrganizationVectorSearchValidation } from "../vector-search-dispatch.ts";
 import {
-    type ChardbMigrationJournal,
-    defineMigrations,
-    migrationDigestAt,
-    pendingMigrations,
-} from "../schema-migrations.ts";
+    type CdbAuthInvalidationRequest,
+    type CdbAuthInvalidationResult,
+    CdbAuthInvalidationStore,
+    initializeCdbAuthInvalidationStore,
+} from "./cdb-auth-invalidation-store.ts";
+import { resolveCdbFileDownload } from "./cdb-file-download.ts";
+import {
+    CDB_FILE_RESHARD_PAGE_SIZE,
+    type CdbFileReshardDrainCursor,
+    type CdbFileReshardIdentity,
+    type CdbFileReshardParityPage,
+    CdbFileReshardStore,
+    type CdbReshardFileRecord,
+    type CdbReshardOrganizationTombstone,
+    initializeCdbFileReshardStore,
+} from "./cdb-file-reshard-store.ts";
+import {
+    type CdbFileDownloadRequest,
+    type CdbFileReadyRequest,
+    type CdbFileReserveRequest,
+    CdbFileRuntime,
+    type CdbOrganizationFileDeletionRequest,
+    type CdbOrganizationFileDeletionResult,
+} from "./cdb-file-runtime.ts";
+import { backfillFilePlacements, initializeFileStore, validateFilePlacementsPage } from "./cdb-file-store.ts";
+import { CDB_FILE_PENDING_TTL_MS, CdbFileStore, type StoredFile } from "./cdb-file-store.ts";
+import {
+    assertFreshReshardDestination,
+    assertUnusedVersionZeroReshardDestination,
+} from "./cdb-fresh-reshard-destination.ts";
+import {
+    CDB_LIVE_STORE_DDL,
+    INVALIDATION_BASE_RETRY_MS,
+    INVALIDATION_MAX_RETRY_MS,
+    type StoredInvalidationRow,
+    type StoredSubscriptionRow,
+    acknowledgeInvalidations as acknowledgeStoredInvalidations,
+    assertLiveSubscriptionIdentity,
+    assertLiveVectorDependencies,
+    assertLiveVectorSubscriptionDependency,
+    assertSubscriptionTables,
+    enqueueRoutingFenceInvalidations,
+    enqueueSchemaMigrationInvalidations,
+    enqueueVectorResourceInvalidations,
+    finalizeRetiredLiveSubscription,
+    initializeLiveStore,
+    parseStoredSubscription,
+    parseStoredSubscriptionRouting,
+    persistLiveSubscription,
+    persistLiveSubscriptionWithVectorDependency,
+    dueInvalidations as readDueInvalidations,
+    nextInvalidationAlarmAt as readNextInvalidationAlarmAt,
+    recordInvalidationFailures,
+    retireLegacyLiveSubscriptions,
+    retireLiveSubscription,
+    sameSubscriptionIdentity,
+    subscriptionInvariant,
+} from "./cdb-live-store.ts";
+import { executeCdbMutation } from "./cdb-mutation-execution.ts";
+import { CdbOpLogRetentionStore } from "./cdb-oplog-retention-store.ts";
+import { executeCdbQueryHandler, executeCdbSelectPlan } from "./cdb-query-execution.ts";
+import { CdbReshardRuntime, type TailTransaction } from "./cdb-reshard-runtime.ts";
+import { CdbVectorMutationContext, bindCdbVectorMutationContext } from "./cdb-vector-mutation.ts";
+import {
+    CDB_VECTOR_DELETED_ORGANIZATION_INSERT_GUARD,
+    CDB_VECTOR_DELETED_ORGANIZATION_WRITE_GUARD,
+    CdbVectorOrganizationDeletionStore,
+    initializeCdbVectorOrganizationDeletionStore,
+    installCdbVectorOrganizationDeletionGuards,
+    uninstallCdbVectorOrganizationDeletionGuards,
+} from "./cdb-vector-organization-deletion-store.ts";
+import { CdbVectorOutboxStore, initializeCdbVectorOutboxStore } from "./cdb-vector-outbox-store.ts";
+import {
+    type CdbVectorReshardDestRequest,
+    CdbVectorReshardDestStore,
+    type CdbVectorReshardParityRequest,
+    initializeCdbVectorReshardDestStore,
+} from "./cdb-vector-reshard-dest-store.ts";
+import {
+    type CdbVectorReshardCursor,
+    type CdbVectorReshardIdentity,
+    CdbVectorReshardSnapshotReader,
+    decodeCdbVectorReshardPage,
+    encodeCdbVectorReshardPage,
+} from "./cdb-vector-reshard-records.ts";
+import {
+    type CdbVectorReshardSnapshotRequest,
+    CdbVectorReshardSnapshotSessionStore,
+    initializeCdbVectorReshardSnapshotSessions,
+} from "./cdb-vector-reshard-snapshot-session.ts";
+import {
+    type CdbVectorReshardSourceDeleteCursor,
+    CdbVectorReshardSourceDrainStore,
+    type CdbVectorReshardSourcePrepareCursor,
+} from "./cdb-vector-reshard-source-drain.ts";
+import { CdbVectorRuntime } from "./cdb-vector-runtime.ts";
+import { executeRegisteredVectorQueryPlan, resolveCdbVectorSearchMatches } from "./cdb-vector-search.ts";
+import type {
+    CdbValidatedVectorMatch,
+    CdbVectorizeMutationIndex,
+    CdbVectorizeSearchIndex,
+} from "./cdb-vectorize-adapter.ts";
+export type { TailTransaction } from "./cdb-reshard-runtime.ts";
+import { renderVectorMutationTriggerSet } from "../vector-triggers.ts";
+import {
+    CDB_RESHARD_IDENTITY_STORE_DDL,
+    CdbReshardIdentityStore,
+    type CdbReshardSplitIdentity,
+    assertCdbReshardRangeIdentity,
+    assertCdbSplitHistoryCapacity,
+    initializeCdbReshardIdentityStore,
+} from "./cdb-reshard-identity-store.ts";
+import {
+    CDB_RESHARD_MAX_BATCH_BYTES,
+    CDB_RESHARD_MAX_ROW_BYTES,
+    applyReshardRow,
+    applyReshardUpdate,
+    assertNoUnexpectedReshardTriggers,
+    assertReshardBatchBudget,
+    assertReshardDestinationRangeEmpty,
+    assertReshardEnvelopeBudget,
+    assertReshardRowForeignKeysColocated,
+    assertReshardSourceDomainDrained,
+    deleteReshardRow,
+    orderReshardTables,
+    readReshardForeignKeys,
+    readReshardTableLayout,
+    renderReshardForeignKeyGuards,
+    reshardJsonBytes,
+} from "./cdb-reshard-relational.ts";
+import {
+    CDB_ROUTING_FENCE_STORE_DDL,
+    type CdbRoutingFence,
+    type CdbRoutingFenceIdentity,
+    CdbRoutingFenceStore,
+} from "./cdb-routing-fence-store.ts";
+import {
+    CDB_SCHEMA_MIGRATION_STORE_DDL,
+    type CdbFreshSchemaProvisionRequest,
+    type CdbSchemaBaselineRequest,
+    type CdbSchemaMigrationActivateRequest,
+    type CdbSchemaMigrationApplyRequest,
+    type CdbSchemaMigrationPrepareRequest,
+    CdbSchemaMigrationStore,
+    type CdbSchemaState,
+} from "./cdb-schema-migration-store.ts";
+import {
+    CDB_SPLIT_OPLOG_STORE_DDL,
+    type SplitOpLogAckResult,
+    type SplitOpLogApplyResult,
+    type SplitOpLogBatch,
+    ackSplitOpLog,
+    applySplitOpLogBatch,
+    beginSplitOpLogDestination,
+    captureSplitOpLogOutcome,
+    finalizeSplitOpLogDestination,
+    finalizeSplitOpLogSource,
+    initializeSplitOpLogAccounting,
+    readSplitOpLogBatch,
+    seedSplitOpLogRange,
+} from "./cdb-split-oplog-store.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
-
-export type {
-    CdbMutationFailure,
-    CdbMutationRequest,
-    CdbMutationResponse,
-    CdbMutationSuccess,
-} from "../rpc.ts";
 
 export interface CdbEnv {
     readonly CDB_GATEWAY?: DurableObjectNamespace;
-    readonly CDB_R2?: unknown;
-    readonly CDB_VECTORIZE?: unknown;
+    readonly CDB_FILES?: R2Bucket;
 }
 
 export type SubscribeArgs = CdbSubscriptionRequest;
 
 const CDB_LOCAL_DDL = `
-CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
-  gateway_id TEXT NOT NULL,
-  registration_id TEXT NOT NULL,
-  connection_id TEXT NOT NULL,
-  client_id TEXT NOT NULL,
-  sub_id INTEGER NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
-  payload_hash TEXT,
-  principal_id TEXT,
-  organization_id TEXT,
-  authority TEXT CHECK (authority IS NULL OR authority IN ('organization', 'user', 'global')),
-  domain_schema_epoch INTEGER CHECK (domain_schema_epoch IS NULL OR domain_schema_epoch > 0),
-  ref TEXT,
-  args_json TEXT,
-  policy_digest TEXT,
-  query_hash TEXT,
-  tables_json TEXT,
-  intervals_json TEXT,
-  PRIMARY KEY (gateway_id, registration_id),
-  CHECK (
-    (
-      state = 'retired'
-      AND payload_hash IS NULL
-      AND principal_id IS NULL
-      AND organization_id IS NULL
-      AND domain_schema_epoch IS NULL
-      AND ref IS NULL
-      AND args_json IS NULL
-      AND policy_digest IS NULL
-      AND query_hash IS NULL
-      AND tables_json IS NULL
-      AND intervals_json IS NULL
-    )
-    OR (
-      state = 'active'
-      AND payload_hash IS NOT NULL
-      AND principal_id IS NOT NULL
-      AND organization_id IS NOT NULL
-      AND domain_schema_epoch IS NOT NULL
-      AND ref IS NOT NULL
-      AND args_json IS NOT NULL
-      AND policy_digest IS NOT NULL
-      AND query_hash IS NOT NULL
-      AND tables_json IS NOT NULL
-      AND intervals_json IS NOT NULL
-    )
-  )
-);
-CREATE INDEX IF NOT EXISTS _chardb_live_subscriptions_by_state
-  ON _chardb_live_subscriptions (state, gateway_id, registration_id);
-CREATE TABLE IF NOT EXISTS _chardb_change_clock (
-  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  change_seq INTEGER NOT NULL CHECK (change_seq >= 0)
-);
-INSERT OR IGNORE INTO _chardb_change_clock (singleton, change_seq) VALUES (1, 0);
-CREATE TABLE IF NOT EXISTS _chardb_live_subscription_tables (
-  gateway_id TEXT NOT NULL,
-  registration_id TEXT NOT NULL,
-  table_name TEXT NOT NULL,
-  PRIMARY KEY (gateway_id, registration_id, table_name),
-  FOREIGN KEY (gateway_id, registration_id)
-    REFERENCES _chardb_live_subscriptions (gateway_id, registration_id)
-    ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS _chardb_live_subscription_tables_by_table
-  ON _chardb_live_subscription_tables (table_name, gateway_id, registration_id);
-CREATE TABLE IF NOT EXISTS _chardb_invalidation_outbox (
-  gateway_id TEXT NOT NULL,
-  registration_id TEXT NOT NULL,
-  change_seq INTEGER NOT NULL CHECK (change_seq > 0),
-  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-  next_attempt_at INTEGER NOT NULL DEFAULT 0 CHECK (next_attempt_at >= 0),
-  last_error TEXT,
-  dead_lettered_at INTEGER,
-  PRIMARY KEY (gateway_id, registration_id),
-  FOREIGN KEY (gateway_id, registration_id)
-    REFERENCES _chardb_live_subscriptions (gateway_id, registration_id)
-    ON DELETE CASCADE
-);
 CREATE TABLE IF NOT EXISTS _chardb_domain_schema (
   table_name TEXT PRIMARY KEY,
   signature TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS _chardb_schema_state (
-  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  active_version INTEGER NOT NULL CHECK (active_version >= 0),
-  active_epoch INTEGER NOT NULL CHECK (active_epoch > 0),
-  active_digest TEXT NOT NULL,
-  last_migration_id TEXT,
-  status TEXT NOT NULL CHECK (status IN ('active', 'migrating')),
-  migration_id TEXT,
-  target_version INTEGER,
-  target_epoch INTEGER,
-  target_digest TEXT,
-  CHECK (
-    (status = 'active' AND migration_id IS NULL AND target_version IS NULL AND target_epoch IS NULL AND target_digest IS NULL)
-    OR
-    (status = 'migrating' AND migration_id IS NOT NULL AND target_version IS NOT NULL AND target_epoch IS NOT NULL AND target_digest IS NOT NULL)
-  )
-);
-CREATE TABLE IF NOT EXISTS _chardb_schema_steps (
-  migration_id TEXT NOT NULL,
-  version INTEGER NOT NULL CHECK (version > 0),
-  digest TEXT NOT NULL,
-  applied_at INTEGER NOT NULL CHECK (applied_at >= 0),
-  PRIMARY KEY (migration_id, version)
-);
 ` as const;
 
-export interface CdbSchemaState {
-    readonly activeVersion: number;
-    readonly activeEpoch: number;
-    readonly activeDigest: string;
-    readonly lastMigrationId: string | null;
-    readonly status: "active" | "migrating";
-    readonly migrationId: string | null;
-    readonly targetVersion: number | null;
-    readonly targetEpoch: number | null;
-    readonly targetDigest: string | null;
-}
-
-interface StoredCdbSchemaState {
-    readonly active_version: number;
-    readonly active_epoch: number;
-    readonly active_digest: string;
-    readonly last_migration_id: string | null;
-    readonly status: "active" | "migrating";
-    readonly migration_id: string | null;
-    readonly target_version: number | null;
-    readonly target_epoch: number | null;
-    readonly target_digest: string | null;
+function cdbSqlIdentifier(value: string): string {
+    return `"${value.replaceAll('"', '""')}"`;
 }
 
 const EMPTY_MIGRATION_JOURNAL = defineMigrations([]);
-
-interface StoredSubscriptionRow {
-    readonly [column: string]: string | number | null;
-    readonly gateway_id: string;
-    readonly registration_id: string;
-    readonly connection_id: string;
-    readonly client_id: string;
-    readonly sub_id: number;
-    readonly state: "active" | "retired";
-    readonly payload_hash: string | null;
-    readonly principal_id: string | null;
-    readonly organization_id: string | null;
-    readonly authority: string | null;
-    readonly domain_schema_epoch: number | null;
-    readonly ref: string | null;
-    readonly args_json: string | null;
-    readonly policy_digest: string | null;
-    readonly query_hash: string | null;
-    readonly tables_json: string | null;
-    readonly intervals_json: string | null;
-}
-
-interface PreparedInterval {
-    readonly table: string;
-    readonly indexName: string;
-    readonly set: IntervalSet;
-}
-
-interface StoredInvalidationRow {
-    readonly [column: string]: string | number | null;
-    readonly gateway_id: string;
-    readonly registration_id: string;
-    readonly connection_id: string;
-    readonly client_id: string;
-    readonly sub_id: number;
-    readonly change_seq: number;
-    readonly attempts: number;
-    readonly next_attempt_at: number;
-    readonly last_error: string | null;
-    readonly dead_lettered_at: number | null;
-}
-
-const INVALIDATION_BATCH_SIZE = 64;
-const INVALIDATION_MAX_ATTEMPTS = 8;
-const INVALIDATION_BASE_RETRY_MS = 1_000;
-const INVALIDATION_MAX_RETRY_MS = 60_000;
-const CDB_MAX_ACTIVE_LIVE_REGISTRATIONS = 4_096;
-const CDB_MAX_LIVE_REGISTRATION_ROWS = 8_192;
-const CDB_MAX_RETIRED_TOMBSTONE_BYTES = 16 * 1_024 * 1_024;
-const CDB_MAX_SUBSCRIPTION_IDENTITY_FIELD_BYTES = 256;
-const CDB_MAX_INVALIDATION_OUTBOX_ROWS = 4_096;
-const CDB_MAX_INVALIDATIONS_PER_MUTATION = 4_096;
-
-function snapshotCdbQueryResultLimits(result: unknown, subject: string): RawJson {
-    const owned = snapshotCdbResultByteLimit(
-        result as RawJson,
-        subject,
-        "select fewer rows or columns, or paginate the result"
-    );
-    if (Array.isArray(owned) && owned.length > CDB_QUERY_RESULT_MAX_ROWS) {
-        throw new CdbError({
-            code: "CDB_INVARIANT",
-            message: `${subject} exceeds the ${CDB_QUERY_RESULT_MAX_ROWS}-row limit`,
-            hint: "add a query limit or paginate the result",
-        });
-    }
-    return owned;
-}
-
-function subscriptionKey(subscription: LiveSubscriptionId): string {
-    return JSON.stringify([subscription.gatewayId, subscription.registrationId]);
-}
-
-function assertLiveSubscriptionIdentity(subscription: LiveSubscriptionId): void {
-    for (const [name, value] of [
-        ["gatewayId", subscription.gatewayId],
-        ["registrationId", subscription.registrationId],
-        ["connectionId", subscription.connectionId],
-        ["clientId", subscription.clientId],
-    ] as const) {
-        if (typeof value !== "string" || value.length === 0) {
-            throw new CdbError({ code: "CDB_INVALID_ARGS", message: `live subscription ${name} must be nonempty` });
-        }
-        if (new TextEncoder().encode(value).byteLength > CDB_MAX_SUBSCRIPTION_IDENTITY_FIELD_BYTES) {
-            throw new CdbError({
-                code: "CDB_INVALID_ARGS",
-                message: `live subscription ${name} exceeds ${CDB_MAX_SUBSCRIPTION_IDENTITY_FIELD_BYTES} UTF-8 bytes`,
-            });
-        }
-    }
-    if (!Number.isSafeInteger(subscription.subId) || subscription.subId < 0) {
-        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "live subscription subId must be non-negative" });
-    }
-}
-
-function subscriptionIdentityBytes(subscription: LiveSubscriptionId): number {
-    const encoder = new TextEncoder();
-    return (
-        encoder.encode(subscription.gatewayId).byteLength +
-        encoder.encode(subscription.registrationId).byteLength +
-        encoder.encode(subscription.connectionId).byteLength +
-        encoder.encode(subscription.clientId).byteLength +
-        8
-    );
-}
-
-function retiredTombstoneBytes(sql: SyncSql): number {
-    return durableRowCount(
-        sql,
-        `SELECT COALESCE(SUM(
-             length(CAST(gateway_id AS BLOB)) +
-             length(CAST(registration_id AS BLOB)) +
-             length(CAST(connection_id AS BLOB)) +
-             length(CAST(client_id AS BLOB)) + 8
-         ), 0) AS count
-         FROM _chardb_live_subscriptions
-         WHERE state = 'retired'`,
-        "retired live subscription tombstone bytes"
-    );
-}
-
-function subscriptionPayloadHash(args: CdbSubscriptionRequest, policyDigest: string): string {
-    return stableHashHex({
-        connectionId: args.subscription.connectionId,
-        clientId: args.subscription.clientId,
-        subId: args.subscription.subId,
-        principalId: args.principalId,
-        organizationId: args.organizationId,
-        ...(args.placement === undefined ? {} : { placement: args.placement }),
-        domainSchemaEpoch: args.domainSchemaEpoch,
-        ref: args.ref,
-        args: args.args,
-        policyDigest,
-        queryHash: args.queryHash,
-        tables: args.tables,
-        intervals: args.intervals,
-    });
-}
-
-function subscriptionInvariant(message: string): CdbError {
-    return new CdbError({ code: "CDB_INVARIANT", message });
-}
-
-function subscriptionCapacityExceeded(subject: string, limit: number): CdbError {
-    return new CdbError({
-        code: "CDB_RATE_LIMITED",
-        message: `Cdb ${subject} capacity is limited to ${limit}`,
-        retryAfterMs: INVALIDATION_BASE_RETRY_MS,
-        hint: "unsubscribe unused live queries or wait for queued invalidations to drain",
-    });
-}
-
-function durableRowCount(sql: SyncSql, query: string, subject: string): number {
-    const row = sql.one<{ count: number | bigint }>(query);
-    const count = Number(row?.count);
-    if (!Number.isSafeInteger(count) || count < 0) {
-        throw subscriptionInvariant(`Cdb ${subject} count is missing or invalid`);
-    }
-    return count;
-}
-
-function assertQueryIntentCoversReads(
-    ref: ChardbRef,
-    declaredTables: readonly string[],
-    readTables: ReadonlySet<string>
-): void {
-    const declared = new Set(declaredTables);
-    const omitted = [...readTables].filter(tableName => !declared.has(tableName)).sort();
-    if (omitted.length === 0) return;
-    throw new CdbError({
-        code: "CDB_INVARIANT",
-        message: `query ${ref} read undeclared cdbTable${omitted.length === 1 ? "" : "s"}: ${omitted.join(", ")}`,
-        hint: "add every table read by the handler to intent.tables",
-    });
-}
-
-function assertQueryIntentCoversRanges(
-    ref: ChardbRef,
-    intent: CdbIntent,
-    observations: ReadonlyMap<object, QueryReadRangeObservation>
-): void {
-    if (!intent.intervals) return;
-    for (const observation of observations.values()) {
-        for (const declared of intent.intervals.filter(bundle => bundle.table === observation.tableName)) {
-            const observed = intervalsForColumnPredicate(
-                observation.predicate,
-                observation.tableName,
-                declared.indexName
-            );
-            if (wireIntervalsCover(declared.intervals, observed)) continue;
-            throw new CdbError({
-                code: "CDB_INVARIANT",
-                message: `query ${ref} read outside declared interval for ${declared.table}.${declared.indexName}`,
-                hint: "widen intent.intervals to cover every range the handler and row policy can read",
-            });
-        }
-    }
-}
-
-function ensureInvalidationOutboxColumns(sql: SyncSql): void {
-    const columns = new Set(
-        sql.all<{ name: string }>("PRAGMA table_info(_chardb_invalidation_outbox)").map(column => column.name)
-    );
-    const additions = [
-        ["attempts", "attempts INTEGER NOT NULL DEFAULT 0"],
-        ["next_attempt_at", "next_attempt_at INTEGER NOT NULL DEFAULT 0"],
-        ["last_error", "last_error TEXT"],
-        ["dead_lettered_at", "dead_lettered_at INTEGER"],
-    ] as const;
-    for (const [name, definition] of additions) {
-        if (!columns.has(name)) sql.exec(`ALTER TABLE _chardb_invalidation_outbox ADD COLUMN ${definition}`);
-    }
-}
-
-function ensureLiveSubscriptionAuthorityColumns(sql: SyncSql): void {
-    const columns = new Set(
-        sql.all<{ name: string }>("PRAGMA table_info(_chardb_live_subscriptions)").map(column => column.name)
-    );
-    if (!columns.has("organization_id")) {
-        sql.exec("ALTER TABLE _chardb_live_subscriptions ADD COLUMN organization_id TEXT");
-    }
-    if (!columns.has("authority")) {
-        sql.exec(
-            "ALTER TABLE _chardb_live_subscriptions ADD COLUMN authority TEXT CHECK (authority IS NULL OR authority IN ('organization', 'user', 'global'))"
-        );
-    }
-    if (!columns.has("query_hash")) {
-        sql.exec("ALTER TABLE _chardb_live_subscriptions ADD COLUMN query_hash TEXT");
-    }
-    if (!columns.has("policy_digest")) {
-        sql.exec("ALTER TABLE _chardb_live_subscriptions ADD COLUMN policy_digest TEXT");
-    }
-    if (!columns.has("domain_schema_epoch")) {
-        sql.exec(
-            "ALTER TABLE _chardb_live_subscriptions ADD COLUMN domain_schema_epoch INTEGER CHECK (domain_schema_epoch IS NULL OR domain_schema_epoch > 0)"
-        );
-    }
-}
-
-function retireLegacyLiveSubscriptions(sql: SyncSql): void {
-    sql.exec(
-        `UPDATE _chardb_live_subscriptions
-         SET state = 'retired',
-             payload_hash = NULL,
-             principal_id = NULL,
-             organization_id = NULL,
-             authority = NULL,
-             domain_schema_epoch = NULL,
-             ref = NULL,
-             args_json = NULL,
-             policy_digest = NULL,
-             query_hash = NULL,
-             tables_json = NULL,
-             intervals_json = NULL
-         WHERE state = 'active'
-           AND (organization_id IS NULL OR query_hash IS NULL OR policy_digest IS NULL OR domain_schema_epoch IS NULL)`
-    );
-    sql.exec(
-        `DELETE FROM _chardb_live_subscription_tables
-         WHERE EXISTS (
-           SELECT 1 FROM _chardb_live_subscriptions AS subscriptions
-           WHERE subscriptions.gateway_id = _chardb_live_subscription_tables.gateway_id
-             AND subscriptions.registration_id = _chardb_live_subscription_tables.registration_id
-             AND subscriptions.state = 'retired'
-         )`
-    );
-    sql.exec(
-        `DELETE FROM _chardb_invalidation_outbox
-         WHERE EXISTS (
-           SELECT 1 FROM _chardb_live_subscriptions AS subscriptions
-           WHERE subscriptions.gateway_id = _chardb_invalidation_outbox.gateway_id
-             AND subscriptions.registration_id = _chardb_invalidation_outbox.registration_id
-             AND subscriptions.state = 'retired'
-         )`
-    );
-}
-
-function currentChangeSeq(sql: SyncSql): number {
-    const row = sql.one<{ change_seq: number }>("SELECT change_seq FROM _chardb_change_clock WHERE singleton = 1");
-    if (!row || !Number.isSafeInteger(row.change_seq) || row.change_seq < 0) {
-        throw subscriptionInvariant("Cdb change clock is missing or invalid");
-    }
-    return row.change_seq;
-}
-
-function storedSubscriptionTables(sql: SyncSql, subscription: LiveSubscriptionId): readonly string[] {
-    return sql
-        .all<{ table_name: string }>(
-            `SELECT table_name
-             FROM _chardb_live_subscription_tables
-             WHERE gateway_id = ? AND registration_id = ?
-             ORDER BY table_name`,
-            subscription.gatewayId,
-            subscription.registrationId
-        )
-        .map(row => row.table_name);
-}
-
-function assertSubscriptionTables(
-    sql: SyncSql,
-    subscription: LiveSubscriptionId,
-    expectedTables: readonly string[]
-): void {
-    const storedTables = storedSubscriptionTables(sql, subscription);
-    if (
-        storedTables.length !== expectedTables.length ||
-        storedTables.some((tableName, index) => tableName !== expectedTables[index])
-    ) {
-        throw subscriptionInvariant("active live subscription table mappings do not match its persisted payload");
-    }
-}
-
-function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionRequest {
-    if (
-        row.state !== "active" ||
-        row.payload_hash === null ||
-        row.principal_id === null ||
-        row.organization_id === null ||
-        row.domain_schema_epoch === null ||
-        row.ref === null ||
-        row.args_json === null ||
-        row.policy_digest === null ||
-        row.query_hash === null ||
-        row.tables_json === null ||
-        row.intervals_json === null
-    ) {
-        throw subscriptionInvariant("active live subscription is missing its persisted payload");
-    }
-
-    let parsedArgs: unknown;
-    let tables: unknown;
-    let intervals: unknown;
-    try {
-        parsedArgs = JSON.parse(row.args_json);
-        tables = JSON.parse(row.tables_json);
-        intervals = JSON.parse(row.intervals_json);
-    } catch (error) {
-        throw subscriptionInvariant(
-            `active live subscription payload is corrupt: ${error instanceof Error ? error.message : "invalid JSON"}`
-        );
-    }
-    const args = snapshotCdbQueryArgs(parsedArgs as RawJson);
-    if (!Number.isSafeInteger(row.domain_schema_epoch) || row.domain_schema_epoch < 1) {
-        throw subscriptionInvariant("active live subscription domain schema epoch is invalid");
-    }
-    if (!Array.isArray(tables) || tables.some(table => typeof table !== "string")) {
-        throw subscriptionInvariant("active live subscription tables payload is corrupt");
-    }
-    if (!Array.isArray(intervals)) {
-        throw subscriptionInvariant("active live subscription intervals payload is corrupt");
-    }
-
-    const request: CdbSubscriptionRequest = {
-        subscription: {
-            gatewayId: row.gateway_id,
-            registrationId: row.registration_id,
-            connectionId: row.connection_id,
-            clientId: ClientId(row.client_id),
-            subId: SubId(row.sub_id),
-        },
-        principalId: PrincipalId(row.principal_id),
-        organizationId: TenantId(row.organization_id),
-        ...(row.authority === "organization" || row.authority === "user" || row.authority === "global"
-            ? { placement: { authority: row.authority, partitionKey: row.organization_id } }
-            : {}),
-        domainSchemaEpoch: row.domain_schema_epoch,
-        ref: ChardbRef(row.ref),
-        args,
-        queryHash: row.query_hash,
-        tables,
-        intervals: intervals as CdbSubscriptionRequest["intervals"],
-    };
-    if (row.payload_hash !== subscriptionPayloadHash(request, row.policy_digest)) {
-        throw subscriptionInvariant("active live subscription payload hash does not match its persisted payload");
-    }
-    return request;
-}
-
-function parseStoredSubscriptionRouting(row: StoredSubscriptionRow): {
-    readonly subscription: LiveSubscriptionId;
-    readonly tables: readonly string[];
-    readonly intervals: CdbSubscriptionRequest["intervals"];
-} {
-    if (row.state !== "active" || row.tables_json === null || row.intervals_json === null) {
-        throw subscriptionInvariant("active live subscription is missing its persisted routing metadata");
-    }
-    let tables: unknown;
-    let intervals: unknown;
-    try {
-        tables = JSON.parse(row.tables_json);
-        intervals = JSON.parse(row.intervals_json);
-    } catch (error) {
-        throw subscriptionInvariant(
-            `active live subscription routing metadata is corrupt: ${error instanceof Error ? error.message : "invalid JSON"}`
-        );
-    }
-    if (!Array.isArray(tables) || tables.some(table => typeof table !== "string") || !Array.isArray(intervals)) {
-        throw subscriptionInvariant("active live subscription routing metadata is corrupt");
-    }
-    return {
-        subscription: {
-            gatewayId: row.gateway_id,
-            registrationId: row.registration_id,
-            connectionId: row.connection_id,
-            clientId: ClientId(row.client_id),
-            subId: SubId(row.sub_id),
-        },
-        tables,
-        intervals: intervals as CdbSubscriptionRequest["intervals"],
-    };
-}
-
-function enqueueInvalidations(sql: SyncSql, touchedTables: readonly string[]): number {
-    const uniqueTables = [...new Set(touchedTables)];
-    const registrations =
-        uniqueTables.length === 0
-            ? []
-            : sql
-                  .all<{ gateway_id: string; registration_id: string }>(
-                      `SELECT DISTINCT mappings.gateway_id, mappings.registration_id
-                       FROM _chardb_live_subscription_tables AS mappings
-                       INNER JOIN _chardb_live_subscriptions AS subscriptions
-                         ON subscriptions.gateway_id = mappings.gateway_id
-                        AND subscriptions.registration_id = mappings.registration_id
-                       WHERE mappings.table_name IN (${uniqueTables.map(() => "?").join(", ")})
-                         AND subscriptions.state = 'active'
-                       ORDER BY mappings.gateway_id, mappings.registration_id
-                       LIMIT ?`,
-                      ...uniqueTables,
-                      CDB_MAX_INVALIDATIONS_PER_MUTATION + 1
-                  )
-                  .map(row => ({ gatewayId: row.gateway_id, registrationId: row.registration_id }));
-    if (registrations.length > CDB_MAX_INVALIDATIONS_PER_MUTATION) {
-        throw subscriptionCapacityExceeded("mutation invalidation fanout", CDB_MAX_INVALIDATIONS_PER_MUTATION);
-    }
-    let projectedOutboxRows = durableRowCount(
-        sql,
-        "SELECT COUNT(*) AS count FROM _chardb_invalidation_outbox",
-        "invalidation outbox"
-    );
-    const existingOutboxKeys = new Set(
-        sql
-            .all<{ gateway_id: string; registration_id: string }>(
-                `SELECT gateway_id, registration_id FROM _chardb_invalidation_outbox
-                 LIMIT ?`,
-                CDB_MAX_INVALIDATION_OUTBOX_ROWS + 1
-            )
-            .map(row => JSON.stringify([row.gateway_id, row.registration_id]))
-    );
-    for (const registration of registrations) {
-        const key = JSON.stringify([registration.gatewayId, registration.registrationId]);
-        if (existingOutboxKeys.has(key)) continue;
-        if (projectedOutboxRows > CDB_MAX_INVALIDATION_OUTBOX_ROWS) {
-            const legacyExisting = sql.one<{ present: number }>(
-                `SELECT 1 AS present FROM _chardb_invalidation_outbox
-                 WHERE gateway_id = ? AND registration_id = ?`,
-                registration.gatewayId,
-                registration.registrationId
-            );
-            if (legacyExisting) continue;
-        }
-        projectedOutboxRows++;
-        if (projectedOutboxRows > CDB_MAX_INVALIDATION_OUTBOX_ROWS) {
-            throw subscriptionCapacityExceeded("invalidation outbox", CDB_MAX_INVALIDATION_OUTBOX_ROWS);
-        }
-    }
-    sql.exec("UPDATE _chardb_change_clock SET change_seq = change_seq + 1 WHERE singleton = 1");
-    if (sql.changes() !== 1) throw subscriptionInvariant("Cdb change clock update did not affect one row");
-    const changeSeq = currentChangeSeq(sql);
-    for (const registration of registrations) {
-        sql.exec(
-            `INSERT INTO _chardb_invalidation_outbox (gateway_id, registration_id, change_seq)
-             VALUES (?, ?, ?)
-             ON CONFLICT(gateway_id, registration_id) DO UPDATE SET
-               change_seq = MAX(change_seq, excluded.change_seq),
-               attempts = CASE WHEN excluded.change_seq > change_seq THEN 0 ELSE attempts END,
-               next_attempt_at = CASE WHEN excluded.change_seq > change_seq THEN 0 ELSE next_attempt_at END,
-               last_error = CASE WHEN excluded.change_seq > change_seq THEN NULL ELSE last_error END,
-               dead_lettered_at = CASE WHEN excluded.change_seq > change_seq THEN NULL ELSE dead_lettered_at END`,
-            registration.gatewayId,
-            registration.registrationId,
-            changeSeq
-        );
-    }
-    return changeSeq;
-}
-
-function sameSubscriptionIdentity(row: StoredSubscriptionRow, subscription: LiveSubscriptionId): boolean {
-    return (
-        row.gateway_id === subscription.gatewayId &&
-        row.registration_id === subscription.registrationId &&
-        row.connection_id === subscription.connectionId &&
-        row.client_id === subscription.clientId &&
-        row.sub_id === subscription.subId
-    );
-}
 
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
     const actual = Object.keys(value).sort();
@@ -763,124 +308,12 @@ function validateInvalidationResponse(
     return acknowledgements;
 }
 
-function invalidationErrorMessage(error: unknown): string {
-    const message = error instanceof Error ? error.message : String(error);
-    return message.slice(0, 512);
-}
-
 function domainSchemaMismatch(tableName: string): CdbError {
     return new CdbError({
         code: "CDB_PARTITION_CONTRACT_CHANGED",
         message: `domain table "${tableName}" is unsigned or does not match the configured schema`,
         hint: "add and run an explicit shard schema migration before deploying this schema",
     });
-}
-
-const QUERY_DB_READ_PROPERTIES = new Set<PropertyKey>(["select"]);
-
-function readOnlyQueryDb<TDb extends object>(db: TDb): TDb {
-    return new Proxy(db, {
-        get(target, property, receiver) {
-            if (!QUERY_DB_READ_PROPERTIES.has(property)) {
-                throw new CdbError({
-                    code: "CDB_UNSUPPORTED_FEATURE",
-                    message: `query database property "${String(property)}" is unavailable in read-only handlers`,
-                });
-            }
-            const value = Reflect.get(target, property, receiver);
-            return typeof value === "function" ? value.bind(target) : value;
-        },
-    });
-}
-
-function snapshotMutationAuth(input: AuthCtx): AuthCtx {
-    const prototype = Object.getPrototypeOf(input);
-    if (prototype !== Object.prototype && prototype !== null) {
-        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "mutation auth payload is malformed" });
-    }
-    const field = (key: keyof AuthCtx): unknown => {
-        const descriptor = Object.getOwnPropertyDescriptor(input, key);
-        if (!descriptor) return undefined;
-        if (!descriptor.enumerable || !("value" in descriptor)) {
-            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "mutation auth payload is malformed" });
-        }
-        return descriptor.value;
-    };
-    const userId = field("userId");
-    const tenantId = field("tenantId");
-    const role = field("role");
-    const roles = field("roles");
-    const authEpochs = field("authEpochs");
-    const activeTeamId = field("activeTeamId");
-    const claims = field("claims");
-    const projected = {
-        userId,
-        ...(tenantId === undefined ? {} : { tenantId }),
-        ...(role === undefined ? {} : { role }),
-        ...(roles === undefined ? {} : { roles }),
-        ...(authEpochs === undefined ? {} : { authEpochs }),
-        ...(activeTeamId === undefined ? {} : { activeTeamId }),
-        claims,
-    };
-    const snapshot = snapshotCdbJsonByteLimit(
-        projected as unknown as RawJson,
-        CDB_MUTATION_ARGS_MAX_BYTES,
-        {
-            code: "CDB_INVALID_ARGS",
-            subject: "mutation auth payload",
-            hint: "reduce mutation auth metadata",
-        },
-        {
-            maxAggregateMembers: CDB_JSON_MAX_AGGREGATE_MEMBERS,
-            maxDepth: CDB_MUTATION_ARGS_MAX_DEPTH,
-        }
-    );
-    if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot)) {
-        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "mutation auth payload is malformed" });
-    }
-    const auth = snapshot as Record<string, RawJson>;
-    if (
-        typeof auth.userId !== "string" ||
-        (auth.tenantId !== undefined && typeof auth.tenantId !== "string") ||
-        (auth.role !== undefined && typeof auth.role !== "string") ||
-        (auth.activeTeamId !== undefined && typeof auth.activeTeamId !== "string") ||
-        (auth.roles !== undefined &&
-            (!Array.isArray(auth.roles) || !auth.roles.every(role => typeof role === "string"))) ||
-        typeof auth.claims !== "object" ||
-        auth.claims === null ||
-        Array.isArray(auth.claims)
-    ) {
-        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "mutation auth payload is malformed" });
-    }
-    const epochs = auth.authEpochs;
-    if (
-        epochs !== undefined &&
-        (typeof epochs !== "object" ||
-            epochs === null ||
-            Array.isArray(epochs) ||
-            ![epochs.global, epochs.tenant, epochs.principal].every(
-                epoch => typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch >= 0
-            ))
-    ) {
-        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "mutation auth payload is malformed" });
-    }
-    return {
-        userId: auth.userId,
-        ...(auth.tenantId === undefined ? {} : { tenantId: auth.tenantId }),
-        ...(auth.role === undefined ? {} : { role: auth.role }),
-        ...(auth.roles === undefined ? {} : { roles: auth.roles as string[] }),
-        ...(epochs === undefined
-            ? {}
-            : {
-                  authEpochs: {
-                      global: epochs.global as number,
-                      tenant: epochs.tenant as number,
-                      principal: epochs.principal as number,
-                  },
-              }),
-        ...(auth.activeTeamId === undefined ? {} : { activeTeamId: auth.activeTeamId }),
-        claims: auth.claims as Record<string, RawJson>,
-    };
 }
 
 export interface CdbRuntimeConfig<TSchema extends Record<string, unknown>> {
@@ -893,13 +326,113 @@ export interface CdbRuntimeConfig<TSchema extends Record<string, unknown>> {
  * Cdb shard. Provisioned as `class_name = "Cdb"` by Wrangler migrations.
  */
 export class Cdb extends DurableObject<CdbEnv> {
-    private readonly intervalMap = new IntervalMap<string>();
-    private readonly subscriptions = new Map<string, LiveSubscriptionId>();
-    private bootstrapped = false;
+    private readonly schemaMigrations: CdbSchemaMigrationStore;
+    private readonly files: CdbFileRuntime;
+    private readonly opLogRetention: CdbOpLogRetentionStore;
+    private readonly resharding: CdbReshardRuntime;
+    private readonly vectors: CdbVectorRuntime;
 
     constructor(state: DurableObjectState, env: CdbEnv) {
         super(state, withChardbLoopbacks(env, state));
-        state.blockConcurrencyWhile(async () => this.bootstrap());
+        this.schemaMigrations = new CdbSchemaMigrationStore(this.ctx.storage);
+        this.resharding = new CdbReshardRuntime({
+            storage: this.ctx.storage,
+            schemaMigrations: this.schemaMigrations,
+            schema: () => this.mutationSchema(),
+            journal: () => this.migrationJournal(),
+            invalidationNowMs: () => this.invalidationNowMs(),
+            scheduleAlarmNoLaterThan: deadline => this.scheduleAlarmNoLaterThan(deadline),
+            allowedApplicationTriggerNames: () => [
+                ...collectSchemaFileResourceDescriptors(this.mutationSchema()).flatMap(
+                    resource => renderFileAttachmentTriggerSet(resource).names
+                ),
+                ...this.vectorResources().flatMap(resource => renderVectorMutationTriggerSet(resource).names),
+                CDB_VECTOR_DELETED_ORGANIZATION_INSERT_GUARD,
+                CDB_VECTOR_DELETED_ORGANIZATION_WRITE_GUARD,
+            ],
+            prepareDestination: sql => {
+                if (this.vectorResources().length === 0) return;
+                initializeCdbVectorReshardDestStore(sql);
+                this.setVectorMutationTriggers(sql, this.vectorResources(), "uninstall");
+                uninstallCdbVectorOrganizationDeletionGuards(sql);
+            },
+            assertDestinationActivation: (sql, args) => {
+                if (this.vectorResources().length === 0) return;
+                const session = sql.one<{
+                    terminal: number;
+                    parity_complete: number;
+                    parity_through_lsn: number | null;
+                    outcome: string;
+                }>(
+                    `SELECT terminal, parity_complete, parity_through_lsn, outcome
+                     FROM _chardb_vector_reshard_dest_sessions WHERE mig_id = ?`,
+                    args.migId
+                );
+                const split = sql.one<{
+                    applied_lsn: number;
+                    bulk_done: number;
+                    inbox_rows: number;
+                    inbox_closed: number;
+                }>(
+                    `SELECT applied_lsn, bulk_done, inbox_rows, inbox_closed
+                     FROM _chardb_split_state WHERE mig_id = ? AND role = 'dest'`,
+                    args.migId
+                );
+                if (
+                    !session ||
+                    session.terminal !== 1 ||
+                    session.parity_complete !== 1 ||
+                    session.outcome !== "finalized" ||
+                    split?.applied_lsn !== session.parity_through_lsn ||
+                    split.bulk_done !== 1 ||
+                    split.inbox_rows !== 0 ||
+                    split.inbox_closed !== 1
+                ) {
+                    throw new CdbError({
+                        code: "CDB_RESHARD_PHASE_MISMATCH",
+                        message: "destination vector movement is not finalized at its applied tail watermark",
+                    });
+                }
+                this.assertVectorMutationTriggersInstalled(sql);
+            },
+        });
+        this.opLogRetention = new CdbOpLogRetentionStore(this.ctx.storage);
+        this.files = new CdbFileRuntime({
+            storage: this.ctx.storage,
+            bucket: this.env.CDB_FILES,
+            resources: () => collectSchemaFileResourceDescriptors(this.mutationSchema()),
+            assertActiveEpoch: epoch => {
+                this.assertActiveSchemaEpoch(epoch);
+            },
+            assertOwnership: organizationId => this.assertFileOwnership(organizationId),
+            metadataTransaction: (organizationId, callback) => this.fileMetadataTransaction(organizationId, callback),
+        });
+        this.vectors = new CdbVectorRuntime({
+            storage: this.ctx.storage,
+            resources: () => this.vectorResources(),
+            resolveIndex: binding => this.resolveVectorIndex(binding),
+            assertDeliveryAdmission: (claim, sql) => {
+                const schema = this.schemaMigrations.state(sql);
+                if (schema.status !== "active") {
+                    throw new CdbError({
+                        code: "CDB_STALE_EPOCH",
+                        message: "vector delivery requires an active schema",
+                    });
+                }
+                this.resharding.assertBackgroundDeliveryAdmission(claim.placementVshard, sql);
+                if (claim.operation === "upsert") this.assertOrganizationActive(claim.organizationId, sql);
+            },
+            organizationDeleted: (organizationId, sql) => new CdbFileStore(sql).isOrganizationDeleted(organizationId),
+            recordOrganizationUnprovenDeleteTurn: (organizationId, sql) =>
+                new CdbVectorOrganizationDeletionStore(sql, callback => callback()).recordUnprovenTurn(organizationId),
+            onDeliverySettled: (claim, _outcome, sql) =>
+                enqueueVectorResourceInvalidations(sql, claim.resourceId).registrations > 0,
+            captureDeliveryTransaction: (sql, placementVshard, callback) =>
+                withExternalReshardCapture(sql, placementVshard, callback),
+            nowMs: () => this.invalidationNowMs(),
+            scheduleAlarmNoLaterThan: deadline => this.scheduleAlarmNoLaterThan(deadline),
+        });
+        state.blockConcurrencyWhile(() => this.bootstrap());
     }
 
     protected mutationSchema(): Record<string, unknown> {
@@ -914,39 +447,668 @@ export class Cdb extends DurableObject<CdbEnv> {
         return EMPTY_MIGRATION_JOURNAL;
     }
 
-    private async bootstrap(): Promise<void> {
-        if (this.bootstrapped) return;
+    private assertFileOwnership(organizationId: string, sql = adaptSqlStorage(this.ctx.storage.sql)): void {
+        new CdbFileReshardStore(sql).assertOwnership(Number(vshardOf([organizationId])));
+    }
+
+    private hasFileResources(): boolean {
+        return collectSchemaFileResourceDescriptors(this.mutationSchema()).length > 0;
+    }
+
+    /** Permanent organization tombstones protect every external resource, not only R2 files. */
+    private hasOrganizationTombstoneResources(): boolean {
+        return this.hasFileResources() || this.vectorResources().length > 0;
+    }
+
+    private assertOrganizationActive(organizationId: string, sql: SyncSql): void {
+        if (
+            !sql.one<{ present: number }>(
+                "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = '_chardb_deleted_organizations'"
+            )
+        ) {
+            return;
+        }
+        if (
+            sql.one<{ present: number }>(
+                "SELECT 1 AS present FROM _chardb_deleted_organizations WHERE organization_id = ?",
+                organizationId
+            )
+        ) {
+            throw new CdbError({ code: "CDB_FORBIDDEN", message: "organization was permanently deleted" });
+        }
+    }
+
+    /** Stage one bounded local cleanup page before any external alarm work. */
+    private stageNextVectorOrganizationDeletion(nowMs: number): boolean {
+        if (this.vectorResources().length === 0) return false;
         const sql = adaptSqlStorage(this.ctx.storage.sql);
-        for (const stmt of `${SHARD_BOOTSTRAP_DDL}\n${CDB_LOCAL_DDL}`
+        const pending = new CdbVectorOrganizationDeletionStore(sql, callback => callback()).nextPendingPage();
+        if (!pending) return false;
+        const transaction = <T>(callback: () => T): T =>
+            this.ctx.storage.transactionSync(() => {
+                this.assertFileOwnership(pending.organizationId, sql);
+                return withExternalReshardCapture(sql, Number(vshardOf([pending.organizationId])), callback);
+            });
+        new CdbVectorOrganizationDeletionStore(sql, transaction).stageNextPage({
+            organizationId: pending.organizationId,
+            nowMs,
+        });
+        return true;
+    }
+
+    private vectorResources() {
+        return collectSchemaResourceDescriptors(this.mutationSchema()).filter(isChardbVectorResourceDescriptor);
+    }
+
+    private vectorResourcesAt(journal: ChardbMigrationJournal, version: number): readonly VectorResourceV1[] {
+        return chardbResourceDescriptorsAt(journal.migrations, version).filter(isChardbVectorResourceDescriptor);
+    }
+
+    private assertVectorMigrationIdentity(
+        previous: readonly VectorResourceV1[],
+        next: readonly VectorResourceV1[]
+    ): void {
+        const nextResourceIds = new Set(next.map(cdbVectorResourceId));
+        for (const resource of previous) {
+            if (nextResourceIds.has(cdbVectorResourceId(resource))) continue;
+            throw new CdbError({
+                code: "CDB_UNSUPPORTED_FEATURE",
+                message: `vector resource ${resource.table}.${resource.column} cannot change or disappear during schema migration`,
+                hint: "wait for an exact vector head, outbox, attempt-ledger, and remote-document migration protocol",
+            });
+        }
+    }
+
+    private setVectorMutationTriggers(
+        sql: SyncSql,
+        resources: readonly VectorResourceV1[],
+        mode: "install" | "uninstall"
+    ): void {
+        for (const resource of resources) {
+            for (const statement of renderVectorMutationTriggerSet(resource)[mode]) sql.exec(statement);
+        }
+    }
+
+    private assertVectorJournalTransitions(journal: ChardbMigrationJournal): void {
+        let previous: readonly VectorResourceV1[] = [];
+        for (let version = 1; version <= journal.version; version++) {
+            const next = this.vectorResourcesAt(journal, version);
+            this.assertVectorMigrationIdentity(previous, next);
+            previous = next;
+        }
+    }
+
+    private assertVectorDomainIdentity(sql: SyncSql, resources: readonly VectorResourceV1[]): void {
+        for (const resource of resources) {
+            const table = cdbSqlIdentifier(resource.table);
+            const column = cdbSqlIdentifier(resource.column);
+            const primaryKey = cdbSqlIdentifier(resource.primaryKey);
+            const organizationColumn = cdbSqlIdentifier(resource.organizationColumn);
+            const resourceId = cdbVectorResourceId(resource);
+            const missingHead = sql.one<{ present: number }>(
+                `SELECT 1 AS present
+                 FROM ${table} AS domain
+                 LEFT JOIN _chardb_vectors AS head
+                   ON head.vector_id = CAST(domain.${column} AS TEXT)
+                  AND head.organization_id = domain.${organizationColumn}
+                  AND head.resource_id = ?
+                  AND head.row_pk = CAST(domain.${primaryKey} AS TEXT)
+                  AND head.state IN ('pending', 'ready')
+                 WHERE domain.${column} IS NOT NULL AND head.vector_id IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM _chardb_deleted_organizations AS deleted
+                     WHERE deleted.organization_id = domain.${organizationColumn}
+                   )
+                 LIMIT 1`,
+                resourceId
+            );
+            if (missingHead) {
+                throw new CdbError({
+                    code: "CDB_PARTITION_CONTRACT_CHANGED",
+                    message: `schema migration left ${resource.table}.${resource.column} without its exact vector head`,
+                });
+            }
+            const missingDomain = sql.one<{ present: number }>(
+                `SELECT 1 AS present
+                 FROM _chardb_vectors AS head
+                 LEFT JOIN ${table} AS domain
+                   ON CAST(domain.${primaryKey} AS TEXT) = head.row_pk
+                  AND domain.${organizationColumn} = head.organization_id
+                  AND CAST(domain.${column} AS TEXT) = head.vector_id
+                 WHERE head.resource_id = ? AND head.state IN ('pending', 'ready')
+                   AND domain.${primaryKey} IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM _chardb_deleted_organizations AS deleted
+                     WHERE deleted.organization_id = head.organization_id
+                   )
+                 LIMIT 1`,
+                resourceId
+            );
+            if (missingDomain) {
+                throw new CdbError({
+                    code: "CDB_PARTITION_CONTRACT_CHANGED",
+                    message: `schema migration orphaned an authoritative ${resource.table}.${resource.column} vector head`,
+                });
+            }
+        }
+    }
+
+    /** Trusted same-isolate hook used by configured runtimes and native conformance fixtures. */
+    protected resolveVectorIndex(binding: string): CdbVectorizeMutationIndex {
+        const descriptor = Object.getOwnPropertyDescriptor(sourceChardbEnv(this.env), binding);
+        const value = descriptor && "value" in descriptor ? descriptor.value : undefined;
+        if (
+            typeof value !== "object" ||
+            value === null ||
+            typeof (value as { upsert?: unknown }).upsert !== "function" ||
+            typeof (value as { deleteByIds?: unknown }).deleteByIds !== "function" ||
+            typeof (value as { getByIds?: unknown }).getByIds !== "function"
+        ) {
+            throw new CdbError({
+                code: "CDB_SHARD_UNAVAILABLE",
+                message: `configured Vectorize binding ${JSON.stringify(binding)} is unavailable`,
+            });
+        }
+        return value as CdbVectorizeMutationIndex;
+    }
+
+    /** Trusted same-isolate lookup for the query-only Vectorize surface. */
+    protected resolveVectorSearchIndex(binding: string): CdbVectorizeSearchIndex {
+        const descriptor = Object.getOwnPropertyDescriptor(sourceChardbEnv(this.env), binding);
+        const value = descriptor && "value" in descriptor ? descriptor.value : undefined;
+        if (typeof value !== "object" || value === null || typeof (value as { query?: unknown }).query !== "function") {
+            throw new CdbError({
+                code: "CDB_SHARD_UNAVAILABLE",
+                message: `configured Vectorize binding ${JSON.stringify(binding)} is unavailable for search`,
+            });
+        }
+        return value as CdbVectorizeSearchIndex;
+    }
+
+    private fileReshardIdentity(
+        args: Pick<Omit<CdbReshardSplitIdentity, "role">, "migId" | "rangeLo" | "rangeHi">
+    ): CdbFileReshardIdentity {
+        return { migId: args.migId, rangeLo: args.rangeLo, rangeHi: args.rangeHi };
+    }
+
+    private assertFileReshardSchema(args: Omit<CdbReshardSplitIdentity, "role">, sql: SyncSql): void {
+        const state = this.schemaMigrations.state(sql);
+        if (
+            state.status !== "active" ||
+            state.activeVersion !== args.schemaVersion ||
+            state.activeEpoch !== args.schemaEpoch ||
+            state.activeDigest !== args.schemaDigest
+        ) {
+            throw new CdbError({
+                code: "CDB_STALE_EPOCH",
+                message: "file reshard schema identity does not match the active Cdb schema",
+            });
+        }
+    }
+
+    private vectorReshardIdentity(
+        args: Pick<Omit<CdbReshardSplitIdentity, "role">, "migId" | "rangeLo" | "rangeHi">
+    ): CdbVectorReshardIdentity {
+        return { migId: args.migId, rangeLo: args.rangeLo, rangeHi: args.rangeHi };
+    }
+
+    /** Require the vector lifecycle to match the generic split identity and phase. */
+    private assertVectorReshardSourceIdentity(
+        args: Omit<CdbReshardSplitIdentity, "role">,
+        sql: SyncSql,
+        phase: "capturing" | "frozen" | "drained"
+    ): CdbVectorReshardIdentity {
+        assertCdbReshardRangeIdentity(args);
+        const schema = this.schemaMigrations.state(sql);
+        if (
+            schema.status !== "active" ||
+            schema.activeVersion !== args.schemaVersion ||
+            schema.activeEpoch !== args.schemaEpoch ||
+            schema.activeDigest !== args.schemaDigest
+        ) {
+            throw new CdbError({
+                code: "CDB_STALE_EPOCH",
+                message: "vector reshard schema identity does not match the active Cdb schema",
+            });
+        }
+        if (!Array.isArray(args.tables)) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "vector reshard table list is invalid" });
+        }
+        const tablesJson = stableJson([...args.tables].sort((left, right) => left.name.localeCompare(right.name)));
+        const identity = sql.one<{
+            readonly range_lo: number;
+            readonly range_hi: number;
+            readonly role: string;
+            readonly schema_version: number;
+            readonly schema_epoch: number;
+            readonly schema_digest: string;
+            readonly tables_json: string;
+        }>(
+            `SELECT range_lo, range_hi, role, schema_version, schema_epoch, schema_digest, tables_json
+             FROM _chardb_split_identity WHERE mig_id = ?`,
+            args.migId
+        );
+        if (
+            !identity ||
+            identity.range_lo !== args.rangeLo ||
+            identity.range_hi !== args.rangeHi ||
+            identity.role !== "source" ||
+            identity.schema_version !== args.schemaVersion ||
+            identity.schema_epoch !== args.schemaEpoch ||
+            identity.schema_digest !== args.schemaDigest ||
+            identity.tables_json !== tablesJson
+        ) {
+            throw new CdbError({
+                code: "CDB_RESHARD_PHASE_MISMATCH",
+                message: `migration ${args.migId} does not match its bound vector source identity`,
+            });
+        }
+        const split = sql.one<{
+            readonly range_lo: number;
+            readonly range_hi: number;
+            readonly role: string;
+            readonly capture: number;
+            readonly drain_started: number;
+            readonly drained: number;
+            readonly abort_started: number;
+        }>(
+            `SELECT range_lo, range_hi, role, capture, drain_started, drained, abort_started
+             FROM _chardb_split_state WHERE mig_id = ?`,
+            args.migId
+        );
+        const exactSplit =
+            split?.range_lo === args.rangeLo &&
+            split.range_hi === args.rangeHi &&
+            split.role === "source" &&
+            split.abort_started === 0;
+        const exactPhase =
+            phase === "capturing"
+                ? split?.capture === 1 && split.drain_started === 0 && split.drained === 0
+                : phase === "frozen"
+                  ? split?.capture === 0 && split.drain_started === 1 && split.drained === 0
+                  : split?.capture === 0 && split.drained === 1;
+        if (!exactSplit || !exactPhase) {
+            throw new CdbError({
+                code: "CDB_RESHARD_PHASE_MISMATCH",
+                message: `migration ${args.migId} is not in its ${phase} vector source phase`,
+            });
+        }
+        return this.vectorReshardIdentity(args);
+    }
+
+    private assertVectorReshardDestIdentity(
+        args: Omit<CdbReshardSplitIdentity, "role">,
+        sql: SyncSql,
+        phase: "bulk" | "parity" | "serving" | "abort"
+    ): CdbVectorReshardIdentity {
+        assertCdbReshardRangeIdentity(args);
+        const schema = this.schemaMigrations.state(sql);
+        if (
+            schema.status !== "active" ||
+            schema.activeVersion !== args.schemaVersion ||
+            schema.activeEpoch !== args.schemaEpoch ||
+            schema.activeDigest !== args.schemaDigest
+        ) {
+            throw new CdbError({
+                code: "CDB_STALE_EPOCH",
+                message: "vector reshard schema identity does not match the active destination schema",
+            });
+        }
+        const tablesJson = stableJson([...args.tables].sort((left, right) => left.name.localeCompare(right.name)));
+        const identity = sql.one<{
+            range_lo: number;
+            range_hi: number;
+            role: string;
+            schema_version: number;
+            schema_epoch: number;
+            schema_digest: string;
+            tables_json: string;
+        }>(
+            `SELECT range_lo, range_hi, role, schema_version, schema_epoch, schema_digest, tables_json
+             FROM _chardb_split_identity WHERE mig_id = ?`,
+            args.migId
+        );
+        const split = sql.one<{
+            range_lo: number;
+            range_hi: number;
+            role: string;
+            bulk_done: number;
+            destination_serving: number;
+            abort_started: number;
+            drained: number;
+            inbox_rows: number;
+            inbox_closed: number;
+        }>(
+            `SELECT range_lo, range_hi, role, bulk_done, destination_serving, abort_started, drained,
+                    inbox_rows, inbox_closed
+             FROM _chardb_split_state WHERE mig_id = ?`,
+            args.migId
+        );
+        const exactIdentity =
+            identity?.range_lo === args.rangeLo &&
+            identity.range_hi === args.rangeHi &&
+            identity.role === "dest" &&
+            identity.schema_version === args.schemaVersion &&
+            identity.schema_epoch === args.schemaEpoch &&
+            identity.schema_digest === args.schemaDigest &&
+            identity.tables_json === tablesJson;
+        const exactSplit = split?.range_lo === args.rangeLo && split.range_hi === args.rangeHi && split.role === "dest";
+        const exactPhase =
+            phase === "bulk"
+                ? split?.bulk_done === 0 &&
+                  split.destination_serving === 0 &&
+                  split.abort_started === 0 &&
+                  split.drained === 0
+                : phase === "parity"
+                  ? split?.bulk_done === 1 &&
+                    split.destination_serving === 0 &&
+                    split.abort_started === 0 &&
+                    split.drained === 0 &&
+                    split.inbox_rows === 0 &&
+                    split.inbox_closed === 1
+                  : phase === "serving"
+                    ? split?.destination_serving === 1 && split.abort_started === 0
+                    : split?.destination_serving === 0 && split.abort_started === 1 && split.drained === 1;
+        if (!exactIdentity || !exactSplit || !exactPhase) {
+            throw new CdbError({
+                code: "CDB_RESHARD_PHASE_MISMATCH",
+                message: `migration ${args.migId} is not in its ${phase} vector destination phase`,
+            });
+        }
+        return this.vectorReshardIdentity(args);
+    }
+
+    private uninstallVectorReshardTriggers(sql: SyncSql, migId: string): number {
+        const triggers = renderVectorReshardTriggers(migId);
+        let removed = 0;
+        for (const [index, statement] of triggers.uninstall.entries()) {
+            const name = triggers.names[index];
+            if (!name) throw new CdbError({ code: "CDB_INVARIANT", message: "vector trigger set is incomplete" });
+            if (sql.one("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?", name)) removed++;
+            sql.exec(statement);
+        }
+        return removed;
+    }
+
+    private assertActiveReshardCaptureWireCompatible(
+        sql: SyncSql,
+        hasOrganizationTombstoneResources: boolean,
+        hasVectorResources: boolean
+    ): void {
+        if (hasOrganizationTombstoneResources) {
+            const fileSources = sql.all<{ mig_id: string }>(
+                `SELECT cursor.mig_id FROM _chardb_split_file_cursor AS cursor
+                 INNER JOIN _chardb_split_state AS state
+                   ON state.mig_id = cursor.mig_id AND state.role = 'source'
+                 WHERE cursor.role = 'source' AND cursor.outcome = 'active' AND state.capture = 1
+                 ORDER BY cursor.mig_id`
+            );
+            for (const source of fileSources) {
+                const triggers = renderFileReshardTriggers(source.mig_id);
+                const tombstoneTriggers = triggers.names.filter(name => name.includes("_org_"));
+                const rows = tombstoneTriggers.map(name =>
+                    sql.one<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", name)
+                );
+                if (rows.some(row => !row?.sql.includes("vector_unproven_turns"))) {
+                    throw new CdbError({
+                        code: "CDB_RESHARD_PHASE_MISMATCH",
+                        message: `active file source ${source.mig_id} uses an incompatible tombstone capture wire; finish or abort it under the prior code before deploying this version`,
+                    });
+                }
+            }
+        }
+        if (hasVectorResources) {
+            const vectorSources = sql.all<{ mig_id: string }>(
+                `SELECT session.mig_id
+                 FROM _chardb_vector_snapshot_sessions AS session
+                 INNER JOIN _chardb_split_state AS state
+                   ON state.mig_id = session.mig_id AND state.role = 'source'
+                 WHERE session.cleaned = 0 AND state.capture = 1
+                 ORDER BY session.mig_id`
+            );
+            for (const source of vectorSources) {
+                assertVectorReshardCaptureForeignKeys(sql);
+                const triggers = renderVectorReshardTriggers(source.mig_id);
+                const outboxTriggers = triggers.names.filter(name => name.includes("_outbox_"));
+                const rows = outboxTriggers.map(name =>
+                    sql.one<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", name)
+                );
+                if (rows.some(row => !row?.sql.includes("terminal_failure"))) {
+                    throw new CdbError({
+                        code: "CDB_RESHARD_PHASE_MISMATCH",
+                        message: `active vector source ${source.mig_id} uses an incompatible outbox capture wire; finish or abort it under the prior code before deploying this version`,
+                    });
+                }
+            }
+        }
+    }
+
+    private assertCachedVectorReshardWireCompatible(sql: SyncSql): void {
+        const pages = [
+            ...sql.all<{ mig_id: string; encoded: string }>(
+                `SELECT mig_id, cached_page_enc AS encoded FROM _chardb_vector_snapshot_sessions
+                 WHERE cleaned = 0 AND cached_page_enc IS NOT NULL`
+            ),
+            ...sql.all<{ mig_id: string; encoded: string }>(
+                `SELECT mig_id, last_page_enc AS encoded FROM _chardb_vector_reshard_dest_sessions
+                 WHERE last_page_enc IS NOT NULL`
+            ),
+        ];
+        for (const page of pages) {
+            try {
+                const decoded = decodeCdbVectorReshardPage(page.encoded);
+                if (encodeCdbVectorReshardPage(decoded) !== page.encoded) throw new Error("noncanonical page");
+            } catch {
+                throw new CdbError({
+                    code: "CDB_RESHARD_PHASE_MISMATCH",
+                    message: `migration ${page.mig_id} retains an incompatible vector snapshot wire; finish or abort it under the prior code before deploying this version`,
+                });
+            }
+        }
+    }
+
+    reshardSideStateProtocolCapabilitiesV2(): {
+        readonly vectorSnapshot: "v2";
+        readonly fileTombstones: "v2";
+    } {
+        return Object.freeze({ vectorSnapshot: "v2" as const, fileTombstones: "v2" as const });
+    }
+
+    private setFileAttachmentTriggers(sql: SyncSql, mode: "install" | "uninstall"): number {
+        let count = 0;
+        for (const resource of collectSchemaFileResourceDescriptors(this.mutationSchema())) {
+            const triggers = renderFileAttachmentTriggerSet(resource);
+            for (const statement of triggers[mode]) {
+                sql.exec(statement);
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private assertVectorMutationTriggersInstalled(sql: SyncSql): void {
+        for (const resource of this.vectorResources()) {
+            for (const name of renderVectorMutationTriggerSet(resource).names) {
+                if (!sql.one("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?", name)) {
+                    throw new CdbError({
+                        code: "CDB_RESHARD_PHASE_MISMATCH",
+                        message: `destination vector mutation trigger ${name} is not installed`,
+                    });
+                }
+            }
+        }
+    }
+
+    private assertVectorDerivedState(sql: SyncSql): void {
+        const capacity = sql.one<{
+            singleton: number;
+            reconciled: number;
+            head_count: number;
+            stored_bytes: number;
+            outbox_rows: number;
+            attempt_rows: number;
+        }>("SELECT * FROM _chardb_vector_capacity WHERE singleton = 1");
+        const actual = sql.one<{
+            head_count: number;
+            stored_bytes: number;
+            outbox_rows: number;
+            attempt_rows: number;
+        }>(
+            `SELECT (SELECT COUNT(*) FROM _chardb_vectors) AS head_count,
+                    (SELECT COALESCE(SUM(COALESCE(length(values_enc), 0) + length(metadata_json)), 0)
+                     FROM _chardb_vectors) AS stored_bytes,
+                    (SELECT COUNT(*) FROM _chardb_vector_outbox) AS outbox_rows,
+                    (SELECT COUNT(*) FROM _chardb_vector_attempts) AS attempt_rows`
+        );
+        const scheduler = sql.one<{ singleton: number; next_vshard: number }>(
+            "SELECT singleton, next_vshard FROM _chardb_vector_scheduler WHERE singleton = 1"
+        );
+        const sequence = sql.one<{ singleton: number; last_seq: number; max_seq: number }>(
+            `SELECT sequence.singleton, sequence.last_seq,
+                    COALESCE((SELECT MAX(created_seq) FROM _chardb_vectors), 0) AS max_seq
+             FROM _chardb_vector_head_sequence AS sequence WHERE sequence.singleton = 1`
+        );
+        if (
+            !capacity ||
+            capacity.singleton !== 1 ||
+            capacity.reconciled !== 1 ||
+            !actual ||
+            capacity.head_count !== actual.head_count ||
+            capacity.stored_bytes !== actual.stored_bytes ||
+            capacity.outbox_rows !== actual.outbox_rows ||
+            capacity.attempt_rows !== actual.attempt_rows ||
+            !scheduler ||
+            scheduler.singleton !== 1 ||
+            !Number.isSafeInteger(scheduler.next_vshard) ||
+            scheduler.next_vshard < 0 ||
+            scheduler.next_vshard >= 16_384 ||
+            !sequence ||
+            sequence.singleton !== 1 ||
+            !Number.isSafeInteger(sequence.last_seq) ||
+            !Number.isSafeInteger(sequence.max_seq) ||
+            sequence.last_seq < sequence.max_seq
+        ) {
+            throw new CdbError({
+                code: "CDB_RESHARD_PHASE_MISMATCH",
+                message: "vector derived state does not match its physical rows",
+            });
+        }
+    }
+
+    private fileSnapshotThroughLsn(sql: SyncSql, migId: string): number {
+        return this.resharding.sourceTailHighWatermark(migId, sql);
+    }
+
+    private fileMetadataTransaction<T>(organizationId: string, callback: (store: CdbFileStore) => T): T {
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertFileOwnership(organizationId, sql);
+            return withExternalReshardCapture(sql, Number(vshardOf([organizationId])), () =>
+                callback(new CdbFileStore(sql))
+            );
+        });
+    }
+
+    private async bootstrap(): Promise<void> {
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        const journal = this.migrationJournal();
+        if (journal.version > 0) assertSchemaResourceJournal(this.mutationSchema(), journal.migrations);
+        this.assertVectorJournalTransitions(journal);
+        for (const stmt of `${SHARD_BOOTSTRAP_DDL}\n${CDB_SPLIT_OPLOG_STORE_DDL}\n${CDB_LIVE_STORE_DDL}\n${CDB_LOCAL_DDL}\n${CDB_SCHEMA_MIGRATION_STORE_DDL}\n${CDB_ROUTING_FENCE_STORE_DDL}\n${CDB_RESHARD_IDENTITY_STORE_DDL}`
             .split(";")
             .map(s => s.trim())
             .filter(Boolean)) {
             sql.exec(stmt);
         }
-        ensureLiveSubscriptionAuthorityColumns(sql);
-        ensureInvalidationOutboxColumns(sql);
+        initializeOpLogPlacement(sql);
+        this.ctx.storage.transactionSync(() => initializeSplitLogAccounting(adaptSqlStorage(this.ctx.storage.sql)));
+        this.ctx.storage.transactionSync(() => initializeSplitOpLogAccounting(adaptSqlStorage(this.ctx.storage.sql)));
+        initializeLiveStore(sql);
+        initializeCdbAuthInvalidationStore(sql);
+        initializeCdbReshardIdentityStore(sql);
+        const hasFileResources = this.hasFileResources();
+        const hasVectorResources = this.vectorResources().length > 0;
+        if (hasFileResources || hasVectorResources) {
+            initializeFileStore(sql);
+            initializeCdbFileReshardStore(sql);
+        }
+        if (hasFileResources || hasVectorResources) initializeExternalReshardCapture(sql);
+        if (hasVectorResources) {
+            initializeCdbVectorOutboxStore(sql);
+            initializeCdbVectorOrganizationDeletionStore(sql);
+            initializeCdbVectorReshardSnapshotSessions(sql);
+            initializeCdbVectorReshardDestStore(sql);
+            this.assertCachedVectorReshardWireCompatible(sql);
+        }
         sql.exec("PRAGMA foreign_keys = ON");
+        this.assertActiveReshardCaptureWireCompatible(sql, hasFileResources || hasVectorResources, hasVectorResources);
         this.ctx.storage.transactionSync(() => retireLegacyLiveSubscriptions(adaptSqlStorage(this.ctx.storage.sql)));
-        const journal = this.migrationJournal();
-        const storedState = this.readSchemaStateOrNull();
-        if (storedState === null) {
-            sql.exec(
-                `INSERT INTO _chardb_schema_state
-                 (singleton, active_version, active_epoch, active_digest, status)
-                 VALUES (1, ?, 1, ?, 'active')`,
-                0,
-                migrationDigestAt(journal, 0)
-            );
-            if (journal.version === 0) this.ensureDomainTables();
-        } else {
-            this.assertPackagedSchemaState(storedState, journal);
-            if (storedState.status === "active" && storedState.activeVersion === journal.version) {
-                this.ensureDomainTables();
+        const migrationState = this.schemaMigrations.initialize(journal);
+        if (migrationState.ensureDomainTables) this.ensureDomainTables();
+        const activeVectorResources =
+            journal.version === 0
+                ? this.vectorResources()
+                : this.vectorResourcesAt(journal, this.schemaMigrations.state(sql).activeVersion);
+        const destinationSessions = hasVectorResources
+            ? sql.all<{
+                  mig_id: string;
+                  outcome: string | null;
+                  role: string;
+                  destination_serving: number;
+                  abort_started: number;
+                  drained: number;
+              }>(
+                  `SELECT identity.mig_id, session.outcome, identity.role,
+                          state.destination_serving, state.abort_started, state.drained
+                   FROM _chardb_split_identity AS identity
+                   JOIN _chardb_split_state AS state
+                     ON state.mig_id = identity.mig_id AND state.role = identity.role
+                   LEFT JOIN _chardb_vector_reshard_dest_sessions AS session
+                     ON session.mig_id = identity.mig_id
+                   WHERE identity.role = 'dest'
+                   ORDER BY identity.mig_id`
+              )
+            : [];
+        for (const session of destinationSessions) {
+            const serving = session.destination_serving === 1;
+            const aborting = session.abort_started === 1;
+            const drained = session.drained === 1;
+            const valid =
+                session.role === "dest" &&
+                ((session.outcome === null &&
+                    ((!serving && !aborting && !drained) ||
+                        (!serving && aborting) ||
+                        (serving && !aborting && drained))) ||
+                    (session.outcome === "active" && !serving && ((!aborting && !drained) || aborting)) ||
+                    (session.outcome === "aborting" && !serving && aborting && drained) ||
+                    (session.outcome === "finalized" &&
+                        ((!aborting && ((!serving && !drained) || serving)) || (!serving && aborting && drained))) ||
+                    (session.outcome === "aborted" && !serving && aborting && drained) ||
+                    (session.outcome === "cleaned" && serving && !aborting && drained));
+            if (!valid) {
+                throw new CdbError({
+                    code: "CDB_RESHARD_PHASE_MISMATCH",
+                    message: `vector destination ${session.mig_id} has an impossible trigger lifecycle state`,
+                });
             }
         }
+        const stagedDestination = destinationSessions.some(
+            session =>
+                session.destination_serving === 0 &&
+                (session.outcome === "active" ||
+                    session.outcome === "aborting" ||
+                    (session.outcome === "finalized" && session.abort_started === 1))
+        );
+        this.setVectorMutationTriggers(sql, activeVectorResources, stagedDestination ? "uninstall" : "install");
+        if (hasVectorResources) {
+            if (stagedDestination) uninstallCdbVectorOrganizationDeletionGuards(sql);
+            else installCdbVectorOrganizationDeletionGuards(sql);
+        }
+        assertLiveVectorDependencies(sql, activeVectorResources.map(cdbVectorResourceId));
         const cursor = this.ctx.storage.sql.exec<StoredSubscriptionRow>(
             `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                    principal_id, organization_id, authority, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+                    principal_id, organization_id, authority, schema_epoch, vshard, domain_schema_epoch,
+                    ref, args_json, policy_digest, query_hash,
                     tables_json, intervals_json
              FROM _chardb_live_subscriptions
              WHERE state = 'active'
@@ -960,13 +1122,28 @@ export class Cdb extends DurableObject<CdbEnv> {
                 if (!(error instanceof CdbError) || error.code !== "CDB_INVALID_ARGS") throw error;
                 const routing = parseStoredSubscriptionRouting(row);
                 assertSubscriptionTables(sql, routing.subscription, [...new Set(routing.tables)].sort());
-                this.installSubscription(routing.subscription, this.prepareIntervals(routing));
+                this.validateIntervals(routing);
                 continue;
             }
             assertSubscriptionTables(sql, request.subscription, [...new Set(request.tables)].sort());
-            this.installSubscription(request.subscription, this.prepareIntervals(request));
+            this.validateIntervals(request);
         }
-        this.bootstrapped = true;
+        const invalidationAlarmAt = readNextInvalidationAlarmAt(sql);
+        if (invalidationAlarmAt !== null) await this.scheduleAlarmNoLaterThan(invalidationAlarmAt);
+        const retention = this.opLogRetention.maintain(this.invalidationNowMs());
+        if (retention.nextAt !== null) await this.scheduleAlarmNoLaterThan(retention.nextAt);
+        if (hasVectorResources && !stagedDestination) {
+            const pendingOrganizationDeletion = new CdbVectorOrganizationDeletionStore(sql, callback =>
+                callback()
+            ).nextPendingPage();
+            if (pendingOrganizationDeletion) {
+                await this.scheduleAlarmNoLaterThan(this.invalidationNowMs() + 1);
+            }
+            const nextVectorAt = new CdbVectorOutboxStore(sql).nextDueAt();
+            if (nextVectorAt !== null) {
+                await this.scheduleAlarmNoLaterThan(Math.max(this.invalidationNowMs() + 1, nextVectorAt));
+            }
+        }
     }
 
     private ensureDomainTables(): void {
@@ -999,10 +1176,10 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     private renderDomainTables() {
-        const tables = [...collectCdbTables(this.mutationSchema())].sort((a, b) =>
-            a.meta.name.localeCompare(b.meta.name)
-        );
+        const schema = this.mutationSchema();
+        const tables = [...collectCdbTables(schema)].sort((a, b) => a.meta.name.localeCompare(b.meta.name));
         const domainTableNames = new Set(tables.map(entry => entry.meta.name));
+        const authTableNames = synthesizedAuthTableNames(schema);
         return tables.map(({ table }) => {
             const meta = resolveCdbMeta(table);
             const authorityColumns = new Set([meta.tenantBy, meta.selfBy].filter(column => column !== undefined));
@@ -1012,7 +1189,11 @@ export class Cdb extends DurableObject<CdbEnv> {
                 hint: "add and run an explicit shard schema migration before deploying this schema",
                 includeForeignKey: reference => {
                     if (domainTableNames.has(reference.foreignTableName)) return true;
-                    if (reference.columns.some(column => authorityColumns.has(column))) return false;
+                    if (
+                        authTableNames.has(reference.foreignTableName) ||
+                        reference.columns.some(column => authorityColumns.has(column))
+                    )
+                        return false;
                     throw new CdbError({
                         code: "CDB_NONLOCAL_FK",
                         message: `domain table "${meta.name}" references non-cdbTable "${reference.foreignTableName}"`,
@@ -1092,344 +1273,148 @@ export class Cdb extends DurableObject<CdbEnv> {
         }
     }
 
-    private readSchemaStateOrNull(sql = adaptSqlStorage(this.ctx.storage.sql)): CdbSchemaState | null {
-        const row = sql.one<StoredCdbSchemaState>(
-            `SELECT active_version, active_epoch, active_digest, last_migration_id, status, migration_id,
-                    target_version, target_epoch, target_digest
-             FROM _chardb_schema_state WHERE singleton = 1`
-        );
-        if (!row) return null;
-        return {
-            activeVersion: row.active_version,
-            activeEpoch: row.active_epoch,
-            activeDigest: row.active_digest,
-            lastMigrationId: row.last_migration_id,
-            status: row.status,
-            migrationId: row.migration_id,
-            targetVersion: row.target_version,
-            targetEpoch: row.target_epoch,
-            targetDigest: row.target_digest,
-        };
-    }
-
-    private readSchemaState(sql = adaptSqlStorage(this.ctx.storage.sql)): CdbSchemaState {
-        const state = this.readSchemaStateOrNull(sql);
-        if (!state) throw new CdbError({ code: "CDB_INVARIANT", message: "Cdb schema state is missing" });
-        return state;
-    }
-
-    private assertPackagedSchemaState(state: CdbSchemaState, journal = this.migrationJournal()): void {
-        if (
-            state.activeVersion > journal.version ||
-            state.activeDigest !== migrationDigestAt(journal, state.activeVersion)
-        ) {
-            throw new CdbError({
-                code: "CDB_PARTITION_CONTRACT_CHANGED",
-                message: `Cdb schema version ${state.activeVersion} does not match the packaged migration journal`,
-            });
-        }
-        if (
-            state.status === "migrating" &&
-            (state.targetVersion === null ||
-                state.targetVersion <= state.activeVersion ||
-                state.targetVersion > journal.version ||
-                state.targetEpoch !== state.activeEpoch + 1 ||
-                state.targetDigest !== migrationDigestAt(journal, state.targetVersion))
-        ) {
-            throw new CdbError({
-                code: "CDB_PARTITION_CONTRACT_CHANGED",
-                message: "Cdb pending schema migration does not match the packaged journal",
-            });
-        }
-    }
-
     private assertActiveSchemaEpoch(
         expectedEpoch: number,
         sql = adaptSqlStorage(this.ctx.storage.sql)
     ): CdbSchemaState {
-        if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch < 1) {
-            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "domain schema epoch is invalid" });
-        }
-        const state = this.readSchemaState(sql);
+        return this.schemaMigrations.assertActiveEpoch(expectedEpoch, () => this.migrationJournal(), sql);
+    }
+
+    private assertRoutingEpoch(schemaEpoch: number, placement: CdbPlacement): void {
+        this.resharding.assertRoutingAdmission(schemaEpoch, Number(vshardOf([placement.partitionKey])));
+    }
+
+    schemaState(): CdbSchemaState {
+        return this.schemaMigrations.state();
+    }
+
+    baselineSchemaMigration(args: CdbSchemaBaselineRequest): CdbSchemaState {
+        this.resharding.assertNoActiveReshard();
+        const journal = this.migrationJournal();
+        const resources = this.vectorResourcesAt(journal, args.targetVersion);
+        return this.schemaMigrations.baseline(
+            args,
+            journal,
+            sql => this.recordMigratedDomainSchema(sql),
+            sql => {
+                this.setVectorMutationTriggers(sql, resources, "install");
+                this.assertVectorDomainIdentity(sql, resources);
+            }
+        );
+    }
+
+    /** Provision a never-used destination at the exact schema held by a topology lease. */
+    provisionFreshReshardDestination(args: CdbFreshSchemaProvisionRequest): CdbSchemaState {
+        const splitMigId = args.migrationId.startsWith("reshard-dest:")
+            ? args.migrationId.slice("reshard-dest:".length)
+            : null;
+        if (splitMigId) this.resharding.assertFreshDestinationProvisioningAllowed(splitMigId);
+        const journal = this.migrationJournal();
+        const current = this.schemaMigrations.state();
         if (
-            state.status !== "active" ||
-            state.activeVersion !== this.migrationJournal().version ||
-            state.activeEpoch !== expectedEpoch
+            current.status === "active" &&
+            current.activeVersion === args.targetVersion &&
+            current.activeEpoch === args.targetEpoch &&
+            current.activeDigest === args.targetDigest &&
+            current.lastMigrationId === args.migrationId
         ) {
-            throw new CdbError({
-                code: "CDB_STALE_EPOCH",
-                message: `Cdb domain schema epoch ${state.activeEpoch} does not match request epoch ${expectedEpoch}`,
-                hint: "retry after routing against the active schema version",
-            });
+            return current;
+        }
+        return this.schemaMigrations.provisionFresh(
+            args,
+            journal,
+            sql => {
+                if (args.targetVersion === 0) {
+                    assertUnusedVersionZeroReshardDestination(sql, this.renderDomainTables());
+                } else {
+                    assertFreshReshardDestination(sql);
+                }
+            },
+            sql => this.recordMigratedDomainSchema(sql),
+            sql => {
+                const resources = this.vectorResourcesAt(journal, args.targetVersion);
+                this.setVectorMutationTriggers(sql, resources, "install");
+                this.assertVectorDomainIdentity(sql, resources);
+            }
+        );
+    }
+
+    prepareSchemaMigration(args: CdbSchemaMigrationPrepareRequest): CdbSchemaState {
+        this.resharding.assertNoActiveReshard();
+        const journal = this.migrationJournal();
+        return this.schemaMigrations.prepare(args, journal);
+    }
+
+    applySchemaMigration(args: CdbSchemaMigrationApplyRequest): CdbSchemaState {
+        this.resharding.assertNoActiveReshard();
+        const journal = this.migrationJournal();
+        const previousResources = this.vectorResourcesAt(journal, args.version - 1);
+        const nextResources = this.vectorResourcesAt(journal, args.version);
+        this.assertVectorMigrationIdentity(previousResources, nextResources);
+        return this.schemaMigrations.apply(args, journal, {
+            beforeStatements: sql => this.setVectorMutationTriggers(sql, previousResources, "uninstall"),
+            afterStatements: sql => {
+                this.setVectorMutationTriggers(sql, nextResources, "install");
+                this.assertVectorDomainIdentity(sql, nextResources);
+            },
+        });
+    }
+
+    async activateSchemaMigration(args: CdbSchemaMigrationActivateRequest): Promise<CdbSchemaState> {
+        this.resharding.assertNoActiveReshard();
+        const state = this.schemaMigrations.activate(
+            args,
+            () => this.migrationJournal(),
+            sql => {
+                this.recordMigratedDomainSchema(sql);
+                enqueueSchemaMigrationInvalidations(sql);
+            }
+        );
+        const nextAttemptAt = readNextInvalidationAlarmAt(adaptSqlStorage(this.ctx.storage.sql));
+        if (nextAttemptAt !== null) {
+            await this.scheduleAlarmNoLaterThan(Math.max(this.invalidationNowMs() + 1, nextAttemptAt));
         }
         return state;
     }
 
-    schemaState(): CdbSchemaState {
-        return this.readSchemaState();
+    /** Prepare one immutable source-side routing range fence. */
+    prepareRoutingFence(args: CdbRoutingFenceIdentity): CdbRoutingFence {
+        return this.resharding.prepareRoutingFence(args);
     }
 
-    baselineSchemaMigration(args: {
-        readonly migrationId: string;
-        readonly targetVersion: number;
-        readonly targetEpoch: number;
-        readonly targetDigest: string;
-    }): CdbSchemaState {
-        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(args.migrationId)) {
-            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema baseline id is invalid" });
-        }
-        const journal = this.migrationJournal();
-        if (
-            args.targetVersion !== journal.version ||
-            args.targetVersion < 1 ||
-            !Number.isSafeInteger(args.targetEpoch) ||
-            args.targetEpoch < 2 ||
-            args.targetDigest !== journal.digest
-        ) {
-            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema baseline target is invalid" });
-        }
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const current = this.readSchemaState(sql);
-            if (
-                current.status === "active" &&
-                current.lastMigrationId === args.migrationId &&
-                current.activeVersion === args.targetVersion &&
-                current.activeEpoch === args.targetEpoch &&
-                current.activeDigest === args.targetDigest
-            ) {
-                return;
-            }
-            if (
-                current.status !== "active" ||
-                current.activeVersion !== 0 ||
-                current.activeDigest !== migrationDigestAt(journal, 0) ||
-                args.targetEpoch !== current.activeEpoch + 1
-            ) {
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "Cdb is not eligible for schema baseline" });
-            }
-            this.recordMigratedDomainSchema(sql);
-            sql.exec(
-                `UPDATE _chardb_schema_state
-                 SET active_version = ?, active_epoch = ?, active_digest = ?, last_migration_id = ?
-                 WHERE singleton = 1 AND status = 'active' AND active_version = 0 AND active_epoch = ?`,
-                args.targetVersion,
-                args.targetEpoch,
-                args.targetDigest,
-                args.migrationId,
-                current.activeEpoch
-            );
-            if (sql.changes() !== 1) {
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "Cdb changed during schema baseline" });
-            }
-        });
-        return this.readSchemaState();
+    /** Stop this source and wake every live registration stranded in the moved range. */
+    async activateRoutingFence(args: CdbRoutingFenceIdentity): Promise<CdbRoutingFence> {
+        return this.resharding.activateRoutingFence(args);
     }
 
-    prepareSchemaMigration(args: {
-        readonly migrationId: string;
-        readonly activeVersion: number;
-        readonly activeDigest: string;
-        readonly targetVersion: number;
-        readonly targetEpoch: number;
-        readonly targetDigest: string;
-    }): CdbSchemaState {
-        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(args.migrationId)) {
-            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration id is invalid" });
+    /** Project one Catalog auth epoch into the existing live-query invalidation outbox. */
+    async invalidateAuthScope(args: CdbAuthInvalidationRequest): Promise<CdbAuthInvalidationResult> {
+        const result = this.ctx.storage.transactionSync(() =>
+            new CdbAuthInvalidationStore(adaptSqlStorage(this.ctx.storage.sql)).apply(args, this.invalidationNowMs())
+        );
+        const nextAttemptAt = readNextInvalidationAlarmAt(adaptSqlStorage(this.ctx.storage.sql));
+        if (nextAttemptAt !== null) {
+            await this.scheduleAlarmNoLaterThan(Math.max(this.invalidationNowMs() + 1, nextAttemptAt));
         }
-        const journal = this.migrationJournal();
-        if (
-            !Number.isSafeInteger(args.activeVersion) ||
-            args.activeVersion < 0 ||
-            !Number.isSafeInteger(args.targetVersion) ||
-            args.targetVersion <= args.activeVersion ||
-            args.targetVersion !== journal.version ||
-            !Number.isSafeInteger(args.targetEpoch) ||
-            args.targetEpoch < 1 ||
-            args.activeDigest !== migrationDigestAt(journal, args.activeVersion) ||
-            args.targetDigest !== migrationDigestAt(journal, args.targetVersion)
-        ) {
-            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration target is invalid" });
-        }
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const current = this.readSchemaState();
-            if (current.status === "migrating") {
-                if (
-                    current.migrationId === args.migrationId &&
-                    current.activeVersion === args.activeVersion &&
-                    current.activeDigest === args.activeDigest &&
-                    current.targetVersion === args.targetVersion &&
-                    current.targetEpoch === args.targetEpoch &&
-                    current.targetDigest === args.targetDigest
-                ) {
-                    return;
-                }
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "another schema migration owns this Cdb" });
-            }
-            if (
-                current.lastMigrationId === args.migrationId &&
-                current.activeVersion === args.targetVersion &&
-                current.activeEpoch === args.targetEpoch &&
-                current.activeDigest === args.targetDigest
-            ) {
-                return;
-            }
-            if (
-                current.activeVersion !== args.activeVersion ||
-                current.activeDigest !== args.activeDigest ||
-                args.targetEpoch !== current.activeEpoch + 1
-            ) {
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "Cdb schema state changed before prepare" });
-            }
-            sql.exec(
-                `UPDATE _chardb_schema_state
-                 SET status = 'migrating', migration_id = ?, target_version = ?, target_epoch = ?, target_digest = ?
-                 WHERE singleton = 1 AND status = 'active' AND active_version = ? AND active_digest = ?`,
-                args.migrationId,
-                args.targetVersion,
-                args.targetEpoch,
-                args.targetDigest,
-                args.activeVersion,
-                args.activeDigest
-            );
-            if (sql.changes() !== 1) {
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "Cdb schema state changed before prepare" });
-            }
-        });
-        return this.readSchemaState();
+        return result;
     }
 
-    applySchemaMigration(args: { readonly migrationId: string; readonly version: number }): CdbSchemaState {
-        const journal = this.migrationJournal();
-        if (!Number.isSafeInteger(args.version) || args.version < 1 || args.version > journal.version) {
-            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration version is invalid" });
-        }
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const current = this.readSchemaState();
-            if (current.status !== "migrating" || current.migrationId !== args.migrationId) {
-                if (current.status === "active" && current.lastMigrationId === args.migrationId) return;
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration does not own this Cdb" });
-            }
-            if (current.targetVersion === null || args.version > current.targetVersion) {
-                throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration step exceeds its target" });
-            }
-            const targetVersion = current.targetVersion;
-            const migration = journal.migrations[args.version - 1];
-            if (!migration || migration.version !== args.version) {
-                throw new CdbError({
-                    code: "CDB_PARTITION_CONTRACT_CHANGED",
-                    message: "schema migration step is missing",
-                });
-            }
-            const existing = sql.one<{ digest: string }>(
-                "SELECT digest FROM _chardb_schema_steps WHERE migration_id = ? AND version = ?",
-                args.migrationId,
-                args.version
-            );
-            if (existing) {
-                if (existing.digest !== migration.digest) {
-                    throw new CdbError({
-                        code: "CDB_PARTITION_CONTRACT_CHANGED",
-                        message: "applied schema migration digest changed",
-                    });
-                }
-                return;
-            }
-            const applied = sql.all<{ version: number; digest: string }>(
-                "SELECT version, digest FROM _chardb_schema_steps WHERE migration_id = ? ORDER BY version",
-                args.migrationId
-            );
-            const expected = pendingMigrations(journal, current.activeVersion).filter(
-                step => step.version <= targetVersion
-            );
-            for (let index = 0; index < applied.length; index++) {
-                const stored = applied[index];
-                const packaged = expected[index];
-                if (!stored || !packaged || stored.version !== packaged.version || stored.digest !== packaged.digest) {
-                    throw new CdbError({
-                        code: "CDB_PARTITION_CONTRACT_CHANGED",
-                        message: "applied schema migration sequence is corrupt",
-                    });
-                }
-            }
-            const next = expected[applied.length];
-            if (!next || next.version !== args.version) {
-                throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration steps must apply in order" });
-            }
-            for (const statement of migration.statements) sql.exec(statement);
-            sql.exec(
-                `INSERT INTO _chardb_schema_steps (migration_id, version, digest, applied_at)
-                 VALUES (?, ?, ?, ?)`,
-                args.migrationId,
-                migration.version,
-                migration.digest,
-                Date.now()
-            );
-        });
-        return this.readSchemaState();
+    /** Mark source data cleanup complete without reopening the fenced range. */
+    completeRoutingFenceCleanup(args: CdbRoutingFenceIdentity): CdbRoutingFence {
+        return this.resharding.completeRoutingFenceCleanup(args);
     }
 
-    activateSchemaMigration(args: { readonly migrationId: string }): CdbSchemaState {
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const current = this.readSchemaState();
-            if (current.status === "active") {
-                if (current.lastMigrationId === args.migrationId) return;
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration is not active" });
-            }
-            if (current.migrationId !== args.migrationId || current.targetVersion === null) {
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration does not own this Cdb" });
-            }
-            const targetVersion = current.targetVersion;
-            const expected = pendingMigrations(this.migrationJournal(), current.activeVersion).filter(
-                step => step.version <= targetVersion
-            );
-            const applied = sql.all<{ version: number; digest: string }>(
-                "SELECT version, digest FROM _chardb_schema_steps WHERE migration_id = ? ORDER BY version",
-                args.migrationId
-            );
-            if (
-                applied.length !== expected.length ||
-                applied.some(
-                    (stored, index) =>
-                        stored.version !== expected[index]?.version || stored.digest !== expected[index]?.digest
-                )
-            ) {
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration steps are incomplete" });
-            }
-            this.recordMigratedDomainSchema(sql);
-            sql.exec(
-                `UPDATE _chardb_schema_state
-                 SET active_version = target_version, active_epoch = target_epoch, active_digest = target_digest,
-                     last_migration_id = migration_id, status = 'active', migration_id = NULL,
-                     target_version = NULL, target_epoch = NULL, target_digest = NULL
-                 WHERE singleton = 1 AND status = 'migrating' AND migration_id = ?`,
-                args.migrationId
-            );
-            if (sql.changes() !== 1) {
-                throw new CdbError({ code: "CDB_INVARIANT", message: "Cdb schema state changed during activation" });
-            }
-        });
-        return this.readSchemaState();
+    cancelRoutingFenceBeforeCutover(args: CdbRoutingFenceIdentity): CdbRoutingFence | null {
+        return this.resharding.cancelRoutingFenceBeforeCutover(args);
     }
 
-    private prepareIntervals(args: { readonly intervals: CdbSubscriptionRequest["intervals"] }): PreparedInterval[] {
-        return args.intervals.map(block => ({
-            table: block.table,
-            indexName: block.indexName,
-            set: intervalSetFromWire(block.intervals),
-        }));
+    /** Inspect the activated source fence that covers one vshard. */
+    activeRoutingFence(vshard: number): CdbRoutingFence | null {
+        return this.resharding.activeRoutingFence(vshard);
     }
 
-    private installSubscription(subscription: LiveSubscriptionId, intervals: readonly PreparedInterval[]): void {
-        const key = subscriptionKey(subscription);
-        this.intervalMap.unregister(key);
-        for (const interval of intervals) {
-            this.intervalMap.register(key, interval.table, interval.indexName, interval.set);
-        }
-        this.subscriptions.set(key, subscription);
+    private validateIntervals(args: { readonly intervals: CdbSubscriptionRequest["intervals"] }): void {
+        for (const block of args.intervals) intervalSetFromWire(block.intervals);
     }
 
     protected invalidationNowMs(): number {
@@ -1440,45 +1425,15 @@ export class Cdb extends DurableObject<CdbEnv> {
         return Math.min(INVALIDATION_MAX_RETRY_MS, INVALIDATION_BASE_RETRY_MS * 2 ** Math.max(0, attempts - 1));
     }
 
-    private dueInvalidations(nowMs: number): readonly StoredInvalidationRow[] {
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        return sql.all<StoredInvalidationRow>(
-            `SELECT outbox.gateway_id, outbox.registration_id, subscriptions.connection_id,
-                    subscriptions.client_id, subscriptions.sub_id, outbox.change_seq, outbox.attempts,
-                    outbox.next_attempt_at, outbox.last_error, outbox.dead_lettered_at
-             FROM _chardb_invalidation_outbox AS outbox
-             INNER JOIN _chardb_live_subscriptions AS subscriptions
-               ON subscriptions.gateway_id = outbox.gateway_id
-              AND subscriptions.registration_id = outbox.registration_id
-             WHERE outbox.next_attempt_at <= ?
-             ORDER BY outbox.next_attempt_at, outbox.gateway_id, outbox.registration_id
-             LIMIT ?`,
-            nowMs,
-            INVALIDATION_BATCH_SIZE
-        );
-    }
-
     private recordInvalidationFailure(rows: readonly StoredInvalidationRow[], nowMs: number, error: unknown): void {
-        const message = invalidationErrorMessage(error);
         this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            for (const row of rows) {
-                const attempts = row.attempts + 1;
-                const deadLetteredAt = row.dead_lettered_at ?? (attempts >= INVALIDATION_MAX_ATTEMPTS ? nowMs : null);
-                const nextAttemptAt = nowMs + this.invalidationRetryDelayMs(attempts);
-                sql.exec(
-                    `UPDATE _chardb_invalidation_outbox
-                     SET attempts = ?, next_attempt_at = ?, last_error = ?, dead_lettered_at = ?
-                     WHERE gateway_id = ? AND registration_id = ? AND change_seq = ?`,
-                    attempts,
-                    nextAttemptAt,
-                    message,
-                    deadLetteredAt,
-                    row.gateway_id,
-                    row.registration_id,
-                    row.change_seq
-                );
-            }
+            recordInvalidationFailures(
+                adaptSqlStorage(this.ctx.storage.sql),
+                rows,
+                nowMs,
+                attempts => this.invalidationRetryDelayMs(attempts),
+                error
+            );
         });
     }
 
@@ -1490,16 +1445,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     ): void {
         const acknowledged = new Set(acknowledgements.map(ack => JSON.stringify([ack.registrationId, ack.changeSeq])));
         this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            for (const acknowledgement of acknowledgements) {
-                sql.exec(
-                    `DELETE FROM _chardb_invalidation_outbox
-                     WHERE gateway_id = ? AND registration_id = ? AND change_seq = ?`,
-                    gatewayId,
-                    acknowledgement.registrationId,
-                    acknowledgement.changeSeq
-                );
-            }
+            acknowledgeStoredInvalidations(adaptSqlStorage(this.ctx.storage.sql), gatewayId, acknowledgements);
         });
         const omitted = rows.filter(row => !acknowledged.has(JSON.stringify([row.registration_id, row.change_seq])));
         if (omitted.length > 0) {
@@ -1508,49 +1454,57 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     private async drainInvalidations(nowMs: number): Promise<void> {
-        const rows = this.dueInvalidations(nowMs);
+        const rows = readDueInvalidations(adaptSqlStorage(this.ctx.storage.sql), nowMs);
         const groups = new Map<string, StoredInvalidationRow[]>();
         for (const row of rows) {
             const group = groups.get(row.gateway_id) ?? [];
             group.push(row);
             groups.set(row.gateway_id, group);
         }
-        for (const [gatewayId, group] of groups) {
-            try {
-                if (!this.env.CDB_GATEWAY) throw new Error("CDB_GATEWAY binding is unavailable");
-                const id = this.env.CDB_GATEWAY.idFromString(gatewayId);
-                const gateway = this.env.CDB_GATEWAY.get(id) as unknown as GatewayInvalidationRpc;
-                const request: GatewayInvalidationRequest = {
-                    sourceCdbId: this.ctx.id.toString(),
-                    gatewayId,
-                    invalidations: group.map(row => ({
-                        subscription: {
-                            gatewayId: row.gateway_id,
-                            registrationId: row.registration_id,
-                            connectionId: row.connection_id,
-                            clientId: ClientId(row.client_id),
-                            subId: SubId(row.sub_id),
-                        },
-                        changeSeq: row.change_seq,
-                    })),
-                };
-                const rawResponse: GatewayInvalidationResponse = await gateway.invalidateSubscriptions(request);
-                const requested = new Map(group.map(row => [row.registration_id, row.change_seq] as const));
-                const acknowledgements = validateInvalidationResponse(rawResponse, gatewayId, requested);
-                this.acknowledgeInvalidations(gatewayId, group, acknowledgements, nowMs);
-            } catch (error) {
-                this.recordInvalidationFailure(group, nowMs, error);
+
+        const outcomes = await Promise.all(
+            [...groups].map(async ([gatewayId, group]) => {
+                try {
+                    if (!this.env.CDB_GATEWAY) throw new Error("CDB_GATEWAY binding is unavailable");
+                    const id = this.env.CDB_GATEWAY.idFromString(gatewayId);
+                    const gateway = this.env.CDB_GATEWAY.get(id) as unknown as GatewayInvalidationRpc;
+                    const request: GatewayInvalidationRequest = {
+                        sourceCdbId: this.ctx.id.toString(),
+                        gatewayId,
+                        invalidations: group.map(row => ({
+                            subscription: {
+                                gatewayId: row.gateway_id,
+                                registrationId: row.registration_id,
+                                connectionId: row.connection_id,
+                                clientId: ClientId(row.client_id),
+                                subId: SubId(row.sub_id),
+                            },
+                            changeSeq: row.change_seq,
+                        })),
+                    };
+                    const rawResponse: GatewayInvalidationResponse = await gateway.invalidateSubscriptions(request);
+                    const requested = new Map(group.map(row => [row.registration_id, row.change_seq] as const));
+                    return {
+                        ok: true as const,
+                        gatewayId,
+                        group,
+                        acknowledgements: validateInvalidationResponse(rawResponse, gatewayId, requested),
+                    };
+                } catch (error) {
+                    return { ok: false as const, group, error };
+                }
+            })
+        );
+
+        // Settle durable outcomes in the same stable Gateway order returned by
+        // the outbox query. Only the network waits run concurrently.
+        for (const outcome of outcomes) {
+            if (outcome.ok) {
+                this.acknowledgeInvalidations(outcome.gatewayId, outcome.group, outcome.acknowledgements, nowMs);
+            } else {
+                this.recordInvalidationFailure(outcome.group, nowMs, outcome.error);
             }
         }
-    }
-
-    private nextInvalidationAlarmAt(): number | null {
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        const row = sql.one<{ next_attempt_at: number | null }>(
-            `SELECT MIN(next_attempt_at) AS next_attempt_at
-             FROM _chardb_invalidation_outbox`
-        );
-        return row?.next_attempt_at ?? null;
     }
 
     private async maintainInvalidationDelivery(): Promise<void> {
@@ -1559,7 +1513,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             await this.drainInvalidations(nowMs);
         } catch (deliveryError) {
             try {
-                await this.ctx.storage.setAlarm(nowMs + INVALIDATION_BASE_RETRY_MS);
+                await this.scheduleAlarmNoLaterThan(nowMs + INVALIDATION_BASE_RETRY_MS);
                 return;
             } catch (alarmError) {
                 throw new CdbError({
@@ -1569,10 +1523,10 @@ export class Cdb extends DurableObject<CdbEnv> {
                 });
             }
         }
-        const nextAttemptAt = this.nextInvalidationAlarmAt();
+        const nextAttemptAt = readNextInvalidationAlarmAt(adaptSqlStorage(this.ctx.storage.sql));
         if (nextAttemptAt === null) return;
         try {
-            await this.ctx.storage.setAlarm(Math.max(nowMs + 1, nextAttemptAt));
+            await this.scheduleAlarmNoLaterThan(Math.max(nowMs + 1, nextAttemptAt));
         } catch (error) {
             throw new CdbError({
                 code: "CDB_SHARD_UNAVAILABLE",
@@ -1582,6 +1536,200 @@ export class Cdb extends DurableObject<CdbEnv> {
         }
     }
 
+    private async scheduleAlarmNoLaterThan(deadline: number): Promise<void> {
+        const storage = this.ctx.storage as DurableObjectStorage & { getAlarm?: () => Promise<number | null> };
+        if (typeof storage.getAlarm !== "function") {
+            await storage.setAlarm(deadline);
+            return;
+        }
+        const current = await storage.getAlarm();
+        if (current === null || deadline < current) await storage.setAlarm(deadline);
+    }
+
+    private async maintainAlarmWork(options: { readonly deliverVectors: boolean }): Promise<void> {
+        let failure: unknown;
+        try {
+            if (this.stageNextVectorOrganizationDeletion(this.invalidationNowMs())) {
+                await this.scheduleAlarmNoLaterThan(this.invalidationNowMs() + 1);
+            }
+        } catch (error) {
+            failure ??= error;
+        }
+        try {
+            await this.maintainInvalidationDelivery();
+        } catch (error) {
+            failure ??= error;
+        }
+        try {
+            await this.files.maintain(this.invalidationNowMs(), deadline => this.scheduleAlarmNoLaterThan(deadline));
+        } catch (error) {
+            failure ??= error;
+        }
+        try {
+            const retention = this.opLogRetention.maintain(this.invalidationNowMs());
+            if (retention.nextAt !== null) await this.scheduleAlarmNoLaterThan(retention.nextAt);
+        } catch (error) {
+            failure ??= error;
+        }
+        if (options.deliverVectors) {
+            try {
+                if (this.vectorResources().length > 0) await this.vectors.maintain();
+            } catch (error) {
+                failure ??= error;
+            }
+        }
+        if (failure) throw failure;
+    }
+
+    /** Private same-Worker RPC used by the organization file upload dispatcher. */
+    async reserveFile(input: CdbFileReserveRequest & { readonly schemaEpoch: number }): Promise<StoredFile> {
+        try {
+            this.resharding.assertRoutingAdmission(input.schemaEpoch, Number(vshardOf([input.organizationId])));
+            const reserved = this.files.reserve(input);
+            await this.scheduleAlarmNoLaterThan(input.nowMs + CDB_FILE_PENDING_TTL_MS);
+            return reserved;
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    /** Private same-Worker RPC that revalidates untrusted Vectorize candidates against authoritative SQLite. */
+    async resolveOrganizationVectorSearch(
+        input: OrganizationVectorSearchValidation
+    ): Promise<readonly CdbValidatedVectorMatch[]> {
+        try {
+            const vshard = Number(vshardOf([input.organizationId]));
+            this.assertActiveSchemaEpoch(input.route.domainSchemaEpoch);
+            this.resharding.assertRoutingAdmission(input.route.schemaEpoch, vshard);
+            this.assertOrganizationActive(input.organizationId, adaptSqlStorage(this.ctx.storage.sql));
+            const matches = await resolveCdbVectorSearchMatches({
+                storage: this.ctx.storage,
+                schema: this.mutationSchema(),
+                auth: input.auth,
+                organizationId: input.organizationId,
+                resource: input.resource,
+                matches: input.matches,
+                limit: input.limit,
+            });
+            this.assertActiveSchemaEpoch(input.route.domainSchemaEpoch);
+            this.resharding.assertRoutingAdmission(input.route.schemaEpoch, vshard);
+            this.assertOrganizationActive(input.organizationId, adaptSqlStorage(this.ctx.storage.sql));
+            return matches.map(match => ({
+                vectorId: match.vectorId,
+                rowPk: match.rowPk,
+                score: match.score,
+                // Stored metadata intentionally has a null prototype. Workers RPC accepts only ordinary JSON objects.
+                metadata: JSON.parse(JSON.stringify(match.metadata)) as Readonly<Record<string, unknown>>,
+            }));
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    /** Private same-Worker RPC after R2 has accepted and hashed the immutable object. */
+    markFileReady(input: CdbFileReadyRequest & { readonly schemaEpoch: number }): StoredFile {
+        try {
+            this.resharding.assertRoutingAdmission(input.schemaEpoch, Number(vshardOf([input.organizationId])));
+            return this.files.markReady(input);
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    /** Private same-Worker RPC that applies row and column policy before exposing object metadata. */
+    async resolveFileDownload(
+        input: CdbFileDownloadRequest & { readonly schemaEpoch: number }
+    ): Promise<StoredFile | null> {
+        try {
+            this.resharding.assertRoutingAdmission(input.schemaEpoch, Number(vshardOf([input.organizationId])));
+            return await resolveCdbFileDownload({
+                storage: this.ctx.storage,
+                schema: this.mutationSchema(),
+                files: this.files,
+                request: input,
+            });
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    /** Private Catalog outbox target. The permanent shard fence wins every late upload or attachment race. */
+    async deleteOrganizationFiles(
+        input: CdbOrganizationFileDeletionRequest
+    ): Promise<CdbOrganizationFileDeletionResult> {
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertActiveSchemaEpoch(input.domainSchemaEpoch, sql);
+            this.assertFileOwnership(input.organizationId, sql);
+            withExternalReshardCapture(sql, Number(vshardOf([input.organizationId])), () => {
+                new CdbFileStore(sql).fenceOrganizationDeletion(input.organizationId, input.nowMs);
+                if (this.vectorResources().length === 0) return;
+                const vectors = new CdbVectorOrganizationDeletionStore(sql, callback => callback());
+                vectors.acceptOrganization({ organizationId: input.organizationId, nowMs: input.nowMs });
+            });
+        });
+        await this.scheduleAlarmNoLaterThan(input.nowMs + 1);
+        return Object.freeze({ organizationId: input.organizationId, accepted: true });
+    }
+
+    /** Private same-Worker operational status for external vector purge completion or manual intervention. */
+    vectorOrganizationPurgeStatus(input: {
+        readonly organizationId: string;
+        readonly schemaEpoch: number;
+        readonly domainSchemaEpoch: number;
+    }) {
+        try {
+            const vshard = Number(vshardOf([input.organizationId]));
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertActiveSchemaEpoch(input.domainSchemaEpoch, sql);
+            this.resharding.assertRoutingAdmission(input.schemaEpoch, vshard, sql);
+            this.assertFileOwnership(input.organizationId, sql);
+            const status = new CdbVectorOrganizationDeletionStore(sql, callback => callback()).readPurgeStatus(
+                input.organizationId
+            );
+            this.assertActiveSchemaEpoch(input.domainSchemaEpoch, sql);
+            this.resharding.assertRoutingAdmission(input.schemaEpoch, vshard, sql);
+            this.assertFileOwnership(input.organizationId, sql);
+            return status;
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    private async executeRegisteredQueryPlan(input: {
+        readonly routed: Extract<QueryRouteResponse, { readonly ok: true }>;
+        readonly placement: CdbPlacement;
+        readonly auth: CdbQueryRequest["auth"];
+        readonly subject: string;
+        readonly ref: ChardbRef;
+    }): Promise<RawJson> {
+        if (input.routed.vectorPlan) {
+            if (input.routed.selectPlan || input.placement.authority !== "organization") {
+                throw subscriptionInvariant("registered vector query has conflicting plan metadata");
+            }
+            return (await executeRegisteredVectorQueryPlan({
+                index: this.resolveVectorSearchIndex(input.routed.vectorPlan.resource.binding),
+                storage: this.ctx.storage,
+                schema: this.mutationSchema(),
+                auth: input.auth,
+                plan: input.routed.vectorPlan,
+            })) as unknown as RawJson;
+        }
+        if (!input.routed.selectPlan) {
+            throw subscriptionInvariant("planned query omitted its canonical executable plan");
+        }
+        return executeCdbSelectPlan({
+            storage: this.ctx.storage,
+            schema: this.mutationSchema(),
+            plan: input.routed.selectPlan,
+            placement: input.placement,
+            auth: input.auth,
+            subject: input.subject,
+            ref: input.ref,
+            intent: input.routed.intent,
+        });
+    }
+
     /**
      * Register a live-query subscription on this shard. Caller is the Gateway DO.
      */
@@ -1589,8 +1737,12 @@ export class Cdb extends DurableObject<CdbEnv> {
         assertLiveSubscriptionIdentity(input.subscription);
         const args = { ...input, args: snapshotCdbQueryArgs(input.args) };
         this.assertActiveSchemaEpoch(args.domainSchemaEpoch);
+        if (Number(vshardOf([args.organizationId])) !== args.vshard) {
+            throw subscriptionInvariant("live subscription vshard does not match its partition");
+        }
+        let routed: Extract<QueryRouteResponse, { readonly ok: true }> | undefined;
         if (args.placement) {
-            const routed = routeValidatedQuery(this.mutationManifest(), { ref: args.ref, args: args.args }, tables =>
+            routed = routeValidatedQuery(this.mutationManifest(), { ref: args.ref, args: args.args }, tables =>
                 cdbPolicyDigest(this.mutationSchema(), tables)
             );
             if (
@@ -1601,217 +1753,64 @@ export class Cdb extends DurableObject<CdbEnv> {
                 throw subscriptionInvariant("live subscription placement does not match its server manifest route");
             }
         }
-        const intervals = this.prepareIntervals(args);
+        this.validateIntervals(args);
         const policyDigest = cdbPolicyDigest(this.mutationSchema(), args.tables);
-        const payloadHash = subscriptionPayloadHash(args, policyDigest);
-        const tableNames = [...new Set(args.tables)].sort();
+        if (routed && (routed.queryHash !== args.queryHash || routed.policyDigest !== policyDigest)) {
+            return {
+                ok: false,
+                registrationState: "absent",
+                subscription: args.subscription,
+                error: subscriptionInvariant(
+                    "live subscription plan or policy does not match its server manifest route"
+                ).toJSON(),
+            };
+        }
+        const vectorResourceId = routed?.vectorPlan ? cdbVectorResourceId(routed.vectorPlan.resource) : null;
         let response: CdbSubscriptionResponse | undefined;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             this.assertActiveSchemaEpoch(args.domainSchemaEpoch, sql);
-            const existing = sql.one<StoredSubscriptionRow>(
-                `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, authority, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
-                        tables_json, intervals_json
-                 FROM _chardb_live_subscriptions
+            const existing = sql.one<{ present: number }>(
+                `SELECT 1 AS present FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
                 args.subscription.gatewayId,
                 args.subscription.registrationId
             );
-            if (existing) {
-                if (!sameSubscriptionIdentity(existing, args.subscription)) {
-                    throw subscriptionInvariant("live subscription registration identity changed across an RPC replay");
-                }
-                if (existing.state === "retired") {
-                    throw subscriptionInvariant("retired live subscription registration cannot be reactivated");
-                }
-                if (existing.payload_hash !== payloadHash) {
-                    throw subscriptionInvariant("live subscription registration payload changed across an RPC replay");
-                }
-                assertSubscriptionTables(sql, args.subscription, tableNames);
-            } else {
-                const registrationRows = durableRowCount(
-                    sql,
-                    "SELECT COUNT(*) AS count FROM _chardb_live_subscriptions",
-                    "live registration row"
-                );
-                if (registrationRows >= CDB_MAX_LIVE_REGISTRATION_ROWS) {
+            try {
+                this.resharding.assertRoutingAdmission(args.schemaEpoch, args.vshard, sql);
+                this.assertOrganizationActive(args.organizationId, sql);
+            } catch (error) {
+                if (isCdbError(error) && error.code === "CDB_STALE_EPOCH" && !existing) {
                     response = {
                         ok: false,
                         registrationState: "absent",
                         subscription: args.subscription,
-                        error: subscriptionCapacityExceeded(
-                            "live registration row",
-                            CDB_MAX_LIVE_REGISTRATION_ROWS
-                        ).toJSON(),
+                        error: error.toJSON(),
                     };
                     return;
                 }
-                const activeRegistrations = durableRowCount(
-                    sql,
-                    "SELECT COUNT(*) AS count FROM _chardb_live_subscriptions WHERE state = 'active'",
-                    "active live registration"
-                );
-                if (activeRegistrations >= CDB_MAX_ACTIVE_LIVE_REGISTRATIONS) {
-                    response = {
-                        ok: false,
-                        registrationState: "absent",
-                        subscription: args.subscription,
-                        error: subscriptionCapacityExceeded(
-                            "active live registration",
-                            CDB_MAX_ACTIVE_LIVE_REGISTRATIONS
-                        ).toJSON(),
-                    };
-                    return;
-                }
-                sql.exec(
-                    `INSERT INTO _chardb_live_subscriptions
-                     (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                      principal_id, organization_id, authority, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
-                      tables_json, intervals_json)
-                     VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    args.subscription.gatewayId,
-                    args.subscription.registrationId,
-                    args.subscription.connectionId,
-                    args.subscription.clientId,
-                    args.subscription.subId,
-                    payloadHash,
-                    args.principalId,
-                    args.organizationId,
-                    args.placement?.authority ?? null,
-                    args.domainSchemaEpoch,
-                    args.ref,
-                    JSON.stringify(args.args),
-                    policyDigest,
-                    args.queryHash,
-                    JSON.stringify(args.tables),
-                    JSON.stringify(args.intervals)
-                );
-                for (const tableName of tableNames) {
-                    sql.exec(
-                        `INSERT INTO _chardb_live_subscription_tables
-                         (gateway_id, registration_id, table_name)
-                         VALUES (?, ?, ?)`,
-                        args.subscription.gatewayId,
-                        args.subscription.registrationId,
-                        tableName
-                    );
-                }
+                throw error;
             }
-            response = { ok: true, subscription: args.subscription, changeSeq: currentChangeSeq(sql) };
+            response = vectorResourceId
+                ? persistLiveSubscriptionWithVectorDependency(sql, args, policyDigest, vectorResourceId)
+                : persistLiveSubscription(sql, args, policyDigest);
         });
         if (!response) throw subscriptionInvariant("subscription completed without a durable outcome");
-        if (!response.ok) return response;
-        this.installSubscription(args.subscription, intervals);
         return response;
     }
 
     async unsubscribe(subscription: LiveSubscriptionId): Promise<void> {
         assertLiveSubscriptionIdentity(subscription);
-        const key = subscriptionKey(subscription);
         this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const existing = sql.one<StoredSubscriptionRow>(
-                `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
-                        tables_json, intervals_json
-                 FROM _chardb_live_subscriptions
-                 WHERE gateway_id = ? AND registration_id = ?`,
-                subscription.gatewayId,
-                subscription.registrationId
-            );
-            if (existing && !sameSubscriptionIdentity(existing, subscription)) {
-                throw subscriptionInvariant("live subscription unregister identity does not match its registration");
-            }
-            if (!existing || existing.state === "active") {
-                const rows = durableRowCount(
-                    sql,
-                    "SELECT COUNT(*) AS count FROM _chardb_live_subscriptions",
-                    "live registration row"
-                );
-                if (!existing && rows >= CDB_MAX_LIVE_REGISTRATION_ROWS) {
-                    throw subscriptionCapacityExceeded("live registration row", CDB_MAX_LIVE_REGISTRATION_ROWS);
-                }
-                const projectedBytes = retiredTombstoneBytes(sql) + subscriptionIdentityBytes(subscription);
-                if (projectedBytes > CDB_MAX_RETIRED_TOMBSTONE_BYTES) {
-                    throw subscriptionCapacityExceeded(
-                        "retired live subscription tombstone bytes",
-                        CDB_MAX_RETIRED_TOMBSTONE_BYTES
-                    );
-                }
-            }
-            sql.exec(
-                `INSERT INTO _chardb_live_subscriptions
-                 (gateway_id, registration_id, connection_id, client_id, sub_id, state)
-                 VALUES (?, ?, ?, ?, ?, 'retired')
-                 ON CONFLICT(gateway_id, registration_id) DO UPDATE SET
-                   state = 'retired',
-                   payload_hash = NULL,
-                   principal_id = NULL,
-                   organization_id = NULL,
-                   authority = NULL,
-                   domain_schema_epoch = NULL,
-                   ref = NULL,
-                   args_json = NULL,
-                   policy_digest = NULL,
-                   query_hash = NULL,
-                   tables_json = NULL,
-                   intervals_json = NULL`,
-                subscription.gatewayId,
-                subscription.registrationId,
-                subscription.connectionId,
-                subscription.clientId,
-                subscription.subId
-            );
-            sql.exec(
-                `DELETE FROM _chardb_live_subscription_tables
-                 WHERE gateway_id = ? AND registration_id = ?`,
-                subscription.gatewayId,
-                subscription.registrationId
-            );
-            sql.exec(
-                `DELETE FROM _chardb_invalidation_outbox
-                 WHERE gateway_id = ? AND registration_id = ?`,
-                subscription.gatewayId,
-                subscription.registrationId
-            );
+            retireLiveSubscription(adaptSqlStorage(this.ctx.storage.sql), subscription);
         });
-        this.intervalMap.unregister(key);
-        this.subscriptions.delete(key);
     }
 
     /** Delete one exact tombstone after Gateway has finished every pending install and cleanup retry for it. */
     async finalizeUnsubscribe(subscription: LiveSubscriptionId): Promise<void> {
         assertLiveSubscriptionIdentity(subscription);
         this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const existing = sql.one<StoredSubscriptionRow>(
-                `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
-                        tables_json, intervals_json
-                 FROM _chardb_live_subscriptions
-                 WHERE gateway_id = ? AND registration_id = ?`,
-                subscription.gatewayId,
-                subscription.registrationId
-            );
-            if (!existing) return;
-            if (!sameSubscriptionIdentity(existing, subscription)) {
-                throw subscriptionInvariant("live subscription finalize identity does not match its tombstone");
-            }
-            if (existing.state !== "retired") {
-                throw subscriptionInvariant("active live subscription cannot be finalized");
-            }
-            sql.exec(
-                `DELETE FROM _chardb_live_subscriptions
-                 WHERE gateway_id = ? AND registration_id = ? AND connection_id = ?
-                   AND client_id = ? AND sub_id = ? AND state = 'retired'`,
-                subscription.gatewayId,
-                subscription.registrationId,
-                subscription.connectionId,
-                subscription.clientId,
-                subscription.subId
-            );
-            if (sql.changes() !== 1) throw subscriptionInvariant("live subscription tombstone changed before finalize");
+            finalizeRetiredLiveSubscription(adaptSqlStorage(this.ctx.storage.sql), subscription);
         });
     }
 
@@ -1819,65 +1818,62 @@ export class Cdb extends DurableObject<CdbEnv> {
     async mutate(input: CdbMutationRequest): Promise<CdbMutationResponse> {
         let response: CdbMutationResponse;
         try {
-            const principalId = input.principalId;
-            const mutId = input.mutId;
-            const ref = input.ref;
-            const schemaEpoch = input.schemaEpoch;
-            const domainSchemaEpoch = input.domainSchemaEpoch;
-            const auth = snapshotMutationAuth(input.auth);
-            const args = snapshotCdbMutationArgs(input.args);
-            const request: CdbMutationRequest = {
-                principalId,
-                mutId,
-                ref,
-                args,
-                ...(input.placement === undefined ? {} : { placement: input.placement }),
-                auth,
-                schemaEpoch,
-                domainSchemaEpoch,
-            };
-            this.assertActiveSchemaEpoch(request.domainSchemaEpoch);
-            const descriptor = resolveMutation(this.mutationManifest(), request.ref as ChardbRef);
-            const declaredPartition = descriptor.extractPartitionKey?.(request.args);
-            if (
-                request.placement &&
-                (descriptor.authority !== request.placement.authority ||
-                    declaredPartition === undefined ||
-                    String(declaredPartition) !== request.placement.partitionKey)
-            ) {
-                throw subscriptionInvariant("mutation placement does not match its server manifest route");
-            }
-            try {
-                await this.ctx.storage.setAlarm(this.invalidationNowMs() + 1);
-            } catch (error) {
-                throw new CdbError({
-                    code: "CDB_SHARD_UNAVAILABLE",
-                    message: "could not arm invalidation recovery before mutation commit",
-                    cause: error,
-                });
-            }
-            const result = executeAtomicMutation({
+            let vectorContext: CdbVectorMutationContext | undefined;
+            response = await executeCdbMutation({
                 storage: this.ctx.storage,
-                schema: this.mutationSchema(),
-                request,
-                ...(request.placement === undefined ? {} : { placement: request.placement }),
-                // This is an internal post-validation RPC. The configured
-                // Gateway validates raw wire args and forwards this exact value.
-                handler: (ctx, args) => descriptor.invokeValidated(ctx, args),
-                cookie: `${this.ctx.id.toString()}:${Date.now()}:${crypto.randomUUID()}`,
-                beforeRun: sql => {
-                    this.assertActiveSchemaEpoch(request.domainSchemaEpoch, sql);
+                cdbId: () => this.ctx.id.toString(),
+                schema: () => this.mutationSchema(),
+                manifest: () => this.mutationManifest(),
+                request: input,
+                invalidationNowMs: () => this.invalidationNowMs(),
+                assertActiveSchemaEpoch: (expectedEpoch, sql) => {
+                    this.assertActiveSchemaEpoch(expectedEpoch, sql);
                 },
-                onWriteSet: ({ touchedTables, sql }) => {
-                    enqueueInvalidations(sql, touchedTables);
+                assertRoutingFence: (schemaEpoch, placement, sql) => {
+                    if (!placement) {
+                        this.resharding.assertUnplacedRoutingAdmission(sql);
+                        return;
+                    }
+                    this.resharding.assertRoutingAdmission(
+                        schemaEpoch,
+                        Number(vshardOf([placement.partitionKey])),
+                        sql
+                    );
+                    if (placement.authority === "organization") {
+                        this.assertOrganizationActive(placement.partitionKey, sql);
+                    }
+                },
+                extendContext: (ctx, sql, isTransactionActive, placement) => {
+                    vectorContext = new CdbVectorMutationContext({
+                        sql,
+                        schema: this.mutationSchema(),
+                        auth: input.auth,
+                        placement,
+                        nowMs: this.invalidationNowMs(),
+                        isTransactionActive,
+                        assertOrganizationActive: organizationId => this.assertOrganizationActive(organizationId, sql),
+                    });
+                    return bindCdbVectorMutationContext(ctx, vectorContext);
+                },
+                captureSplitOutcome: ({ sql, principalId, mutId, placement }) => {
+                    vectorContext?.assertDomainHeads();
+                    if (!placement) return;
+                    this.resharding.captureSplitOutcome({
+                        sql,
+                        principalId,
+                        mutId,
+                        vshard: Number(vshardOf([placement.partitionKey])),
+                    });
                 },
             });
-            response = { ok: true, ...result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
         }
         try {
-            await this.maintainInvalidationDelivery();
+            // Vector outbox delivery can wait on an external Vectorize call. The
+            // transaction already armed the durable alarm, so keep that network
+            // boundary out of the committed mutation response path.
+            await this.maintainAlarmWork({ deliverVectors: false });
         } catch {
             // The pre-armed alarm owns recovery. The mutation is committed and
             // its result must remain stable across an op-log replay.
@@ -1886,7 +1882,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     override async alarm(): Promise<void> {
-        await this.maintainInvalidationDelivery();
+        await this.maintainAlarmWork({ deliverVectors: true });
     }
 
     /** Execute a registered shard-local query without exposing it through Gateway yet. */
@@ -1894,6 +1890,11 @@ export class Cdb extends DurableObject<CdbEnv> {
         try {
             const request = { ...input, args: snapshotCdbQueryArgs(input.args) };
             this.assertActiveSchemaEpoch(request.domainSchemaEpoch);
+            if (request.placement) this.assertRoutingEpoch(request.schemaEpoch, request.placement);
+            else this.resharding.assertUnplacedRoutingAdmission();
+            if (request.placement?.authority === "organization") {
+                this.assertOrganizationActive(request.placement.partitionKey, adaptSqlStorage(this.ctx.storage.sql));
+            }
             const descriptor = resolveQuery(this.mutationManifest(), request.ref);
             const routed =
                 request.placement || descriptor.compilePlan
@@ -1911,24 +1912,63 @@ export class Cdb extends DurableObject<CdbEnv> {
             }
             const declaredIntent =
                 routed?.intent ?? (descriptor.extractIntent ? descriptor.extractIntent(request.args) : undefined);
-            const readTables = new Set<string>();
-            const readRanges = new Map<object, QueryReadRangeObservation>();
-            const database = wrapQueryDb(
-                drizzle(this.ctx.storage, { schema: this.mutationSchema() }),
-                request.auth,
-                tableName => readTables.add(tableName),
-                observation => readRanges.set(observation.token, observation),
-                request.placement
-            );
-            const result = snapshotCdbQueryResultLimits(
-                await descriptor.invokeValidated({ db: readOnlyQueryDb(database), auth: request.auth }, request.args),
-                "query result"
-            );
-            if (declaredIntent) {
-                assertQueryIntentCoversReads(request.ref, declaredIntent.tables, readTables);
-                assertQueryIntentCoversRanges(request.ref, declaredIntent, readRanges);
+            let result: RawJson;
+            if (descriptor.compilePlan) {
+                if (!routed || !request.placement || !declaredIntent) {
+                    throw subscriptionInvariant("planned query omitted its canonical plan, placement, or intent");
+                }
+                result = await this.executeRegisteredQueryPlan({
+                    routed,
+                    placement: request.placement,
+                    auth: request.auth,
+                    subject: "query result",
+                    ref: request.ref,
+                });
+            } else {
+                result = await executeCdbQueryHandler({
+                    storage: this.ctx.storage,
+                    schema: this.mutationSchema(),
+                    auth: request.auth,
+                    placement: request.placement,
+                    subject: "query result",
+                    ref: request.ref,
+                    intent: declaredIntent,
+                    invoke: db => descriptor.invokeValidated({ db, auth: request.auth }, request.args),
+                });
+            }
+            if (request.placement) this.assertRoutingEpoch(request.schemaEpoch, request.placement);
+            else this.resharding.assertUnplacedRoutingAdmission();
+            if (request.placement?.authority === "organization") {
+                this.assertOrganizationActive(request.placement.partitionKey, adaptSqlStorage(this.ctx.storage.sql));
             }
             this.assertActiveSchemaEpoch(request.domainSchemaEpoch);
+            return { ok: true, result };
+        } catch (error) {
+            return { ok: false, error: cdbRuntimeError(error).toJSON() };
+        }
+    }
+
+    /** Execute one native binding plan after revalidation against this shard's packaged schema. */
+    async executePlan(input: CdbBindingPlanRequest): Promise<CdbQueryResponse> {
+        try {
+            this.assertActiveSchemaEpoch(input.domainSchemaEpoch);
+            this.assertRoutingEpoch(input.schemaEpoch, input.placement);
+            if (input.placement.authority === "organization") {
+                this.assertOrganizationActive(input.placement.partitionKey, adaptSqlStorage(this.ctx.storage.sql));
+            }
+            const result = await executeCdbSelectPlan({
+                storage: this.ctx.storage,
+                schema: this.mutationSchema(),
+                plan: input.plan,
+                placement: input.placement,
+                auth: input.auth,
+                subject: "DB select plan result",
+            });
+            this.assertRoutingEpoch(input.schemaEpoch, input.placement);
+            if (input.placement.authority === "organization") {
+                this.assertOrganizationActive(input.placement.partitionKey, adaptSqlStorage(this.ctx.storage.sql));
+            }
+            this.assertActiveSchemaEpoch(input.domainSchemaEpoch);
             return { ok: true, result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
@@ -1942,7 +1982,8 @@ export class Cdb extends DurableObject<CdbEnv> {
             this.assertActiveSchemaEpoch(request.domainSchemaEpoch, sql);
             const row = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, authority, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+                        principal_id, organization_id, authority, schema_epoch, vshard, domain_schema_epoch,
+                        ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
@@ -1958,14 +1999,25 @@ export class Cdb extends DurableObject<CdbEnv> {
                 throw subscriptionInvariant("registered query principal does not match fresh authorization");
             }
             const subscription = parseStoredSubscription(row);
+            if (Number(vshardOf([subscription.organizationId])) !== request.vshard) {
+                throw subscriptionInvariant("registered query vshard does not match its persisted partition");
+            }
             if (subscription.domainSchemaEpoch !== request.domainSchemaEpoch) {
                 throw new CdbError({
                     code: "CDB_STALE_EPOCH",
                     message: "registered query belongs to an older domain schema epoch",
                 });
             }
+            if (subscription.schemaEpoch !== request.schemaEpoch || subscription.vshard !== request.vshard) {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "registered query belongs to an older physical routing generation",
+                    hint: "resolve the active vshard placement from Catalog and reinstall the subscription",
+                });
+            }
+            this.resharding.assertRoutingAdmission(request.schemaEpoch, request.vshard, sql);
             assertSubscriptionTables(sql, subscription.subscription, [...new Set(subscription.tables)].sort());
-            this.prepareIntervals(subscription);
+            this.validateIntervals(subscription);
 
             const routed = routeValidatedQuery(
                 this.mutationManifest(),
@@ -1992,6 +2044,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             if (routed.authority === "organization" && reroutedPartition !== request.auth.tenantId) {
                 throw subscriptionInvariant("registered query organization does not match fresh authorization");
             }
+            if (routed.authority === "organization") this.assertOrganizationActive(reroutedPartition, sql);
             if (routed.authority === "user" && reroutedPartition !== request.auth.userId) {
                 throw subscriptionInvariant("registered query user does not match fresh authorization");
             }
@@ -2004,33 +2057,39 @@ export class Cdb extends DurableObject<CdbEnv> {
             if (routed.queryHash !== subscription.queryHash) {
                 throw subscriptionInvariant("registered query intent changed after registration");
             }
+            const vectorResourceId = routed.vectorPlan ? cdbVectorResourceId(routed.vectorPlan.resource) : null;
+            assertLiveVectorSubscriptionDependency(sql, subscription.subscription, vectorResourceId);
 
             const descriptor = resolveQuery(this.mutationManifest(), subscription.ref);
-            const readTables = new Set<string>();
-            const readRanges = new Map<object, QueryReadRangeObservation>();
-            const database = wrapQueryDb(
-                drizzle(this.ctx.storage, { schema: this.mutationSchema() }),
-                request.auth,
-                tableName => readTables.add(tableName),
-                observation => readRanges.set(observation.token, observation),
-                { authority: routed.authority, partitionKey: reroutedPartition }
-            );
-            const result = snapshotCdbQueryResultLimits(
-                await descriptor.invokeValidated(
-                    { db: readOnlyQueryDb(database), auth: request.auth },
-                    subscription.args
-                ),
-                "registered query result"
-            );
+            let result: RawJson;
+            if (descriptor.compilePlan) {
+                result = await this.executeRegisteredQueryPlan({
+                    routed,
+                    placement: { authority: routed.authority, partitionKey: reroutedPartition },
+                    auth: request.auth,
+                    subject: "registered query result",
+                    ref: subscription.ref,
+                });
+            } else {
+                result = await executeCdbQueryHandler({
+                    storage: this.ctx.storage,
+                    schema: this.mutationSchema(),
+                    auth: request.auth,
+                    placement: { authority: routed.authority, partitionKey: reroutedPartition },
+                    subject: "registered query result",
+                    ref: subscription.ref,
+                    intent: routed.intent,
+                    invoke: db => descriptor.invokeValidated({ db, auth: request.auth }, subscription.args),
+                });
+            }
             if (!Array.isArray(result)) {
                 throw subscriptionInvariant("registered query result must be an array");
             }
-            assertQueryIntentCoversReads(subscription.ref, routed.intent.tables, readTables);
-            assertQueryIntentCoversRanges(subscription.ref, routed.intent, readRanges);
 
             const current = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, authority, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+                        principal_id, organization_id, authority, schema_epoch, vshard, domain_schema_epoch,
+                        ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
                  WHERE gateway_id = ? AND registration_id = ?`,
@@ -2047,13 +2106,18 @@ export class Cdb extends DurableObject<CdbEnv> {
                 current.payload_hash !== row.payload_hash ||
                 current.policy_digest !== row.policy_digest ||
                 current.query_hash !== row.query_hash ||
+                current.schema_epoch !== row.schema_epoch ||
+                current.vshard !== row.vshard ||
                 current.domain_schema_epoch !== row.domain_schema_epoch
             ) {
                 throw subscriptionInvariant("registered query changed while its handler was running");
             }
             parseStoredSubscription(current);
             assertSubscriptionTables(sql, request.subscription, [...new Set(subscription.tables)].sort());
+            assertLiveVectorSubscriptionDependency(sql, request.subscription, vectorResourceId);
             this.assertActiveSchemaEpoch(request.domainSchemaEpoch, sql);
+            this.resharding.assertRoutingAdmission(request.schemaEpoch, request.vshard, sql);
+            if (routed.authority === "organization") this.assertOrganizationActive(reroutedPartition, sql);
             return { ok: true, result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
@@ -2061,45 +2125,797 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     /**
-     * Snapshot the current op-log row id. The Catalog records this as the
-     * shard's bookmark for an open barrier, giving every barrier a per-shard
-     * coordinate that PITR restore can replay forward to.
-     */
-    /**
      * Source-side begin: records the migration in `_chardb_split_state` and
      * installs `AFTER INSERT/UPDATE/DELETE` triggers on each migrating table
      * that project changes into `_chardb_split_log`. The destination later
      * replays those rows in LSN order, filtering by `vshardOf(partition_key)`
-     * so peer migrations on the same source don't cross-pollute. Triggers are
-     * `IF NOT EXISTS`, so re-entry after a crash is idempotent.
+     * so peer migrations on the same source don't cross-pollute. Exact
+     * re-entry replaces every deterministic trigger inside this transaction,
+     * upgrading active captures without a write gap.
      */
+    prepareReshardFileSource(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly afterKind: "file" | "organization_tombstone";
+            readonly afterId: string;
+            readonly limit: number;
+        }
+    ): {
+        enabled: boolean;
+        backfill: { files: number; tombstones: number; done: boolean };
+        cursor: { kind: "file" | "organization_tombstone"; afterId: string; done: boolean };
+    } {
+        if (!this.hasOrganizationTombstoneResources()) {
+            return {
+                enabled: false,
+                backfill: { files: 0, tombstones: 0, done: true },
+                cursor: { kind: args.afterKind, afterId: args.afterId, done: true },
+            };
+        }
+        if (args.limit !== CDB_FILE_RESHARD_PAGE_SIZE) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "file reshard preparation limit must be 500" });
+        }
+        let result:
+            | {
+                  enabled: true;
+                  backfill: { files: number; tombstones: number; done: boolean };
+                  cursor: { kind: "file" | "organization_tombstone"; afterId: string; done: boolean };
+              }
+            | undefined;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertFileReshardSchema(args, sql);
+            const backfill = backfillFilePlacements(sql, args.limit);
+            const cursor = backfill.done
+                ? validateFilePlacementsPage(sql, {
+                      afterKind: args.afterKind,
+                      afterId: args.afterId,
+                      limit: args.limit,
+                  })
+                : { kind: args.afterKind, afterId: args.afterId, done: false };
+            result = { enabled: true, backfill, cursor };
+        });
+        if (!result) throw new CdbError({ code: "CDB_INVARIANT", message: "file reshard preparation failed" });
+        return result;
+    }
+
+    beginReshardFileSource(args: Omit<CdbReshardSplitIdentity, "role">): {
+        enabled: boolean;
+        triggersInstalled: number;
+    } {
+        if (!this.hasOrganizationTombstoneResources()) return { enabled: false, triggersInstalled: 0 };
+        let triggersInstalled = 0;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.resharding.assertReshardMovement({
+                migId: args.migId,
+                role: "source",
+                range: { lo: args.rangeLo, hi: args.rangeHi },
+                tables: args.tables,
+                sql,
+            });
+            const missing = sql.one<{ present: number }>(
+                `SELECT 1 AS present FROM _chardb_files WHERE placement_vshard IS NULL
+                 UNION ALL
+                 SELECT 1 AS present FROM _chardb_deleted_organizations WHERE placement_vshard IS NULL LIMIT 1`
+            );
+            if (missing) {
+                throw new CdbError({
+                    code: "CDB_RESHARD_PHASE_MISMATCH",
+                    message: "file placement backfill must finish before source capture starts",
+                });
+            }
+            new CdbFileReshardStore(sql).beginSource(this.fileReshardIdentity(args), Date.now());
+            const triggers = renderFileReshardTriggers(args.migId);
+            for (const statement of triggers.uninstall) sql.exec(statement);
+            for (const statement of triggers.install) {
+                sql.exec(statement);
+                triggersInstalled++;
+            }
+        });
+        return { enabled: true, triggersInstalled };
+    }
+
+    beginReshardFileDest(args: Omit<CdbReshardSplitIdentity, "role">): {
+        enabled: boolean;
+        triggersUninstalled: number;
+    } {
+        if (!this.hasOrganizationTombstoneResources()) return { enabled: false, triggersUninstalled: 0 };
+        let triggersUninstalled = 0;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertFileReshardSchema(args, sql);
+            this.resharding.assertFreshDestinationProvisioningAllowed(args.migId);
+            new CdbFileReshardStore(sql).beginDest(this.fileReshardIdentity(args), Date.now());
+            triggersUninstalled = this.setFileAttachmentTriggers(sql, "uninstall");
+        });
+        return { enabled: true, triggersUninstalled };
+    }
+
+    readReshardFileSnapshot(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly afterPlacement: number;
+            readonly afterFileId: string;
+            readonly limit: number;
+        }
+    ) {
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.resharding.assertReshardMovement({ migId: args.migId, role: "source", sql });
+            const page = new CdbFileReshardStore(sql).readSnapshot({
+                ...this.fileReshardIdentity(args),
+                afterPlacement: args.afterPlacement,
+                afterFileId: args.afterFileId,
+                limit: args.limit,
+            });
+            return { ...page, throughLsn: this.fileSnapshotThroughLsn(sql, args.migId) };
+        });
+    }
+
+    applyReshardFileSnapshot(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly rows: readonly CdbReshardFileRecord[];
+            readonly throughLsn: number;
+        }
+    ): { applied: number; inserted: number } {
+        let result: { applied: number; inserted: number } | undefined;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.resharding.assertReshardMovement({ migId: args.migId, role: "dest", sql });
+            result = new CdbFileReshardStore(sql).applySnapshot(
+                this.fileReshardIdentity(args),
+                args.rows,
+                args.throughLsn
+            );
+        });
+        if (!result) throw new CdbError({ code: "CDB_INVARIANT", message: "file snapshot apply failed" });
+        return result;
+    }
+
+    readReshardFileTombstones(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly afterPlacement: number;
+            readonly afterOrganizationId: string;
+            readonly limit: number;
+        }
+    ) {
+        const page = this.readReshardFileTombstonesV2(args);
+        if (page.rows.some(row => row.vectorUnprovenTurns !== 0)) {
+            throw new CdbError({
+                code: "CDB_RESHARD_PHASE_MISMATCH",
+                message: "legacy file tombstone snapshot cannot carry vector purge progress",
+            });
+        }
+        return {
+            ...page,
+            rows: page.rows.map(({ vectorUnprovenTurns: _omitted, ...row }) => row),
+        };
+    }
+
+    readReshardFileTombstonesV2(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly afterPlacement: number;
+            readonly afterOrganizationId: string;
+            readonly limit: number;
+        }
+    ) {
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.resharding.assertReshardMovement({ migId: args.migId, role: "source", sql });
+            const page = new CdbFileReshardStore(sql).readTombstones({
+                ...this.fileReshardIdentity(args),
+                afterPlacement: args.afterPlacement,
+                afterOrganizationId: args.afterOrganizationId,
+                limit: args.limit,
+            });
+            return { ...page, throughLsn: this.fileSnapshotThroughLsn(sql, args.migId) };
+        });
+    }
+
+    applyReshardFileTombstones(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly rows: readonly CdbReshardOrganizationTombstone[];
+            readonly throughLsn: number;
+        }
+    ): { applied: number; inserted: number } {
+        const rows = args.rows.map(row => {
+            const vectorUnprovenTurns = (row as Partial<CdbReshardOrganizationTombstone>).vectorUnprovenTurns;
+            if (vectorUnprovenTurns !== undefined && vectorUnprovenTurns !== 0) {
+                throw new CdbError({
+                    code: "CDB_RESHARD_PHASE_MISMATCH",
+                    message: "legacy file tombstone apply cannot carry vector purge progress",
+                });
+            }
+            return { ...row, vectorUnprovenTurns: 0 };
+        });
+        return this.applyReshardFileTombstonesV2({ ...args, rows });
+    }
+
+    applyReshardFileTombstonesV2(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly rows: readonly CdbReshardOrganizationTombstone[];
+            readonly throughLsn: number;
+        }
+    ): { applied: number; inserted: number } {
+        let result: { applied: number; inserted: number } | undefined;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.resharding.assertReshardMovement({ migId: args.migId, role: "dest", sql });
+            result = new CdbFileReshardStore(sql).applyTombstones(
+                this.fileReshardIdentity(args),
+                args.rows,
+                args.throughLsn
+            );
+        });
+        if (!result) throw new CdbError({ code: "CDB_INVARIANT", message: "file tombstone apply failed" });
+        return result;
+    }
+
+    fenceReshardFileSource(args: Omit<CdbReshardSplitIdentity, "role">): { fenced: boolean } {
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.resharding.assertReshardMovement({ migId: args.migId, role: "source", sql });
+            new CdbFileReshardStore(sql).fenceSource(this.fileReshardIdentity(args), Date.now());
+        });
+        return { fenced: true };
+    }
+
+    validateReshardFiles(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly cursor: CdbFileReshardDrainCursor;
+            readonly limit: number;
+        }
+    ) {
+        this.resharding.assertReshardMovement({ migId: args.migId, role: "dest" });
+        return new CdbFileReshardStore(adaptSqlStorage(this.ctx.storage.sql)).validate(
+            this.fileReshardIdentity(args),
+            args.cursor,
+            args.limit
+        );
+    }
+
+    reshardFileAppliedProvenance(args: Omit<CdbReshardSplitIdentity, "role">): { rows: number; legacyRows: number } {
+        this.resharding.assertReshardMovement({ migId: args.migId, role: "dest" });
+        return new CdbFileReshardStore(adaptSqlStorage(this.ctx.storage.sql)).appliedProvenance(
+            this.fileReshardIdentity(args)
+        );
+    }
+
+    readReshardFileParityPage(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly role: "source" | "dest";
+            readonly cursor: CdbFileReshardDrainCursor;
+            readonly limit: number;
+        }
+    ): CdbFileReshardParityPage {
+        this.resharding.assertReshardMovement({ migId: args.migId, role: args.role });
+        return new CdbFileReshardStore(adaptSqlStorage(this.ctx.storage.sql)).readParityPage(
+            this.fileReshardIdentity(args),
+            args.role,
+            args.cursor,
+            args.limit
+        );
+    }
+
+    prepareReshardFileDestAttachments(args: Omit<CdbReshardSplitIdentity, "role">): {
+        prepared: boolean;
+        triggersInstalled: number;
+    } {
+        let prepared = false;
+        let triggersInstalled = 0;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.resharding.assertReshardMovement({ migId: args.migId, role: "dest", sql });
+            triggersInstalled = this.setFileAttachmentTriggers(sql, "install");
+            prepared = new CdbFileReshardStore(sql).prepareDestAttachments(
+                this.fileReshardIdentity(args),
+                Date.now()
+            ).prepared;
+        });
+        return { prepared, triggersInstalled };
+    }
+
+    activateReshardFileDest(args: Omit<CdbReshardSplitIdentity, "role">): { activated: boolean } {
+        let activated = false;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.resharding.assertReshardMovement({ migId: args.migId, role: "dest", sql });
+            activated = new CdbFileReshardStore(sql).activateDest(this.fileReshardIdentity(args), Date.now()).activated;
+        });
+        return { activated };
+    }
+
+    stopReshardFileSource(args: Omit<CdbReshardSplitIdentity, "role">): {
+        stopped: boolean;
+        triggersUninstalled: number;
+    } {
+        let stopped = false;
+        let triggersUninstalled = 0;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.resharding.assertReshardMovement({ migId: args.migId, role: "source", sql });
+            const capture = renderFileReshardTriggers(args.migId);
+            for (const statement of capture.uninstall) {
+                sql.exec(statement);
+                triggersUninstalled++;
+            }
+            // Attachment triggers are table-wide. Source routing rejects the moved range,
+            // while unrelated ranges on this Cdb still need their normal file lifecycle.
+            stopped = new CdbFileReshardStore(sql).stopSourceAttachments(
+                this.fileReshardIdentity(args),
+                Date.now()
+            ).stopped;
+        });
+        return { stopped, triggersUninstalled };
+    }
+
+    drainReshardFiles(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly cursor: CdbFileReshardDrainCursor;
+            readonly limit: number;
+        }
+    ) {
+        let result: ReturnType<CdbFileReshardStore["drain"]> | undefined;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.resharding.assertReshardMovement({ migId: args.migId, role: "source", sql });
+            result = new CdbFileReshardStore(sql).drain(this.fileReshardIdentity(args), args.cursor, args.limit);
+        });
+        if (!result) throw new CdbError({ code: "CDB_INVARIANT", message: "file metadata drain failed" });
+        return result;
+    }
+
+    abortReshardFiles(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly role: "source" | "dest";
+            readonly afterKind?: "" | "file" | "organization_tombstone";
+            readonly afterId?: string;
+            readonly limit?: number;
+        }
+    ) {
+        let result: {
+            afterKind: "" | "file" | "organization_tombstone";
+            afterId: string;
+            deleted: number;
+            done: boolean;
+        } = {
+            afterKind: args.afterKind ?? "",
+            afterId: args.afterId ?? "",
+            deleted: 0,
+            done: true,
+        };
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const store = new CdbFileReshardStore(sql);
+            if (args.role === "source") {
+                for (const statement of renderFileReshardTriggers(args.migId).uninstall) sql.exec(statement);
+                this.setFileAttachmentTriggers(sql, "install");
+                store.abortSource(this.fileReshardIdentity(args), Date.now());
+                return;
+            }
+            this.setFileAttachmentTriggers(sql, "uninstall");
+            result = store.abortDest(
+                this.fileReshardIdentity(args),
+                Date.now(),
+                args.afterKind,
+                args.afterId,
+                args.limit
+            );
+        });
+        return result;
+    }
+
+    finishReshardFiles(
+        args: Omit<CdbReshardSplitIdentity, "role"> & { readonly role: "source" | "dest"; readonly limit?: number }
+    ) {
+        let result: { cleaned: number; done: boolean } | undefined;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            result = new CdbFileReshardStore(sql).finish(
+                this.fileReshardIdentity(args),
+                args.role,
+                Date.now(),
+                args.limit
+            );
+        });
+        if (!result) throw new CdbError({ code: "CDB_INVARIANT", message: "file reshard finish failed" });
+        return result;
+    }
+
+    beginReshardVectorSource(args: Omit<CdbReshardSplitIdentity, "role">) {
+        if (this.vectorResources().length === 0) {
+            return { enabled: false as const, triggersInstalled: 0, snapshot: null };
+        }
+        let result:
+            | {
+                  enabled: true;
+                  triggersInstalled: number;
+                  snapshot: ReturnType<CdbVectorReshardSnapshotSessionStore["begin"]>;
+              }
+            | undefined;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardSourceIdentity(args, sql, "capturing");
+            assertVectorReshardCaptureForeignKeys(sql);
+            const triggers = renderVectorReshardTriggers(args.migId);
+            this.uninstallVectorReshardTriggers(sql, args.migId);
+            for (const statement of triggers.install) sql.exec(statement);
+            const snapshot = new CdbVectorReshardSnapshotSessionStore(sql).begin(identity);
+            result = { enabled: true, triggersInstalled: triggers.install.length, snapshot };
+        });
+        if (!result) throw new CdbError({ code: "CDB_INVARIANT", message: "vector source capture begin failed" });
+        return result;
+    }
+
+    inspectReshardVectorSnapshot(args: Omit<CdbReshardSplitIdentity, "role">) {
+        if (this.vectorResources().length === 0) return { enabled: false as const, snapshot: null };
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardSourceIdentity(args, sql, "capturing");
+            return {
+                enabled: true as const,
+                snapshot: new CdbVectorReshardSnapshotSessionStore(sql).inspect(identity),
+            };
+        });
+    }
+
+    readReshardVectorSnapshot(args: Omit<CdbReshardSplitIdentity, "role"> & CdbVectorReshardSnapshotRequest) {
+        if (this.vectorResources().length === 0) return { enabled: false as const, page: null };
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardSourceIdentity(args, sql, "capturing");
+            const page = new CdbVectorReshardSnapshotSessionStore(sql).read(identity, {
+                pageNumber: args.pageNumber,
+                cursor: args.cursor,
+            });
+            return { enabled: true as const, page };
+        });
+    }
+
+    stopReshardVectorSource(args: Omit<CdbReshardSplitIdentity, "role">) {
+        if (this.vectorResources().length === 0) {
+            return { enabled: false as const, stopped: false, triggersUninstalled: 0 };
+        }
+        let triggersUninstalled = 0;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardSourceIdentity(args, sql, "frozen");
+            const snapshot = new CdbVectorReshardSnapshotSessionStore(sql).inspect(identity);
+            if (!snapshot.terminal) {
+                throw new CdbError({
+                    code: "CDB_RESHARD_PHASE_MISMATCH",
+                    message: "vector snapshot must finish before source capture stops",
+                });
+            }
+            const tail = sql.one<{ readonly acked_lsn: number; readonly high_lsn: number }>(
+                `SELECT state.acked_lsn,
+                        MAX(state.acked_lsn, COALESCE(
+                            (SELECT MAX(tail.lsn) FROM _chardb_split_log AS tail WHERE tail.mig_id = state.mig_id),
+                            0
+                        )) AS high_lsn
+                 FROM _chardb_split_state AS state
+                 WHERE state.mig_id = ? AND state.role = 'source'`,
+                args.migId
+            );
+            if (!tail || tail.acked_lsn !== tail.high_lsn) {
+                throw new CdbError({
+                    code: "CDB_RESHARD_PHASE_MISMATCH",
+                    message: "generic source tail must converge before vector capture stops",
+                });
+            }
+            triggersUninstalled = this.uninstallVectorReshardTriggers(sql, args.migId);
+        });
+        return { enabled: true as const, stopped: triggersUninstalled > 0, triggersUninstalled };
+    }
+
+    beginReshardVectorDest(args: Omit<CdbReshardSplitIdentity, "role"> & { readonly throughHeadSeq: number }) {
+        if (this.vectorResources().length === 0) return { enabled: false as const, cursor: null };
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardDestIdentity(args, sql, "bulk");
+            initializeCdbVectorReshardDestStore(sql);
+            this.setVectorMutationTriggers(sql, this.vectorResources(), "uninstall");
+            uninstallCdbVectorOrganizationDeletionGuards(sql);
+            return {
+                enabled: true as const,
+                cursor: new CdbVectorReshardDestStore(sql).begin(identity, args.throughHeadSeq),
+            };
+        });
+    }
+
+    applyReshardVectorSnapshot(args: Omit<CdbReshardSplitIdentity, "role"> & CdbVectorReshardDestRequest) {
+        if (this.vectorResources().length === 0) return { enabled: false as const, result: null };
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardDestIdentity(args, sql, "bulk");
+            return { enabled: true as const, result: new CdbVectorReshardDestStore(sql).apply(identity, args) };
+        });
+    }
+
+    readReshardVectorParityPage(
+        args: Omit<CdbReshardSplitIdentity, "role"> & { readonly cursor: CdbVectorReshardCursor }
+    ) {
+        if (this.vectorResources().length === 0) return { enabled: false as const, encodedPage: null, throughLsn: 0 };
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardSourceIdentity(args, sql, "frozen");
+            const page = new CdbVectorReshardSnapshotReader(sql).read(identity, args.cursor);
+            return {
+                enabled: true as const,
+                encodedPage: encodeCdbVectorReshardPage(page),
+                throughLsn: this.fileSnapshotThroughLsn(sql, args.migId),
+            };
+        });
+    }
+
+    verifyReshardVectorParity(args: Omit<CdbReshardSplitIdentity, "role"> & CdbVectorReshardParityRequest) {
+        if (this.vectorResources().length === 0) return { enabled: false as const, result: null };
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardDestIdentity(args, sql, "parity");
+            const split = sql.one<{ applied_lsn: number }>(
+                "SELECT applied_lsn FROM _chardb_split_state WHERE mig_id = ? AND role = 'dest'",
+                args.migId
+            );
+            if (!split || split.applied_lsn !== args.throughLsn) {
+                throw new CdbError({
+                    code: "CDB_RESHARD_PHASE_MISMATCH",
+                    message: "vector parity watermark does not equal the destination tail cursor",
+                });
+            }
+            return {
+                enabled: true as const,
+                result: new CdbVectorReshardDestStore(sql).verifyParityPage(identity, args),
+            };
+        });
+    }
+
+    finalizeReshardVectorDest(args: Omit<CdbReshardSplitIdentity, "role"> & { readonly throughLsn: number }) {
+        if (this.vectorResources().length === 0) {
+            return { enabled: false as const, finalized: false, triggersInstalled: 0 };
+        }
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardDestIdentity(args, sql, "parity");
+            const split = sql.one<{ applied_lsn: number }>(
+                "SELECT applied_lsn FROM _chardb_split_state WHERE mig_id = ? AND role = 'dest'",
+                args.migId
+            );
+            if (!split || split.applied_lsn !== args.throughLsn) {
+                throw new CdbError({
+                    code: "CDB_RESHARD_PHASE_MISMATCH",
+                    message: "vector finalization watermark does not equal the destination tail cursor",
+                });
+            }
+            const changed = new CdbVectorReshardDestStore(sql).finalize(identity, args.throughLsn).finalized;
+            const finalized =
+                sql.one<{ outcome: string }>(
+                    "SELECT outcome FROM _chardb_vector_reshard_dest_sessions WHERE mig_id = ?",
+                    args.migId
+                )?.outcome === "finalized";
+            this.assertVectorDerivedState(sql);
+            const resources = this.vectorResources();
+            this.setVectorMutationTriggers(sql, resources, "install");
+            installCdbVectorOrganizationDeletionGuards(sql);
+            const triggersInstalled = resources.reduce(
+                (count, resource) => count + renderVectorMutationTriggerSet(resource).install.length,
+                0
+            );
+            this.assertVectorMutationTriggersInstalled(sql);
+            return { enabled: true as const, finalized, changed, triggersInstalled };
+        });
+    }
+
+    prepareReshardVectorSourceDrain(
+        args: Omit<CdbReshardSplitIdentity, "role"> & { readonly cursor: CdbVectorReshardSourcePrepareCursor }
+    ) {
+        if (this.vectorResources().length === 0) return { enabled: false as const, result: null };
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardSourceIdentity(args, sql, "frozen");
+            return {
+                enabled: true as const,
+                result: new CdbVectorReshardSourceDrainStore(sql).prepare(identity, args.cursor),
+            };
+        });
+    }
+
+    drainReshardVectorSource(
+        args: Omit<CdbReshardSplitIdentity, "role"> & { readonly cursor: CdbVectorReshardSourceDeleteCursor }
+    ) {
+        if (this.vectorResources().length === 0) return { enabled: false as const, result: null };
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardSourceIdentity(args, sql, "frozen");
+            if (args.cursor.kind === "head") {
+                assertReshardSourceDomainDrained(sql, args.migId, args.tables);
+            }
+            return {
+                enabled: true as const,
+                result: new CdbVectorReshardSourceDrainStore(sql).delete(identity, args.cursor),
+            };
+        });
+    }
+
+    abortReshardVectorDest(
+        args: Omit<CdbReshardSplitIdentity, "role"> & {
+            readonly destinationGeneration: number;
+            readonly limit?: number;
+        }
+    ) {
+        if (this.vectorResources().length === 0) return { enabled: false as const, result: null };
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const session = sql.one("SELECT 1 FROM _chardb_vector_reshard_dest_sessions WHERE mig_id = ?", args.migId);
+            const bound = sql.one("SELECT 1 FROM _chardb_split_identity WHERE mig_id = ?", args.migId);
+            if (!session) {
+                if (bound) {
+                    this.assertVectorReshardDestIdentity(args, sql, "abort");
+                    this.setVectorMutationTriggers(sql, this.vectorResources(), "install");
+                    installCdbVectorOrganizationDeletionGuards(sql);
+                } else {
+                    assertCdbReshardRangeIdentity(args);
+                    const schema = this.schemaMigrations.state(sql);
+                    const split = sql.one<{
+                        role: string;
+                        range_lo: number;
+                        range_hi: number;
+                        destination_generation: number | null;
+                        destination_serving: number;
+                        abort_started: number;
+                        drained: number;
+                    }>(
+                        `SELECT role, range_lo, range_hi, destination_generation, destination_serving,
+                                abort_started, drained
+                         FROM _chardb_split_state WHERE mig_id = ?`,
+                        args.migId
+                    );
+                    if (
+                        schema.status !== "active" ||
+                        schema.activeVersion !== args.schemaVersion ||
+                        schema.activeEpoch !== args.schemaEpoch ||
+                        schema.activeDigest !== args.schemaDigest ||
+                        split?.role !== "dest" ||
+                        split.range_lo !== args.rangeLo ||
+                        split.range_hi !== args.rangeHi ||
+                        split.destination_generation !== args.destinationGeneration ||
+                        split.destination_serving !== 0 ||
+                        split.abort_started !== 1 ||
+                        split.drained !== 1
+                    ) {
+                        throw new CdbError({
+                            code: "CDB_RESHARD_PHASE_MISMATCH",
+                            message: `migration ${args.migId} has no exact vector destination abort tombstone`,
+                        });
+                    }
+                }
+                return { enabled: false as const, result: null };
+            }
+            const identity = this.assertVectorReshardDestIdentity(args, sql, "abort");
+            this.setVectorMutationTriggers(sql, this.vectorResources(), "uninstall");
+            uninstallCdbVectorOrganizationDeletionGuards(sql);
+            const result = new CdbVectorReshardDestStore(sql).abort(identity, args.limit, { allowFinalized: true });
+            if (result.done) {
+                this.setVectorMutationTriggers(sql, this.vectorResources(), "install");
+                installCdbVectorOrganizationDeletionGuards(sql);
+            }
+            return { enabled: true as const, result };
+        });
+    }
+
+    private cleanupReshardVectorSource(
+        args: Omit<CdbReshardSplitIdentity, "role">,
+        options: { readonly allowAbsent?: boolean } = {}
+    ) {
+        if (this.vectorResources().length === 0) {
+            return { enabled: false as const, cleaned: false, done: true, triggersUninstalled: 0 };
+        }
+        let cleaned = false;
+        let done = false;
+        let triggersUninstalled = 0;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const session = sql.one("SELECT 1 FROM _chardb_vector_snapshot_sessions WHERE mig_id = ?", args.migId);
+            if (!session && options.allowAbsent) {
+                const bound = sql.one("SELECT 1 FROM _chardb_split_identity WHERE mig_id = ?", args.migId);
+                if (bound) {
+                    this.assertVectorReshardSourceIdentity(args, sql, "drained");
+                    triggersUninstalled = this.uninstallVectorReshardTriggers(sql, args.migId);
+                } else {
+                    assertCdbReshardRangeIdentity(args);
+                    const schema = this.schemaMigrations.state(sql);
+                    const split = sql.one<{
+                        role: string;
+                        range_lo: number;
+                        range_hi: number;
+                        capture: number;
+                        abort_started: number;
+                        drained: number;
+                    }>(
+                        `SELECT role, range_lo, range_hi, capture, abort_started, drained
+                         FROM _chardb_split_state WHERE mig_id = ?`,
+                        args.migId
+                    );
+                    if (
+                        schema.status !== "active" ||
+                        schema.activeVersion !== args.schemaVersion ||
+                        schema.activeEpoch !== args.schemaEpoch ||
+                        schema.activeDigest !== args.schemaDigest ||
+                        split?.role !== "source" ||
+                        split.range_lo !== args.rangeLo ||
+                        split.range_hi !== args.rangeHi ||
+                        split.capture !== 0 ||
+                        split.abort_started !== 1 ||
+                        split.drained !== 1
+                    ) {
+                        throw new CdbError({
+                            code: "CDB_RESHARD_PHASE_MISMATCH",
+                            message: `migration ${args.migId} has no exact vector source abort tombstone`,
+                        });
+                    }
+                }
+                done = true;
+                return;
+            }
+            const identity = this.assertVectorReshardSourceIdentity(args, sql, "drained");
+            triggersUninstalled = this.uninstallVectorReshardTriggers(sql, args.migId);
+            cleaned = new CdbVectorReshardSnapshotSessionStore(sql).cleanup(identity).cleaned;
+            done =
+                sql.one<{ cleaned: number }>(
+                    "SELECT cleaned FROM _chardb_vector_snapshot_sessions WHERE mig_id = ?",
+                    args.migId
+                )?.cleaned === 1;
+        });
+        return { enabled: true as const, cleaned, done, triggersUninstalled };
+    }
+
+    abortReshardVectors(args: Omit<CdbReshardSplitIdentity, "role">) {
+        return this.cleanupReshardVectorSource(args, { allowAbsent: true });
+    }
+
+    finishReshardVectorDest(args: Omit<CdbReshardSplitIdentity, "role">) {
+        if (this.vectorResources().length === 0) return { enabled: false as const, cleaned: false, done: true };
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const identity = this.assertVectorReshardDestIdentity(args, sql, "serving");
+            const cleanup = new CdbVectorReshardDestStore(sql).cleanup(identity);
+            const done =
+                sql.one<{ cleaned: number }>(
+                    "SELECT cleaned FROM _chardb_vector_reshard_dest_sessions WHERE mig_id = ?",
+                    args.migId
+                )?.cleaned === 1;
+            return { enabled: true as const, ...cleanup, done };
+        });
+    }
+
+    finishReshardVectors(args: Omit<CdbReshardSplitIdentity, "role">) {
+        return this.cleanupReshardVectorSource(args);
+    }
+
     async beginReshardSource(args: {
         migId: string;
         rangeLo: number;
         rangeHi: number;
+        schemaVersion: number;
+        schemaEpoch: number;
+        schemaDigest: string;
         tables: readonly TableSpec[];
     }): Promise<{ enabled: boolean; triggersInstalled: number }> {
-        let triggers = 0;
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            sql.exec(
-                `INSERT INTO _chardb_split_state (mig_id, range_lo, range_hi, role, capture, updated_at)
-         VALUES (?, ?, ?, 'source', 1, ?)
-         ON CONFLICT(mig_id) DO UPDATE SET capture = 1, updated_at = excluded.updated_at`,
-                args.migId,
-                args.rangeLo,
-                args.rangeHi,
-                Date.now()
+        if (!this.hasOrganizationTombstoneResources()) {
+            this.ctx.storage.transactionSync(() =>
+                this.resharding.assertNoUnmovableFileState(adaptSqlStorage(this.ctx.storage.sql))
             );
-            for (const t of args.tables) {
-                const ts = renderTableTriggers(args.migId, t);
-                for (const stmt of ts.install) {
-                    sql.exec(stmt);
-                    triggers++;
-                }
-            }
-        });
-        return { enabled: true, triggersInstalled: triggers };
+        }
+        return this.resharding.beginReshardSource(args);
+    }
+
+    /** Persist fail-closed destination ownership before any provisioning can expose the shard. */
+    prepareReshardDestOwnership(args: {
+        migId: string;
+        rangeLo: number;
+        rangeHi: number;
+        destinationGeneration: number;
+    }): { prepared: boolean; serving: boolean } {
+        return this.resharding.prepareReshardDestOwnership(args);
     }
 
     /** Destination-shard counterpart; tracks the migration so duplicate applies are rejected. */
@@ -2107,34 +2923,80 @@ export class Cdb extends DurableObject<CdbEnv> {
         migId: string;
         rangeLo: number;
         rangeHi: number;
+        schemaVersion: number;
+        schemaEpoch: number;
+        schemaDigest: string;
+        tables: readonly TableSpec[];
+        destinationGeneration: number;
     }): Promise<{ ready: boolean }> {
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        sql.exec(
-            `INSERT OR IGNORE INTO _chardb_split_state (mig_id, range_lo, range_hi, role, capture, updated_at)
-       VALUES (?, ?, ?, 'dest', 0, ?)`,
-            args.migId,
-            args.rangeLo,
-            args.rangeHi,
-            Date.now()
-        );
-        return { ready: true };
+        return this.resharding.beginReshardDest(args);
+    }
+
+    /** Start serving only after Catalog has committed this exact cutover generation. */
+    async activateReshardDestServing(
+        args: Omit<CdbReshardSplitIdentity, "role"> & { destinationGeneration: number }
+    ): Promise<{ activated: boolean }> {
+        const result = this.resharding.activateReshardDestServing(args);
+        if (this.vectorResources().length > 0) {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const pendingOrganizationDeletion = new CdbVectorOrganizationDeletionStore(sql, callback =>
+                callback()
+            ).nextPendingPage();
+            if (pendingOrganizationDeletion) {
+                await this.scheduleAlarmNoLaterThan(this.invalidationNowMs() + 1);
+            }
+            const nextVectorAt = new CdbVectorOutboxStore(sql).nextDueAt();
+            if (nextVectorAt !== null) {
+                await this.scheduleAlarmNoLaterThan(Math.max(this.invalidationNowMs() + 1, nextVectorAt));
+            }
+        }
+        return result;
+    }
+
+    /** Read bounded captured mutation outcomes in source LSN order. */
+    async readSplitOpLogBatch(args: {
+        migId: string;
+        afterLsn: number;
+        limit: number;
+    }): Promise<SplitOpLogBatch> {
+        return this.resharding.readSplitOpLogBatch(args);
+    }
+
+    /** Prune source mutation outcomes only after the Resharder durably records destination acceptance. */
+    async ackSplitOpLog(args: { migId: string; throughLsn: number }): Promise<SplitOpLogAckResult> {
+        return this.resharding.ackSplitOpLog(args);
+    }
+
+    /** Reconstruct source mutation outcomes and its durable cursor atomically on the destination. */
+    async applySplitOpLogBatch(args: {
+        migId: string;
+        rangeLo: number;
+        rangeHi: number;
+        entries: SplitOpLogBatch["entries"];
+    }): Promise<SplitOpLogApplyResult> {
+        return this.resharding.applySplitOpLogBatch(args);
     }
 
     /** Returns the tail-capture watermark — the latest `_chardb_split_log.lsn` Source has produced. */
     async tailWatermark(migId: string): Promise<{ lsn: number }> {
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        const row = sql.one<{ max_lsn: number | null }>(
-            "SELECT MAX(lsn) AS max_lsn FROM _chardb_split_log WHERE mig_id = ?",
-            migId
-        );
-        return { lsn: row?.max_lsn ?? 0 };
+        return this.resharding.tailWatermark(migId);
+    }
+
+    /** Resolve the deterministic parent-before-child order for bulk copy. */
+    async reshardTableOrder(args: {
+        migId: string;
+        role: "source" | "dest";
+        range: RangeFilter;
+        tables: readonly TableSpec[];
+    }): Promise<{ tableNames: readonly string[] }> {
+        return this.resharding.reshardTableOrder(args);
     }
 
     /**
      * Read one paginated bulk-copy batch from this (source) shard. The batch
      * contains rows whose partition column hashes into `[lo, hi]`; the caller
      * pages by `afterRowid` until `done=true`. Rows are returned as plain
-     * column maps so the destination can reuse `renderRowApply`.
+     * column maps for the destination's primary-key-aware apply path.
      */
     async bulkCopyBatch(args: {
         migId: string;
@@ -2143,24 +3005,14 @@ export class Cdb extends DurableObject<CdbEnv> {
         afterRowid: number;
         limit: number;
     }): Promise<{ rows: readonly Record<string, RawJson>[]; lastRowid: number; done: boolean }> {
-        const ident = quoteIdent(args.table.name);
-        const cols = args.table.columns.map(quoteIdent).join(", ");
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        const raw = sql.all<Record<string, RawJson> & { rowid: number }>(
-            `SELECT rowid, ${cols} FROM ${ident} WHERE rowid > ? ORDER BY rowid LIMIT ?`,
-            args.afterRowid,
-            args.limit
-        );
-        const rows = filterRowsInRange(raw, args.table.partitionColumn, args.range);
-        const lastRowid = raw.at(-1)?.rowid ?? args.afterRowid;
-        const done = raw.length < args.limit;
-        return { rows, lastRowid, done };
+        return this.resharding.bulkCopyBatch(args);
     }
 
     /**
      * Apply a bulk-copy batch on this (destination) shard. Each row is filtered
      * by `vshardOf(partition_key) ∈ range` defensively so a misrouted batch
-     * cannot corrupt non-migrating data, then upserted via `INSERT OR REPLACE`.
+     * cannot corrupt non-migrating data, then upserted against the declared
+     * primary key without SQLite's delete-and-insert `REPLACE` behavior.
      * The whole batch runs in a single `transactionSync` to keep destination
      * state consistent against retries.
      */
@@ -2170,18 +3022,12 @@ export class Cdb extends DurableObject<CdbEnv> {
         range: RangeFilter;
         rows: readonly Record<string, RawJson>[];
     }): Promise<{ applied: number; skipped: number }> {
-        const accepted = filterRowsInRange(args.rows, args.table.partitionColumn, args.range);
-        const skipped = args.rows.length - accepted.length;
-        let applied = 0;
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            for (const r of accepted) {
-                const { sql: stmt, params } = renderRowApply(args.table, r);
-                sql.exec(stmt, ...(params as readonly (string | number | bigint | Uint8Array | null)[]));
-                applied++;
-            }
-        });
-        return { applied, skipped };
+        return this.resharding.applyBulkBatch(args);
+    }
+
+    /** Permanently reject delayed bulk batches once all source snapshots are copied. */
+    async closeReshardBulkDest(args: Omit<CdbReshardSplitIdentity, "role">): Promise<{ closed: boolean }> {
+        return this.resharding.closeReshardBulkDest(args);
     }
 
     /**
@@ -2195,62 +3041,58 @@ export class Cdb extends DurableObject<CdbEnv> {
         afterLsn: number;
         limit: number;
     }): Promise<{
-        entries: readonly TailEntry[];
+        transactions: readonly TailTransaction[];
         lastLsn: number;
         done: boolean;
     }> {
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        const entries = sql.all<TailEntry>(
-            "SELECT lsn, op, table_name, pk, after, before FROM _chardb_split_log WHERE mig_id = ? AND lsn > ? ORDER BY lsn LIMIT ?",
-            args.migId,
-            args.afterLsn,
-            args.limit
-        );
-        const lastLsn = entries.at(-1)?.lsn ?? args.afterLsn;
-        const done = entries.length < args.limit;
-        return { entries, lastLsn, done };
+        return this.resharding.readTailBatch(args);
+    }
+
+    /** Prune only tail transactions the Resharder has durably acknowledged. */
+    async ackTail(args: { migId: string; throughLsn: number }): Promise<{ pruned: number; ackedLsn: number }> {
+        return this.resharding.ackTail(args);
+    }
+
+    /** Durably stage complete source transactions while stale bulk pages may still arrive. */
+    async stageTailBatch(args: {
+        migId: string;
+        tables: readonly TableSpec[];
+        range: RangeFilter;
+        transactions: readonly TailTransaction[];
+    }): Promise<{ staged: number; lastLsn: number }> {
+        return this.resharding.stageTailBatch(args);
+    }
+
+    async readStagedTailBatch(args: { migId: string; limit: number }): Promise<{ transactions: TailTransaction[] }> {
+        return this.resharding.readStagedTailBatch(args);
+    }
+
+    async ackStagedTail(args: { migId: string; throughLsn: number }): Promise<{ removed: number }> {
+        return this.resharding.ackStagedTail(args);
+    }
+
+    async closeTailStaging(args: Omit<CdbReshardSplitIdentity, "role">): Promise<{ closed: boolean }> {
+        return this.resharding.closeTailStaging(args);
     }
 
     /**
-     * Apply a tail batch on the destination. `ins`/`upd` decode `after` (a
-     * trigger-emitted JSON object) and upsert; `del` deletes by partition
-     * column = `pk`. Range-filtered defensively as in `applyBulkBatch`.
+     * Apply one source-ordered, cross-table tail batch on the destination.
+     * The data changes and durable LSN cursor commit in one transaction.
+     * Inserts and updates use primary-key-aware upserts. Deletes use the exact
+     * primary key recovered from the trigger pre-image.
      */
     async applyTailBatch(args: {
         migId: string;
-        table: TableSpec;
+        tables: readonly TableSpec[];
         range: RangeFilter;
-        entries: readonly TailEntry[];
+        transactions: readonly TailTransaction[];
     }): Promise<{ applied: number; lastLsn: number }> {
-        let applied = 0;
-        let lastLsn = 0;
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            for (const e of args.entries) {
-                lastLsn = e.lsn;
-                const pk = parseScalarPk(e.pk);
-                if (!isPkInRange(pk, args.range)) continue;
-                if (e.op === "del") {
-                    sql.exec(
-                        `DELETE FROM ${quoteIdent(args.table.name)} WHERE ${quoteIdent(args.table.partitionColumn)} = ?`,
-                        pk
-                    );
-                } else {
-                    const row = parseJsonColumn("after", e.after);
-                    if (!row) continue;
-                    const { sql: stmt, params } = renderRowApply(args.table, row);
-                    sql.exec(stmt, ...(params as readonly (string | number | bigint | Uint8Array | null)[]));
-                }
-                applied++;
-            }
-            sql.exec(
-                "UPDATE _chardb_split_state SET applied_lsn = MAX(applied_lsn, ?), updated_at = ? WHERE mig_id = ?",
-                lastLsn,
-                Date.now(),
-                args.migId
-            );
-        });
-        return { applied, lastLsn };
+        return this.resharding.applyTailBatch(args);
+    }
+
+    /** Freeze source capture after fenced convergence and before destructive drain. */
+    async stopReshardCapture(args: Omit<CdbReshardSplitIdentity, "role">): Promise<{ stopped: boolean }> {
+        return this.resharding.stopReshardCapture(args);
     }
 
     /**
@@ -2265,47 +3107,52 @@ export class Cdb extends DurableObject<CdbEnv> {
         range: RangeFilter;
         batchSize: number;
     }): Promise<{ deleted: number; done: boolean }> {
-        const ident = quoteIdent(args.table.name);
-        const pkCol = quoteIdent(args.table.partitionColumn);
-        let deleted = 0;
-        let done = true;
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const rows = sql.all<{ rowid: number; pk: RawJson }>(
-                `SELECT rowid, ${pkCol} AS pk FROM ${ident} ORDER BY rowid LIMIT ?`,
-                args.batchSize
-            );
-            const candidates: number[] = [];
-            for (const r of rows) {
-                if (isPkInRange(r.pk, args.range)) candidates.push(r.rowid);
-            }
-            for (const rid of candidates) {
-                sql.exec(`DELETE FROM ${ident} WHERE rowid = ?`, rid);
-                deleted++;
-            }
-            done = rows.length < args.batchSize;
-        });
-        return { deleted, done };
+        return this.resharding.dropMigratedRange(args);
     }
 
     /**
      * Tear down the per-migration triggers and mark the split-state row as
      * drained. After this call the source is clean of all migration artifacts.
      */
-    async finishReshardSource(args: { migId: string; tables: readonly TableSpec[] }): Promise<void> {
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            for (const t of args.tables) {
-                const ts = renderTableTriggers(args.migId, t);
-                for (const stmt of ts.uninstall) sql.exec(stmt);
-            }
-            sql.exec(
-                "UPDATE _chardb_split_state SET capture = 0, drained = 1, updated_at = ? WHERE mig_id = ?",
-                Date.now(),
-                args.migId
-            );
-            sql.exec("DELETE FROM _chardb_split_log WHERE mig_id = ?", args.migId);
-        });
+    async finishReshardSource(args: Omit<CdbReshardSplitIdentity, "role">): Promise<void> {
+        return this.resharding.finishReshardSource(args);
+    }
+
+    /** Stop source capture and remove all transient artifacts before a pre-fence abort. */
+    async abortReshardSource(args: Omit<CdbReshardSplitIdentity, "role">): Promise<void> {
+        return this.resharding.abortReshardSource(args);
+    }
+
+    /** Permanently fence destination movement RPCs before bounded abort cleanup starts. */
+    async beginReshardDestAbort(
+        args: Omit<CdbReshardSplitIdentity, "role"> & { destinationGeneration: number }
+    ): Promise<{ started: boolean }> {
+        const result = await this.resharding.beginReshardDestAbort(args);
+        if (this.vectorResources().length > 0) {
+            this.ctx.storage.transactionSync(() => {
+                const sql = adaptSqlStorage(this.ctx.storage.sql);
+                const ownsVectorAbort =
+                    sql.one("SELECT 1 FROM _chardb_split_identity WHERE mig_id = ?", args.migId) !== null ||
+                    sql.one("SELECT 1 FROM _chardb_vector_reshard_dest_sessions WHERE mig_id = ?", args.migId) !== null;
+                if (ownsVectorAbort) {
+                    this.setVectorMutationTriggers(sql, this.vectorResources(), "uninstall");
+                    uninstallCdbVectorOrganizationDeletionGuards(sql);
+                }
+            });
+        }
+        return result;
+    }
+
+    /** Delete one bounded child-before-parent destination abort batch. */
+    async abortReshardDestBatch(
+        args: Omit<CdbReshardSplitIdentity, "role"> & { batchSize: number }
+    ): Promise<{ deleted: number; done: boolean }> {
+        return this.resharding.abortReshardDestBatch(args);
+    }
+
+    /** Mark a successful destination split drained and release transfer-only state. */
+    async finishReshardDest(args: Omit<CdbReshardSplitIdentity, "role">): Promise<void> {
+        return this.resharding.finishReshardDest(args);
     }
 
     async barrierBookmark(): Promise<number> {
@@ -2344,34 +3191,4 @@ function cdbRuntimeError(error: unknown): CdbError {
         return new CdbError({ code: "CDB_INVARIANT", message: error.message });
     }
     return new CdbError({ code: "CDB_INVARIANT", message: "mutation failed with a non-Error value" });
-}
-
-export type { IntervalSet, IntervalKey };
-export { SubId };
-
-export interface TailEntry {
-    lsn: number;
-    op: "ins" | "upd" | "del";
-    table_name: string;
-    pk: string;
-    /** `json_object(...)` of the post-image; `null` for `del` ops. */
-    after: JsonText | null;
-    /** `json_object(...)` of the pre-image (currently only set for `del`). */
-    before: JsonText | null;
-}
-
-const ALLOWED_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
-function quoteIdent(raw: string): string {
-    if (!ALLOWED_IDENT.test(raw)) throw new Error(`reshard: refusing identifier: ${raw}`);
-    return `"${raw}"`;
-}
-
-function parseScalarPk(s: string): string | number {
-    const n = Number(s);
-    if (s !== "" && Number.isFinite(n) && String(n) === s) return n;
-    return s;
-}
-
-function isPkInRange(value: unknown, range: RangeFilter): boolean {
-    return inRange(value, range);
 }

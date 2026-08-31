@@ -1,8 +1,9 @@
 /**
- * `chardb/react` — `ChardbProvider` + hooks. All hooks accept function refs
- * from `chardb/server`; users never type a wire identifier as a string.
+ * `@chardb/core/react` — `ChardbProvider` + hooks. All hooks accept function refs
+ * from `@chardb/core/server`; users never type a wire identifier as a string.
  */
 
+import type { Column } from "drizzle-orm";
 import {
     type PropsWithChildren,
     type ReactElement,
@@ -19,6 +20,7 @@ import {
 import type { ChardbClient, ChardbClientOptions } from "../client/index.ts";
 import { createDeferredChardbClientController } from "../client/index.ts";
 import { snapshotSubscriptionArguments } from "../client/serialized-json.ts";
+import { type ChardbFileClient, type FileRef, createFileClient } from "../files/index.ts";
 import { stableJson } from "../util/canonical.ts";
 import type { RawJson } from "../wire.ts";
 
@@ -49,23 +51,20 @@ export type InferRow<F> = F extends (...args: never[]) => Promise<infer R>
     : never;
 
 /**
- * Subset of the better-auth `authClient` API the provider relies on.
- * Typed structurally so consumers can pass any object that satisfies
- * the shape — no hard dependency on `better-auth/client` at the type
- * level (the actual `createAuthClient(...)` value satisfies this).
+ * Subset of the Better Auth client API the provider relies on. Both the
+ * framework-neutral client and the React client expose the same session atom,
+ * although the React client keeps it under `$store.atoms.session` and exposes
+ * `useSession` as a hook.
  */
 export interface AuthClientLike {
     readonly $fetch: <T = unknown>(
         path: string,
         init?: { method?: string; body?: unknown }
     ) => Promise<{ data: T | null; error: { message?: string } | null }>;
-    /**
-     * Better-auth's `useSession` is a nanostores atom (not a React
-     * hook): `{ get(): SessionStoreValue, subscribe(fn): () => void }`.
-     * `useSession()` from this module wraps it in `useSyncExternalStore`
-     * to project the current shape into React state.
-     */
-    readonly useSession: AuthSessionAtom;
+    readonly useSession?: AuthSessionAtom | (() => unknown);
+    readonly $store?: {
+        readonly atoms: { readonly session?: AuthSessionAtom; readonly [key: string]: unknown };
+    };
 }
 
 /** Minimal nanostores atom surface — just enough to drive `useSyncExternalStore`. */
@@ -77,6 +76,7 @@ export interface AuthSessionAtom {
 export interface SessionData {
     readonly user?: { readonly id: string; readonly [k: string]: unknown };
     readonly session?: {
+        readonly id?: string;
         readonly userId?: string;
         readonly activeOrganizationId?: string | null;
         readonly [k: string]: unknown;
@@ -86,7 +86,6 @@ export interface SessionData {
 
 interface ChardbContextValue {
     readonly client: ChardbClient;
-    readonly auth: AuthClientLike | null;
 }
 
 type ProviderClientResource =
@@ -99,26 +98,60 @@ interface PendingClientClose {
 
 const ChardbCtx = createContext<ChardbContextValue | null>(null);
 
+function authSessionAtom(auth: AuthClientLike | null): AuthSessionAtom | null {
+    const direct = auth?.useSession;
+    if (
+        typeof direct === "object" &&
+        direct !== null &&
+        typeof direct.get === "function" &&
+        typeof direct.subscribe === "function"
+    ) {
+        return direct;
+    }
+    const stored = auth?.$store?.atoms.session;
+    return stored && typeof stored.get === "function" && typeof stored.subscribe === "function" ? stored : null;
+}
+
+function sessionIdentity(atom: AuthSessionAtom | null): string | null {
+    const data = atom?.get().data;
+    const userId = data?.user?.id ?? data?.session?.userId;
+    if (!userId) return null;
+    return JSON.stringify([userId, data?.session?.id ?? null]);
+}
+
+function useAuthSessionIdentity(atom: AuthSessionAtom | null): string | null {
+    const subscribe = useCallback((listener: () => void) => (atom ? atom.subscribe(listener) : () => {}), [atom]);
+    const getSnapshot = useCallback(() => sessionIdentity(atom), [atom]);
+    return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
 export interface ChardbProviderProps extends Partial<ChardbClientOptions> {
     readonly client?: ChardbClient;
     /**
      * better-auth `createAuthClient(...)` instance. When provided,
-     * `ChardbProvider` derives `getJwt` from `authClient.$fetch("/token")`
-     * (the standard `jwt()` plugin endpoint) so the user doesn't write
-     * their own JWT-fetch shim. `useSession()` delegates to
-     * `authClient.useSession()`.
+     * `ChardbProvider` gets a token from the standard Better Auth `jwt()`
+     * plugin through `$fetch("/token")`. Better Auth clients use a dynamic
+     * action proxy, so property-presence checks cannot discover optional
+     * actions safely. Accepts clients created by `better-auth/react` and
+     * `better-auth/client`.
      */
     readonly auth?: AuthClientLike;
 }
 
 export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): ReactElement {
     const jwtAuth = props.getJwt === undefined ? props.auth : undefined;
+    const sessionAtom = authSessionAtom(props.auth ?? null);
+    const authSessionIdentity = useAuthSessionIdentity(sessionAtom);
+    const jwtSessionIdentity = jwtAuth === undefined ? null : authSessionIdentity;
     const resource = useMemo<ProviderClientResource>(() => {
         if (props.client !== undefined) return { client: props.client, owned: false };
         const getJwt =
             props.getJwt ??
             (jwtAuth
                 ? async () => {
+                      if (jwtSessionIdentity === null) {
+                          throw new Error("chardb: cannot fetch a JWT without an authenticated Better Auth session");
+                      }
                       const r = await jwtAuth.$fetch<{ token: string }>("/token");
                       if (r.error || !r.data?.token) {
                           throw new Error(`chardb: failed to fetch JWT (${r.error?.message ?? "no token"})`);
@@ -129,25 +162,23 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
         if (!props.endpoint || !getJwt) {
             throw new Error("ChardbProvider requires {endpoint} plus either {getJwt} or {auth: createAuthClient(...)}");
         }
-        const controller = createDeferredChardbClientController({
-            endpoint: props.endpoint,
-            getJwt,
-            ...(props.clientId !== undefined ? { clientId: props.clientId } : {}),
-            ...(props.logicalDb !== undefined ? { logicalDb: props.logicalDb } : {}),
-            ...(props.crossTab !== undefined ? { crossTab: props.crossTab } : {}),
-            ...(props.persistMutations !== undefined ? { persistMutations: props.persistMutations } : {}),
-            ...(props.mutationTimeoutMs !== undefined ? { mutationTimeoutMs: props.mutationTimeoutMs } : {}),
-        });
+        const controller = createDeferredChardbClientController(
+            {
+                endpoint: props.endpoint,
+                getJwt,
+                ...(props.clientId !== undefined ? { clientId: props.clientId } : {}),
+                ...(props.mutationTimeoutMs !== undefined ? { mutationTimeoutMs: props.mutationTimeoutMs } : {}),
+            },
+            { autoStartOnOperation: false }
+        );
         return { client: controller.client, owned: true, start: controller.start };
     }, [
         props.client,
         props.endpoint,
         props.getJwt,
         jwtAuth,
+        jwtSessionIdentity,
         props.clientId,
-        props.logicalDb,
-        props.crossTab,
-        props.persistMutations,
         props.mutationTimeoutMs,
     ]);
     const pendingCloses = useRef(new WeakMap<ChardbClient, Set<PendingClientClose>>());
@@ -158,7 +189,7 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
             for (const pending of pendingForClient) pending.cancelled = true;
             pendingCloses.current.delete(resource.client);
         }
-        if (resource.owned) resource.start();
+        if (resource.owned && (jwtAuth === undefined || jwtSessionIdentity !== null)) resource.start();
         return () => {
             if (!resource.owned) return;
             const pending: PendingClientClose = { cancelled: false };
@@ -174,12 +205,9 @@ export function ChardbProvider(props: PropsWithChildren<ChardbProviderProps>): R
                 if (!pending.cancelled) resource.client.close();
             });
         };
-    }, [resource]);
+    }, [resource, jwtAuth, jwtSessionIdentity]);
 
-    const value = useMemo<ChardbContextValue>(
-        () => ({ client: resource.client, auth: props.auth ?? null }),
-        [resource.client, props.auth]
-    );
+    const value = useMemo<ChardbContextValue>(() => ({ client: resource.client }), [resource.client]);
 
     return createElement(ChardbCtx.Provider, { value }, props.children);
 }
@@ -190,12 +218,6 @@ export function useChardb(): ChardbClient {
     return c.client;
 }
 
-function useChardbAuth(): AuthClientLike | null {
-    const c = useContext(ChardbCtx);
-    if (!c) throw new Error("useChardbAuth must be used inside <ChardbProvider>");
-    return c.auth;
-}
-
 export interface UseQueryResult<T> {
     readonly data: T[] | undefined;
     readonly state: "pending" | "live" | "error" | "refetching" | "closed";
@@ -204,7 +226,7 @@ export interface UseQueryResult<T> {
 /**
  * Wire-shape stamp every `defineQuery` value carries. Pulled out of
  * the server `QueryFn` type so the React side can refer to it without
- * dragging in `chardb/server`.
+ * dragging in `@chardb/core/server`.
  */
 export interface QueryHandleStamp<TArgs> {
     readonly __chardbRef: { toString(): string };
@@ -272,36 +294,7 @@ export function useMutation<TArgs extends RawJson = RawJson, TResult = RawJson>(
     return useCallback((args: TArgs) => client.mutate<TResult>(fn.__chardbRef.toString(), args), [client, fn]);
 }
 
-export interface SessionShape {
-    readonly userId: string | null;
-    readonly tenantId: string | null;
-    readonly isPending: boolean;
-    readonly raw: SessionData | null;
-}
-
-/**
- * Read the current session from the better-auth client passed to
- * `ChardbProvider auth={...}`. Projects the better-auth session into
- * the `AuthCtx`-shaped fields chardb policies care about
- * (`userId`/`tenantId`); the full session is exposed as `raw` for
- * consumers that want the rest. Returns nulls when no `auth` was
- * provided to the provider — callers can fall back to anonymous /
- * unauthenticated UI.
- */
-const NULL_SESSION_SNAPSHOT: { readonly data: SessionData | null; readonly isPending: boolean } = {
-    data: null,
-    isPending: false,
-};
-
-export function useSession(): SessionShape {
-    const auth = useChardbAuth();
-    const subscribe = useCallback(
-        (listener: () => void) => (auth ? auth.useSession.subscribe(listener) : () => {}),
-        [auth]
-    );
-    const getSnapshot = useCallback(() => (auth ? auth.useSession.get() : NULL_SESSION_SNAPSHOT), [auth]);
-    const session = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-    const userId = session.data?.user?.id ?? session.data?.session?.userId ?? null;
-    const tenantId = (session.data?.session?.activeOrganizationId as string | null | undefined) ?? null;
-    return { userId, tenantId, isPending: session.isPending, raw: session.data };
+/** Bind a Drizzle `file(...)` column to authenticated same-origin upload and download operations. */
+export function useFile(column: Column | FileRef): ChardbFileClient {
+    return useMemo(() => createFileClient(column), [column]);
 }

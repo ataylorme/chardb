@@ -6,8 +6,9 @@ import {
     claimDueGatewaySnapshot,
     installGatewayRegistration,
     stageGatewaySnapshot,
-} from "../../src/server/do/gateway.ts";
+} from "../../src/server/do/gateway-registration-store.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
+import { gatewayBucketName } from "../../src/server/gateway-bucket.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, type RawJson, SubId, TenantId } from "../../src/types.ts";
 import { stableHashHex } from "../../src/util/canonical.ts";
 import baseWorker, { Catalog, Cdb as LiveCdb, Gateway as LiveGateway } from "./gateway-live.entry.ts";
@@ -89,6 +90,11 @@ export class Gateway extends LiveGateway {
     // time. This durability fixture claims and acknowledges explicitly, so keep
     // the alarm from racing those deterministic transitions after reconstruction.
     override async alarm(): Promise<void> {}
+
+    // The production Gateway eagerly drains accepted invalidations. This
+    // fixture pauses that healthy path so each crash boundary can be staged by
+    // its explicit test endpoint.
+    protected override startEagerGatewayWork(): void {}
 
     protected override gatewayNowMs(): number {
         return this.snapshotNowMs ?? super.gatewayNowMs();
@@ -295,7 +301,7 @@ export class Gateway extends LiveGateway {
 export class Cdb extends LiveCdb {
     override async alarm(): Promise<void> {}
 
-    async fixtureDrain(): Promise<void> {
+    override async fixtureDrain(): Promise<void> {
         await super.alarm();
     }
 
@@ -436,7 +442,7 @@ export default {
                 return new Response("invalid drain target", { status: 400 });
             }
             const gateway = env.CDB_GATEWAY.get(
-                env.CDB_GATEWAY.idFromName(clientId.slice(0, 12))
+                env.CDB_GATEWAY.idFromName(gatewayBucketName(clientId))
             ) as unknown as GatewayFixtureRpc;
             await gateway.fixtureDrainAt(nowMs);
             return Response.json({ ok: true });
@@ -448,7 +454,7 @@ export default {
                 return new Response("invalid delivery identity", { status: 400 });
             }
             const gateway = env.CDB_GATEWAY.get(
-                env.CDB_GATEWAY.idFromName(clientId.slice(0, 12))
+                env.CDB_GATEWAY.idFromName(gatewayBucketName(clientId))
             ) as unknown as GatewayFixtureRpc;
             return Response.json(await gateway.fixtureDeliveryState(clientId, subId));
         }

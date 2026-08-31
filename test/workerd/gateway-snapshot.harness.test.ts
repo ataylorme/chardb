@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { Miniflare } from "miniflare";
+import { disposeMiniflareBounded } from "../../scripts/miniflare-lifecycle.mjs";
 import { createChardbClient } from "../../src/client/index.ts";
+import { gatewayBucketName } from "../../src/server/gateway-bucket.ts";
 import { type ChardbRef, ClientId, Cookie, MutId, SubId } from "../../src/types.ts";
 import { type Down, PROTOCOL_V, type Up, decodeWire, encodeWire } from "../../src/wire.ts";
 
@@ -240,10 +242,9 @@ async function fixtureFetch<T>(pathname: string, search: Record<string, string> 
     return (await response.json()) as T;
 }
 
-async function restartMiniflare(): Promise<void> {
-    await mf?.dispose();
-    mf = startMiniflare();
-    workerdUrl = await mf.ready;
+async function reconstructSnapshotGateway(): Promise<void> {
+    if (!mf) throw new Error("miniflare not initialized");
+    await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", { name: "snapshot-delivery-proof" });
 }
 
 function nextDown(socket: WebSocket): Promise<Down> {
@@ -427,7 +428,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-    await mf?.dispose();
+    await disposeMiniflareBounded(mf, { label: "Gateway snapshot fixture final teardown" });
+    mf = undefined;
     if (persistencePath) await rm(persistencePath, { recursive: true, force: true });
 });
 
@@ -467,7 +469,7 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
             lastSentAt: null,
         });
 
-        await restartMiniflare();
+        await reconstructSnapshotGateway();
 
         const afterRestart = await call<SnapshotState>("inspect");
         expect(afterRestart.instanceId).not.toBe(beforeRestart.instanceId);
@@ -568,7 +570,7 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
         const gatewayBeforeEviction = await gatewayState(clientId);
         const cdbBeforeEviction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
         await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", {
-            name: clientId.slice(0, 12),
+            name: gatewayBucketName(clientId),
             webSockets: "hibernate",
         });
         await mf.unsafeEvictDurableObject(WORKER_NAME, "Cdb", { name: shardId });
@@ -790,7 +792,6 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
                 endpoint: endpoint.toString(),
                 clientId,
                 getJwt: async () => jwt,
-                crossTab: false,
             });
             subscription = client.subscribe<Record<string, unknown>>(
                 queryRef,
@@ -835,7 +836,7 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
             await replacementHelloHeld;
             const gatewayBeforeReplayReconstruction = await gatewayState(clientId);
             await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", {
-                name: clientId.slice(0, 12),
+                name: gatewayBucketName(clientId),
                 webSockets: "hibernate",
             });
             const gatewayAfterReplayReconstruction = await gatewayState(clientId);

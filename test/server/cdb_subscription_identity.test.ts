@@ -1,13 +1,13 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
-import { IntervalMap } from "../../src/intervals.ts";
 import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { emptyManifest } from "../../src/server/manifest.ts";
 import type { CdbSubscriptionRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 import { stableHashHex } from "../../src/util/canonical.ts";
+import { vshardOf } from "../../src/vshard.ts";
 
 const organization = sqliteTable("organization", { id: text("id").primaryKey() });
 const { cdbTable } = forOrg();
@@ -108,6 +108,8 @@ function request(
         subscription: identity,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-1"),
+        schemaEpoch: 1,
+        vshard: Number(vshardOf(["org-1"])),
         domainSchemaEpoch: 1,
         ref: ChardbRef("queries.ts#messages"),
         args: { organizationId: "org-1" },
@@ -147,7 +149,7 @@ describe("Cdb live subscription identity", () => {
 
     afterEach(() => db.close());
 
-    test("rebuilds active registrations with colliding client subIds", async () => {
+    test("preserves active registrations with colliding client subIds across reconstruction", async () => {
         const first = subscription("gateway-do-1", "client-1");
         const second = subscription("gateway-do-1", "client-2");
         const third = subscription("gateway-do-2", "client-1");
@@ -174,16 +176,7 @@ describe("Cdb live subscription identity", () => {
             intervals_json: '[{"table":"messages","indexName":"by_org","intervals":[{"kind":"full"}]}]',
         });
 
-        const firstRebuild = spyOn(IntervalMap.prototype, "register");
         await reconstruct();
-        const firstRebuiltIntervals = firstRebuild.mock.calls.map(([key, table, indexName]) => [key, table, indexName]);
-        firstRebuild.mockRestore();
-
-        expect(firstRebuiltIntervals).toEqual([
-            ['["gateway-do-1","registration-client-1"]', "messages", "by_org"],
-            ['["gateway-do-1","registration-client-2"]', "messages", "by_org"],
-            ['["gateway-do-2","registration-client-1"]', "messages", "by_org"],
-        ]);
 
         expect(durableLiveState(db)).toEqual({
             registrations: [
@@ -233,6 +226,12 @@ describe("Cdb live subscription identity", () => {
         await expect(cdb.subscribe(request(identity, { queryHash: "query-hash-drifted" }))).rejects.toMatchObject({
             code: "CDB_INVARIANT",
         });
+        await expect(cdb.subscribe(request(identity, { schemaEpoch: 2 }))).rejects.toMatchObject({
+            code: "CDB_INVARIANT",
+        });
+        await expect(
+            cdb.subscribe(request(subscription("gateway-do-1", "client-wrong-vshard"), { vshard: 0 }))
+        ).rejects.toMatchObject({ code: "CDB_INVARIANT" });
         expect(durableLiveState(db)).toEqual({
             registrations: [durableRegistration(identity, "active")],
             tables: [durableTable(identity)],
@@ -240,35 +239,39 @@ describe("Cdb live subscription identity", () => {
         });
     });
 
-    test("rejects oversized query arguments before durable registration or interval installation", async () => {
-        const intervalRegistrations = spyOn(IntervalMap.prototype, "register");
+    test("rejects oversized query arguments before durable registration", async () => {
         const identity = subscription("gateway-query-args", "client-query-args");
-        try {
-            for (const args of [
-                { value: "é".repeat(262_139) },
-                Array.from({ length: 2_048 }, (_, index) => (index === 0 ? [null, null] : [null])),
-            ] as CdbSubscriptionRequest["args"][]) {
-                await expect(cdb.subscribe(request(identity, { args }))).rejects.toMatchObject({
-                    code: "CDB_INVALID_ARGS",
-                    retryable: false,
-                });
-            }
-            expect(intervalRegistrations).not.toHaveBeenCalled();
-            expect(durableLiveState(db)).toEqual({ registrations: [], tables: [], invalidations: [] });
-
-            await expect(cdb.subscribe(request(identity))).resolves.toEqual({
-                ok: true,
-                subscription: identity,
-                changeSeq: 0,
+        for (const args of [
+            { value: "é".repeat(262_139) },
+            Array.from({ length: 2_048 }, (_, index) => (index === 0 ? [null, null] : [null])),
+        ] as CdbSubscriptionRequest["args"][]) {
+            await expect(cdb.subscribe(request(identity, { args }))).rejects.toMatchObject({
+                code: "CDB_INVALID_ARGS",
+                retryable: false,
             });
-            expect(durableLiveState(db)).toEqual({
-                registrations: [durableRegistration(identity, "active")],
-                tables: [durableTable(identity)],
-                invalidations: [],
-            });
-        } finally {
-            intervalRegistrations.mockRestore();
         }
+        expect(durableLiveState(db)).toEqual({ registrations: [], tables: [], invalidations: [] });
+
+        await expect(cdb.subscribe(request(identity))).resolves.toEqual({
+            ok: true,
+            subscription: identity,
+            changeSeq: 0,
+        });
+        expect(durableLiveState(db)).toEqual({
+            registrations: [durableRegistration(identity, "active")],
+            tables: [durableTable(identity)],
+            invalidations: [],
+        });
+    });
+
+    test("rejects malformed interval metadata before creating durable mappings", async () => {
+        const identity = subscription("gateway-intervals", "client-intervals");
+        const intervals = [
+            { table: "messages", indexName: "by_org", intervals: [{ kind: "range" }] },
+        ] as unknown as CdbSubscriptionRequest["intervals"];
+
+        await expect(cdb.subscribe(request(identity, { intervals }))).rejects.toBeInstanceOf(TypeError);
+        expect(durableLiveState(db)).toEqual({ registrations: [], tables: [], invalidations: [] });
     });
 
     test("enforces the fixed active cap across reconstruction, replay, release, and legacy over-cap state", async () => {
@@ -279,18 +282,12 @@ describe("Cdb live subscription identity", () => {
             await cdb.subscribe(request(identity));
         }
         const excess = subscription("gateway-do-capacity", "capacity-excess", "registration-capacity-excess");
-        const intervalInstall = spyOn(IntervalMap.prototype, "register");
-        try {
-            await expect(cdb.subscribe(request(excess))).resolves.toMatchObject({
-                ok: false,
-                registrationState: "absent",
-                subscription: excess,
-                error: { code: "CDB_RATE_LIMITED", retryable: true },
-            });
-            expect(intervalInstall).not.toHaveBeenCalled();
-        } finally {
-            intervalInstall.mockRestore();
-        }
+        await expect(cdb.subscribe(request(excess))).resolves.toMatchObject({
+            ok: false,
+            registrationState: "absent",
+            subscription: excess,
+            error: { code: "CDB_RATE_LIMITED", retryable: true },
+        });
         expect(
             db.prepare("SELECT COUNT(*) AS count FROM _chardb_live_subscriptions WHERE state = 'active'").get()
         ).toEqual({ count: 4_096 });
@@ -308,38 +305,13 @@ describe("Cdb live subscription identity", () => {
             change_seq: 0,
         });
 
-        const storageSql = state.storage.sql as unknown as {
-            exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): Cursor<T>;
-        };
-        const originalExec = storageSql.exec.bind(storageSql) as typeof storageSql.exec;
-        const rebuildInstall = spyOn(IntervalMap.prototype, "register");
-        let observedIncrementalInstall = false;
-        storageSql.exec = function exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): Cursor<T> {
-            const cursor = originalExec<T>(query, ...bindings);
-            if (!query.includes("SELECT gateway_id, registration_id, connection_id")) return cursor;
-            return {
-                columnNames: cursor.columnNames,
-                raw: () => cursor.raw(),
-                *[Symbol.iterator]() {
-                    let index = 0;
-                    for (const row of cursor) {
-                        if (index === 1) {
-                            expect(rebuildInstall).toHaveBeenCalled();
-                            observedIncrementalInstall = true;
-                        }
-                        index += 1;
-                        yield row;
-                    }
-                },
-            };
-        };
-        try {
-            await reconstruct();
-        } finally {
-            storageSql.exec = originalExec;
-            rebuildInstall.mockRestore();
-        }
-        expect(observedIncrementalInstall).toBe(true);
+        await reconstruct();
+        expect(
+            db.prepare("SELECT COUNT(*) AS count FROM _chardb_live_subscriptions WHERE state = 'active'").get()
+        ).toEqual({ count: 4_096 });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM _chardb_live_subscription_tables").get()).toEqual({
+            count: 4_096,
+        });
         const first = active[0] as LiveSubscriptionId;
         await expect(cdb.subscribe(request(first))).resolves.toEqual({
             ok: true,
@@ -358,6 +330,8 @@ describe("Cdb live subscription identity", () => {
             subId: legacy.subId,
             principalId: legacyRequest.principalId,
             organizationId: legacyRequest.organizationId,
+            schemaEpoch: legacyRequest.schemaEpoch,
+            vshard: legacyRequest.vshard,
             domainSchemaEpoch: legacyRequest.domainSchemaEpoch,
             ref: legacyRequest.ref,
             args: legacyRequest.args,
@@ -369,9 +343,10 @@ describe("Cdb live subscription identity", () => {
         db.prepare(
             `INSERT INTO _chardb_live_subscriptions
              (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-              principal_id, organization_id, domain_schema_epoch, ref, args_json, policy_digest, query_hash,
+              principal_id, organization_id, schema_epoch, vshard, domain_schema_epoch,
+              ref, args_json, policy_digest, query_hash,
               tables_json, intervals_json)
-             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(
             legacy.gatewayId,
             legacy.registrationId,
@@ -381,6 +356,8 @@ describe("Cdb live subscription identity", () => {
             payloadHash,
             legacyRequest.principalId,
             legacyRequest.organizationId,
+            legacyRequest.schemaEpoch,
+            legacyRequest.vshard,
             legacyRequest.domainSchemaEpoch,
             legacyRequest.ref,
             JSON.stringify(legacyRequest.args),
@@ -557,7 +534,7 @@ describe("Cdb live subscription identity", () => {
         await expect(bootstrap).rejects.toMatchObject({ code: "CDB_INVARIANT" });
     });
 
-    test("retires active rows created before authority and policy identity existed", async () => {
+    test("retires active rows created before authority, policy, and routing identity existed", async () => {
         const legacyDb = new Database(":memory:");
         try {
             legacyDb.exec(`
@@ -608,7 +585,8 @@ describe("Cdb live subscription identity", () => {
             expect(
                 legacyDb
                     .prepare(
-                        `SELECT state, payload_hash, principal_id, organization_id, ref, args_json, policy_digest,
+                        `SELECT state, payload_hash, principal_id, organization_id, schema_epoch, vshard,
+                                ref, args_json, policy_digest,
                                 query_hash,
                                 tables_json, intervals_json
                          FROM _chardb_live_subscriptions
@@ -620,6 +598,8 @@ describe("Cdb live subscription identity", () => {
                 payload_hash: null,
                 principal_id: null,
                 organization_id: null,
+                schema_epoch: null,
+                vshard: null,
                 ref: null,
                 args_json: null,
                 policy_digest: null,

@@ -5,7 +5,7 @@
  * pre-built `defineAuth(...)` value (or inline `plugins`/`options`),
  * the user's Drizzle schema, the API refs, a Hono router, and the
  * `mountChardb` reserved-prefix handler. The shape it returns is a
- * Hono instance augmented with the DB entrypoint and six chardb Durable Object classes,
+ * Hono instance augmented with the DB entrypoint and four chardb Durable Object classes,
  * a lazy merged `.schema`, the `auth` value, and a chardb-mounted
  * `.fetch`.
  *
@@ -16,22 +16,27 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { admin } from "better-auth/plugins/admin";
+import { jwt } from "better-auth/plugins/jwt";
 import { organization } from "better-auth/plugins/organization";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { defineAuth } from "../../src/auth/synthesize.ts";
 import type { ChardbBinding } from "../../src/binding.ts";
+import { CdbError } from "../../src/errors.ts";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
+import { forOrg, forOrgUser } from "../../src/server/cdb-tenant.ts";
 import { chardb } from "../../src/server/chardb.ts";
 import { defineMutation, defineQuery } from "../../src/server/define.ts";
 import { Cdb } from "../../src/server/do/cdb.ts";
 import { Gateway } from "../../src/server/do/gateway.ts";
+import { defineMigrations } from "../../src/server/schema-migrations.ts";
 import type { RawJson } from "../../src/types.ts";
 import { stableJson } from "../../src/util/canonical.ts";
 import { vshardOf } from "../../src/vshard.ts";
 
 const organizationTable = sqliteTable("organization", { id: text("id").primaryKey() });
+const userTable = sqliteTable("user", { id: text("id").primaryKey() });
 const { cdbTable } = forOrg();
 const items = cdbTable(
     "items",
@@ -44,10 +49,25 @@ const items = cdbTable(
     },
     { roles: { member: { read: "*" } } }
 );
+const { cdbTable: orgUserTable } = forOrgUser();
+const drafts = orgUserTable(
+    "drafts",
+    {
+        id: text("id").primaryKey(),
+        organizationId: text("organization_id")
+            .notNull()
+            .references(() => organizationTable.id),
+        userId: text("user_id")
+            .notNull()
+            .references(() => userTable.id),
+    },
+    { roles: { self: { read: "*" } } }
+);
 
 const auth = defineAuth({
     appName: "chardb-factory-test",
-    plugins: [organization()],
+    baseURL: "https://example.com",
+    plugins: [organization(), jwt()],
 });
 
 type RoutedArgs = { readonly organizationId: string } & { readonly [key: string]: RawJson };
@@ -83,6 +103,60 @@ const queryWithNonJsonTransform = defineQuery({
 });
 
 describe("chardb({…})", () => {
+    test("fails at construction when api transport is configured without jwt()", () => {
+        const authWithoutJwt = defineAuth({ plugins: [organization()] });
+        let caught: unknown;
+        try {
+            chardb({ auth: authWithoutJwt, schema: { items }, api: { routedMutation } });
+        } catch (error) {
+            caught = error;
+        }
+        expect(caught).toBeInstanceOf(CdbError);
+        expect(caught).toMatchObject({
+            code: "CDB_AUTH_NOT_BOUND",
+            message: "chardb: authenticated DB transport requires Better Auth's jwt() plugin",
+        });
+    });
+
+    test("allows a core-only route setup when authenticated DB transport is not configured", () => {
+        const coreAuth = defineAuth({});
+        const app = chardb({ auth: coreAuth, schema: {} });
+        expect(app.auth).toBe(coreAuth);
+        expect(app.schema.user).toBeDefined();
+    });
+
+    test("fails clearly when forOrg() is used without organization()", () => {
+        const authWithoutOrganization = defineAuth({ plugins: [jwt()] });
+        const app = chardb({ auth: authWithoutOrganization, schema: { items } });
+        let caught: unknown;
+        try {
+            void app.schema;
+        } catch (error) {
+            caught = error;
+        }
+        expect(caught).toBeInstanceOf(CdbError);
+        expect(caught).toMatchObject({
+            code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+            message:
+                'chardb: cdbTable "items" uses forOrg(), but defineAuth() did not configure Better Auth\'s organization() plugin',
+        });
+    });
+
+    test("rejects forOrgUser() when Better Auth omits organization()", () => {
+        const authWithoutOrganization = defineAuth({ plugins: [jwt()] });
+        const app = chardb({ auth: authWithoutOrganization, schema: { drafts } });
+
+        expect(() => void app.schema).toThrow(CdbError);
+        try {
+            void app.schema;
+        } catch (error) {
+            expect(error).toMatchObject({
+                code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                hint: "Add organization() to defineAuth({ plugins: [...] }).",
+            });
+        }
+    });
+
     test("returns a Hono instance the user can chain routes on", async () => {
         const app = chardb({ auth, schema: { items } });
         app.get("/hello", c => c.text("world"));
@@ -92,7 +166,168 @@ describe("chardb({…})", () => {
             { waitUntil() {}, passThroughOnException() {}, props: undefined } as Parameters<typeof app.fetch>[2]
         );
         expect(res.status).toBe(200);
+        expect(res.headers.get("Cf-Chardb-Server-Version")).toBe("0.1.0");
+        expect(res.headers.get("Server-Timing")).toMatch(/^cdb;dur=\d+;desc="chardb total"$/);
+        expect(res.headers.get("cf-chardb-correlation-id")).toBeTruthy();
         expect(await res.text()).toBe("world");
+    });
+
+    test("maps typed route failures through the shared HTTP boundary", async () => {
+        const app = chardb({ auth, schema: { items } });
+        app.get("/forbidden", () => {
+            throw new CdbError({ code: "CDB_FORBIDDEN", message: "membership revoked" });
+        });
+        const response = await app.fetch(
+            new Request("https://example.com/forbidden"),
+            {} as Parameters<typeof app.fetch>[1],
+            { waitUntil() {}, passThroughOnException() {}, props: undefined } as Parameters<typeof app.fetch>[2]
+        );
+        expect(response.status).toBe(403);
+        expect((await response.json()) as unknown).toMatchObject({
+            error: { code: "CDB_FORBIDDEN", message: "membership revoked", retryable: false },
+        });
+    });
+
+    test("rejects Better Auth at the HTTP boundary while its Catalog schema is fenced", async () => {
+        const app = chardb({
+            auth: defineAuth({}),
+            schema: {},
+            migrations: defineMigrations([{ version: 1, name: "initial", statements: ["SELECT 1"] }]),
+        });
+        const catalog = {
+            async schemaState() {
+                return { activeVersion: 0, status: "migrating" as const };
+            },
+            async authAdapterRpc() {
+                throw new Error("fenced auth must not reach the adapter RPC");
+            },
+        };
+        const env = {
+            CDB_CATALOG: { idFromName: () => "global", get: () => catalog },
+        } as unknown as Parameters<typeof app.fetch>[1];
+        const response = await app.fetch(new Request("https://example.com/api/auth/get-session"), env, {
+            waitUntil() {},
+            passThroughOnException() {},
+            props: undefined,
+        } as Parameters<typeof app.fetch>[2]);
+
+        expect(response.status).toBe(409);
+        expect((await response.json()) as unknown).toMatchObject({
+            error: {
+                code: "CDB_STALE_EPOCH",
+                message: "Catalog auth schema migration is not active",
+                retryable: true,
+            },
+        });
+    });
+
+    test("pins unconfigured Better Auth instances to each canonical request origin", async () => {
+        const app = chardb({ auth: defineAuth({}), schema: {} });
+        app.get("/auth-origin", c => c.json({ baseURL: c.var.auth.options.baseURL }));
+        const env = {} as Parameters<typeof app.fetch>[1];
+        const ctx = {
+            waitUntil() {},
+            passThroughOnException() {},
+            props: undefined,
+        } as Parameters<typeof app.fetch>[2];
+
+        const local = await app.fetch(new Request("http://127.0.0.1:8787/auth-origin"), env, ctx);
+        const deployed = await app.fetch(new Request("https://app.example/auth-origin"), env, ctx);
+        expect((await local.json()) as unknown).toEqual({ baseURL: "http://127.0.0.1:8787" });
+        expect((await deployed.json()) as unknown).toEqual({ baseURL: "https://app.example" });
+    });
+
+    test("binds the typed Better Auth runtime to Hono routes and caches it per env", async () => {
+        const app = chardb({ auth, schema: { items } });
+        let firstRuntime: unknown;
+        app.get("/auth-runtime", c => {
+            const getSession: typeof c.var.auth.api.getSession = c.var.auth.api.getSession;
+            const createOrganization: typeof c.var.auth.api.createOrganization = c.var.auth.api.createOrganization;
+            const reused = firstRuntime === undefined ? null : firstRuntime === c.var.auth;
+            firstRuntime ??= c.var.auth;
+            return c.json({
+                hasGetSession: typeof getSession === "function",
+                hasCreateOrganization: typeof createOrganization === "function",
+                reused,
+            });
+        });
+
+        const env = {} as Parameters<typeof app.fetch>[1];
+        const db = {
+            async executeQuery() {
+                return { ok: true as const, result: null };
+            },
+            async executeMutation() {
+                return { ok: true as const, cookie: "cookie", ran: true, result: null, rowsAffected: 0 };
+            },
+        } satisfies ChardbBinding;
+        const ctx = {
+            exports: { DB: db },
+            waitUntil() {},
+            passThroughOnException() {},
+            props: undefined,
+        } as unknown as Parameters<typeof app.fetch>[2];
+        const request = (requestEnv: Parameters<typeof app.fetch>[1] = env): Promise<Response> =>
+            app.fetch(new Request("https://example.com/auth-runtime"), requestEnv, ctx);
+
+        expect((await (await request()).json()) as unknown).toEqual({
+            hasGetSession: true,
+            hasCreateOrganization: true,
+            reused: null,
+        });
+        expect((await (await request()).json()) as unknown).toEqual({
+            hasGetSession: true,
+            hasCreateOrganization: true,
+            reused: true,
+        });
+        expect((await (await request({} as Parameters<typeof app.fetch>[1])).json()) as unknown).toEqual({
+            hasGetSession: true,
+            hasCreateOrganization: true,
+            reused: false,
+        });
+    });
+
+    test("binds Better Auth before inline routes run", async () => {
+        const app = chardb({
+            auth,
+            schema: { items },
+            routes: router => {
+                router.get("/inline-auth", c => c.json({ available: typeof c.var.auth.api.getSession === "function" }));
+            },
+        });
+        const response = await app.fetch(
+            new Request("https://example.com/inline-auth"),
+            {} as Parameters<typeof app.fetch>[1],
+            { waitUntil() {}, passThroughOnException() {}, props: undefined } as Parameters<typeof app.fetch>[2]
+        );
+        expect((await response.json()) as unknown).toEqual({ available: true });
+    });
+
+    test("passes the caller's exact Better Auth plugin profile to the runtime", async () => {
+        const organizationPlugin = organization();
+        const adminPlugin = admin();
+        const plugins = [organizationPlugin, adminPlugin] as const;
+        const exactAuth = defineAuth({ baseURL: "https://example.com", plugins });
+        const app = chardb({ auth: exactAuth, schema: { items } });
+        app.get("/auth-profile", c => {
+            const runtimePlugins = c.var.auth.options.plugins;
+            return c.json({
+                sameTuple: runtimePlugins === plugins,
+                sameOrganizationPlugin: runtimePlugins?.[0] === organizationPlugin,
+                sameAdminPlugin: runtimePlugins?.[1] === adminPlugin,
+            });
+        });
+
+        const response = await app.fetch(
+            new Request("https://example.com/auth-profile"),
+            {} as Parameters<typeof app.fetch>[1],
+            { waitUntil() {}, passThroughOnException() {}, props: undefined } as Parameters<typeof app.fetch>[2]
+        );
+        expect((await response.json()) as unknown).toEqual({
+            sameTuple: true,
+            sameOrganizationPlugin: true,
+            sameAdminPlugin: true,
+        });
     });
 
     test("exposes the native DB loopback as typed Hono environment state", async () => {
@@ -119,7 +354,7 @@ describe("chardb({…})", () => {
         expect((await res.json()) as unknown).toEqual({ available: true });
     });
 
-    test("the DB entrypoint and six Durable Object classes are direct configured fields", () => {
+    test("the DB entrypoint and four Durable Object classes are direct configured fields", () => {
         const app = chardb({ auth, schema: { items } });
         // Existence + identity — these are the named exports wrangler binds.
         expect(typeof app.DB).toBe("function");
@@ -128,9 +363,9 @@ describe("chardb({…})", () => {
         expect(typeof app.Catalog).toBe("function");
         expect(typeof app.Gateway).toBe("function");
         expect(app.Gateway).not.toBe(Gateway);
-        expect(typeof app.BlobMeta).toBe("function");
         expect(typeof app.Resharder).toBe("function");
-        expect(typeof app.GsiShard).toBe("function");
+        expect("BlobMeta" in app).toBe(false);
+        expect("GsiShard" in app).toBe(false);
     });
 
     test("the configured Gateway resolves mutation refs from the factory api manifest", () => {
@@ -325,9 +560,9 @@ describe("chardb({…})", () => {
 
     test(".schema merges synthesized auth tables with the domain namespace", () => {
         const app = chardb({ auth, schema: { items } });
-        const schema = app.schema as Record<string, unknown>;
-        expect(schema.items).toBe(items);
-        expect(schema.user).toBeDefined();
-        expect(schema.organization).toBeDefined();
+        const organizationIdColumn: typeof app.auth.organization.id = app.schema.organization.id;
+        expect(app.schema.items).toBe(items);
+        expect(app.schema.user).toBeDefined();
+        expect(organizationIdColumn).toBeDefined();
     });
 });

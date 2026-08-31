@@ -1,6 +1,6 @@
 /**
  * Internal `cdbTable(name, columns, config)` builder. Not exported
- * directly from `chardb/server` — schema files obtain a tenancy-bound
+ * directly from `@chardb/core/server` — schema files obtain a tenancy-bound
  * `cdbTable` via `forOrg() / forUser() / global()` from `cdb-tenant.ts`.
  *
  * Responsibilities:
@@ -27,6 +27,7 @@ import { attachCdbMeta, getCdbMeta } from "./cdb-table-registry.ts";
 import {
     type AuthTargetKind,
     COL_VERBS,
+    type CdbScopeKind,
     type CdbTableConfig,
     type CdbTableMeta,
     type ColVerb,
@@ -58,12 +59,13 @@ type BuiltTable<TName extends string, TCols extends CdbColumnsInput> = SQLiteTab
  * Construct a single cdbTable with explicit tenancy axis. Called by the
  * factory layer (`cdb-tenant.ts`) — never exported publicly.
  */
-export function createCdbTable<TName extends string, TCols extends CdbColumnsInput, K extends TenantKind>(args: {
+export function createCdbTable<TName extends string, TCols extends CdbColumnsInput, K extends CdbScopeKind>(args: {
     readonly name: TName;
     readonly columns: TCols;
     readonly config: CdbTableConfig<TCols, K>;
-    readonly tenantKind: K;
+    readonly tenantKind: TenantKind;
     readonly authTarget: AuthTargetKind;
+    readonly selfTarget?: "user";
 }): BuiltTable<TName, TCols> {
     const table = sqliteTable(args.name, args.columns) as BuiltTable<TName, TCols>;
 
@@ -134,7 +136,7 @@ export function createCdbTable<TName extends string, TCols extends CdbColumnsInp
 
     const rawRoles =
         (cfg.roles as { readonly [k: string]: RoleValue<TCols> } | undefined) ??
-        ({} as { readonly [k: string]: RoleValue<TCols> });
+        (args.tenantKind === "user" ? ({ self: "*" } as const) : ({} as { readonly [k: string]: RoleValue<TCols> }));
     const rawColumns =
         (cfg.columns as { readonly [k: string]: ColumnSpec<TCols, RoleName> } | undefined) ??
         ({} as { readonly [k: string]: ColumnSpec<TCols, RoleName> });
@@ -149,7 +151,7 @@ export function createCdbTable<TName extends string, TCols extends CdbColumnsInp
             hint: "remove the `selfBy:` field; the `self` role resolves to the user-tenant predicate automatically",
         });
     }
-    if (args.tenantKind !== "user" && selfBy === undefined) {
+    if (args.tenantKind !== "user" && selfBy === undefined && args.selfTarget === undefined) {
         if (rolesContainSelf(rawRoles) || columnsContainSelf(rawColumns)) {
             throw new CdbError({
                 code: "CDB_INVALID_SELF",
@@ -174,6 +176,7 @@ export function createCdbTable<TName extends string, TCols extends CdbColumnsInp
         name: args.name,
         tenantKind: args.tenantKind,
         authTarget: args.authTarget,
+        selfTarget: args.selfTarget ?? (selfBy ? "user" : undefined),
         tenantBy: tenantByOverride,
         partitionBy: partitionByMeta,
         publicRead: cfg.publicRead === true,
@@ -199,6 +202,8 @@ const RESOLVED = new WeakMap<SQLiteTable, ResolvedCdbMeta>();
 export interface ResolvedCdbMeta extends CdbTableMeta {
     /** Resolved tenant column (auto-discovered or explicit). */
     readonly tenantBy: string | undefined;
+    /** Resolved user ownership column under forOrgUser or explicit selfBy. */
+    readonly selfBy: string | undefined;
 }
 
 export function resolveCdbMeta(table: SQLiteTable): ResolvedCdbMeta {
@@ -212,7 +217,8 @@ export function resolveCdbMeta(table: SQLiteTable): ResolvedCdbMeta {
         });
     }
     const tenantBy = autoDiscoverTenantColumn(table, meta);
-    const resolved: ResolvedCdbMeta = { ...meta, tenantBy };
+    const selfBy = resolveSelfColumn(table, meta);
+    const resolved: ResolvedCdbMeta = { ...meta, tenantBy, selfBy };
     RESOLVED.set(table, resolved);
     return resolved;
 }
@@ -250,6 +256,55 @@ function autoDiscoverTenantColumn(table: SQLiteTable, meta: CdbTableMeta): strin
         });
     }
     return unique[0];
+}
+
+function resolveSelfColumn(table: SQLiteTable, meta: CdbTableMeta): string | undefined {
+    if (!meta.selfTarget) return undefined;
+    const matches = foreignKeyColumnsTo(table, meta.selfTarget);
+    if (meta.selfBy) {
+        if (matches.includes(meta.selfBy)) return meta.selfBy;
+        throw new CdbError({
+            code: "CDB_INVALID_SELF",
+            message: `cdbTable("${meta.name}"): selfBy "${meta.selfBy}" does not reference the Better Auth user table`,
+            hint: "point selfBy at a column with `.references(() => auth.user.id)`",
+        });
+    }
+    if (matches.length === 0) {
+        throw new CdbError({
+            code: "CDB_INVALID_SELF",
+            message: `cdbTable("${meta.name}"): forOrgUser() requires an FK to "user"`,
+            hint: "add a `.references(() => auth.user.id)` column, or use forOrg() for organization-level rows",
+        });
+    }
+    if (matches.length > 1) {
+        throw new CdbError({
+            code: "CDB_INVALID_SELF",
+            message: `cdbTable("${meta.name}"): multiple FKs to "user" (${matches.join(", ")})`,
+            hint: `add \`selfBy: "<colName>"\` to disambiguate`,
+        });
+    }
+    const discovered = matches[0] as string;
+    const columns = getTableColumns(table) as Record<string, { readonly name: string }>;
+    const jsKey = Object.entries(columns).find(([, column]) => column.name === discovered)?.[0];
+    if (jsKey !== "userId") {
+        throw new CdbError({
+            code: "CDB_INVALID_SELF",
+            message: `cdbTable("${meta.name}"): forOrgUser() requires selfBy for nonconventional user column "${jsKey ?? discovered}"`,
+            hint: `add \`selfBy: "${jsKey ?? discovered}"\` so insert types include the managed owner column`,
+        });
+    }
+    return discovered;
+}
+
+function foreignKeyColumnsTo(table: SQLiteTable, targetName: string): string[] {
+    const cfg = getTableConfig(table);
+    const matches: string[] = [];
+    for (const fk of cfg.foreignKeys as readonly ForeignKey[]) {
+        const ref = fk.reference();
+        if (getTableName(ref.foreignTable) !== targetName) continue;
+        for (const col of ref.columns as readonly AnyColumn[]) matches.push(col.name);
+    }
+    return [...new Set(matches)];
 }
 
 function resolvePartitionByMeta(

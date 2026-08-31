@@ -22,7 +22,7 @@ describe("migration admin endpoint", () => {
     test("keeps an unconfigured endpoint hidden and rejects invalid secrets before Catalog", async () => {
         let calls = 0;
         const catalog = {
-            schemaState() {
+            adminSchemaState() {
                 calls += 1;
                 return {};
             },
@@ -68,31 +68,31 @@ describe("migration admin endpoint", () => {
             targetDigest: null,
         } as const;
         const env = migrationEnv({
-            schemaState() {
+            adminSchemaState() {
                 calls.push("state");
                 return state;
             },
-            beginSchemaMigration(input: unknown) {
+            adminBeginSchemaMigration(input: unknown) {
                 calls.push(["begin", input]);
                 return { ...state, status: "migrating", migrationId: "deploy-2", targetVersion: 2 };
             },
-            beginSchemaBaseline(input: unknown) {
+            adminBeginSchemaBaseline(input: unknown) {
                 calls.push(["baseline", input]);
                 return { ...state, status: "migrating", migrationId: "baseline-1", targetVersion: 1 };
             },
-            schemaMigrationShards(input: unknown) {
+            adminSchemaMigrationShards(input: unknown) {
                 calls.push(["shards", input]);
                 return [{ shardId: "ShardDO_0", status: "pending", lastError: null, updatedAt: 1 }];
             },
-            migrateSchemaShard(input: unknown) {
+            adminMigrateSchemaShard(input: unknown) {
                 calls.push(["shard", input]);
                 return { shardId: "ShardDO_0", status: "active", lastError: null, updatedAt: 2 };
             },
-            applyCatalogSchemaMigration(input: unknown) {
+            adminApplyCatalogSchemaMigration(input: unknown) {
                 calls.push(["catalog", input]);
                 return { ...state, status: "migrating", migrationId: "deploy-2", targetVersion: 2 };
             },
-            completeSchemaMigration(input: unknown) {
+            adminCompleteSchemaMigration(input: unknown) {
                 calls.push(["complete", input]);
                 return { ...state, activeVersion: 2, activeEpoch: 3 };
             },
@@ -161,7 +161,7 @@ describe("migration admin endpoint", () => {
     test("rejects malformed, oversized, and extra-field bodies before Catalog", async () => {
         let calls = 0;
         const env = migrationEnv({
-            beginSchemaMigration() {
+            adminBeginSchemaMigration() {
                 calls += 1;
             },
         });
@@ -178,5 +178,56 @@ describe("migration admin endpoint", () => {
             expect(response.status).toBe(400);
         }
         expect(calls).toBe(0);
+    });
+
+    test("projects stable RPC error codes without exposing transport prefixes or stacks", async () => {
+        for (const [message, expected] of [
+            [
+                "CDB_INVALID_ARGS: Catalog migration steps must apply in order",
+                { status: 400, code: "CDB_INVALID_ARGS" },
+            ],
+            ["CDB_STALE_EPOCH: schema migration shards are incomplete", { status: 409, code: "CDB_STALE_EPOCH" }],
+        ] as const) {
+            const env = migrationEnv({
+                adminCompleteSchemaMigration() {
+                    throw new Error(message);
+                },
+            });
+            const response = await handleMigrationAdminRequest(
+                authorized("/_chardb/migrations/complete", {
+                    method: "POST",
+                    body: JSON.stringify({ migrationId: "deploy-2" }),
+                }),
+                env
+            );
+            expect(response.status).toBe(expected.status);
+            const text = await response.text();
+            expect(JSON.parse(text)).toEqual({
+                ok: false,
+                error: message.slice(message.indexOf(":") + 2),
+                code: expected.code,
+                retryable: expected.code === "CDB_STALE_EPOCH",
+            });
+            expect(text).not.toContain("CdbError:");
+            expect(text).not.toContain(" at ");
+        }
+
+        const secretFailure = "database password appeared in an unexpected failure";
+        const env = migrationEnv({
+            adminCompleteSchemaMigration() {
+                throw new Error(secretFailure);
+            },
+        });
+        const response = await handleMigrationAdminRequest(
+            authorized("/_chardb/migrations/complete", {
+                method: "POST",
+                body: JSON.stringify({ migrationId: "deploy-2" }),
+            }),
+            env
+        );
+        expect(response.status).toBe(500);
+        const text = await response.text();
+        expect(JSON.parse(text)).toEqual({ ok: false, error: "internal error" });
+        expect(text).not.toContain(secretFailure);
     });
 });

@@ -1,5 +1,5 @@
 /**
- * `chardb/drizzle` — async SQLite driver + runtime `migrate()` + the
+ * Internal async SQLite driver, runtime `migrate()`, and the
  * `defineChardbConfig` helper that writes `drizzle.config.ts`.
  *
  * Drizzle's standard Proxy driver path is what wires the SDK to the wire

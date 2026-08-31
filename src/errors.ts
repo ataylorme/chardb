@@ -21,8 +21,6 @@ export const CDB_ERROR_CODES = [
     "CDB_SCATTER_NOT_INDEX",
     "CDB_MUT_ID_COLLISION",
     "CDB_MUTATION_OUTCOME_UNKNOWN",
-    "CDB_PITR_IDEMPOTENCY_RESET",
-    "CDB_PITR_INCONSISTENT",
     "CDB_OPLOG_PRESSURE",
     "CDB_AUTH_PROFILE_INCOMPATIBLE",
     "CDB_RESERVED_TABLE_NAME",
@@ -35,16 +33,10 @@ export const CDB_ERROR_CODES = [
     "CDB_SHARD_UNAVAILABLE",
     "CDB_CATALOG_UNAVAILABLE",
     "CDB_FORBIDDEN",
-    "CDB_PARTIAL_COMMIT",
     "CDB_GSI_STRICT_REQUIRES_2PC",
-    "CDB_GSI_NOT_DECLARED",
     "CDB_VECTORIZE_INDEX_MISSING",
     "CDB_VECTORIZE_DIM_MISMATCH",
-    "CDB_PRESENCE_KEY_TOO_LARGE",
-    "CDB_SCHEDULE_DUPLICATE_REF",
-    "CDB_SCHEDULE_OCCURRENCE_MISSED",
     "CDB_STREAM_ABORTED",
-    "CDB_LEDGER_HASH_CHAIN_VIOLATION",
     "CDB_DISTINCT_CAP_EXCEEDED",
     "CDB_INVARIANT",
     "CDB_RESHARD_PHASE_MISMATCH",
@@ -160,4 +152,18 @@ export class CdbError extends Error {
 /** Type-narrowing helper for catch sites. */
 export function isCdbError(e: unknown): e is CdbError {
     return e instanceof CdbError;
+}
+
+/** Encode an expected Chardb failure into the message that Workers RPC preserves. */
+export function throwCdbRpcError(error: unknown): never {
+    if (!isCdbError(error)) throw error;
+    throw new Error(`${error.code}: ${error.message}`);
+}
+
+/** Rehydrate a Chardb failure after Workers RPC strips custom Error properties. */
+export function rehydrateCdbRpcError(error: unknown): unknown {
+    if (isCdbError(error) || !(error instanceof Error)) return error;
+    const match = /^(CDB_[A-Z_]+):\s*([\s\S]*)$/.exec(error.message);
+    if (!match?.[1] || !isCdbErrorCode(match[1])) return error;
+    return new CdbError({ code: match[1], message: match[2] || match[1] });
 }

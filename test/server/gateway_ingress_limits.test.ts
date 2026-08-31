@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { Gateway, type GatewayEnv, type VerifiedGwAttachment } from "../../src/server/do/gateway.ts";
+import type { VerifiedGwAttachment } from "../../src/server/do/gateway-auth-dispatch.ts";
+import { Gateway, type GatewayEnv } from "../../src/server/do/gateway.ts";
 import { ClientId, Cookie, PrincipalId } from "../../src/types.ts";
 
 const INBOUND_TEXT_LIMIT = 1024 * 1024;
@@ -121,7 +122,6 @@ describe("Gateway inbound WebSocket text limit", () => {
         expect(dispatched).toEqual([]);
         expect(socket.sent).toEqual([]);
         expect(socket.closed).toEqual([{ code: 1009, reason: "message too large" }]);
-        expect(db.query("SELECT COUNT(*) AS count FROM _gw_subs").get()).toEqual({ count: 0 });
         expect(db.query("SELECT COUNT(*) AS count FROM _gw_registration_generations").get()).toEqual({ count: 0 });
     });
 

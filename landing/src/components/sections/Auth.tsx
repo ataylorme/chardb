@@ -8,16 +8,16 @@ export function Auth() {
             <SectionHeading>Auth and data, one schema.</SectionHeading>
             <SectionLead>
                 Better Auth identities, tenant membership, roles, row rules, and column masks belong in the same typed
-                model as application data. The organization path enforces that boundary today. The destination is one
-                transaction and query layer across the full supported Better Auth workflow.
+                model as application data. Better Auth owns sign-in, sessions, organizations, membership, and JWTs;
+                Chardb uses that authority to route and enforce every organization operation.
             </SectionLead>
 
             <BulletList
                 items={[
-                    "today: Catalog-backed Better Auth identity, membership, roles, and auth epochs",
-                    "today: row predicates and readable or writable column rules enforced inside Cdb",
-                    "today: live reruns re-check authority before replacing client state",
-                    "target: supported Better Auth workflows can make atomic multi-write changes",
+                    "Catalog-backed Better Auth identity, membership, roles, and auth epochs",
+                    "row predicates and readable or writable column rules enforced inside Cdb",
+                    "live reruns re-check authority before replacing client state",
+                    "organization switching and revocation take effect without a second data system",
                 ]}
             />
 
@@ -175,7 +175,7 @@ export function Auth() {
 
             <p className="mt-6 text-sm text-fg-muted">
                 The tested organization slice includes anonymous sign-in, membership lookup, mutation, readback,
-                cross-organization denial, role revocation, reconnect, and restart. Do not use production data yet.
+                cross-organization denial, role revocation, reconnect, and restart.
             </p>
 
             <PullQuote>users should not require a second data system.</PullQuote>

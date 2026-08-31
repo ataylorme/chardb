@@ -207,6 +207,40 @@ describe("bounded DB select plan compiler", () => {
         }
     });
 
+    test("requires explicit null predicates", () => {
+        const { select } = recorder();
+        for (const predicate of [
+            eq(messages.deletedAt, null as never),
+            inArray(messages.deletedAt, [null as never]),
+            between(messages.deletedAt, null as never, 3),
+            between(messages.deletedAt, 1, null as never),
+        ]) {
+            expect(() => select().from(messages).where(predicate)).toThrow(
+                expect.objectContaining({ code: "CDB_UNSUPPORTED_FEATURE" })
+            );
+        }
+
+        expect(() => select().from(messages).where(isNull(messages.deletedAt))).not.toThrow();
+
+        const base = {
+            version: 1,
+            kind: "select",
+            table: "binding_plan_messages",
+            selection: { kind: "all" },
+            cardinality: "many",
+        };
+        for (const where of [
+            { kind: "compare", op: "eq", column: "deleted_at", value: null },
+            { kind: "in", column: "deleted_at", values: [null] },
+            { kind: "between", column: "deleted_at", lower: null, upper: 3 },
+            { kind: "between", column: "deleted_at", lower: 1, upper: null },
+        ]) {
+            expect(() => validateChardbSelectPlanV1({ ...base, where })).toThrow(
+                expect.objectContaining({ code: "CDB_INVALID_ARGS" })
+            );
+        }
+    });
+
     test("locks the local limit, ordering, IN, and boolean-child bounds", () => {
         const { select } = recorder();
         for (const limit of [0, CHARDB_SELECT_PLAN_MAX_LIMIT + 1, 1.5, Number.NaN]) {
@@ -296,6 +330,27 @@ describe("bounded DB select plan compiler", () => {
         expect(reads).toBe(0);
     });
 
+    test("does not read properties through a proxy while validating", () => {
+        let reads = 0;
+        const target = {
+            version: 1,
+            kind: "select",
+            table: "binding_plan_messages",
+            selection: { kind: "all" },
+            where: { kind: "compare", op: "eq", column: "id", value: "x" },
+            cardinality: "many",
+        } as const;
+        const plan = new Proxy(target, {
+            get(object, property, receiver) {
+                reads++;
+                return Reflect.get(object, property, receiver);
+            },
+        });
+
+        expect(validateChardbSelectPlanV1(plan)).toEqual(target);
+        expect(reads).toBe(0);
+    });
+
     test("enforces predicate depth, node count, and serialized bytes", () => {
         let deep: Record<string, unknown> = { kind: "compare", op: "eq", column: "id", value: "x" };
         for (let index = 0; index < 17; index++) {
@@ -327,6 +382,46 @@ describe("bounded DB select plan compiler", () => {
                 cardinality: "many",
             })
         ).toThrow(expect.objectContaining({ code: "CDB_INVALID_ARGS" }));
+
+        let oversizedArrayOwnKeys = 0;
+        const oversizedValues = new Proxy(
+            Array.from({ length: CHARDB_SELECT_PLAN_MAX_IN_VALUES + 1 }, (_, index) => String(index)),
+            {
+                ownKeys(target) {
+                    oversizedArrayOwnKeys++;
+                    return Reflect.ownKeys(target);
+                },
+            }
+        );
+        expect(() =>
+            validateChardbSelectPlanV1({
+                version: 1,
+                kind: "select",
+                table: "binding_plan_messages",
+                selection: { kind: "all" },
+                where: { kind: "in", column: "id", values: oversizedValues },
+                cardinality: "many",
+            })
+        ).toThrow(new RegExp(`at most ${CHARDB_SELECT_PLAN_MAX_IN_VALUES} entries`));
+        expect(oversizedArrayOwnKeys).toBe(0);
+
+        const aggregateChunk = "é".repeat(Math.floor(CHARDB_SELECT_PLAN_MAX_BYTES / 4) + 1);
+        expect(() =>
+            validateChardbSelectPlanV1({
+                version: 1,
+                kind: "select",
+                table: "binding_plan_messages",
+                selection: { kind: "all" },
+                where: {
+                    kind: "and",
+                    predicates: [
+                        { kind: "compare", op: "eq", column: "id", value: aggregateChunk },
+                        { kind: "compare", op: "eq", column: "channel_id", value: aggregateChunk },
+                    ],
+                },
+                cardinality: "many",
+            })
+        ).toThrow(new RegExp(`predicate string values exceed ${CHARDB_SELECT_PLAN_MAX_BYTES} UTF-8 bytes`));
 
         expect(() =>
             validateChardbSelectPlanV1({

@@ -1,3 +1,4 @@
+import type { ChardbSelectPlanV1 } from "../binding-plan.ts";
 import type { CdbError } from "../errors.ts";
 import type { ChardbRef, ClientId, PrincipalId, RawJson, ShardId, SubId, TenantId } from "../types.ts";
 import type { WireInterval } from "../wire.ts";
@@ -5,10 +6,10 @@ import type { AuthCtx, MutationAuthority } from "./define.ts";
 import type {
     OrganizationAuthority,
     OrganizationAuthorityRequest,
-    RouteResult,
     UserAuthority,
     UserAuthorityRequest,
-} from "./do/catalog.ts";
+} from "./do/catalog-authority-store.ts";
+import type { OrganizationAuthorityRouteRequest, OrganizationAuthorityRouteResult, RouteResult } from "./do/catalog.ts";
 
 /** Structured-cloneable error envelope shared by every mutation RPC hop. */
 export type CdbErrorWire = ReturnType<CdbError["toJSON"]>;
@@ -46,6 +47,13 @@ export interface CatalogOrganizationAuthorityRpc {
     resolveOrganizationAuthority(request: OrganizationAuthorityRequest): Promise<OrganizationAuthority | null>;
 }
 
+/** Catalog boundary that derives organization authority and placement in one DO turn. */
+export interface CatalogOrganizationAuthorityRouteRpc {
+    resolveOrganizationAuthorityRoute(
+        request: OrganizationAuthorityRouteRequest
+    ): Promise<OrganizationAuthorityRouteResult>;
+}
+
 /** Catalog boundary for deriving authority from the persisted Better Auth user row. */
 export interface CatalogUserAuthorityRpc {
     resolveUserAuthority(request: UserAuthorityRequest): Promise<UserAuthority | null>;
@@ -73,6 +81,10 @@ export interface CdbSubscriptionRequest {
     readonly principalId: PrincipalId;
     readonly organizationId: TenantId;
     readonly placement?: CdbPlacement;
+    /** Catalog's physical routing generation for this vshard placement. */
+    readonly schemaEpoch: number;
+    /** Exact logical vshard covered by the subscription. */
+    readonly vshard: number;
     readonly domainSchemaEpoch: number;
     readonly ref: ChardbRef;
     readonly args: RawJson;
@@ -165,13 +177,26 @@ export interface CdbMutationRpc {
 }
 
 /** Internal shard query request. Gateway supplies validated args and trusted auth. */
-export interface CdbQueryRequest {
+interface CdbQueryRequestBase {
     readonly ref: ChardbRef;
     readonly args: RawJson;
-    readonly placement?: CdbPlacement;
     readonly auth: AuthCtx;
     readonly domainSchemaEpoch: number;
 }
+
+/** Routed queries always carry the Catalog generation used to select their Cdb. */
+export type CdbQueryRequest = CdbQueryRequestBase &
+    (
+        | {
+              readonly placement: CdbPlacement;
+              readonly schemaEpoch: number;
+          }
+        | {
+              /** Legacy shard-local queries have no routing generation to fence. */
+              readonly placement?: undefined;
+              readonly schemaEpoch?: undefined;
+          }
+    );
 
 export type CdbQueryResponse =
     | { readonly ok: true; readonly result: RawJson }
@@ -179,6 +204,19 @@ export type CdbQueryResponse =
 
 export interface CdbQueryRpc {
     query(request: CdbQueryRequest): Promise<CdbQueryResponse>;
+}
+
+/** Internal typed-plan request. DB and Cdb both revalidate and rederive placement. */
+export interface CdbBindingPlanRequest {
+    readonly plan: ChardbSelectPlanV1;
+    readonly placement: CdbPlacement;
+    readonly auth: AuthCtx;
+    readonly schemaEpoch: number;
+    readonly domainSchemaEpoch: number;
+}
+
+export interface CdbBindingPlanRpc {
+    executePlan(request: CdbBindingPlanRequest): Promise<CdbQueryResponse>;
 }
 
 /** Authenticated input for one server-routed query outside the live socket path. */
@@ -193,6 +231,10 @@ export interface CdbRegisteredQueryRequest {
     readonly subscription: LiveSubscriptionId;
     readonly placement?: CdbPlacement;
     readonly auth: AuthCtx;
+    /** Fresh Catalog physical routing generation. */
+    readonly schemaEpoch: number;
+    /** Fresh Catalog vshard identity for the persisted partition. */
+    readonly vshard: number;
     readonly domainSchemaEpoch: number;
 }
 

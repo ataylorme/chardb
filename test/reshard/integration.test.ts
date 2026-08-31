@@ -4,7 +4,7 @@ import { Database } from "bun:sqlite";
  *
  * Drives a workload through a "source" bun:sqlite database with the trigger
  * set installed, then replays the captured `_chardb_split_log` rows into a
- * "destination" bun:sqlite database via `renderRowApply`, filtered by the
+ * "destination" bun:sqlite database via the production row applier, filtered by the
  * migration's vshard range. Asserts:
  *   - rows in-range survive INSERT → UPDATE → DELETE → INSERT cycles with
  *     destination state matching the source for every in-range key,
@@ -18,12 +18,15 @@ import { Database } from "bun:sqlite";
  * the workerd-level harness still on the roadmap.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
+import type { SyncSql } from "../../src/oplog/wrapper.ts";
 import { inRange, rowVshard } from "../../src/reshard/range.ts";
-import { type TableSpec, renderRowApply, renderTableTriggers } from "../../src/reshard/triggers.ts";
+import { type TableSpec, renderTableTriggers } from "../../src/reshard/triggers.ts";
+import { applyReshardRow } from "../../src/server/do/cdb-reshard-relational.ts";
 
 const SPLIT_LOG_DDL = `
 CREATE TABLE _chardb_split_log (
   lsn INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_tx_id INTEGER NOT NULL,
   mig_id TEXT NOT NULL,
   op TEXT NOT NULL,
   table_name TEXT NOT NULL,
@@ -31,6 +34,15 @@ CREATE TABLE _chardb_split_log (
   before TEXT,
   after TEXT,
   ts INTEGER NOT NULL
+)`;
+
+const SPLIT_STATE_DDL = `
+CREATE TABLE _chardb_split_state (
+  mig_id TEXT PRIMARY KEY, range_lo INTEGER NOT NULL, range_hi INTEGER NOT NULL,
+  role TEXT NOT NULL, capture INTEGER NOT NULL,
+  split_log_rows INTEGER NOT NULL DEFAULT 0, split_log_bytes INTEGER NOT NULL DEFAULT 0,
+  capture_tx_id INTEGER, capture_tx_rows INTEGER NOT NULL DEFAULT 0,
+  capture_tx_bytes INTEGER NOT NULL DEFAULT 0
 )`;
 
 const messagesSpec: TableSpec = {
@@ -59,11 +71,26 @@ interface TailRow {
 function makeSource() {
     const db = new Database(":memory:");
     db.run(SPLIT_LOG_DDL);
+    db.run(SPLIT_STATE_DDL);
+    db.run(`CREATE TABLE _chardb_op_log (
+      event_id INTEGER PRIMARY KEY AUTOINCREMENT, payload_enc BLOB NOT NULL,
+      byte_size INTEGER NOT NULL, placement_vshard INTEGER
+    )`);
+    db.run("INSERT INTO _chardb_split_state VALUES (?, 0, 16383, 'source', 1, 0, 0, NULL, 0, 0)", [MIG_ID]);
     db.run("CREATE TABLE messages (id TEXT PRIMARY KEY, org_id TEXT, channel_id TEXT, body TEXT, created_at INTEGER)");
     db.run("CREATE TABLE channels (id TEXT PRIMARY KEY, org_id TEXT, name TEXT)");
     for (const stmt of renderTableTriggers(MIG_ID, messagesSpec).install) db.run(stmt);
     for (const stmt of renderTableTriggers(MIG_ID, channelsSpec).install) db.run(stmt);
     return db;
+}
+
+function sourceWrite(db: Database, statement: string, params: readonly unknown[] = []): void {
+    db.transaction(() => {
+        db.run("INSERT INTO _chardb_op_log (payload_enc, byte_size, placement_vshard) VALUES (X'', 0, 0)");
+        const tx = (db.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
+        db.run(statement, params as never[]);
+        db.run("UPDATE _chardb_op_log SET payload_enc = X'01', byte_size = 1 WHERE event_id = ?", [tx]);
+    })();
 }
 
 function makeDest() {
@@ -75,6 +102,23 @@ function makeDest() {
 
 function spec(name: string): TableSpec {
     return name === "messages" ? messagesSpec : channelsSpec;
+}
+
+function syncSql(db: Database): SyncSql {
+    return {
+        exec(statement, ...params) {
+            db.run(statement, params as never[]);
+        },
+        one<T>(statement: string, ...params: never[]): T | null {
+            return (db.query(statement).get(...params) as T | null) ?? null;
+        },
+        all<T>(statement: string, ...params: never[]): T[] {
+            return db.query(statement).all(...params) as T[];
+        },
+        changes() {
+            return Number((db.query("SELECT changes() AS n").get() as { n: number }).n);
+        },
+    };
 }
 
 function applyTail(dest: Database, src: Database, range: { lo: number; hi: number }) {
@@ -92,8 +136,7 @@ function applyTail(dest: Database, src: Database, range: { lo: number; hi: numbe
             continue;
         }
         const after = JSON.parse(r.after ?? "{}") as Record<string, unknown>;
-        const apply = renderRowApply(t, after);
-        dest.run(apply.sql, apply.params as unknown[] as never[]);
+        applyReshardRow(syncSql(dest), t, after);
     }
 }
 
@@ -114,11 +157,11 @@ describe("reshard pipeline — multi-table integration", () => {
     });
 
     test("INSERT → UPDATE → DELETE → INSERT cycles converge on destination for in-range rows", () => {
-        src.run("INSERT INTO channels VALUES (?, ?, ?)", ["ch-1", orgA, "general"]);
-        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-1", orgA, "ch-1", "first", 1]);
-        src.run("UPDATE messages SET body = ? WHERE id = ?", ["edited", "m-1"]);
-        src.run("DELETE FROM messages WHERE id = ?", ["m-1"]);
-        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-1", orgA, "ch-1", "reborn", 2]);
+        sourceWrite(src, "INSERT INTO channels VALUES (?, ?, ?)", ["ch-1", orgA, "general"]);
+        sourceWrite(src, "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-1", orgA, "ch-1", "first", 1]);
+        sourceWrite(src, "UPDATE messages SET body = ? WHERE id = ?", ["edited", "m-1"]);
+        sourceWrite(src, "DELETE FROM messages WHERE id = ?", ["m-1"]);
+        sourceWrite(src, "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-1", orgA, "ch-1", "reborn", 2]);
 
         const aV = rowVshard(orgA);
         applyTail(dest, src, { lo: aV, hi: aV });
@@ -130,10 +173,10 @@ describe("reshard pipeline — multi-table integration", () => {
     });
 
     test("out-of-range rows are filtered before apply and never reach the destination", () => {
-        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-A", orgA, "ch-1", "in", 1]);
-        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-Z", orgZ, "ch-9", "out", 1]);
-        src.run("INSERT INTO channels VALUES (?, ?, ?)", ["ch-1", orgA, "in"]);
-        src.run("INSERT INTO channels VALUES (?, ?, ?)", ["ch-9", orgZ, "out"]);
+        sourceWrite(src, "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-A", orgA, "ch-1", "in", 1]);
+        sourceWrite(src, "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-Z", orgZ, "ch-9", "out", 1]);
+        sourceWrite(src, "INSERT INTO channels VALUES (?, ?, ?)", ["ch-1", orgA, "in"]);
+        sourceWrite(src, "INSERT INTO channels VALUES (?, ?, ?)", ["ch-9", orgZ, "out"]);
 
         const aV = rowVshard(orgA);
         applyTail(dest, src, { lo: aV, hi: aV });
@@ -144,9 +187,30 @@ describe("reshard pipeline — multi-table integration", () => {
         expect(chanRows.map(r => r.id)).toEqual(["ch-1"]);
     });
 
+    test("partition-key moves remove stale destination rows and admit rows that move into range", () => {
+        const aV = rowVshard(orgA);
+        let outside = orgZ;
+        while (rowVshard(outside) === aV) outside += "z";
+
+        sourceWrite(src, "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["move-out", orgA, "ch-1", "before", 1]);
+        applyTail(dest, src, { lo: aV, hi: aV });
+        expect((dump(dest, "messages") as { id: string }[]).map(row => row.id)).toEqual(["move-out"]);
+
+        src.run("DELETE FROM _chardb_split_log");
+        sourceWrite(src, "UPDATE messages SET org_id = ?, body = ? WHERE id = ?", [outside, "outside", "move-out"]);
+        sourceWrite(src, "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["move-in", outside, "ch-2", "before", 2]);
+        src.run("DELETE FROM _chardb_split_log WHERE op = 'ins'");
+        sourceWrite(src, "UPDATE messages SET org_id = ?, body = ? WHERE id = ?", [orgA, "inside", "move-in"]);
+
+        applyTail(dest, src, { lo: aV, hi: aV });
+        expect(dump(dest, "messages")).toEqual([
+            { id: "move-in", org_id: orgA, channel_id: "ch-2", body: "inside", created_at: 2 },
+        ]);
+    });
+
     test("re-running the tail replay is idempotent — no row drift", () => {
-        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-1", orgA, "ch-1", "v1", 1]);
-        src.run("UPDATE messages SET body = ? WHERE id = ?", ["v2", "m-1"]);
+        sourceWrite(src, "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-1", orgA, "ch-1", "v1", 1]);
+        sourceWrite(src, "UPDATE messages SET body = ? WHERE id = ?", ["v2", "m-1"]);
 
         const aV = rowVshard(orgA);
         applyTail(dest, src, { lo: aV, hi: aV });
@@ -159,8 +223,14 @@ describe("reshard pipeline — multi-table integration", () => {
 
     test("multi-table workload — channels and messages share the log without contamination", () => {
         for (let i = 0; i < 20; i++) {
-            src.run("INSERT INTO channels VALUES (?, ?, ?)", [`ch-${i}`, orgA, `c${i}`]);
-            src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", [`m-${i}`, orgA, `ch-${i}`, `body-${i}`, i]);
+            sourceWrite(src, "INSERT INTO channels VALUES (?, ?, ?)", [`ch-${i}`, orgA, `c${i}`]);
+            sourceWrite(src, "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", [
+                `m-${i}`,
+                orgA,
+                `ch-${i}`,
+                `body-${i}`,
+                i,
+            ]);
         }
 
         const aV = rowVshard(orgA);
@@ -185,10 +255,10 @@ describe("reshard pipeline — multi-table integration", () => {
         // Asserts the destination converges and the per-row ops counter
         // confirms no row was applied twice (proxy for "no duplicate work").
         for (let i = 0; i < 50; i++) {
-            src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", [`m-${i}`, orgA, "ch-1", `b${i}`, i]);
+            sourceWrite(src, "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", [`m-${i}`, orgA, "ch-1", `b${i}`, i]);
         }
         for (let i = 0; i < 25; i++) {
-            src.run("UPDATE messages SET body = ? WHERE id = ?", [`b${i}-edit`, `m-${i}`]);
+            sourceWrite(src, "UPDATE messages SET body = ? WHERE id = ?", [`b${i}-edit`, `m-${i}`]);
         }
 
         const aV = rowVshard(orgA);
@@ -215,8 +285,7 @@ describe("reshard pipeline — multi-table integration", () => {
                     continue;
                 }
                 const after = JSON.parse(r.after ?? "{}") as Record<string, unknown>;
-                const a = renderRowApply(t, after);
-                dest.run(a.sql, a.params as unknown[] as never[]);
+                applyReshardRow(syncSql(dest), t, after);
             }
         };
 
@@ -228,8 +297,8 @@ describe("reshard pipeline — multi-table integration", () => {
 
         // Concurrent writes happen during the crash window — they must also
         // be picked up on resume, exercising the cursor-vs-tail contract.
-        src.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-100", orgA, "ch-1", "post-crash", 100]);
-        src.run("UPDATE messages SET body = ? WHERE id = ?", ["post-crash-edit", "m-100"]);
+        sourceWrite(src, "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", ["m-100", orgA, "ch-1", "post-crash", 100]);
+        sourceWrite(src, "UPDATE messages SET body = ? WHERE id = ?", ["post-crash-edit", "m-100"]);
 
         // Restart: read everything strictly after the cursor and apply.
         const remaining = src

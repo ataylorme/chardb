@@ -1,0 +1,38 @@
+name = "__WORKER_NAME__"
+main = "src/worker.ts"
+compatibility_date = "2026-08-27"
+compatibility_flags = ["nodejs_compat"]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Cdb", "Catalog", "Gateway", "Resharder"]
+
+[[durable_objects.bindings]]
+name = "CDB_CATALOG"
+class_name = "Catalog"
+
+[[durable_objects.bindings]]
+name = "CDB_SHARD"
+class_name = "Cdb"
+
+[[durable_objects.bindings]]
+name = "CDB_GATEWAY"
+class_name = "Gateway"
+
+[[durable_objects.bindings]]
+name = "CDB_RESHARD"
+class_name = "Resharder"
+
+[[vectorize]]
+binding = "CDB_PROOF_VECTORS"
+index_name = "__INDEX_NAME__"
+remote = true
+
+[vars]
+CDB_RELEASE_SHA256 = "__RELEASE_SHA256__"
+
+[observability.logs]
+enabled = true
+
+[observability.traces]
+enabled = true

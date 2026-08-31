@@ -1,9 +1,6 @@
 import { CdbError, type CdbErrorCode } from "../errors.ts";
+import { CDB_ARGUMENT_MAX_BYTES, CDB_ARGUMENT_MAX_DEPTH, CDB_ARGUMENT_MAX_MEMBERS } from "../json-limits.ts";
 import type { RawJson } from "../types.ts";
-
-const MAX_ARGUMENT_MEMBERS = 4_096;
-const MAX_ARGUMENT_BYTES = 512 * 1_024;
-const MAX_ARGUMENT_DEPTH = 99;
 
 export interface SerializedJsonLimits {
     readonly memberLimit?: number;
@@ -189,17 +186,17 @@ function snapshotSerializedJson(value: unknown, limit: number, subject: string, 
 }
 
 export function snapshotMutationArguments(args: RawJson): RawJson {
-    return snapshotSerializedJson(args, MAX_ARGUMENT_BYTES, "mutation arguments", {
-        memberLimit: MAX_ARGUMENT_MEMBERS,
-        maxDepth: MAX_ARGUMENT_DEPTH,
+    return snapshotSerializedJson(args, CDB_ARGUMENT_MAX_BYTES, "mutation arguments", {
+        memberLimit: CDB_ARGUMENT_MAX_MEMBERS,
+        maxDepth: CDB_ARGUMENT_MAX_DEPTH,
         errorCode: "CDB_INVALID_ARGS",
     });
 }
 
 export function snapshotSubscriptionArguments(args: RawJson): RawJson {
-    return snapshotSerializedJson(args, MAX_ARGUMENT_BYTES, "subscription arguments", {
-        memberLimit: MAX_ARGUMENT_MEMBERS,
-        maxDepth: MAX_ARGUMENT_DEPTH,
+    return snapshotSerializedJson(args, CDB_ARGUMENT_MAX_BYTES, "subscription arguments", {
+        memberLimit: CDB_ARGUMENT_MAX_MEMBERS,
+        maxDepth: CDB_ARGUMENT_MAX_DEPTH,
         errorCode: "CDB_INVALID_ARGS",
     });
 }

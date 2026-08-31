@@ -7,7 +7,7 @@
  *   - epoch counters: schema_epoch, auth_epoch_global, auth_epoch_tenant, auth_epoch_principal
  *   - JWKS cache (SWR)
  *   - reference tables (replicated)
- *   - barrier records (PITR + tenant snapshot)
+ *   - unretained internal bookmark barriers used by development fixtures
  *
  * Epoch bumps are CAS-guarded: every bump runs as `UPDATE … SET epoch=epoch+1`
  * inside `transactionSync`; concurrent admin actions serialize at the DO input
@@ -17,7 +17,6 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { renderSqliteTableDdl } from "../../auth/ddl.ts";
 import {
     type CatalogJwkResolution,
     type CatalogJwkResolutionRequest,
@@ -30,169 +29,116 @@ import {
     fetchValidatedJwks,
     parseCachedJwk,
 } from "../../auth/jwks_cache.ts";
-import { getAuthRuntime, placementFor, tableFor } from "../../auth/runtime.ts";
-import {
-    type AuthIncrementWhere,
-    type AuthReadWhere,
-    assertAuthIncrementInput,
-    authCount,
-    authCreate,
-    authDelete,
-    authFindFirstId,
-    authFindFirstIncrementId,
-    authFindMany,
-    authFindOne,
-    authIncrementOne,
-    authPreloadScopeRows,
-    authTableColumns,
-    authUpdate,
-} from "../../auth/sql.ts";
-import { CdbError } from "../../errors.ts";
-import type { RawJson } from "../../types.ts";
-import { type PrincipalId, ShardId, type TenantId, type Vshard } from "../../types.ts";
-import { VSHARD_COUNT, VshardMap, type VshardRange } from "../../vshard.ts";
+import { CdbError, isCdbError, rehydrateCdbRpcError, throwCdbRpcError } from "../../errors.ts";
+import type { PrincipalId, RawJson, ShardId, TenantId } from "../../types.ts";
+import { VSHARD_COUNT, vshardOf } from "../../vshard.ts";
 import { withChardbLoopbacks } from "../loopback.ts";
+import { readCurrentOwnerVectorPurgeStatus } from "../organization-deletion-status.ts";
+import { chardbResourceDescriptorsAt, isChardbVectorResourceDescriptor } from "../resource-descriptors.ts";
+import { type ChardbMigrationJournal, defineMigrations, pendingMigrations } from "../schema-migrations.ts";
 import {
-    type ChardbMigrationJournal,
-    defineMigrations,
-    migrationDigestAt,
-    pendingMigrations,
-} from "../schema-migrations.ts";
+    CATALOG_AUTH_INVALIDATION_BATCH_SIZE,
+    CatalogAuthInvalidationStore,
+    type CatalogAuthInvalidationTarget,
+    initializeCatalogAuthInvalidationStore,
+} from "./catalog-auth-invalidation-store.ts";
+import {
+    type CatalogAuthAdapterRpcRequest,
+    type CatalogAuthAdapterRpcResult,
+    type CatalogAuthEpochChange,
+    type CatalogAuthIncrementRequest,
+    type CatalogAuthIncrementResult,
+    type CatalogAuthMutationRequest,
+    type CatalogAuthMutationResult,
+    type CatalogAuthQueryRequest,
+    type OrganizationAuthority,
+    type OrganizationAuthorityRequest,
+    type UserAuthority,
+    type UserAuthorityRequest,
+    bumpCatalogAuthEpoch,
+    catalogOrganizationAuthorityAvailable,
+    catalogUserAuthorityAvailable,
+    countCatalogAuth,
+    incrementCatalogAuthWithEffects,
+    initializeCatalogAuthorityStorage,
+    mutateCatalogAuthWithEffects,
+    queryCatalogAuth,
+    readCatalogAuthEpoch,
+    recordMigratedCatalogAuthoritySchema,
+    resolveOrganizationAuthorityFromCatalog,
+    resolveUserAuthorityFromCatalog,
+} from "./catalog-authority-store.ts";
+import { acknowledgeCatalogBarrier, listOpenCatalogBarriers, recordCatalogBarrier } from "./catalog-barrier-store.ts";
+import {
+    type CatalogOrganizationDeletionBarrier,
+    type CatalogOrganizationDeletionBarrierIdentity,
+    type CatalogOrganizationDeletionBarrierStatus,
+    CatalogOrganizationDeletionBarrierStore,
+    initializeCatalogOrganizationDeletionBarrierStore,
+} from "./catalog-organization-deletion-barrier-store.ts";
+import {
+    type CatalogOrganizationDeletion,
+    type CatalogOrganizationDeletionShard,
+    CatalogOrganizationDeletionStore,
+    initializeCatalogOrganizationDeletionStore,
+} from "./catalog-organization-deletion-store.ts";
+import { type CatalogCutoverRequest, type CatalogCutoverResult, CatalogRoutingStore } from "./catalog-routing-store.ts";
+import {
+    type CatalogSchemaShardState,
+    type CatalogSchemaState,
+    type CatalogSql,
+    activateCatalogSchemaShard,
+    applyCatalogSchemaMigrationStep,
+    beginCatalogSchemaChange,
+    catalogSchemaBaselineExists,
+    completeCatalogSchemaMigration,
+    initializeCatalogStorage,
+    readCatalogSchemaMigrationShards,
+    readCatalogSchemaState,
+    recordCatalogSchemaShardFailure,
+} from "./catalog-schema-store.ts";
+import {
+    type CatalogTopologyOperation,
+    type CatalogTopologyOperationIdentity,
+    CatalogTopologyOperationStore,
+    initializeCatalogTopologyOperationStore,
+} from "./catalog-topology-operation-store.ts";
+import type { CdbAuthInvalidationRequest, CdbAuthInvalidationResult } from "./cdb-auth-invalidation-store.ts";
+import type { CdbVectorOrganizationPurgeStatus } from "./cdb-vector-organization-deletion-store.ts";
+import { DurableAlarmScheduler } from "./gateway-alarm-store.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
-
-const CATALOG_DDL = `
-CREATE TABLE IF NOT EXISTS catalog_meta (
-  k TEXT PRIMARY KEY,
-  v TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS catalog_ranges (
-  lo INTEGER NOT NULL,
-  hi INTEGER NOT NULL,
-  shard_id TEXT NOT NULL,
-  PRIMARY KEY (lo)
-);
-CREATE TABLE IF NOT EXISTS catalog_epoch (
-  scope TEXT NOT NULL,
-  scope_id TEXT NOT NULL,
-  epoch INTEGER NOT NULL,
-  PRIMARY KEY (scope, scope_id)
-);
-CREATE TABLE IF NOT EXISTS catalog_jwks (
-  kid TEXT PRIMARY KEY,
-  jwk_json TEXT NOT NULL,
-  fetched_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS catalog_jwks_v2 (
-  jwks_url TEXT NOT NULL,
-  kid TEXT NOT NULL,
-  jwk_json TEXT NOT NULL,
-  fetched_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL,
-  PRIMARY KEY (jwks_url, kid)
-);
-CREATE TABLE IF NOT EXISTS catalog_jwks_refresh (
-  jwks_url TEXT PRIMARY KEY,
-  next_fetch_at INTEGER NOT NULL,
-  refreshing_until INTEGER NOT NULL,
-  failure_count INTEGER NOT NULL,
-  last_success_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS catalog_barrier (
-  barrier_id TEXT PRIMARY KEY,
-  ts INTEGER NOT NULL,
-  expected_shards TEXT NOT NULL,
-  ack_shards TEXT NOT NULL,
-  bookmarks TEXT NOT NULL,
-  tenant_prefix TEXT
-);
-CREATE TABLE IF NOT EXISTS catalog_policy_digest (
-  digest TEXT PRIMARY KEY,
-  set_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS catalog_schema_state (
-  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  active_version INTEGER NOT NULL CHECK (active_version >= 0),
-  active_epoch INTEGER NOT NULL CHECK (active_epoch > 0),
-  active_digest TEXT NOT NULL,
-  last_migration_id TEXT,
-  status TEXT NOT NULL CHECK (status IN ('active', 'migrating')),
-  migration_id TEXT,
-  target_version INTEGER,
-  target_epoch INTEGER,
-  target_digest TEXT,
-  CHECK (
-    (status = 'active' AND migration_id IS NULL AND target_version IS NULL AND target_epoch IS NULL AND target_digest IS NULL)
-    OR
-    (status = 'migrating' AND migration_id IS NOT NULL AND target_version IS NOT NULL AND target_epoch IS NOT NULL AND target_digest IS NOT NULL)
-  )
-);
-CREATE TABLE IF NOT EXISTS catalog_schema_shards (
-  migration_id TEXT NOT NULL,
-  shard_id TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('pending', 'active')),
-  last_error TEXT,
-  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
-  PRIMARY KEY (migration_id, shard_id)
-);
-CREATE TABLE IF NOT EXISTS catalog_schema_steps (
-  migration_id TEXT NOT NULL,
-  version INTEGER NOT NULL CHECK (version > 0),
-  digest TEXT NOT NULL,
-  applied_at INTEGER NOT NULL CHECK (applied_at >= 0),
-  PRIMARY KEY (migration_id, version)
-);
-CREATE TABLE IF NOT EXISTS catalog_schema_baselines (
-  migration_id TEXT PRIMARY KEY,
-  target_version INTEGER NOT NULL CHECK (target_version > 0),
-  target_digest TEXT NOT NULL,
-  created_at INTEGER NOT NULL CHECK (created_at >= 0)
-);
-` as const;
 
 export interface CatalogEnv {
     readonly CDB_SHARD?: DurableObjectNamespace;
 }
 
-type AuthEpochScope = "global" | "tenant" | "principal";
-type CatalogSql = ReturnType<typeof adaptSqlStorage>;
-
 const JWKS_URL_MAX_BYTES = 2_048;
-
-const JWKS_V2_COLUMNS = [
-    ["jwks_url", "TEXT", 1, 1],
-    ["kid", "TEXT", 1, 2],
-    ["jwk_json", "TEXT", 1, 0],
-    ["fetched_at", "INTEGER", 1, 0],
-    ["expires_at", "INTEGER", 1, 0],
-] as const;
-
-const JWKS_REFRESH_COLUMNS = [
-    ["jwks_url", "TEXT", 0, 1],
-    ["next_fetch_at", "INTEGER", 1, 0],
-    ["refreshing_until", "INTEGER", 1, 0],
-    ["failure_count", "INTEGER", 1, 0],
-    ["last_success_at", "INTEGER", 0, 0],
-] as const;
 
 type JwksRefreshOutcome =
     | { readonly ok: true }
     | { readonly ok: false; readonly message: string; readonly retryAfterMs: number };
 
-function assertInternalTable(
-    sql: CatalogSql,
-    table: "catalog_jwks_v2" | "catalog_jwks_refresh",
-    expected: readonly (readonly [name: string, type: string, notnull: number, pk: number])[]
-): void {
-    const actual = sql
-        .all<{ name: string; type: string; notnull: number; pk: number }>(`PRAGMA table_info('${table}')`)
-        .map(row => [row.name, row.type.toUpperCase(), row.notnull, row.pk] as const);
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-        throw new CdbError({
-            code: "CDB_INVARIANT",
-            message: `Catalog internal schema mismatch for ${table}`,
-        });
+function projectOrganizationDeletionHandoff(
+    deletion: CatalogOrganizationDeletion | null,
+    shards: readonly CatalogOrganizationDeletionShard[]
+): CatalogOrganizationDeletionStatus["handoff"] {
+    if (!deletion) {
+        return Object.freeze({ state: "not_started" as const, attempts: 0, completedAt: null, lastError: null });
     }
+    const attempts = shards.reduce((sum, shard) => sum + shard.attempts, deletion.attempts);
+    if (!Number.isSafeInteger(attempts) || attempts < 0) {
+        throw new CdbError({ code: "CDB_INVARIANT", message: "organization deletion handoff attempts are invalid" });
+    }
+    const lastError =
+        deletion.lastError ??
+        shards.find(shard => shard.status === "pending" && shard.lastError !== null)?.lastError ??
+        null;
+    return Object.freeze({
+        state: deletion.status,
+        attempts,
+        completedAt: deletion.completedAt,
+        lastError,
+    });
 }
 
 function normalizeJwksUrl(rawUrl: string): string | null {
@@ -210,53 +156,6 @@ function jwksResolutionUnavailable(message: string, retryAfterMs: number): Catal
     return { ok: false, message, retryAfterMs: Math.max(1, Math.ceil(retryAfterMs)) };
 }
 
-function addEpochScope(
-    scopes: Map<string, { scope: AuthEpochScope; scopeId: string }>,
-    scope: AuthEpochScope,
-    scopeId: string
-) {
-    scopes.set(`${scope}\0${scopeId}`, { scope, scopeId });
-}
-
-function addRowEpochScopes(
-    scopes: Map<string, { scope: AuthEpochScope; scopeId: string }>,
-    model: string,
-    row: Record<string, RawJson>
-): void {
-    const rule = placementFor(model);
-    if (rule.kind === "replicated") {
-        addEpochScope(scopes, "global", "global");
-    } else {
-        const scopeId = row[rule.column];
-        if (typeof scopeId === "string") addEpochScope(scopes, rule.kind, scopeId);
-    }
-
-    // Membership-like models affect both halves of auth-dependent state.
-    // The placement rule supplies the primary scope; conventional Better
-    // Auth fields add the other scope when the row carries one.
-    if (typeof row.organizationId === "string") addEpochScope(scopes, "tenant", row.organizationId);
-    if (typeof row.userId === "string") addEpochScope(scopes, "principal", row.userId);
-}
-
-function authEpochScopeColumns(model: string, table: Parameters<typeof authTableColumns>[0]): readonly string[] {
-    const schemaColumns = authTableColumns(table);
-    const placement = placementFor(model);
-    const candidates = [...(placement.kind === "replicated" ? [] : [placement.column]), "organizationId", "userId"];
-    return [...new Set(candidates.filter(column => schemaColumns.has(column)))];
-}
-
-function bumpAuthEpochInSql(sql: CatalogSql, scope: AuthEpochScope, scopeId: string): number {
-    const dbScope = scope === "global" ? "auth_global" : scope === "tenant" ? "auth_tenant" : "auth_principal";
-    sql.exec("INSERT OR IGNORE INTO catalog_epoch (scope, scope_id, epoch) VALUES (?, ?, 0)", dbScope, scopeId);
-    sql.exec("UPDATE catalog_epoch SET epoch = epoch + 1 WHERE scope = ? AND scope_id = ?", dbScope, scopeId);
-    const row = sql.one<{ epoch: number }>(
-        "SELECT epoch FROM catalog_epoch WHERE scope = ? AND scope_id = ?",
-        dbScope,
-        scopeId
-    );
-    return row?.epoch ?? 1;
-}
-
 export interface RouteResult {
     readonly shardId: ShardId;
     /** Domain schema epoch. Changes only after every shard activates one packaged migration target. */
@@ -265,24 +164,13 @@ export interface RouteResult {
     readonly schemaEpoch: number;
 }
 
-export interface CatalogSchemaState {
-    readonly activeVersion: number;
-    readonly activeEpoch: number;
-    readonly activeDigest: string;
-    readonly lastMigrationId: string | null;
-    readonly status: "active" | "migrating";
-    readonly migrationId: string | null;
-    readonly targetVersion: number | null;
-    readonly targetEpoch: number | null;
-    readonly targetDigest: string | null;
+export interface OrganizationAuthorityRouteRequest extends OrganizationAuthorityRequest {
+    readonly vshard: number;
 }
 
-export interface CatalogSchemaShardState {
-    readonly shardId: string;
-    readonly status: "pending" | "active";
-    readonly lastError: string | null;
-    readonly updatedAt: number;
-}
+export type OrganizationAuthorityRouteResult =
+    | { readonly authority: OrganizationAuthority; readonly route: RouteResult }
+    | { readonly authority: null };
 
 interface CdbSchemaMigrationRpc {
     prepareSchemaMigration(args: {
@@ -303,72 +191,110 @@ interface CdbSchemaMigrationRpc {
     }): Promise<unknown>;
 }
 
-interface StoredCatalogSchemaState {
-    readonly active_version: number;
-    readonly active_epoch: number;
-    readonly active_digest: string;
-    readonly last_migration_id: string | null;
-    readonly status: "active" | "migrating";
-    readonly migration_id: string | null;
-    readonly target_version: number | null;
-    readonly target_epoch: number | null;
-    readonly target_digest: string | null;
+interface CdbOrganizationDeletionRpc {
+    /** Legacy RPC name. The shard treats this as cleanup for every organization-owned resource. */
+    deleteOrganizationFiles(args: {
+        readonly organizationId: string;
+        readonly nowMs: number;
+        readonly domainSchemaEpoch: number;
+    }): Promise<{
+        readonly organizationId: string;
+        readonly accepted: true;
+    }>;
+    vectorOrganizationPurgeStatus(input: {
+        readonly organizationId: string;
+        readonly schemaEpoch: number;
+        readonly domainSchemaEpoch: number;
+    }): Promise<CdbVectorOrganizationPurgeStatus | null>;
+}
+
+export interface CatalogOrganizationDeletionStatus {
+    readonly organizationId: string;
+    readonly authDeleted: boolean;
+    readonly handoffComplete: boolean;
+    readonly handoff: {
+        readonly state: "not_started" | "pending" | "complete";
+        readonly attempts: number;
+        readonly completedAt: number | null;
+        readonly lastError: string | null;
+    };
+    readonly vectorPurge: CdbVectorOrganizationPurgeStatus | null;
+}
+
+interface CdbAuthInvalidationRpc {
+    invalidateAuthScope(args: CdbAuthInvalidationRequest): Promise<CdbAuthInvalidationResult>;
 }
 
 const EMPTY_MIGRATION_JOURNAL = defineMigrations([]);
+
+/** Retained for callers compiled against the earlier vector deletion feature gate. */
+export function assertCatalogOrganizationDeletionSupported(
+    _journal: ChardbMigrationJournal,
+    deletedOrganizationIds: readonly string[]
+): void {
+    void deletedOrganizationIds;
+}
 
 export interface CatalogRuntimeConfig {
     readonly migrations: () => ChardbMigrationJournal;
 }
 
-export interface OrganizationAuthorityRequest {
-    /** Subject from a successfully signature-verified JWT. */
-    readonly principalId: PrincipalId;
-    /** Organization selected by the operation, not by JWT role claims. */
-    readonly organizationId: TenantId;
+interface CatalogTopologyOperationRequest {
+    readonly migId: string;
+    readonly sourceShard: string;
+    readonly destinationShard: string;
+    readonly rangeLo: number;
+    readonly rangeHi: number;
+    readonly startEpoch: number;
 }
 
-export interface OrganizationAuthority {
-    readonly principalId: PrincipalId;
-    readonly organizationId: TenantId;
-    /** Canonical comma-separated Better Auth membership role. */
-    readonly role: string;
-    /** Sorted, deduplicated membership roles. */
-    readonly roles: readonly string[];
-    readonly authEpochs: {
-        readonly global: number;
-        readonly tenant: number;
-        readonly principal: number;
-    };
+interface CatalogDerivedTopologyOperationRequest {
+    readonly migId: string;
+    readonly destinationShard: string;
+    readonly rangeLo: number;
+    readonly rangeHi: number;
 }
 
-export interface UserAuthorityRequest {
-    /** Subject from a successfully signature-verified JWT. */
-    readonly principalId: PrincipalId;
+const CATALOG_TOPOLOGY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+function assertDerivedTopologyOperationRequest(args: CatalogDerivedTopologyOperationRequest): void {
+    if (!CATALOG_TOPOLOGY_ID.test(args.migId)) {
+        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "topology migration id is invalid" });
+    }
+    if (!CATALOG_TOPOLOGY_ID.test(args.destinationShard)) {
+        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "topology destination shard is invalid" });
+    }
+    if (
+        !Number.isSafeInteger(args.rangeLo) ||
+        !Number.isSafeInteger(args.rangeHi) ||
+        args.rangeLo < 0 ||
+        args.rangeHi < args.rangeLo ||
+        args.rangeHi >= VSHARD_COUNT
+    ) {
+        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "topology vshard range is invalid" });
+    }
 }
 
-export interface UserAuthority {
-    readonly principalId: PrincipalId;
-    /** Canonical comma-separated Better Auth user role. */
-    readonly role: string;
-    /** Sorted, deduplicated user roles. */
-    readonly roles: readonly string[];
-    readonly authEpochs: {
-        readonly global: number;
-        /** User scope has no organization epoch. */
-        readonly tenant: 0;
-        readonly principal: number;
-    };
+interface CatalogOrganizationDeletionBarrierRequest {
+    readonly migId: string;
+    readonly rangeLo: number;
+    readonly rangeHi: number;
 }
 
 export class Catalog extends DurableObject<CatalogEnv> {
     private bootstrapped = false;
     private authTablesBootstrapped = false;
-    private cachedMap: VshardMap | null = null;
+    private readonly routingStore: CatalogRoutingStore;
+    private readonly alarmScheduler: DurableAlarmScheduler;
     private readonly jwksRefreshes = new Map<string, Promise<JwksRefreshOutcome>>();
 
     constructor(state: DurableObjectState, env: CatalogEnv) {
         super(state, withChardbLoopbacks(env, state));
+        this.routingStore = new CatalogRoutingStore({
+            sql: adaptSqlStorage(this.ctx.storage.sql),
+            transactionSync: callback => this.ctx.storage.transactionSync(callback),
+        });
+        this.alarmScheduler = new DurableAlarmScheduler(state.storage);
         state.blockConcurrencyWhile(async () => this.bootstrap());
     }
 
@@ -379,69 +305,21 @@ export class Catalog extends DurableObject<CatalogEnv> {
     private async bootstrap(): Promise<void> {
         if (this.bootstrapped) return;
         const sql = adaptSqlStorage(this.ctx.storage.sql);
-        sql.exec("PRAGMA foreign_keys = ON");
-        for (const stmt of CATALOG_DDL.split(";")
-            .map(s => s.trim())
-            .filter(Boolean)) {
-            sql.exec(stmt);
-        }
-        assertInternalTable(sql, "catalog_jwks_v2", JWKS_V2_COLUMNS);
-        assertInternalTable(sql, "catalog_jwks_refresh", JWKS_REFRESH_COLUMNS);
-        sql.exec(
-            "INSERT OR IGNORE INTO catalog_ranges (lo, hi, shard_id) VALUES (?, ?, ?)",
-            0,
-            VSHARD_COUNT - 1,
-            "ShardDO_0"
-        );
-        sql.exec(
-            "INSERT OR IGNORE INTO catalog_epoch (scope, scope_id, epoch) VALUES (?, ?, ?)",
-            "schema",
-            "global",
-            1
-        );
         const journal = this.migrationJournal();
-        sql.exec(
-            `INSERT OR IGNORE INTO catalog_schema_state
-             (singleton, active_version, active_epoch, active_digest, status)
-             VALUES (1, ?, 1, ?, 'active')`,
-            0,
-            migrationDigestAt(journal, 0)
-        );
-        const schemaState = this.readSchemaState();
-        if (schemaState.activeVersion > journal.version) {
-            throw new CdbError({
-                code: "CDB_PARTITION_CONTRACT_CHANGED",
-                message: `Catalog schema version ${schemaState.activeVersion} is newer than packaged version ${journal.version}`,
-            });
-        }
-        if (schemaState.activeDigest !== migrationDigestAt(journal, schemaState.activeVersion)) {
-            throw new CdbError({
-                code: "CDB_PARTITION_CONTRACT_CHANGED",
-                message: `Catalog schema digest does not match packaged migration version ${schemaState.activeVersion}`,
-            });
-        }
-        if (
-            schemaState.status === "migrating" &&
-            (schemaState.targetVersion === null ||
-                schemaState.targetVersion <= schemaState.activeVersion ||
-                schemaState.targetVersion > journal.version ||
-                schemaState.targetEpoch !== schemaState.activeEpoch + 1 ||
-                schemaState.targetDigest !== migrationDigestAt(journal, schemaState.targetVersion))
-        ) {
-            throw new CdbError({
-                code: "CDB_PARTITION_CONTRACT_CHANGED",
-                message: "Catalog pending schema migration does not match the packaged journal",
-            });
-        }
-        sql.exec(
-            "INSERT OR IGNORE INTO catalog_epoch (scope, scope_id, epoch) VALUES (?, ?, ?)",
-            "auth_global",
-            "global",
-            1
-        );
+        const schemaState = initializeCatalogStorage(sql, journal);
+        initializeCatalogOrganizationDeletionStore(sql);
+        initializeCatalogOrganizationDeletionBarrierStore(sql);
+        initializeCatalogTopologyOperationStore(sql);
+        initializeCatalogAuthInvalidationStore(sql);
         if (schemaState.status === "active" && schemaState.activeVersion === journal.version) {
             this.ensureAuthTables();
         }
+        const nextAuthInvalidation = new CatalogAuthInvalidationStore(sql).nextPendingAt();
+        const nextDeletion = this.hasOrganizationCleanupResources()
+            ? new CatalogOrganizationDeletionStore(sql).nextPendingAt()
+            : null;
+        const nextAlarm = this.earliestPending(nextAuthInvalidation, nextDeletion);
+        if (nextAlarm !== null) await this.scheduleAlarmNoLaterThan(Math.max(Date.now() + 1, nextAlarm));
         this.bootstrapped = true;
     }
 
@@ -462,315 +340,109 @@ export class Catalog extends DurableObject<CatalogEnv> {
                 hint: "retry after the schema migration activates",
             });
         }
-        let runtime: ReturnType<typeof getAuthRuntime>;
-        try {
-            runtime = getAuthRuntime();
-        } catch {
-            // Auth runtime not bound — chardb({auth}) wasn't configured.
-            // Catalog still needs to function for non-auth deployments.
-            return;
-        }
         this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            for (const table of Object.values(runtime.schema)) {
-                const ddl = renderSqliteTableDdl(table);
-                const metadataKey = `auth_ddl_v1:${ddl.tableName}`;
-                const existing = sql.one<{ sql: string }>(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-                    ddl.tableName
-                );
-                const recorded = sql.one<{ v: string }>("SELECT v FROM catalog_meta WHERE k = ?", metadataKey);
-                if (existing) {
-                    if (recorded?.v !== ddl.signature) {
-                        throw new CdbError({
-                            code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
-                            message: `Catalog auth table "${ddl.tableName}" predates auth DDL v1 or has an incompatible schema`,
-                            hint: "recreate pre-release Catalog storage or add an explicit auth schema migration",
-                        });
-                    }
-                    for (let index = 0; index < ddl.indexNames.length; index++) {
-                        const indexName = ddl.indexNames[index];
-                        const expectedSql = ddl.indexes[index];
-                        if (!indexName || !expectedSql) {
-                            throw new CdbError({
-                                code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
-                                message: `Catalog auth table "${ddl.tableName}" has invalid index metadata`,
-                            });
-                        }
-                        const present = sql.one<{ sql: string }>(
-                            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?",
-                            indexName,
-                            ddl.tableName
-                        );
-                        if (present?.sql !== expectedSql) {
-                            throw new CdbError({
-                                code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
-                                message: `Catalog auth table "${ddl.tableName}" has an incompatible declared index`,
-                                hint: "recreate pre-release Catalog storage or add an explicit auth schema migration",
-                            });
-                        }
-                    }
-                    continue;
-                }
-                sql.exec(ddl.createTable);
-                for (const statement of ddl.indexes) sql.exec(statement);
-                sql.exec("INSERT OR REPLACE INTO catalog_meta (k, v) VALUES (?, ?)", metadataKey, ddl.signature);
-            }
+            initializeCatalogAuthorityStorage(adaptSqlStorage(this.ctx.storage.sql));
         });
         this.authTablesBootstrapped = true;
     }
 
-    private recordMigratedAuthSchema(sql: CatalogSql): void {
-        let runtime: ReturnType<typeof getAuthRuntime>;
-        try {
-            runtime = getAuthRuntime();
-        } catch (error) {
-            if (error instanceof CdbError && error.code === "CDB_AUTH_NOT_BOUND") return;
-            throw error;
-        }
-        const rendered = Object.values(runtime.schema)
-            .map(table => renderSqliteTableDdl(table))
-            .sort((left, right) => left.tableName.localeCompare(right.tableName));
-        const expectedNames = new Set(rendered.map(ddl => ddl.tableName));
-        for (const ddl of rendered) {
-            const table = sql.one<{ sql: string }>(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-                ddl.tableName
-            );
-            if (table?.sql !== ddl.createTable) {
-                throw new CdbError({
-                    code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
-                    message: `Catalog auth migration did not produce table "${ddl.tableName}"`,
-                });
-            }
-            for (let index = 0; index < ddl.indexNames.length; index++) {
-                const name = ddl.indexNames[index];
-                const expectedSql = ddl.indexes[index];
-                if (!name || !expectedSql) {
-                    throw new CdbError({
-                        code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
-                        message: `Catalog auth migration has invalid index metadata for "${ddl.tableName}"`,
-                    });
-                }
-                const present = sql.one<{ sql: string }>(
-                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ? AND tbl_name = ?",
-                    name,
-                    ddl.tableName
-                );
-                if (present?.sql !== expectedSql) {
-                    throw new CdbError({
-                        code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
-                        message: `Catalog auth migration did not produce index "${String(name)}"`,
-                    });
-                }
-            }
-            sql.exec(
-                "INSERT OR REPLACE INTO catalog_meta (k, v) VALUES (?, ?)",
-                `auth_ddl_v1:${ddl.tableName}`,
-                ddl.signature
-            );
-        }
-        const recorded = sql.all<{ k: string }>(
-            "SELECT k FROM catalog_meta WHERE substr(k, 1, 12) = 'auth_ddl_v1:' ORDER BY k"
-        );
-        for (const row of recorded) {
-            const tableName = row.k.slice(12);
-            if (expectedNames.has(tableName)) continue;
-            const existing = sql.one<{ present: number }>(
-                "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?",
-                tableName
-            );
-            if (existing) {
-                throw new CdbError({
-                    code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
-                    message: `Catalog auth migration left removed table "${tableName}" in storage`,
-                });
-            }
-            sql.exec("DELETE FROM catalog_meta WHERE k = ?", row.k);
-        }
-    }
-
     /** Run a Better Auth model write against Catalog-owned storage. */
-    async mutateAuth(args: {
-        readonly model: string;
-        readonly op: "create" | "update" | "delete";
-        readonly where?: { readonly [k: string]: RawJson };
-        readonly payload?: { readonly [k: string]: RawJson };
-        readonly returnRow?: boolean;
-        readonly limitOne?: boolean;
-    }): Promise<{
-        readonly ok: true;
-        readonly row?: Record<string, RawJson> | null;
-        readonly affected?: number;
-    }> {
+    async mutateAuth(args: CatalogAuthMutationRequest): Promise<CatalogAuthMutationResult> {
         await this.bootstrap();
         this.ensureAuthTables();
-        const table = tableFor(args.model);
-        const scopeColumns = authEpochScopeColumns(args.model, table);
-        const placement = placementFor(args.model);
-        let row: Record<string, RawJson> | null | undefined;
-        let affected = 0;
-        this.ctx.storage.transactionSync(() => {
+        const hasOrganizationCleanupResources = this.hasOrganizationCleanupResources();
+        const nowMs = Date.now();
+        const mutate = () => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const scopes = new Map<string, { scope: AuthEpochScope; scopeId: string }>();
-            switch (args.op) {
-                case "create": {
-                    if (!args.payload) throw new Error("auth: create requires payload");
-                    row = authCreate(sql, table, args.payload);
-                    affected = 1;
-                    addRowEpochScopes(scopes, args.model, row);
-                    break;
-                }
-                case "update": {
-                    if (!args.where || !args.payload) {
-                        throw new Error("auth: update requires where and payload");
-                    }
-                    if (args.limitOne && Object.keys(args.where).length === 0) break;
-                    const mutationWhere = args.limitOne
-                        ? (() => {
-                              const id = authFindFirstId(sql, table, args.where);
-                              return id === null ? null : { id };
-                          })()
-                        : args.where;
-                    if (!mutationWhere) break;
-                    const before = authPreloadScopeRows(
-                        sql,
-                        table,
-                        mutationWhere,
-                        scopeColumns,
-                        scopeColumns.map(column => args.payload?.[column]),
-                        args.payload
-                    );
-                    const returnRow = args.returnRow !== false;
-                    const fullBefore =
-                        returnRow && before.matchedRows > 0 ? authFindOne(sql, table, mutationWhere) : null;
-                    const r = authUpdate(sql, table, mutationWhere, args.payload, returnRow);
-                    affected = r.affected;
-                    if (affected > 0) {
-                        if (placement.kind === "replicated") addEpochScope(scopes, "global", "global");
-                        row = returnRow ? (r.row ?? (fullBefore ? { ...fullBefore, ...args.payload } : null)) : null;
-                        for (const previous of before.rows) {
-                            addRowEpochScopes(scopes, args.model, previous);
-                            const next: Record<string, RawJson> = { ...previous };
-                            for (const column of scopeColumns) {
-                                if (Object.hasOwn(args.payload, column)) next[column] = args.payload[column] as RawJson;
-                            }
-                            addRowEpochScopes(scopes, args.model, next);
-                        }
-                    } else {
-                        row = r.row;
-                    }
-                    break;
-                }
-                case "delete": {
-                    if (!args.where) throw new Error("auth: delete requires where");
-                    if (args.limitOne && Object.keys(args.where).length === 0) break;
-                    const mutationWhere = args.limitOne
-                        ? (() => {
-                              const id = authFindFirstId(sql, table, args.where);
-                              return id === null ? null : { id };
-                          })()
-                        : args.where;
-                    if (!mutationWhere) break;
-                    const before = authPreloadScopeRows(sql, table, mutationWhere, scopeColumns);
-                    affected = authDelete(sql, table, mutationWhere).affected;
-                    if (affected > 0) {
-                        if (placement.kind === "replicated") addEpochScope(scopes, "global", "global");
-                        for (const previous of before.rows) addRowEpochScopes(scopes, args.model, previous);
-                    }
-                    break;
+            const deletionStore = new CatalogOrganizationDeletionStore(sql);
+            const deletionBarriers = new CatalogOrganizationDeletionBarrierStore(sql);
+            if (
+                args.model === "organization" &&
+                (args.op === "create" || args.op === "update") &&
+                typeof args.payload?.id === "string" &&
+                deletionStore.isDeleted(args.payload.id)
+            ) {
+                throw new CdbError({
+                    code: "CDB_INVALID_ARGS",
+                    message: "organization id was permanently retired after deletion",
+                });
+            }
+            const mutation = mutateCatalogAuthWithEffects(sql, args);
+            this.enqueueAuthInvalidations(sql, mutation.authEpochChanges, nowMs);
+            for (const organizationId of mutation.deletedOrganizationIds) {
+                const vshard = Number(vshardOf([organizationId]));
+                deletionBarriers.assertDeletionAllowed(vshard);
+                deletionStore.record(organizationId, vshard, nowMs);
+                if (hasOrganizationCleanupResources) {
+                    deletionStore.recordShards(organizationId, [this.organizationDeletionTarget(vshard)], nowMs);
+                } else {
+                    deletionStore.complete(organizationId, nowMs);
                 }
             }
-            for (const scope of scopes.values()) bumpAuthEpochInSql(sql, scope.scope, scope.scopeId);
-        });
-        return { ok: true, row: row ?? null, affected };
+            return mutation;
+        };
+        const outcome = await this.alarmScheduler.transactionWithEarlierAlarm(nowMs, mutate);
+        return outcome.result;
     }
 
     /** Atomically apply Better Auth's guarded single-row numeric increment contract. */
-    async incrementAuth(args: {
-        readonly model: string;
-        readonly where: readonly AuthIncrementWhere[];
-        readonly increment: { readonly [k: string]: number };
-        readonly set?: { readonly [k: string]: RawJson };
-    }): Promise<{
-        readonly ok: true;
-        readonly row: Record<string, RawJson> | null;
-        readonly affected: number;
-    }> {
+    async incrementAuth(args: CatalogAuthIncrementRequest): Promise<CatalogAuthIncrementResult> {
         await this.bootstrap();
         this.ensureAuthTables();
-        const table = tableFor(args.model);
-        const scopeColumns = authEpochScopeColumns(args.model, table);
-        const placement = placementFor(args.model);
-        const set = args.set ?? {};
-        let row: Record<string, RawJson> | null = null;
-        let affected = 0;
-        this.ctx.storage.transactionSync(() => {
+        const nowMs = Date.now();
+        const outcome = await this.alarmScheduler.transactionWithEarlierAlarm(nowMs, () => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
-            assertAuthIncrementInput(table, args.where, args.increment, set);
-            const targetId = authFindFirstIncrementId(sql, table, args.where);
-            if (targetId === null) return;
-
-            const replacementAccounting = Object.create(null) as Record<string, RawJson>;
-            for (const key of Object.keys(set)) replacementAccounting[key] = set[key] as RawJson;
-            for (const [key, delta] of Object.entries(args.increment)) replacementAccounting[key] = delta;
-            const before = authPreloadScopeRows(
-                sql,
-                table,
-                { id: targetId },
-                scopeColumns,
-                scopeColumns.map(column => set[column]),
-                replacementAccounting
-            );
-            if (before.matchedRows !== 1) {
-                throw new CdbError({
-                    code: "CDB_INVARIANT",
-                    message: "Catalog incrementAuth selected a row that disappeared inside one transaction",
-                });
-            }
-
-            const result = authIncrementOne(sql, table, targetId, args.where, args.increment, set);
-            affected = result.affected;
-            row = result.row;
-            if (affected === 0) return;
-            if (!row) {
-                throw new CdbError({
-                    code: "CDB_INVARIANT",
-                    message: "Catalog incrementAuth updated a row but could not reload it",
-                });
-            }
-            const scopes = new Map<string, { scope: AuthEpochScope; scopeId: string }>();
-            if (placement.kind === "replicated") addEpochScope(scopes, "global", "global");
-            for (const previous of before.rows) addRowEpochScopes(scopes, args.model, previous);
-            addRowEpochScopes(scopes, args.model, row);
-            for (const scope of scopes.values()) bumpAuthEpochInSql(sql, scope.scope, scope.scopeId);
+            const increment = incrementCatalogAuthWithEffects(sql, args);
+            this.enqueueAuthInvalidations(sql, increment.authEpochChanges, nowMs);
+            return increment;
         });
-        return { ok: true, row, affected };
+        return outcome.result;
     }
 
     /** Read Better Auth rows from Catalog-owned storage. */
-    async queryAuth(args: {
-        readonly model: string;
-        readonly where: readonly AuthReadWhere[];
-        readonly limit?: number;
-        readonly offset?: number;
-        readonly sortBy?: { readonly field: string; readonly direction: "asc" | "desc" };
-    }): Promise<readonly Record<string, RawJson>[]> {
+    async queryAuth(args: CatalogAuthQueryRequest): Promise<readonly Record<string, RawJson>[]> {
         await this.bootstrap();
         this.ensureAuthTables();
-        const table = tableFor(args.model);
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        return authFindMany(sql, table, args.where, args.limit, args.offset, args.sortBy);
+        return queryCatalogAuth(adaptSqlStorage(this.ctx.storage.sql), args);
     }
 
     /** Count Better Auth rows without materializing them across the Catalog RPC. */
-    async countAuth(args: {
-        readonly model: string;
-        readonly where: readonly AuthReadWhere[];
-    }): Promise<number> {
+    async countAuth(args: Pick<CatalogAuthQueryRequest, "model" | "where">): Promise<number> {
         await this.bootstrap();
         this.ensureAuthTables();
-        return authCount(adaptSqlStorage(this.ctx.storage.sql), tableFor(args.model), args.where);
+        return countCatalogAuth(adaptSqlStorage(this.ctx.storage.sql), args);
+    }
+
+    /**
+     * Keep expected adapter failures on the caller side of the Workers RPC boundary.
+     * Throwing a migration fence through RPC restarts the Durable Object turn in local
+     * Workerd even when Better Auth converts that rejection into a closed HTTP response.
+     */
+    async authAdapterRpc(request: CatalogAuthAdapterRpcRequest): Promise<CatalogAuthAdapterRpcResult> {
+        try {
+            switch (request.operation) {
+                case "mutate":
+                    return { ok: true, value: await this.mutateAuth(request.args) };
+                case "increment":
+                    return { ok: true, value: await this.incrementAuth(request.args) };
+                case "query":
+                    return { ok: true, value: await this.queryAuth(request.args) };
+                case "count":
+                    return { ok: true, value: await this.countAuth(request.args) };
+                default:
+                    throw new CdbError({ code: "CDB_INVALID_ARGS", message: "unknown auth adapter operation" });
+            }
+        } catch (error) {
+            if (!isCdbError(error)) throw error;
+            return {
+                ok: false,
+                error: {
+                    code: error.code,
+                    message: error.message,
+                    ...(error.hint === undefined ? {} : { hint: error.hint }),
+                },
+            };
+        }
     }
 
     /**
@@ -781,95 +453,69 @@ export class Catalog extends DurableObject<CatalogEnv> {
     async resolveOrganizationAuthority(args: OrganizationAuthorityRequest): Promise<OrganizationAuthority | null> {
         await this.bootstrap();
         if (!args.principalId || !args.organizationId) return null;
-
-        let runtime: ReturnType<typeof getAuthRuntime>;
-        try {
-            runtime = getAuthRuntime();
-        } catch (error) {
-            if (error instanceof CdbError && error.code === "CDB_AUTH_NOT_BOUND") return null;
-            throw error;
-        }
-        const authSchema = runtime.schema as unknown as Record<string, unknown>;
-        if (!authSchema.organization || !authSchema.member) return null;
-
+        if (!catalogOrganizationAuthorityAvailable()) return null;
         this.ensureAuthTables();
-        const organizationTable = tableFor("organization");
-        const memberTable = tableFor("member");
-        let authority: OrganizationAuthority | null = null;
-        this.ctx.storage.transactionSync(() => {
+        return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const organization = authFindOne(sql, organizationTable, { id: args.organizationId });
-            if (!organization) return;
-            const membership = authFindOne(sql, memberTable, {
-                organizationId: args.organizationId,
-                userId: args.principalId,
+            if (new CatalogOrganizationDeletionStore(sql).isDeleted(args.organizationId)) return null;
+            return resolveOrganizationAuthorityFromCatalog(sql, args);
+        });
+    }
+
+    /**
+     * Resolve current organization membership and physical placement without an
+     * interleaving Catalog turn between the authority and routing reads.
+     */
+    async resolveOrganizationAuthorityRoute(
+        args: OrganizationAuthorityRouteRequest
+    ): Promise<OrganizationAuthorityRouteResult> {
+        await this.bootstrap();
+        if (!Number.isSafeInteger(args.vshard) || args.vshard < 0 || args.vshard >= VSHARD_COUNT) {
+            throw new CdbError({ code: "CDB_INVALID_ARGS", message: "virtual shard is out of range" });
+        }
+        const currentSchemaState = this.readSchemaState();
+        if (
+            currentSchemaState.status !== "active" ||
+            currentSchemaState.activeVersion !== this.migrationJournal().version
+        ) {
+            throw new CdbError({
+                code: "CDB_STALE_EPOCH",
+                message: `schema migration ${currentSchemaState.migrationId ?? "unknown"} is in progress`,
+                hint: "retry after the schema migration activates",
             });
-            const roles = canonicalMembershipRoles(membership?.role);
-            if (roles.length === 0) return;
-            authority = {
-                principalId: args.principalId,
-                organizationId: args.organizationId,
-                role: roles.join(","),
-                roles,
-                authEpochs: {
-                    global: this.readEpoch("auth_global", "global"),
-                    tenant: this.readEpoch("auth_tenant", args.organizationId),
-                    principal: this.readEpoch("auth_principal", args.principalId),
-                },
+        }
+        if (!args.principalId || !args.organizationId) return { authority: null };
+        if (!catalogOrganizationAuthorityAvailable()) return { authority: null };
+        this.ensureAuthTables();
+        return this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const schemaState = this.readSchemaState();
+            if (schemaState.status !== "active" || schemaState.activeVersion !== this.migrationJournal().version) {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: `schema migration ${schemaState.migrationId ?? "unknown"} is in progress`,
+                    hint: "retry after the schema migration activates",
+                });
+            }
+            if (new CatalogOrganizationDeletionStore(sql).isDeleted(args.organizationId)) return { authority: null };
+            const authority = resolveOrganizationAuthorityFromCatalog(sql, args);
+            if (!authority) return { authority: null };
+            return {
+                authority,
+                route: { ...this.routingStore.route(args.vshard), domainSchemaEpoch: schemaState.activeEpoch },
             };
         });
-        return authority;
     }
 
     /** Resolve user authority from the Catalog-owned Better Auth user row. */
     async resolveUserAuthority(args: UserAuthorityRequest): Promise<UserAuthority | null> {
         await this.bootstrap();
         if (!args.principalId) return null;
-
-        let runtime: ReturnType<typeof getAuthRuntime>;
-        try {
-            runtime = getAuthRuntime();
-        } catch (error) {
-            if (error instanceof CdbError && error.code === "CDB_AUTH_NOT_BOUND") return null;
-            throw error;
-        }
-        const authSchema = runtime.schema as unknown as Record<string, unknown>;
-        if (!authSchema.user) return null;
-
+        if (!catalogUserAuthorityAvailable()) return null;
         this.ensureAuthTables();
-        const userTable = tableFor("user");
-        let authority: UserAuthority | null = null;
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const user = authFindOne(sql, userTable, { id: args.principalId });
-            if (!user) return;
-            const storedRoles = canonicalMembershipRoles(user.role);
-            const roles = storedRoles.length === 0 ? ["user"] : storedRoles;
-            authority = {
-                principalId: args.principalId,
-                role: roles.join(","),
-                roles,
-                authEpochs: {
-                    global: this.readEpoch("auth_global", "global"),
-                    tenant: 0,
-                    principal: this.readEpoch("auth_principal", args.principalId),
-                },
-            };
-        });
-        return authority;
-    }
-
-    private map(): VshardMap {
-        if (this.cachedMap) return this.cachedMap;
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        const rows: VshardRange[] = [];
-        const cursor = this.ctx.storage.sql.exec<{ lo: number; hi: number; shard_id: string }>(
-            "SELECT lo, hi, shard_id FROM catalog_ranges ORDER BY lo ASC"
+        return this.ctx.storage.transactionSync(() =>
+            resolveUserAuthorityFromCatalog(adaptSqlStorage(this.ctx.storage.sql), args)
         );
-        for (const r of cursor) rows.push({ lo: r.lo, hi: r.hi, shardId: ShardId(r.shard_id) });
-        void sql;
-        this.cachedMap = new VshardMap(rows);
-        return this.cachedMap;
     }
 
     async route(vshard: number): Promise<RouteResult> {
@@ -881,15 +527,395 @@ export class Catalog extends DurableObject<CatalogEnv> {
                 hint: "retry after the schema migration activates",
             });
         }
-        return {
-            shardId: this.map().routeVshard(vshard as Vshard),
-            domainSchemaEpoch: schemaState.activeEpoch,
-            schemaEpoch: this.readEpoch("schema", "global"),
-        };
+        return { ...this.routingStore.route(vshard), domainSchemaEpoch: schemaState.activeEpoch };
+    }
+
+    /** Private operational status routed through the current vshard owner. */
+    async organizationDeletionPurgeStatus(input: {
+        readonly organizationId: string;
+    }): Promise<CatalogOrganizationDeletionStatus> {
+        try {
+            await this.bootstrap();
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const store = new CatalogOrganizationDeletionStore(sql);
+            const deletion = store.read(input.organizationId);
+            const shards = deletion ? store.shards(input.organizationId) : [];
+            const handoff = projectOrganizationDeletionHandoff(deletion, shards);
+            if (!deletion) {
+                return Object.freeze({
+                    organizationId: input.organizationId,
+                    authDeleted: false,
+                    handoffComplete: false,
+                    handoff,
+                    vectorPurge: null,
+                });
+            }
+            if (!this.hasVectorCleanupResources()) {
+                return Object.freeze({
+                    organizationId: deletion.organizationId,
+                    authDeleted: true,
+                    handoffComplete: deletion.status === "complete",
+                    handoff,
+                    vectorPurge: null,
+                });
+            }
+            const shardNamespace = this.env.CDB_SHARD;
+            if (!shardNamespace) {
+                throw new CdbError({ code: "CDB_SHARD_UNAVAILABLE", message: "CDB_SHARD binding is unavailable" });
+            }
+            const vectorPurge = await readCurrentOwnerVectorPurgeStatus({
+                organizationId: deletion.organizationId,
+                vshard: deletion.vshard,
+                deps: {
+                    route: vshard => this.route(vshard),
+                    cdb: shardId =>
+                        shardNamespace.get(shardNamespace.idFromName(shardId)) as unknown as CdbOrganizationDeletionRpc,
+                },
+            });
+            if (deletion.status === "complete" && vectorPurge === null) {
+                throw new CdbError({
+                    code: "CDB_INVARIANT",
+                    message: "completed vector deletion handoff has no current-owner purge tombstone",
+                });
+            }
+            return Object.freeze({
+                organizationId: deletion.organizationId,
+                authDeleted: true,
+                handoffComplete: deletion.status === "complete",
+                handoff,
+                vectorPurge,
+            });
+        } catch (error) {
+            throwCdbRpcError(rehydrateCdbRpcError(error));
+        }
+    }
+
+    override async alarm(): Promise<void> {
+        const nowMs = Date.now();
+        await this.deliverAuthInvalidations(nowMs);
+        if (this.hasOrganizationCleanupResources()) await this.deliverOrganizationDeletions(nowMs);
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        const nextAuthInvalidation = new CatalogAuthInvalidationStore(sql).nextPendingAt();
+        const nextDeletion = this.hasOrganizationCleanupResources()
+            ? new CatalogOrganizationDeletionStore(sql).nextPendingAt()
+            : null;
+        const nextAlarm = this.earliestPending(nextAuthInvalidation, nextDeletion);
+        if (nextAlarm !== null) await this.scheduleAlarmNoLaterThan(Math.max(nowMs + 1, nextAlarm));
+    }
+
+    private async deliverOrganizationDeletions(nowMs: number): Promise<void> {
+        const store = new CatalogOrganizationDeletionStore(adaptSqlStorage(this.ctx.storage.sql));
+        // Reconcile deletion rows written by the earlier parent-only outbox shape.
+        for (const deletion of store.due(nowMs)) {
+            try {
+                this.ctx.storage.transactionSync(() => {
+                    const currentStore = new CatalogOrganizationDeletionStore(adaptSqlStorage(this.ctx.storage.sql));
+                    const current = currentStore.read(deletion.organizationId);
+                    if (!current || current.status === "complete") return;
+                    currentStore.recordShards(
+                        deletion.organizationId,
+                        [this.organizationDeletionTarget(deletion.vshard)],
+                        nowMs
+                    );
+                });
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                this.ctx.storage.transactionSync(() => {
+                    const currentStore = new CatalogOrganizationDeletionStore(adaptSqlStorage(this.ctx.storage.sql));
+                    const current = currentStore.read(deletion.organizationId);
+                    if (current?.status === "pending") currentStore.defer(deletion.organizationId, nowMs, message);
+                });
+            }
+        }
+        const handoffs = store.dueShards(nowMs);
+        const outcomes = await Promise.all(
+            handoffs.map(async handoff => {
+                try {
+                    if (!this.env.CDB_SHARD) {
+                        throw new CdbError({
+                            code: "CDB_SHARD_UNAVAILABLE",
+                            message: "CDB_SHARD binding is unavailable",
+                        });
+                    }
+                    const route = await this.route(handoff.vshard);
+                    const id = this.env.CDB_SHARD.idFromName(handoff.shardId);
+                    const cdb = this.env.CDB_SHARD.get(id) as unknown as CdbOrganizationDeletionRpc;
+                    const result = await cdb.deleteOrganizationFiles({
+                        organizationId: handoff.organizationId,
+                        nowMs,
+                        domainSchemaEpoch: route.domainSchemaEpoch,
+                    });
+                    this.assertOrganizationDeletionResult(result, handoff.organizationId);
+                    return { handoff, error: null } as const;
+                } catch (error) {
+                    return { handoff, error } as const;
+                }
+            })
+        );
+        this.ctx.storage.transactionSync(() => {
+            const currentStore = new CatalogOrganizationDeletionStore(adaptSqlStorage(this.ctx.storage.sql));
+            for (const outcome of outcomes) {
+                const current = currentStore.read(outcome.handoff.organizationId);
+                if (!current || current.status === "complete") continue;
+                if (outcome.error === null) {
+                    currentStore.completeShard(outcome.handoff.organizationId, outcome.handoff.shardId, nowMs);
+                } else {
+                    const message = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+                    currentStore.deferShard(outcome.handoff.organizationId, outcome.handoff.shardId, nowMs, message);
+                }
+            }
+        });
+    }
+
+    private enqueueAuthInvalidations(sql: CatalogSql, changes: readonly CatalogAuthEpochChange[], nowMs: number): void {
+        const store = new CatalogAuthInvalidationStore(sql);
+        const activeTopology = new CatalogTopologyOperationStore(sql).active();
+        for (const change of changes) {
+            if (change.scope === "global") {
+                store.enqueueGlobal(change.epoch, nowMs);
+                continue;
+            }
+            if (change.scope === "principal") {
+                store.enqueuePrincipal(change.scopeId, change.epoch, nowMs);
+                continue;
+            }
+            const vshard = Number(vshardOf([change.scopeId]));
+            const shardIds = new Set<string>([this.routingStore.route(vshard).shardId]);
+            if (activeTopology && activeTopology.rangeLo <= vshard && vshard <= activeTopology.rangeHi) {
+                shardIds.add(activeTopology.sourceShard);
+                shardIds.add(activeTopology.destinationShard);
+            }
+            store.enqueueTargets(change.scope, change.scopeId, change.epoch, [...shardIds], nowMs);
+        }
+    }
+
+    /** The current owner captures pre-cutover tombstones; the range barrier closes the handoff race. */
+    private organizationDeletionTarget(vshard: number): string {
+        return this.routingStore.route(vshard).shardId;
+    }
+
+    private async deliverAuthInvalidations(nowMs: number): Promise<void> {
+        const store = new CatalogAuthInvalidationStore(adaptSqlStorage(this.ctx.storage.sql));
+        const targets = store.dueTargets(nowMs);
+        const outcomes = await Promise.all(
+            targets.map(async target => {
+                try {
+                    const request = { scope: target.scope, scopeId: target.scopeId, epoch: target.epoch };
+                    const result = await this.callAuthInvalidation(target.shardId, request);
+                    this.assertAuthInvalidationResult(result, request);
+                    return { target, error: null } as const;
+                } catch (error) {
+                    return { target, error } as const;
+                }
+            })
+        );
+        this.ctx.storage.transactionSync(() => {
+            const current = new CatalogAuthInvalidationStore(adaptSqlStorage(this.ctx.storage.sql));
+            for (const outcome of outcomes) {
+                if (outcome.error === null) current.completeTarget(outcome.target);
+                else current.deferTarget(outcome.target, nowMs, outcome.error);
+            }
+        });
+
+        const principal = store.duePrincipal(nowMs);
+        if (principal) {
+            const page = this.globalAuthInvalidationShardPage(principal.cursorShardId);
+            if (page.length === 0) {
+                this.ctx.storage.transactionSync(() =>
+                    new CatalogAuthInvalidationStore(adaptSqlStorage(this.ctx.storage.sql)).completePrincipal(
+                        principal.scopeId,
+                        principal.epoch
+                    )
+                );
+            } else {
+                const lastShardId = page.at(-1);
+                if (!lastShardId) {
+                    throw new CdbError({ code: "CDB_INVARIANT", message: "principal auth shard page is empty" });
+                }
+                const request = {
+                    scope: "principal" as const,
+                    scopeId: principal.scopeId,
+                    epoch: principal.epoch,
+                };
+                const principalOutcomes = await Promise.all(
+                    page.map(async shardId => {
+                        try {
+                            const result = await this.callAuthInvalidation(shardId, request);
+                            this.assertAuthInvalidationResult(result, request);
+                            return null;
+                        } catch (error) {
+                            return error;
+                        }
+                    })
+                );
+                const failure = principalOutcomes.find(error => error !== null);
+                this.ctx.storage.transactionSync(() => {
+                    const current = new CatalogAuthInvalidationStore(adaptSqlStorage(this.ctx.storage.sql));
+                    if (failure) current.deferPrincipal(principal.scopeId, principal.epoch, nowMs, failure);
+                    else current.advancePrincipal(principal.scopeId, principal.epoch, lastShardId, nowMs);
+                });
+            }
+        }
+
+        const global = store.dueGlobal(nowMs);
+        if (!global) return;
+        const page = this.globalAuthInvalidationShardPage(global.cursorShardId);
+        if (page.length === 0) {
+            this.ctx.storage.transactionSync(() =>
+                new CatalogAuthInvalidationStore(adaptSqlStorage(this.ctx.storage.sql)).completeGlobal(global.epoch)
+            );
+            return;
+        }
+        const lastShardId = page.at(-1);
+        if (!lastShardId) throw new CdbError({ code: "CDB_INVARIANT", message: "global auth shard page is empty" });
+        const request = { scope: "global" as const, scopeId: "global", epoch: global.epoch };
+        const globalOutcomes = await Promise.all(
+            page.map(async shardId => {
+                try {
+                    const result = await this.callAuthInvalidation(shardId, request);
+                    this.assertAuthInvalidationResult(result, request);
+                    return null;
+                } catch (error) {
+                    return error;
+                }
+            })
+        );
+        const failure = globalOutcomes.find(error => error !== null);
+        this.ctx.storage.transactionSync(() => {
+            const current = new CatalogAuthInvalidationStore(adaptSqlStorage(this.ctx.storage.sql));
+            if (failure) current.deferGlobal(global.epoch, nowMs, failure);
+            else current.advanceGlobal(global.epoch, lastShardId, nowMs);
+        });
+    }
+
+    private globalAuthInvalidationShardPage(afterExclusive: string | null): readonly string[] {
+        const shardIds = new Set<string>(
+            this.routingStore.listShardIdsPage(afterExclusive, CATALOG_AUTH_INVALIDATION_BATCH_SIZE)
+        );
+        const active = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql)).active();
+        if (active) {
+            for (const participant of [active.sourceShard, active.destinationShard]) {
+                if (afterExclusive === null || participant > afterExclusive) shardIds.add(participant);
+            }
+        }
+        return [...shardIds].sort().slice(0, CATALOG_AUTH_INVALIDATION_BATCH_SIZE);
+    }
+
+    private async callAuthInvalidation(
+        shardId: string,
+        request: CdbAuthInvalidationRequest
+    ): Promise<CdbAuthInvalidationResult> {
+        if (!this.env.CDB_SHARD) {
+            throw new CdbError({ code: "CDB_SHARD_UNAVAILABLE", message: "CDB_SHARD binding is unavailable" });
+        }
+        const id = this.env.CDB_SHARD.idFromName(shardId);
+        return (this.env.CDB_SHARD.get(id) as unknown as CdbAuthInvalidationRpc).invalidateAuthScope(request);
+    }
+
+    private assertAuthInvalidationResult(result: CdbAuthInvalidationResult, request: CdbAuthInvalidationRequest): void {
+        if (
+            !result ||
+            result.accepted !== true ||
+            result.scope !== request.scope ||
+            result.scopeId !== request.scopeId ||
+            !Number.isSafeInteger(result.epoch) ||
+            result.epoch < request.epoch ||
+            !Number.isSafeInteger(result.registrations) ||
+            result.registrations < 0 ||
+            !Number.isSafeInteger(result.changeSeq) ||
+            result.changeSeq < 0 ||
+            Object.keys(result).length !== 6
+        ) {
+            throw new CdbError({ code: "CDB_INVARIANT", message: "Cdb auth invalidation response is invalid" });
+        }
+    }
+
+    private earliestPending(left: number | null, right: number | null): number | null {
+        if (left === null) return right;
+        if (right === null) return left;
+        return Math.min(left, right);
+    }
+
+    private hasOrganizationCleanupResources(): boolean {
+        return this.migrationJournal().migrations.some(migration =>
+            migration.resources.some(resource => resource.kind === "file" || resource.kind === "vector")
+        );
+    }
+
+    private hasVectorCleanupResources(): boolean {
+        return chardbResourceDescriptorsAt(this.migrationJournal().migrations).some(isChardbVectorResourceDescriptor);
+    }
+
+    private assertOrganizationDeletionResult(
+        result: Awaited<ReturnType<CdbOrganizationDeletionRpc["deleteOrganizationFiles"]>>,
+        organizationId: string
+    ): void {
+        if (
+            !result ||
+            result.organizationId !== organizationId ||
+            result.accepted !== true ||
+            Object.keys(result).length !== 2
+        ) {
+            throw new CdbError({ code: "CDB_INVARIANT", message: "Cdb organization cleanup response is invalid" });
+        }
+    }
+
+    private async scheduleAlarmNoLaterThan(deadline: number): Promise<void> {
+        await this.alarmScheduler.scheduleEarlier(deadline);
     }
 
     schemaState(): CatalogSchemaState {
         return this.readSchemaState();
+    }
+
+    async adminSchemaState(): Promise<CatalogSchemaState> {
+        return await this.adminMigrationRpc(() => this.schemaState());
+    }
+
+    async adminBeginSchemaMigration(args: {
+        readonly migrationId: string;
+        readonly targetVersion: number;
+    }): Promise<CatalogSchemaState> {
+        return await this.adminMigrationRpc(() => this.beginSchemaMigration(args));
+    }
+
+    async adminBeginSchemaBaseline(args: {
+        readonly migrationId: string;
+        readonly targetVersion: number;
+    }): Promise<CatalogSchemaState> {
+        return await this.adminMigrationRpc(() => this.beginSchemaBaseline(args));
+    }
+
+    async adminSchemaMigrationShards(args: {
+        readonly migrationId: string;
+    }): Promise<readonly CatalogSchemaShardState[]> {
+        return await this.adminMigrationRpc(() => this.schemaMigrationShards(args));
+    }
+
+    async adminMigrateSchemaShard(args: {
+        readonly migrationId: string;
+        readonly shardId: string;
+    }): Promise<CatalogSchemaShardState> {
+        return await this.adminMigrationRpc(() => this.migrateSchemaShard(args));
+    }
+
+    async adminApplyCatalogSchemaMigration(args: {
+        readonly migrationId: string;
+        readonly version: number;
+    }): Promise<CatalogSchemaState> {
+        return await this.adminMigrationRpc(() => this.applyCatalogSchemaMigration(args));
+    }
+
+    async adminCompleteSchemaMigration(args: { readonly migrationId: string }): Promise<CatalogSchemaState> {
+        return await this.adminMigrationRpc(() => this.completeSchemaMigration(args));
+    }
+
+    private async adminMigrationRpc<T>(operation: () => T | Promise<T>): Promise<T> {
+        try {
+            return await operation();
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
     }
 
     beginSchemaMigration(args: { readonly migrationId: string; readonly targetVersion: number }): CatalogSchemaState {
@@ -916,78 +942,14 @@ export class Catalog extends DurableObject<CatalogEnv> {
             throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration target version is invalid" });
         }
         this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const current = this.readSchemaState();
-            if (current.status === "migrating") {
-                if (current.migrationId === args.migrationId && current.targetVersion === args.targetVersion) return;
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "another schema migration is in progress" });
-            }
-            if (current.activeVersion === args.targetVersion && current.lastMigrationId === args.migrationId) return;
-            if (args.targetVersion <= current.activeVersion) {
-                throw new CdbError({
-                    code: "CDB_INVALID_ARGS",
-                    message: "schema migration must advance the active version",
-                });
-            }
-            if (baseline && (current.activeVersion !== 0 || args.targetVersion !== journal.version)) {
-                throw new CdbError({
-                    code: "CDB_INVALID_ARGS",
-                    message: "schema baseline requires version-zero storage and the complete packaged journal",
-                });
-            }
-            sql.exec(
-                `UPDATE catalog_schema_state
-                 SET status = 'migrating', migration_id = ?, target_version = ?,
-                     target_epoch = active_epoch + 1, target_digest = ?
-                 WHERE singleton = 1 AND status = 'active'`,
-                args.migrationId,
-                args.targetVersion,
-                migrationDigestAt(journal, args.targetVersion)
-            );
-            if (sql.changes() !== 1) throw new CdbError({ code: "CDB_INVARIANT", message: "schema state changed" });
-            sql.exec(
-                `INSERT INTO catalog_schema_shards (migration_id, shard_id, status, last_error, updated_at)
-                 SELECT ?, shard_id, 'pending', NULL, ?
-                 FROM (SELECT DISTINCT shard_id FROM catalog_ranges)
-                 ORDER BY shard_id`,
-                args.migrationId,
-                Date.now()
-            );
-            if (sql.changes() < 1) {
-                throw new CdbError({ code: "CDB_INVARIANT", message: "schema migration has no target shards" });
-            }
-            if (baseline) {
-                sql.exec(
-                    `INSERT INTO catalog_schema_baselines (migration_id, target_version, target_digest, created_at)
-                     VALUES (?, ?, ?, ?)`,
-                    args.migrationId,
-                    args.targetVersion,
-                    migrationDigestAt(journal, args.targetVersion),
-                    Date.now()
-                );
-            }
+            new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql)).assertNoActive();
+            beginCatalogSchemaChange(adaptSqlStorage(this.ctx.storage.sql), journal, args, baseline);
         });
         return this.readSchemaState();
     }
 
     schemaMigrationShards(args: { readonly migrationId: string }): readonly CatalogSchemaShardState[] {
-        const current = this.readSchemaState();
-        if (current.status !== "migrating" || current.migrationId !== args.migrationId) {
-            if (current.status === "active" && current.lastMigrationId === args.migrationId) return [];
-            throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration does not own Catalog" });
-        }
-        return adaptSqlStorage(this.ctx.storage.sql)
-            .all<{ shard_id: string; status: "pending" | "active"; last_error: string | null; updated_at: number }>(
-                `SELECT shard_id, status, last_error, updated_at
-                 FROM catalog_schema_shards WHERE migration_id = ? ORDER BY shard_id`,
-                args.migrationId
-            )
-            .map(row => ({
-                shardId: row.shard_id,
-                status: row.status,
-                lastError: row.last_error,
-                updatedAt: row.updated_at,
-            }));
+        return readCatalogSchemaMigrationShards(adaptSqlStorage(this.ctx.storage.sql), args);
     }
 
     async migrateSchemaShard(args: {
@@ -1015,10 +977,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
         try {
             const id = this.env.CDB_SHARD.idFromName(args.shardId);
             const cdb = this.env.CDB_SHARD.get(id) as unknown as CdbSchemaMigrationRpc;
-            const baseline = adaptSqlStorage(this.ctx.storage.sql).one<{ present: number }>(
-                "SELECT 1 AS present FROM catalog_schema_baselines WHERE migration_id = ?",
-                args.migrationId
-            );
+            const baseline = catalogSchemaBaselineExists(adaptSqlStorage(this.ctx.storage.sql), args.migrationId);
             if (baseline) {
                 await cdb.baselineSchemaMigration({
                     migrationId: args.migrationId,
@@ -1044,42 +1003,12 @@ export class Catalog extends DurableObject<CatalogEnv> {
         } catch (error) {
             const message = (error instanceof Error ? error.message : String(error)).slice(0, 512);
             this.ctx.storage.transactionSync(() => {
-                const sql = adaptSqlStorage(this.ctx.storage.sql);
-                sql.exec(
-                    `UPDATE catalog_schema_shards SET last_error = ?, updated_at = ?
-                     WHERE migration_id = ? AND shard_id = ? AND status = 'pending'`,
-                    message,
-                    Date.now(),
-                    args.migrationId,
-                    args.shardId
-                );
+                recordCatalogSchemaShardFailure(adaptSqlStorage(this.ctx.storage.sql), args, message);
             });
             throw error;
         }
         this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const owner = this.readSchemaState();
-            if (owner.status !== "migrating" || owner.migrationId !== args.migrationId) {
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration ownership changed" });
-            }
-            sql.exec(
-                `UPDATE catalog_schema_shards
-                 SET status = 'active', last_error = NULL, updated_at = ?
-                 WHERE migration_id = ? AND shard_id = ? AND status = 'pending'`,
-                Date.now(),
-                args.migrationId,
-                args.shardId
-            );
-            if (sql.changes() !== 1) {
-                const active = sql.one<{ status: string }>(
-                    "SELECT status FROM catalog_schema_shards WHERE migration_id = ? AND shard_id = ?",
-                    args.migrationId,
-                    args.shardId
-                );
-                if (active?.status !== "active") {
-                    throw new CdbError({ code: "CDB_INVARIANT", message: "schema migration shard state changed" });
-                }
-            }
+            activateCatalogSchemaShard(adaptSqlStorage(this.ctx.storage.sql), args);
         });
         const active = this.schemaMigrationShards({ migrationId: args.migrationId }).find(
             shard => shard.shardId === args.shardId
@@ -1094,134 +1023,19 @@ export class Catalog extends DurableObject<CatalogEnv> {
             throw new CdbError({ code: "CDB_INVALID_ARGS", message: "Catalog schema migration version is invalid" });
         }
         this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const current = this.readSchemaState();
-            if (current.status !== "migrating" || current.migrationId !== args.migrationId) {
-                if (current.status === "active" && current.lastMigrationId === args.migrationId) return;
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration does not own Catalog" });
-            }
-            if (current.targetVersion === null || args.version > current.targetVersion) {
-                throw new CdbError({ code: "CDB_INVALID_ARGS", message: "Catalog migration step exceeds its target" });
-            }
-            const migration = journal.migrations[args.version - 1];
-            if (!migration || migration.version !== args.version) {
-                throw new CdbError({
-                    code: "CDB_PARTITION_CONTRACT_CHANGED",
-                    message: "Catalog schema migration step is missing",
-                });
-            }
-            const existing = sql.one<{ digest: string }>(
-                "SELECT digest FROM catalog_schema_steps WHERE migration_id = ? AND version = ?",
-                args.migrationId,
-                args.version
-            );
-            if (existing) {
-                if (existing.digest !== migration.digest) {
-                    throw new CdbError({
-                        code: "CDB_PARTITION_CONTRACT_CHANGED",
-                        message: "applied Catalog schema migration digest changed",
-                    });
-                }
-                return;
-            }
-            const targetVersion = current.targetVersion;
-            const applied = sql.all<{ version: number; digest: string }>(
-                "SELECT version, digest FROM catalog_schema_steps WHERE migration_id = ? ORDER BY version",
-                args.migrationId
-            );
-            const expected = pendingMigrations(journal, current.activeVersion).filter(
-                step => step.version <= targetVersion
-            );
-            for (let index = 0; index < applied.length; index++) {
-                const stored = applied[index];
-                const packaged = expected[index];
-                if (!stored || !packaged || stored.version !== packaged.version || stored.digest !== packaged.digest) {
-                    throw new CdbError({
-                        code: "CDB_PARTITION_CONTRACT_CHANGED",
-                        message: "applied Catalog schema migration sequence is corrupt",
-                    });
-                }
-            }
-            const next = expected[applied.length];
-            if (!next || next.version !== args.version) {
-                throw new CdbError({
-                    code: "CDB_INVALID_ARGS",
-                    message: "Catalog migration steps must apply in order",
-                });
-            }
-            const baseline = sql.one<{ present: number }>(
-                "SELECT 1 AS present FROM catalog_schema_baselines WHERE migration_id = ?",
-                args.migrationId
-            );
-            if (!baseline) {
-                for (const statement of migration.catalogStatements) sql.exec(statement);
-            }
-            sql.exec(
-                `INSERT INTO catalog_schema_steps (migration_id, version, digest, applied_at)
-                 VALUES (?, ?, ?, ?)`,
-                args.migrationId,
-                migration.version,
-                migration.digest,
-                Date.now()
-            );
+            applyCatalogSchemaMigrationStep(adaptSqlStorage(this.ctx.storage.sql), journal, args);
         });
         return this.readSchemaState();
     }
 
     completeSchemaMigration(args: { readonly migrationId: string }): CatalogSchemaState {
         this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const current = this.readSchemaState();
-            if (current.status === "active") {
-                if (current.lastMigrationId === args.migrationId) return;
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration is not active" });
-            }
-            if (current.migrationId !== args.migrationId) {
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration id does not own Catalog" });
-            }
-            const pending = sql.one<{ count: number }>(
-                `SELECT COUNT(*) AS count FROM catalog_schema_shards
-                 WHERE migration_id = ? AND status != 'active'`,
-                args.migrationId
+            completeCatalogSchemaMigration(
+                adaptSqlStorage(this.ctx.storage.sql),
+                this.migrationJournal(),
+                args,
+                recordMigratedCatalogAuthoritySchema
             );
-            if (!pending || pending.count !== 0) {
-                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration shards are incomplete" });
-            }
-            const targetVersion = current.targetVersion;
-            if (targetVersion === null) {
-                throw new CdbError({ code: "CDB_INVARIANT", message: "Catalog schema migration target is missing" });
-            }
-            const expected = pendingMigrations(this.migrationJournal(), current.activeVersion).filter(
-                step => step.version <= targetVersion
-            );
-            const applied = sql.all<{ version: number; digest: string }>(
-                "SELECT version, digest FROM catalog_schema_steps WHERE migration_id = ? ORDER BY version",
-                args.migrationId
-            );
-            if (
-                applied.length !== expected.length ||
-                applied.some(
-                    (stored, index) =>
-                        stored.version !== expected[index]?.version || stored.digest !== expected[index]?.digest
-                )
-            ) {
-                throw new CdbError({
-                    code: "CDB_STALE_EPOCH",
-                    message: "Catalog schema migration steps are incomplete",
-                });
-            }
-            this.recordMigratedAuthSchema(sql);
-            sql.exec("DELETE FROM catalog_schema_shards WHERE migration_id = ?", args.migrationId);
-            sql.exec("DELETE FROM catalog_schema_baselines WHERE migration_id = ?", args.migrationId);
-            sql.exec(
-                `UPDATE catalog_schema_state
-                 SET active_version = target_version, active_epoch = target_epoch, active_digest = target_digest,
-                     last_migration_id = migration_id, status = 'active', migration_id = NULL, target_version = NULL,
-                     target_epoch = NULL, target_digest = NULL
-                 WHERE singleton = 1 AND status = 'migrating' AND migration_id = ?`,
-                args.migrationId
-            );
-            if (sql.changes() !== 1) throw new CdbError({ code: "CDB_INVARIANT", message: "schema state changed" });
         });
         this.authTablesBootstrapped = true;
         return this.readSchemaState();
@@ -1229,12 +1043,292 @@ export class Catalog extends DurableObject<CatalogEnv> {
 
     /** Return each physical shard that owns at least one current vshard range. */
     async listShardIds(): Promise<readonly ShardId[]> {
-        const shardIds: ShardId[] = [];
-        const cursor = this.ctx.storage.sql.exec<{ shard_id: string }>(
-            "SELECT DISTINCT shard_id FROM catalog_ranges ORDER BY shard_id ASC"
+        return this.routingStore.listShardIds();
+    }
+
+    /** Claim the Catalog topology before any range data moves. */
+    beginDerivedTopologyOperation(args: CatalogDerivedTopologyOperationRequest): CatalogTopologyOperation {
+        assertDerivedTopologyOperationRequest(args);
+        let operation: CatalogTopologyOperation | null = null;
+        this.ctx.storage.transactionSync(() => {
+            const store = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql));
+            const existing = store.read(args.migId);
+            if (existing) {
+                const schema = this.readSchemaState();
+                if (
+                    schema.status !== "active" ||
+                    schema.activeVersion !== existing.schemaVersion ||
+                    schema.activeEpoch !== existing.schemaEpoch ||
+                    schema.activeDigest !== existing.schemaDigest
+                ) {
+                    throw new CdbError({ code: "CDB_STALE_EPOCH", message: "topology schema identity changed" });
+                }
+                operation = store.begin(
+                    {
+                        ...existing,
+                        destinationShard: args.destinationShard,
+                        rangeLo: args.rangeLo,
+                        rangeHi: args.rangeHi,
+                    },
+                    Date.now()
+                );
+                return;
+            }
+            const schema = this.readSchemaState();
+            if (schema.status !== "active" || schema.activeVersion !== this.migrationJournal().version) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration blocks topology operation" });
+            }
+            const start = this.routingStore.route(args.rangeLo);
+            const end = this.routingStore.route(args.rangeHi);
+            if (
+                start.shardId !== end.shardId ||
+                start.schemaEpoch !== end.schemaEpoch ||
+                !this.routingStore.ownsRange(args.rangeLo, args.rangeHi, start.shardId)
+            ) {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "topology range does not have one exact current owner",
+                });
+            }
+            if (args.destinationShard === start.shardId) {
+                throw new CdbError({
+                    code: "CDB_INVALID_ARGS",
+                    message: "topology source and destination must differ",
+                });
+            }
+            operation = store.begin(
+                {
+                    migrationId: args.migId,
+                    sourceShard: start.shardId,
+                    destinationShard: args.destinationShard,
+                    rangeLo: args.rangeLo,
+                    rangeHi: args.rangeHi,
+                    startEpoch: start.schemaEpoch,
+                    schemaVersion: schema.activeVersion,
+                    schemaEpoch: schema.activeEpoch,
+                    schemaDigest: schema.activeDigest,
+                },
+                Date.now()
+            );
+        });
+        if (!operation) throw new CdbError({ code: "CDB_INVARIANT", message: "topology operation was not recorded" });
+        return operation;
+    }
+
+    /** Claim the Catalog topology with an already-derived exact source identity. */
+    beginTopologyOperation(args: CatalogTopologyOperationRequest): CatalogTopologyOperation {
+        let operation: CatalogTopologyOperation | null = null;
+        this.ctx.storage.transactionSync(() => {
+            const store = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql));
+            const existing = store.read(args.migId);
+            if (existing) {
+                const schema = this.readSchemaState();
+                if (
+                    schema.status !== "active" ||
+                    schema.activeVersion !== existing.schemaVersion ||
+                    schema.activeEpoch !== existing.schemaEpoch ||
+                    schema.activeDigest !== existing.schemaDigest
+                ) {
+                    throw new CdbError({ code: "CDB_STALE_EPOCH", message: "topology schema identity changed" });
+                }
+                operation = store.begin(
+                    this.topologyIdentity(args, existing.schemaVersion, existing.schemaEpoch, existing.schemaDigest),
+                    Date.now()
+                );
+                return;
+            }
+            const schema = this.readSchemaState();
+            if (schema.status !== "active" || schema.activeVersion !== this.migrationJournal().version) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration blocks topology operation" });
+            }
+            const start = this.routingStore.route(args.rangeLo);
+            const end = this.routingStore.route(args.rangeHi);
+            if (
+                start.schemaEpoch !== args.startEpoch ||
+                end.schemaEpoch !== args.startEpoch ||
+                start.shardId !== args.sourceShard ||
+                end.shardId !== args.sourceShard ||
+                !this.routingStore.ownsRange(args.rangeLo, args.rangeHi, args.sourceShard)
+            ) {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "topology source identity does not match current routing",
+                });
+            }
+            operation = store.begin(
+                this.topologyIdentity(args, schema.activeVersion, schema.activeEpoch, schema.activeDigest),
+                Date.now()
+            );
+        });
+        if (!operation) throw new CdbError({ code: "CDB_INVARIANT", message: "topology operation was not recorded" });
+        return operation;
+    }
+
+    topologyOperation(args: { readonly migrationId: string }): CatalogTopologyOperation | null {
+        return new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql)).read(args.migrationId);
+    }
+
+    topologyRoutingStatus(args: CatalogTopologyOperationRequest): {
+        readonly owner: "source" | "destination";
+        readonly schemaEpoch: number;
+        readonly operationStatus: CatalogTopologyOperation["status"];
+    } {
+        const operation = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql)).read(args.migId);
+        if (
+            !operation ||
+            operation.sourceShard !== args.sourceShard ||
+            operation.destinationShard !== args.destinationShard ||
+            operation.rangeLo !== args.rangeLo ||
+            operation.rangeHi !== args.rangeHi ||
+            operation.startEpoch !== args.startEpoch
+        ) {
+            throw new CdbError({ code: "CDB_STALE_EPOCH", message: "topology recovery identity does not match" });
+        }
+        const start = this.routingStore.route(args.rangeLo);
+        const end = this.routingStore.route(args.rangeHi);
+        const source =
+            start.schemaEpoch === args.startEpoch &&
+            end.schemaEpoch === args.startEpoch &&
+            start.shardId === args.sourceShard &&
+            end.shardId === args.sourceShard &&
+            this.routingStore.ownsRange(args.rangeLo, args.rangeHi, args.sourceShard);
+        const destination =
+            start.schemaEpoch === args.startEpoch + 1 &&
+            end.schemaEpoch === args.startEpoch + 1 &&
+            start.shardId === args.destinationShard &&
+            end.shardId === args.destinationShard &&
+            this.routingStore.ownsRange(args.rangeLo, args.rangeHi, args.destinationShard);
+        if (source === destination) {
+            throw new CdbError({
+                code: "CDB_STALE_EPOCH",
+                message: "topology recovery does not match an exact source or destination owner",
+            });
+        }
+        if ((operation.status === "aborted" && !source) || (operation.status === "completed" && !destination)) {
+            throw new CdbError({
+                code: "CDB_STALE_EPOCH",
+                message: "topology recovery owner contradicts its operation status",
+            });
+        }
+        return {
+            owner: source ? "source" : "destination",
+            schemaEpoch: start.schemaEpoch,
+            operationStatus: operation.status,
+        };
+    }
+
+    /** Fence new Better Auth organization deletions before the final resource-tail convergence pass. */
+    async beginOrganizationDeletionBarrier(
+        args: CatalogOrganizationDeletionBarrierRequest
+    ): Promise<CatalogOrganizationDeletionBarrier> {
+        const identity = this.deletionBarrierIdentity(args);
+        const nowMs = Date.now();
+        let barrier: CatalogOrganizationDeletionBarrier | null = null;
+        let ready = false;
+        this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const topology = new CatalogTopologyOperationStore(sql).read(args.migId);
+            if (
+                !topology ||
+                topology.status !== "active" ||
+                topology.rangeLo !== args.rangeLo ||
+                topology.rangeHi !== args.rangeHi
+            ) {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "organization deletion barrier does not match an active topology operation",
+                });
+            }
+            const store = new CatalogOrganizationDeletionBarrierStore(sql);
+            barrier = store.begin(identity, nowMs);
+            ready = store.status(identity).olderDeletionsComplete;
+        });
+        if (!barrier) throw new CdbError({ code: "CDB_INVARIANT", message: "deletion barrier was not recorded" });
+        if (!ready) await this.scheduleAlarmNoLaterThan(nowMs + 1);
+        return barrier;
+    }
+
+    organizationDeletionBarrierStatus(
+        args: CatalogOrganizationDeletionBarrierRequest
+    ): CatalogOrganizationDeletionBarrierStatus {
+        return new CatalogOrganizationDeletionBarrierStore(adaptSqlStorage(this.ctx.storage.sql)).status(
+            this.deletionBarrierIdentity(args)
         );
-        for (const row of cursor) shardIds.push(ShardId(row.shard_id));
-        return shardIds;
+    }
+
+    completeTopologyOperation(args: CatalogTopologyOperationRequest): CatalogTopologyOperation {
+        let operation: CatalogTopologyOperation | null = null;
+        this.ctx.storage.transactionSync(() => {
+            const store = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql));
+            const stored = store.read(args.migId);
+            if (!stored) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "topology operation lease is missing" });
+            }
+            const identity = this.topologyIdentity(args, stored.schemaVersion, stored.schemaEpoch, stored.schemaDigest);
+            const exact = store.begin(identity, Date.now());
+            if (exact.status === "completed") {
+                operation = exact;
+                return;
+            }
+            if (exact.status === "aborted") {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "aborted topology operation cannot complete" });
+            }
+            const start = this.routingStore.route(args.rangeLo);
+            const end = this.routingStore.route(args.rangeHi);
+            if (
+                start.schemaEpoch !== args.startEpoch + 1 ||
+                end.schemaEpoch !== args.startEpoch + 1 ||
+                start.shardId !== args.destinationShard ||
+                end.shardId !== args.destinationShard ||
+                !this.routingStore.ownsRange(args.rangeLo, args.rangeHi, args.destinationShard)
+            ) {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "topology completion does not match current routing",
+                });
+            }
+            operation = store.complete(identity, start.schemaEpoch, Date.now());
+        });
+        if (!operation) throw new CdbError({ code: "CDB_INVARIANT", message: "topology operation did not complete" });
+        return operation;
+    }
+
+    abortTopologyOperation(args: CatalogTopologyOperationRequest): CatalogTopologyOperation {
+        let operation: CatalogTopologyOperation | null = null;
+        this.ctx.storage.transactionSync(() => {
+            const store = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql));
+            const stored = store.read(args.migId);
+            if (!stored) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "topology operation lease is missing" });
+            }
+            const identity = this.topologyIdentity(args, stored.schemaVersion, stored.schemaEpoch, stored.schemaDigest);
+            const exact = store.begin(identity, Date.now());
+            if (exact.status === "aborted") {
+                operation = exact;
+                return;
+            }
+            if (exact.status === "completed") {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "completed topology operation cannot abort" });
+            }
+            const start = this.routingStore.route(args.rangeLo);
+            const end = this.routingStore.route(args.rangeHi);
+            if (
+                start.schemaEpoch !== args.startEpoch ||
+                end.schemaEpoch !== args.startEpoch ||
+                start.shardId !== args.sourceShard ||
+                end.shardId !== args.sourceShard ||
+                !this.routingStore.ownsRange(args.rangeLo, args.rangeHi, args.sourceShard)
+            ) {
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "a cut-over topology operation cannot abort" });
+            }
+            const nowMs = Date.now();
+            operation = store.abort(identity, nowMs);
+            const barriers = new CatalogOrganizationDeletionBarrierStore(adaptSqlStorage(this.ctx.storage.sql));
+            const barrier = barriers.read(args.migId);
+            if (barrier) barriers.abort(this.deletionBarrierIdentity(args), nowMs);
+        });
+        if (!operation) throw new CdbError({ code: "CDB_INVARIANT", message: "topology operation did not abort" });
+        return operation;
     }
 
     /**
@@ -1247,99 +1341,118 @@ export class Catalog extends DurableObject<CatalogEnv> {
      * `epoch=N` or the post-cutover map at `epoch=N+1`, never a half-applied
      * intermediate. Mirrors the `CatalogCutover` action in `spec/Resharder.tla`.
      */
-    async cutover(args: {
-        migId: string;
-        lo: number;
-        hi: number;
-        fromShard: string;
-        toShard: string;
-    }): Promise<{ applied: boolean; newEpoch: number }> {
+    async cutover(args: CatalogCutoverRequest & { readonly startEpoch?: number }): Promise<CatalogCutoverResult> {
         const schemaState = this.readSchemaState();
-        if (schemaState.status !== "active" || schemaState.activeVersion !== this.migrationJournal().version) {
+        const storedTopology = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql)).read(
+            args.migId
+        );
+        const schemaMatchesStoredTopology =
+            storedTopology !== null &&
+            schemaState.activeVersion === storedTopology.schemaVersion &&
+            schemaState.activeEpoch === storedTopology.schemaEpoch &&
+            schemaState.activeDigest === storedTopology.schemaDigest;
+        if (
+            schemaState.status !== "active" ||
+            (storedTopology === null && schemaState.activeVersion !== this.migrationJournal().version) ||
+            (storedTopology !== null && !schemaMatchesStoredTopology)
+        ) {
             throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration blocks routing cutover" });
         }
-        let applied = false;
-        let newEpoch = 0;
-        let committedMap: VshardMap | null = null;
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const guard = sql.one<{ v: string }>("SELECT v FROM catalog_meta WHERE k = ?", `cutover:${args.migId}`);
-            if (guard) {
-                newEpoch = this.readEpoch("schema", "global");
-                return;
-            }
-            const next = this.map().split(args.lo, args.hi, ShardId(args.toShard));
-            sql.exec("DELETE FROM catalog_ranges");
-            for (const r of next.ranges_()) {
-                sql.exec("INSERT INTO catalog_ranges (lo, hi, shard_id) VALUES (?, ?, ?)", r.lo, r.hi, r.shardId);
-            }
-            sql.exec("UPDATE catalog_epoch SET epoch = epoch + 1 WHERE scope = 'schema' AND scope_id = 'global'");
-            sql.exec("INSERT INTO catalog_meta (k, v) VALUES (?, ?)", `cutover:${args.migId}`, args.fromShard);
-            applied = true;
-            const row = sql.one<{ epoch: number }>(
-                "SELECT epoch FROM catalog_epoch WHERE scope = 'schema' AND scope_id = 'global'"
-            );
-            newEpoch = row?.epoch ?? 0;
-            committedMap = next;
+        return this.routingStore.cutover(args, {
+            before: currentEpoch => {
+                const store = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql));
+                const existing = store.read(args.migId);
+                if (!existing) {
+                    throw new CdbError({
+                        code: "CDB_STALE_EPOCH",
+                        message: "topology operation lease is missing",
+                    });
+                }
+                const startEpoch = args.startEpoch ?? existing.startEpoch;
+                const identity = this.topologyIdentity(
+                    {
+                        migId: args.migId,
+                        sourceShard: args.fromShard,
+                        destinationShard: args.toShard,
+                        rangeLo: args.lo,
+                        rangeHi: args.hi,
+                        startEpoch,
+                    },
+                    existing.schemaVersion,
+                    existing.schemaEpoch,
+                    existing.schemaDigest
+                );
+                const exact = store.begin(identity, Date.now());
+                if (exact.status === "aborted") {
+                    throw new CdbError({
+                        code: "CDB_STALE_EPOCH",
+                        message: "aborted topology operation cannot cut over",
+                    });
+                }
+                if (
+                    exact.status === "active" &&
+                    (schemaState.activeVersion !== exact.schemaVersion ||
+                        schemaState.activeEpoch !== exact.schemaEpoch ||
+                        schemaState.activeDigest !== exact.schemaDigest ||
+                        (currentEpoch !== exact.startEpoch && currentEpoch !== exact.startEpoch + 1))
+                ) {
+                    throw new CdbError({ code: "CDB_STALE_EPOCH", message: "topology schema identity changed" });
+                }
+            },
+            after: (_newEpoch, _applied) => {
+                const store = new CatalogOrganizationDeletionBarrierStore(adaptSqlStorage(this.ctx.storage.sql));
+                const barrier = store.read(args.migId);
+                if (barrier) {
+                    store.release(
+                        {
+                            migrationId: args.migId,
+                            rangeLo: args.lo,
+                            rangeHi: args.hi,
+                        },
+                        Date.now()
+                    );
+                }
+            },
         });
-        if (committedMap) this.cachedMap = committedMap;
-        return { applied, newEpoch };
     }
 
-    async splitRange(lo: number, hi: number, toShard: string): Promise<void> {
-        const schemaState = this.readSchemaState();
-        if (schemaState.status !== "active" || schemaState.activeVersion !== this.migrationJournal().version) {
-            throw new CdbError({ code: "CDB_STALE_EPOCH", message: "schema migration blocks routing split" });
-        }
-        const next = this.map().split(lo, hi, ShardId(toShard));
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            sql.exec("DELETE FROM catalog_ranges");
-            for (const r of next.ranges_()) {
-                sql.exec("INSERT INTO catalog_ranges (lo, hi, shard_id) VALUES (?, ?, ?)", r.lo, r.hi, r.shardId);
-            }
-            sql.exec("UPDATE catalog_epoch SET epoch = epoch + 1 WHERE scope = 'schema' AND scope_id = 'global'");
-        });
-        this.cachedMap = next;
+    private deletionBarrierIdentity(
+        args: CatalogOrganizationDeletionBarrierRequest
+    ): CatalogOrganizationDeletionBarrierIdentity {
+        return { migrationId: args.migId, rangeLo: args.rangeLo, rangeHi: args.rangeHi };
     }
 
-    bumpAuthEpoch(scope: "global" | "tenant" | "principal", scopeId: string): number {
-        let next = 1;
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            next = bumpAuthEpochInSql(sql, scope, scopeId);
-        });
-        return next;
+    private topologyIdentity(
+        args: CatalogTopologyOperationRequest,
+        schemaVersion: number,
+        schemaEpoch: number,
+        schemaDigest: string
+    ): CatalogTopologyOperationIdentity {
+        return {
+            migrationId: args.migId,
+            sourceShard: args.sourceShard,
+            destinationShard: args.destinationShard,
+            rangeLo: args.rangeLo,
+            rangeHi: args.rangeHi,
+            startEpoch: args.startEpoch,
+            schemaVersion,
+            schemaEpoch,
+            schemaDigest,
+        };
     }
 
-    private readEpoch(scope: string, scopeId: string): number {
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        const row = sql.one<{ epoch: number }>(
-            "SELECT epoch FROM catalog_epoch WHERE scope = ? AND scope_id = ?",
-            scope,
-            scopeId
-        );
-        return row?.epoch ?? 0;
+    async bumpAuthEpoch(scope: "global" | "tenant" | "principal", scopeId: string): Promise<number> {
+        const nowMs = Date.now();
+        return this.alarmScheduler.transactionWithEarlierAlarm(nowMs, () => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const epoch = bumpCatalogAuthEpoch(sql, scope, scopeId);
+            this.enqueueAuthInvalidations(sql, [{ scope, scopeId, epoch }], nowMs);
+            return epoch;
+        });
     }
 
     private readSchemaState(): CatalogSchemaState {
-        const row = adaptSqlStorage(this.ctx.storage.sql).one<StoredCatalogSchemaState>(
-            `SELECT active_version, active_epoch, active_digest, last_migration_id, status, migration_id,
-                    target_version, target_epoch, target_digest
-             FROM catalog_schema_state WHERE singleton = 1`
-        );
-        if (!row) throw new CdbError({ code: "CDB_INVARIANT", message: "Catalog schema state is missing" });
-        return {
-            activeVersion: row.active_version,
-            activeEpoch: row.active_epoch,
-            activeDigest: row.active_digest,
-            lastMigrationId: row.last_migration_id,
-            status: row.status,
-            migrationId: row.migration_id,
-            targetVersion: row.target_version,
-            targetEpoch: row.target_epoch,
-            targetDigest: row.target_digest,
-        };
+        return readCatalogSchemaState(adaptSqlStorage(this.ctx.storage.sql));
     }
 
     authEpoch(args: { tenantId?: TenantId; principalId?: PrincipalId }): {
@@ -1347,14 +1460,17 @@ export class Catalog extends DurableObject<CatalogEnv> {
         tenant: number;
         principal: number;
     } {
-        return {
-            global: this.readEpoch("auth_global", "global"),
-            tenant: args.tenantId ? this.readEpoch("auth_tenant", args.tenantId) : 0,
-            principal: args.principalId ? this.readEpoch("auth_principal", args.principalId) : 0,
-        };
+        return readCatalogAuthEpoch(adaptSqlStorage(this.ctx.storage.sql), args);
     }
 
     async resolveJwk(request: CatalogJwkResolutionRequest): Promise<CatalogJwkResolution> {
+        const schemaState = this.readSchemaState();
+        if (schemaState.status !== "active" || schemaState.activeVersion !== this.migrationJournal().version) {
+            return jwksResolutionUnavailable(
+                "Catalog schema migration blocks JWKS resolution",
+                JWKS_FAILURE_BACKOFF_INITIAL_MS
+            );
+        }
         const jwksUrl = normalizeJwksUrl(request.jwksUrl);
         if (jwksUrl === null) {
             return jwksResolutionUnavailable("Catalog JWKS URL is invalid", JWKS_FAILURE_BACKOFF_MAX_MS);
@@ -1552,92 +1668,35 @@ export class Catalog extends DurableObject<CatalogEnv> {
         expectedShards: readonly string[];
         tenantPrefix?: string;
     }): Promise<void> {
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        sql.exec(
-            `INSERT OR REPLACE INTO catalog_barrier
-       (barrier_id, ts, expected_shards, ack_shards, bookmarks, tenant_prefix) VALUES (?, ?, ?, '[]', '{}', ?)`,
-            args.barrierId,
-            args.ts,
-            JSON.stringify(args.expectedShards),
-            args.tenantPrefix ?? null
-        );
+        recordCatalogBarrier(adaptSqlStorage(this.ctx.storage.sql), args);
     }
 
     /**
-     * Records a shard ack against an outstanding barrier. The bookmark is the
-     * shard's `_chardb_op_log` row id at the moment it observed the barrier;
-     * a barrier is "complete" once every expected shard has acked, at which
-     * point the (barrierId → bookmarks) map is the durable PITR snapshot
-     * coordinate for the cluster.
+     * Record a shard op-log bookmark against an internal barrier. Completion
+     * means every expected shard acknowledged it. Chardb does not retain,
+     * export, or restore these bookmarks.
      */
     async ackBarrier(args: {
         barrierId: string;
         shardId: string;
         bookmark: number;
     }): Promise<{ complete: boolean }> {
-        let complete = false;
-        this.ctx.storage.transactionSync(() => {
-            const sql = adaptSqlStorage(this.ctx.storage.sql);
-            const row = sql.one<{ expected_shards: string; ack_shards: string; bookmarks: string }>(
-                "SELECT expected_shards, ack_shards, bookmarks FROM catalog_barrier WHERE barrier_id = ?",
-                args.barrierId
-            );
-            if (!row) return;
-            const expected = JSON.parse(row.expected_shards) as string[];
-            const acks = new Set<string>(JSON.parse(row.ack_shards) as string[]);
-            const bookmarks = JSON.parse(row.bookmarks) as Record<string, number>;
-            acks.add(args.shardId);
-            bookmarks[args.shardId] = args.bookmark;
-            sql.exec(
-                "UPDATE catalog_barrier SET ack_shards = ?, bookmarks = ? WHERE barrier_id = ?",
-                JSON.stringify([...acks].sort()),
-                JSON.stringify(bookmarks),
-                args.barrierId
-            );
-            complete = expected.every(s => acks.has(s));
-        });
-        return { complete };
+        return this.ctx.storage.transactionSync(() =>
+            acknowledgeCatalogBarrier(adaptSqlStorage(this.ctx.storage.sql), args)
+        );
     }
 
-    /**
-     * One barrier tick. Called by the parent Worker's cron at the cadence
-     * controlled by `policy.pitr.barrierIntervalMs` (default 60s). Returns the
-     * created barrier id so the caller can fan out shard-side ack RPCs.
-     */
+    /** Creates one internal barrier record from the current physical shard set. */
     async openBarrier(now: number): Promise<{ barrierId: string; expectedShards: readonly string[] }> {
-        const expectedShards = [
-            ...new Set(
-                this.map()
-                    .ranges_()
-                    .map(r => r.shardId as string)
-            ),
-        ].sort();
+        const expectedShards = this.routingStore.listShardIds().map(shardId => shardId as string);
         const barrierId = `b-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
         await this.recordBarrier({ barrierId, ts: now, expectedShards });
         return { barrierId, expectedShards };
     }
 
-    /**
-     * Lists open (incomplete) barriers — useful for the doctor command and the
-     * Resharder's "wait for last barrier ack" precondition before cutover.
-     */
+    /** Lists internal barriers that still lack at least one shard acknowledgement. */
     async openBarriers(): Promise<readonly { barrierId: string; ts: number; missing: readonly string[] }[]> {
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        const out: { barrierId: string; ts: number; missing: readonly string[] }[] = [];
-        const cursor = this.ctx.storage.sql.exec<{
-            barrier_id: string;
-            ts: number;
-            expected_shards: string;
-            ack_shards: string;
-        }>("SELECT barrier_id, ts, expected_shards, ack_shards FROM catalog_barrier ORDER BY ts ASC");
-        for (const r of cursor) {
-            const expected = JSON.parse(r.expected_shards) as string[];
-            const acks = new Set<string>(JSON.parse(r.ack_shards) as string[]);
-            const missing = expected.filter(s => !acks.has(s));
-            if (missing.length > 0) out.push({ barrierId: r.barrier_id, ts: r.ts, missing });
-        }
-        void sql;
-        return out;
+        return listOpenCatalogBarriers(adaptSqlStorage(this.ctx.storage.sql));
     }
 }
 
@@ -1647,16 +1706,4 @@ export function configureCatalogRuntime(config: CatalogRuntimeConfig): typeof Ca
             return config.migrations();
         }
     };
-}
-
-function canonicalMembershipRoles(value: RawJson | undefined): readonly string[] {
-    if (typeof value !== "string") return [];
-    return [
-        ...new Set(
-            value
-                .split(",")
-                .map(role => role.trim())
-                .filter(Boolean)
-        ),
-    ].sort();
 }

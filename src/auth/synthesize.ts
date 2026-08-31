@@ -42,8 +42,6 @@ import type {
     BetterAuthDBSchema,
     DBFieldAttribute,
 } from "better-auth/db";
-import { admin } from "better-auth/plugins/admin";
-import { organization } from "better-auth/plugins/organization";
 import type {
     Invitation,
     Member,
@@ -52,11 +50,27 @@ import type {
     Team,
     TeamMember,
 } from "better-auth/plugins/organization";
-import { getTableColumns, sql } from "drizzle-orm";
+import { getTableColumns, getTableName, sql } from "drizzle-orm";
 import type { Column } from "drizzle-orm";
 import { index, integer, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 import type { AnySQLiteColumn, AnySQLiteTable, SQLiteColumnBuilderBase } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../errors.ts";
+
+const SYNTHESIZED_AUTH_TABLES = new WeakSet<object>();
+
+/** Internal runtime marker used to keep Catalog-owned foreign keys out of shard DDL. */
+export function isSynthesizedAuthTable(value: unknown): boolean {
+    return typeof value === "object" && value !== null && SYNTHESIZED_AUTH_TABLES.has(value);
+}
+
+/** SQL table names for the synthesized auth tables present in a merged schema. */
+export function synthesizedAuthTableNames(schema: Readonly<Record<string, unknown>>): ReadonlySet<string> {
+    const names = new Set<string>();
+    for (const value of Object.values(schema)) {
+        if (isSynthesizedAuthTable(value)) names.add(getTableName(value as AnySQLiteTable));
+    }
+    return names;
+}
 
 /** Core better-auth tables — always present regardless of plugins. */
 export const AUTH_DEFAULT_TABLES = ["user", "session", "account", "verification"] as const;
@@ -248,7 +262,9 @@ export function synthesizeAuthSchema<
 
     const ordered = Object.entries(spec).sort(([ka, a], [kb, b]) => orderOf(a) - orderOf(b) || ka.localeCompare(kb));
     for (const [model, entry] of ordered) {
-        tables[model] = buildTable(model, entry, () => tables);
+        const table = buildTable(model, entry, () => tables);
+        SYNTHESIZED_AUTH_TABLES.add(table);
+        tables[model] = table;
     }
 
     for (const k of AUTH_DEFAULT_TABLES) {
@@ -287,7 +303,7 @@ export function synthesizeAuthSchema<
  * ```ts
  * // src/server/auth.ts
  * import { organization } from "better-auth/plugins/organization";
- * import { defineAuth } from "chardb/auth";
+ * import { defineAuth } from "@chardb/core/server";
  *
  * export const auth = defineAuth({ plugins: [organization()] });
  * //     ^ typed as ChardbAuth<"organization" | "member" | "invitation">
@@ -313,68 +329,18 @@ export type ChardbAuth<TPlugins extends readonly unknown[] = [], TExtra extends 
 } & SynthesizedAuthSchema<TPlugins, TExtra>;
 
 /**
- * The two better-auth plugins chardb bakes into every `defineAuth`
- * call by default.
- *
- *   - `organization()` — every chardb app is multi-tenant by default;
- *     the `member.role` lattice is the org-scoped RBAC axis cdbTable's
- *     unprefixed role names match against (`admin`, `member`, custom
- *     names).
- *   - `admin()` — system-wide user roles. cdbTable's `user:`-prefixed
- *     role names match against `user.role` from this plugin.
- *
- * Users may still pass either explicitly to `defineAuth` to override
- * options (e.g. `organization({ teams: true })`); chardb's defaults
- * only apply when the user did not supply an instance of the same
- * plugin id.
+ * Bundle the caller's exact Better Auth profile with its synthesized
+ * tables. Chardb does not add, remove, reorder, or reconstruct plugins;
+ * the configured plugin tuple remains the single source of truth.
  */
-const ORGANIZATION_PLUGIN_ID = "organization";
-const ADMIN_PLUGIN_ID = "admin";
-
-function pluginById(plugins: readonly BetterAuthPlugin[] | undefined, id: string): BetterAuthPlugin | undefined {
-    if (!plugins) return undefined;
-    for (const p of plugins) {
-        if ((p as { id?: string }).id === id) return p;
-    }
-    return undefined;
-}
-
-/** Tables the bundled `organization()` plugin contributes. Used to widen the synthesized schema's static type. */
-const ORG_PLUGIN_TABLES = ["organization", "member", "invitation", "team", "teamMember", "organizationRole"] as const;
-
-/**
- * Default chardb auth profile: `organization()` and `admin()` are
- * always present unless the user passed their own configured instance
- * of the same plugin (in which case theirs wins). The user's
- * additional plugins (`anonymous()`, `jwt()`, `passkey()`, ...) are
- * appended verbatim.
- */
-export function withChardbDefaults<TPlugins extends readonly BetterAuthPlugin[]>(
-    options: AuthOptionsInput<TPlugins>
-): AuthOptionsInput<readonly BetterAuthPlugin[]> {
-    const userPlugins = (options.plugins ?? []) as readonly BetterAuthPlugin[];
-    const merged: BetterAuthPlugin[] = [];
-    if (!pluginById(userPlugins, ORGANIZATION_PLUGIN_ID)) merged.push(organization());
-    if (!pluginById(userPlugins, ADMIN_PLUGIN_ID)) merged.push(admin());
-    for (const p of userPlugins) merged.push(p);
-    return { ...options, plugins: merged };
-}
-
 export function defineAuth<
     const TPlugins extends readonly BetterAuthPlugin[] = [],
     const TExtra extends readonly string[] = [],
->(
-    options: AuthOptionsInput<TPlugins>,
-    extraTables?: TExtra
-): ChardbAuth<TPlugins, TExtra[number] | (typeof ORG_PLUGIN_TABLES)[number]> {
-    const expandedOptions = withChardbDefaults(options);
-    const tables = synthesizeAuthSchema(expandedOptions, extraTables);
-    // Re-key the result back to TPlugins-shaped (the bundled defaults
-    // contribute the org tables, which are also enumerated in
-    // `KnownAuthTables` and so already typed at the consumer surface).
-    return { options: expandedOptions as unknown as BetterAuthOptions, ...tables } as unknown as ChardbAuth<
+>(options: AuthOptionsInput<TPlugins>, extraTables?: TExtra): ChardbAuth<TPlugins, TExtra[number]> {
+    const tables = synthesizeAuthSchema(options, extraTables);
+    return { options: options as unknown as BetterAuthOptions, ...tables } as unknown as ChardbAuth<
         TPlugins,
-        TExtra[number] | (typeof ORG_PLUGIN_TABLES)[number]
+        TExtra[number]
     >;
 }
 

@@ -3,9 +3,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { and, between, eq, exists, gt, gte, sql } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
+import { forOrg, globalScope } from "../../src/server/cdb-tenant.ts";
 import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
-import { forOrg, globalScope } from "../../src/server/index.ts";
 import { manifestFromExports, resolveQuery, routeValidatedQuery } from "../../src/server/manifest.ts";
 import { CDB_RESULT_MAX_BYTES } from "../../src/server/result_limits.ts";
 import type {
@@ -16,6 +16,7 @@ import type {
 } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId, TenantId } from "../../src/types.ts";
 import { stableHashHex, stableJson } from "../../src/util/canonical.ts";
+import { vshardOf } from "../../src/vshard.ts";
 import type { WireEndpoint, WireInterval } from "../../src/wire.ts";
 
 interface Cursor<T> extends Iterable<T> {
@@ -613,6 +614,8 @@ function liveRequest(
         subscription,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-a"),
+        schemaEpoch: 1,
+        vshard: Number(vshardOf(["org-a"])),
         domainSchemaEpoch: 1,
         ref,
         args,
@@ -626,7 +629,7 @@ function registeredQuery(
     subscription: LiveSubscriptionId,
     auth: CdbRegisteredQueryRequest["auth"] = AUTH
 ): CdbRegisteredQueryRequest {
-    return { subscription, auth, domainSchemaEpoch: 1 };
+    return { subscription, auth, schemaEpoch: 1, vshard: Number(vshardOf(["org-a"])), domainSchemaEpoch: 1 };
 }
 
 function sizedResultArgs(rows: number, character: string, characterCount: number) {
@@ -641,6 +644,8 @@ function intentCoverageLiveRequest(subscription: LiveSubscriptionId, mode: Inten
         subscription,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-a"),
+        schemaEpoch: 1,
+        vshard: Number(vshardOf(["org-a"])),
         domainSchemaEpoch: 1,
         ref: registeredIntentCoverage.__chardbRef,
         args,
@@ -664,6 +669,8 @@ function rangeCoverageLiveRequest(subscription: LiveSubscriptionId, mode: RangeC
         subscription,
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-a"),
+        schemaEpoch: 1,
+        vshard: Number(vshardOf(["org-a"])),
         domainSchemaEpoch: 1,
         ref: registeredRangeCoverage.__chardbRef,
         args,
@@ -760,6 +767,8 @@ describe("Cdb registered query execution", () => {
             principalId: PrincipalId("user-2"),
             organizationId: TenantId("settings-v1"),
             placement,
+            schemaEpoch: 1,
+            vshard: Number(vshardOf(["settings-v1"])),
             domainSchemaEpoch: 1,
             ref: registeredGlobalSettings.__chardbRef,
             args,
@@ -779,6 +788,8 @@ describe("Cdb registered query execution", () => {
                     authEpochs: { global: 4, tenant: 0, principal: 7 },
                     claims: {},
                 },
+                schemaEpoch: 1,
+                vshard: Number(vshardOf(["settings-v1"])),
                 domainSchemaEpoch: 1,
             })
         ).resolves.toEqual({
@@ -790,6 +801,8 @@ describe("Cdb registered query execution", () => {
                 subscription,
                 placement: { authority: "global", partitionKey: "settings-v2" },
                 auth: { userId: "user-2", role: "admin", roles: ["admin"], claims: {} },
+                schemaEpoch: 1,
+                vshard: Number(vshardOf(["settings-v1"])),
                 domainSchemaEpoch: 1,
             })
         ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVARIANT" } });
@@ -798,6 +811,8 @@ describe("Cdb registered query execution", () => {
                 subscription,
                 placement: { authority: "user", partitionKey: "settings-v1" },
                 auth: { userId: "settings-v1", role: "admin", roles: ["admin"], claims: {} },
+                schemaEpoch: 1,
+                vshard: Number(vshardOf(["settings-v1"])),
                 domainSchemaEpoch: 1,
             })
         ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVARIANT" } });

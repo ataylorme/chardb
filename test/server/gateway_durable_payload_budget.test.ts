@@ -18,7 +18,7 @@ import {
     installGatewayRegistration,
     retireGatewayRegistration,
     stageGatewaySnapshot,
-} from "../../src/server/do/gateway.ts";
+} from "../../src/server/do/gateway-registration-store.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 
 function syncSql(db: Database): SyncSql {

@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { CdbError } from "../../src/errors.ts";
-import { Gateway, type GatewayEnv, type VerifiedGwAttachment } from "../../src/server/do/gateway.ts";
+import type { VerifiedGwAttachment } from "../../src/server/do/gateway-auth-dispatch.ts";
+import { Gateway, type GatewayEnv } from "../../src/server/do/gateway.ts";
 import {
     CDB_JSON_MAX_AGGREGATE_MEMBERS,
     CDB_MUTATION_ARGS_MAX_BYTES,
@@ -59,7 +60,7 @@ interface GatewayInternals {
     unsettledMutationsByConnection: Map<string, number>;
     authRefreshBarriers: Map<string, Promise<boolean>>;
     settleMut: () => Promise<void>;
-    routeMut: () => Promise<CdbMutationResponse>;
+    routeMut: (msg: { readonly mutId: string }) => Promise<CdbMutationResponse>;
 }
 
 function attachment(connectionId: string, cookie = `cookie-${connectionId}`): VerifiedGwAttachment {
@@ -320,6 +321,48 @@ describe("Gateway unsettled mutation admission", () => {
         expect(socket.attachment.lastCookie).toBe(Cookie("cookie-replacement"));
         expect(internals.unsettledMutationCount).toBe(0);
         expect(internals.unsettledMutationsByConnection.size).toBe(0);
+    });
+
+    test("does not regress the delivered cookie when mutation completions arrive out of order", async () => {
+        const internals = gateway as unknown as GatewayInternals;
+        const socket = new FakeSocket(attachment("connection-1", "cookie-base"));
+        const releases = new Map<string, (response: CdbMutationResponse) => void>();
+        internals.routeMut = msg =>
+            new Promise(resolve => {
+                releases.set((msg as { readonly mutId: string }).mutId, resolve);
+            });
+
+        const first = mutation(gateway, socket, "first");
+        const second = mutation(gateway, socket, "second");
+        await Promise.resolve();
+        releases.get("second")?.({
+            ok: true,
+            cookie: "cookie-second",
+            ran: true,
+            result: "second",
+            rowsAffected: 1,
+        });
+        await second;
+        releases.get("first")?.({
+            ok: true,
+            cookie: "cookie-first",
+            ran: true,
+            result: "first",
+            rowsAffected: 1,
+        });
+        await first;
+
+        expect(socket.attachment.lastCookie).toBe(Cookie("cookie-second"));
+        expect(socket.sent.map(message => JSON.parse(message))).toEqual([
+            expect.objectContaining({
+                cookie: "cookie-second",
+                mutResults: [expect.objectContaining({ mutId: "second" })],
+            }),
+            expect.objectContaining({
+                cookie: "cookie-second",
+                mutResults: [expect.objectContaining({ mutId: "first" })],
+            }),
+        ]);
     });
 
     test("caps exact serialized mutation argument bytes before auth waiting or reservation", async () => {

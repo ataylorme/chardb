@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "chardb",
+      "name": "@chardb/core",
       "dependencies": {
         "@noble/hashes": "^1.5.0",
         "@standard-schema/spec": "^1.1.0",
@@ -22,6 +22,7 @@
         "drizzle-orm": "^0.45.2",
         "drizzle-zod": "0.8.3",
         "miniflare": "^4.20260730.0",
+        "playwright-core": "^1.49.0",
         "react": "^18.3.1",
         "react-dom": "^18.3.1",
         "react-test-renderer": "^18.3.1",
@@ -30,29 +31,13 @@
         "zod": "^4.0.0",
       },
       "peerDependencies": {
-        "@sinclair/typebox": ">=0.32.0",
-        "arktype": ">=2.0.0",
         "better-auth": "~1.6.30",
-        "drizzle-arktype": ">=0.1.0",
         "drizzle-orm": ">=0.36.0",
-        "drizzle-typebox": ">=0.1.0",
-        "drizzle-valibot": ">=0.2.0",
-        "drizzle-zod": ">=0.8.0",
         "react": ">=18.0.0",
-        "valibot": ">=0.30.0",
-        "zod": ">=3.25.0",
       },
       "optionalPeers": [
-        "@sinclair/typebox",
-        "arktype",
         "better-auth",
-        "drizzle-arktype",
-        "drizzle-typebox",
-        "drizzle-valibot",
-        "drizzle-zod",
         "react",
-        "valibot",
-        "zod",
       ],
     },
     "landing": {

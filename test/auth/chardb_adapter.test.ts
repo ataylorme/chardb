@@ -1,5 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { admin } from "better-auth/plugins/admin";
+import { organization } from "better-auth/plugins/organization";
 import { chardbAuthAdapter } from "../../src/auth/chardb_adapter.ts";
 import { renderSqliteTableDdl } from "../../src/auth/ddl.ts";
 import { bindAuthRuntime, resetAuthRuntime } from "../../src/auth/runtime.ts";
@@ -13,7 +15,7 @@ import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import { chardb } from "../../src/server/chardb.ts";
 import { Catalog, configureCatalogRuntime } from "../../src/server/do/catalog.ts";
 import { defineMigrations } from "../../src/server/schema-migrations.ts";
-import { PrincipalId, TenantId } from "../../src/types.ts";
+import { PrincipalId, ShardId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -46,6 +48,7 @@ class CatalogHarness {
     private readonly state: DurableObjectState;
     private CatalogClass: typeof Catalog = Catalog;
     private env: Record<string, unknown> = {};
+    private alarm: number | null = null;
     catalog: Catalog;
 
     constructor(
@@ -61,6 +64,26 @@ class CatalogHarness {
             storage: {
                 sql: sqlStorage(this.db, this.sqlStatements),
                 transactionSync: <T>(callback: () => T): T => this.db.transaction(callback)(),
+                getAlarm: async () => this.alarm,
+                setAlarm: async (scheduledTime: number | Date) => {
+                    this.alarm = scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime;
+                },
+                transaction: async <T>(callback: (transaction: DurableObjectTransaction) => Promise<T>): Promise<T> => {
+                    this.db.run("BEGIN IMMEDIATE");
+                    try {
+                        const result = await callback({
+                            getAlarm: async () => this.alarm,
+                            setAlarm: async (scheduledTime: number | Date) => {
+                                this.alarm = scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime;
+                            },
+                        } as unknown as DurableObjectTransaction);
+                        this.db.run("COMMIT");
+                        return result;
+                    } catch (error) {
+                        this.db.run("ROLLBACK");
+                        throw error;
+                    }
+                },
             },
             blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
                 this.bootstrap = callback();
@@ -102,8 +125,9 @@ function namespaceFor(harness: CatalogHarness): DurableObjectNamespace {
     } as unknown as DurableObjectNamespace;
 }
 
-const auth = defineAuth({});
+const auth = defineAuth({ plugins: [organization(), admin()] });
 const authWithNickname = defineAuth({
+    plugins: [organization(), admin()],
     user: { additionalFields: { nickname: { type: "string", required: false } } },
 });
 const rateLimitAuth = defineAuth({ rateLimit: { storage: "database" } });
@@ -369,15 +393,12 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(secondPage.map(row => row.id)).toEqual(["tied-user-c", "tied-user-d"]);
     });
 
-    test("routes adapter counts to countAuth without falling back to queryAuth", async () => {
+    test("routes adapter counts through the structured Catalog boundary without materializing rows", async () => {
         const requests: unknown[] = [];
         const catalog = {
-            async countAuth(request: unknown) {
-                requests.push(request);
-                return 7;
-            },
-            async queryAuth() {
-                throw new Error("count must not materialize auth rows");
+            async authAdapterRpc(request: unknown) {
+                requests.push(structuredClone(request));
+                return { ok: true, value: 7 };
             },
         };
         const namespace = {
@@ -387,7 +408,12 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespace } })(auth.options);
 
         await expect(adapter.count({ model: "user", where: eq("name", "Counted") })).resolves.toBe(7);
-        expect(requests).toEqual([{ model: "user", where: [{ field: "name", operator: "eq", value: "Counted" }] }]);
+        expect(requests).toEqual([
+            {
+                operation: "count",
+                args: { model: "user", where: [{ field: "name", operator: "eq", value: "Counted" }] },
+            },
+        ]);
     });
 
     test("routes bounded in filters through Catalog reads", async () => {
@@ -435,22 +461,93 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS" });
     });
 
+    test("honors Better Auth organization list filter operators", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const now = new Date("2026-08-24T00:00:00Z");
+        for (const [id, name] of [
+            ["filter-a", "Ada Lovelace"],
+            ["filter-b", "Grace Hopper"],
+            ["filter-c", "Linus Torvalds"],
+            ["filter-d", "Margaret Hamilton"],
+        ] as const) {
+            await adapter.create({
+                model: "user",
+                forceAllowId: true,
+                data: {
+                    id,
+                    name,
+                    email: `${id}@example.com`,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
+            });
+        }
+
+        const ids = async (operator: "contains" | "starts_with" | "ends_with", value: string) =>
+            (
+                await adapter.findMany<Record<string, unknown>>({
+                    model: "user",
+                    where: [{ field: "name", operator, value, mode: "insensitive" }],
+                    sortBy: { field: "id", direction: "asc" },
+                })
+            ).map(row => row.id);
+
+        await expect(ids("contains", "HOP")).resolves.toEqual(["filter-b"]);
+        await expect(ids("starts_with", "lin")).resolves.toEqual(["filter-c"]);
+        await expect(ids("ends_with", "TON")).resolves.toEqual(["filter-d"]);
+        await expect(
+            adapter.count({ model: "user", where: [{ field: "id", operator: "ne", value: "filter-a" }] })
+        ).resolves.toBe(3);
+        await expect(
+            adapter.count({
+                model: "user",
+                where: [{ field: "id", operator: "not_in", value: ["filter-a", "filter-c"] }],
+            })
+        ).resolves.toBe(2);
+        await expect(
+            adapter.findMany<Record<string, unknown>>({
+                model: "user",
+                where: [
+                    { field: "id", operator: "gte", value: "filter-b" },
+                    { field: "id", operator: "lt", value: "filter-d" },
+                ],
+                sortBy: { field: "id", direction: "asc" },
+            })
+        ).resolves.toEqual([expect.objectContaining({ id: "filter-b" }), expect.objectContaining({ id: "filter-c" })]);
+    });
+
+    test("rejects hostile Better Auth filter operators and modes before Catalog SQL", async () => {
+        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const find = (where: Record<string, unknown>) => adapter.findMany({ model: "user", where: [where as never] });
+
+        await expect(find({ field: "name", operator: "between", value: "Ada" })).rejects.toMatchObject({
+            code: "CDB_UNSUPPORTED_FEATURE",
+        });
+        await expect(find({ field: "name", operator: "eq", value: "Ada", mode: "locale-aware" })).rejects.toMatchObject(
+            { code: "CDB_INVALID_ARGS" }
+        );
+        await expect(
+            find({ field: "emailVerified", operator: "eq", value: true, mode: "insensitive" })
+        ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS" });
+        await expect(
+            find({ field: "id", operator: "in", value: ["filter-a"], mode: "insensitive" })
+        ).rejects.toMatchObject({ code: "CDB_UNSUPPORTED_FEATURE" });
+    });
+
     test("routes incrementOne through the native Catalog RPC without fallback reads or writes", async () => {
         const requests: unknown[] = [];
         const catalog = {
-            async incrementAuth(request: unknown) {
-                requests.push(request);
+            async authAdapterRpc(request: unknown) {
+                requests.push(structuredClone(request));
                 return {
                     ok: true,
-                    affected: 1,
-                    row: { id: "rate-native", key: "native", count: 2, lastRequest: 100 },
+                    value: {
+                        ok: true,
+                        affected: 1,
+                        row: { id: "rate-native", key: "native", count: 2, lastRequest: 100 },
+                    },
                 };
-            },
-            async queryAuth() {
-                throw new Error("incrementOne must not use the findMany fallback");
-            },
-            async mutateAuth() {
-                throw new Error("incrementOne must not use the updateMany fallback");
             },
         };
         const namespace = {
@@ -468,19 +565,27 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
                     { field: "count", operator: "lt", value: 3 },
                 ],
                 increment: { count: 1 },
+                set: { lastRequest: 200 },
             })
         ).resolves.toMatchObject({ id: "rate-native", count: 2 });
         expect(requests).toEqual([
             {
-                model: "rateLimit",
-                where: [
-                    { field: "key", operator: "eq", value: "native" },
-                    { field: "lastRequest", operator: "gt", value: 50 },
-                    { field: "count", operator: "lt", value: 3 },
-                ],
-                increment: { count: 1 },
+                operation: "increment",
+                args: {
+                    model: "rateLimit",
+                    where: [
+                        { field: "key", operator: "eq", value: "native" },
+                        { field: "lastRequest", operator: "gt", value: 50 },
+                        { field: "count", operator: "lt", value: 3 },
+                    ],
+                    increment: { count: 1 },
+                    set: { lastRequest: 200 },
+                },
             },
         ]);
+        const request = (requests[0] as { args: { increment: object; set: object } }).args;
+        expect(Object.getPrototypeOf(request.increment)).toBe(Object.prototype);
+        expect(Object.getPrototypeOf(request.set)).toBe(Object.prototype);
     });
 
     test("maps swapped physical incrementOne fields back to their canonical columns", async () => {
@@ -1328,6 +1433,26 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
                 where: [{ field: "id", operator: "eq", value: "migrated-user" }],
             })
         ).rejects.toMatchObject({ code: "CDB_STALE_EPOCH" });
+        await expect(
+            harness.catalog.authAdapterRpc({
+                operation: "query",
+                args: { model: "user", where: [{ field: "id", operator: "eq", value: "migrated-user" }] },
+            })
+        ).resolves.toEqual({
+            ok: false,
+            error: {
+                code: "CDB_STALE_EPOCH",
+                message: "Catalog auth schema migration is not active",
+                hint: "retry after the schema migration activates",
+            },
+        });
+        const fencedAdapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(
+            authWithNickname.options
+        );
+        await expect(fencedAdapter.findOne({ model: "user", where: eq("id", "migrated-user") })).rejects.toMatchObject({
+            code: "CDB_STALE_EPOCH",
+            retryable: true,
+        });
 
         expect(harness.catalog.beginSchemaMigration({ migrationId: "auth-v1", targetVersion: 1 })).toMatchObject({
             status: "migrating",
@@ -1424,12 +1549,12 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("Catalog keeps tenant and principal epochs independent across restart", async () => {
-        expect(harness.catalog.bumpAuthEpoch("tenant", "tenant-a")).toBe(1);
-        expect(harness.catalog.bumpAuthEpoch("tenant", "tenant-b")).toBe(1);
-        expect(harness.catalog.bumpAuthEpoch("principal", "user-a")).toBe(1);
-        expect(harness.catalog.bumpAuthEpoch("principal", "user-b")).toBe(1);
-        expect(harness.catalog.bumpAuthEpoch("tenant", "tenant-a")).toBe(2);
-        expect(harness.catalog.bumpAuthEpoch("principal", "user-b")).toBe(2);
+        expect(await harness.catalog.bumpAuthEpoch("tenant", "tenant-a")).toBe(1);
+        expect(await harness.catalog.bumpAuthEpoch("tenant", "tenant-b")).toBe(1);
+        expect(await harness.catalog.bumpAuthEpoch("principal", "user-a")).toBe(1);
+        expect(await harness.catalog.bumpAuthEpoch("principal", "user-b")).toBe(1);
+        expect(await harness.catalog.bumpAuthEpoch("tenant", "tenant-a")).toBe(2);
+        expect(await harness.catalog.bumpAuthEpoch("principal", "user-b")).toBe(2);
 
         await harness.restart();
         expect(harness.catalog.authEpoch({ tenantId: "tenant-a" as never, principalId: "user-a" as never })).toEqual({
@@ -1475,17 +1600,22 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             },
         });
 
-        expect(
-            await harness.catalog.resolveOrganizationAuthority({
-                principalId: PrincipalId("authority-user"),
-                organizationId: TenantId("authority-org"),
-            })
-        ).toEqual({
+        const expectedAuthority = {
             principalId: PrincipalId("authority-user"),
             organizationId: TenantId("authority-org"),
             role: "admin,member,owner",
             roles: ["admin", "member", "owner"],
+            userRole: "user",
             authEpochs: { global: 1, tenant: 2, principal: 2 },
+        } as const;
+        const authorityRequest = {
+            principalId: PrincipalId("authority-user"),
+            organizationId: TenantId("authority-org"),
+        };
+        expect(await harness.catalog.resolveOrganizationAuthority(authorityRequest)).toEqual(expectedAuthority);
+        expect(await harness.catalog.resolveOrganizationAuthorityRoute({ ...authorityRequest, vshard: 73 })).toEqual({
+            authority: expectedAuthority,
+            route: { shardId: ShardId("ShardDO_0"), schemaEpoch: 1, domainSchemaEpoch: 1 },
         });
     });
 

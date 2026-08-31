@@ -18,8 +18,8 @@
  *   - findOne → `SELECT * FROM t WHERE ... LIMIT 1`.
  *   - findMany → `SELECT * FROM t WHERE ... ORDER BY ... LIMIT ? OFFSET ?`.
  *
- * Read predicates support a flat AND of equality and bounded `in`
- * filters. Mutation predicates remain equality-only.
+ * Read predicates support Better Auth's full operator set as a flat AND.
+ * Mutation predicates remain equality-only.
  */
 
 import { type Column, getTableColumns, getTableName } from "drizzle-orm";
@@ -57,16 +57,29 @@ export interface AuthIncrementWhere {
     readonly value: RawJson;
 }
 
+export type AuthReadScalarOperator =
+    | "eq"
+    | "ne"
+    | "lt"
+    | "lte"
+    | "gt"
+    | "gte"
+    | "contains"
+    | "starts_with"
+    | "ends_with";
+
 export type AuthReadWhere =
     | {
           readonly field: string;
-          readonly operator: "eq";
+          readonly operator: AuthReadScalarOperator;
           readonly value: RawJson;
+          readonly mode?: "sensitive" | "insensitive";
       }
     | {
           readonly field: string;
-          readonly operator: "in";
+          readonly operator: "in" | "not_in";
           readonly value: readonly RawJson[];
+          readonly mode?: "sensitive" | "insensitive";
       };
 
 const tableInfoCache = new WeakMap<AnySQLiteTable, TableInfo>();
@@ -154,27 +167,64 @@ function bindReadWhere(
             });
         }
         const quoted = quoteIdent(sqlName);
-        if (condition.operator === "eq") {
+        if (condition.operator === "in" || condition.operator === "not_in") {
+            if (condition.value.length > AUTH_READ_IN_MAX_VALUES) {
+                throw new CdbError({
+                    code: "CDB_INVALID_ARGS",
+                    message: `auth/sql: ${condition.operator} filter exceeds ${AUTH_READ_IN_MAX_VALUES} values`,
+                });
+            }
+            if (condition.value.length === 0) {
+                parts.push(condition.operator === "in" ? "0=1" : "1=1");
+                continue;
+            }
+            parts.push(
+                `${quoted} ${condition.operator === "in" ? "IN" : "NOT IN"} (${condition.value.map(() => "?").join(", ")})`
+            );
+            for (const value of condition.value) params.push(toSqlValue(value));
+            continue;
+        }
+
+        const insensitive = condition.mode === "insensitive";
+        const expression = insensitive ? `lower(${quoted})` : quoted;
+        const value = toSqlValue(condition.value);
+        const comparableValue = insensitive && typeof value === "string" ? value.toLowerCase() : value;
+        if (condition.operator === "eq" || condition.operator === "ne") {
             if (condition.value === null) {
-                parts.push(`${quoted} IS NULL`);
+                parts.push(`${quoted} IS ${condition.operator === "eq" ? "" : "NOT "}NULL`);
             } else {
-                parts.push(`${quoted} = ?`);
-                params.push(toSqlValue(condition.value));
+                parts.push(`${expression} ${condition.operator === "eq" ? "=" : "!="} ?`);
+                params.push(comparableValue);
             }
             continue;
         }
-        if (condition.value.length > AUTH_READ_IN_MAX_VALUES) {
-            throw new CdbError({
-                code: "CDB_INVALID_ARGS",
-                message: `auth/sql: in filter exceeds ${AUTH_READ_IN_MAX_VALUES} values`,
-            });
-        }
-        if (condition.value.length === 0) {
-            parts.push("0=1");
+        if (
+            condition.operator === "lt" ||
+            condition.operator === "lte" ||
+            condition.operator === "gt" ||
+            condition.operator === "gte"
+        ) {
+            const operator = { lt: "<", lte: "<=", gt: ">", gte: ">=" }[condition.operator];
+            parts.push(`${expression} ${operator} ?`);
+            params.push(comparableValue);
             continue;
         }
-        parts.push(`${quoted} IN (${condition.value.map(() => "?").join(", ")})`);
-        for (const value of condition.value) params.push(toSqlValue(value));
+        if (typeof comparableValue !== "string") {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: `auth/sql: ${condition.operator} filter requires a string value`,
+            });
+        }
+        if (condition.operator === "contains") {
+            parts.push(`instr(${expression}, ?) > 0`);
+            params.push(comparableValue);
+        } else if (condition.operator === "starts_with") {
+            parts.push(`instr(${expression}, ?) = 1`);
+            params.push(comparableValue);
+        } else {
+            parts.push(`substr(${expression}, length(${expression}) - length(?) + 1) = ?`);
+            params.push(comparableValue, comparableValue);
+        }
     }
     return { sql: parts.join(" AND "), params };
 }

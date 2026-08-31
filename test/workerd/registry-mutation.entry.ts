@@ -1,15 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
+import { jwt } from "better-auth/plugins/jwt";
 import { gte } from "drizzle-orm";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { isCdbError } from "../../src/errors.ts";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
+import { globalScope } from "../../src/server/cdb-tenant.ts";
 import { chardb } from "../../src/server/chardb.ts";
 import { createApi } from "../../src/server/define.ts";
-import type { CdbMutationRequest, CdbMutationResponse } from "../../src/server/do/cdb.ts";
-import { globalScope } from "../../src/server/index.ts";
 import { manifestFromExports, routeMutation, routeValidatedQuery } from "../../src/server/manifest.ts";
 import type {
+    CdbMutationRequest,
+    CdbMutationResponse,
     CdbRegisteredQueryRequest,
     CdbSubscriptionRequest,
     GatewayInvalidationRequest,
@@ -17,6 +19,7 @@ import type {
     LiveSubscriptionId,
 } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
+import { vshardOf } from "../../src/vshard.ts";
 
 const { cdbTable } = globalScope();
 const entries = cdbTable(
@@ -45,6 +48,17 @@ const putEntry = api.mutation({
                 probeClaim: ctx.auth.claims.probe ?? null,
             },
         };
+    },
+});
+
+const putRoutedEntry = api.mutation({
+    ref: "src/probe.ts#putRoutedEntry",
+    authority: "global",
+    partitionKey: "ownerId",
+    args: z.object({ id: z.string().min(1), ownerId: z.string().min(1), value: z.number().int() }),
+    handler: function putRoutedEntry(ctx, args) {
+        ctx.db.insert(entries).values(args).run();
+        return args.id;
     },
 });
 
@@ -96,8 +110,12 @@ const registryEntries = api.query({
     },
 });
 
-const app = chardb({ schema, api: { putEntry, inspectEntries, rawAfterTyped, registryEntries } });
-const manifest = manifestFromExports({ putEntry, inspectEntries, rawAfterTyped, registryEntries });
+const app = chardb({
+    auth: { plugins: [jwt()] },
+    schema,
+    api: { putEntry, putRoutedEntry, inspectEntries, rawAfterTyped, registryEntries },
+});
+const manifest = manifestFromExports({ putEntry, putRoutedEntry, inspectEntries, rawAfterTyped, registryEntries });
 
 interface StoredEntry extends Record<string, SqlStorageValue> {
     readonly id: string;
@@ -214,9 +232,10 @@ export class InvalidationGateway extends DurableObject<Record<string, never>> {
 }
 
 interface DispatchBody {
-    readonly operation: "put" | "inspect" | "raw" | "unknown";
+    readonly operation: "put" | "routed" | "inspect" | "raw" | "unknown";
     readonly mutId: string;
     readonly args: unknown;
+    readonly schemaEpoch?: number;
 }
 
 const AUTH = {
@@ -238,6 +257,8 @@ function subscriptionRequest(gatewayId: string): CdbSubscriptionRequest {
         },
         principalId: PrincipalId(AUTH.userId),
         organizationId: TenantId(AUTH.tenantId),
+        schemaEpoch: 1,
+        vshard: Number(vshardOf([AUTH.tenantId])),
         domainSchemaEpoch: 1,
         ref: ChardbRef("queries.ts#registryEntries"),
         args: {},
@@ -263,6 +284,8 @@ function registeredSubscriptionRequest(gatewayId: string, registrationId: string
         principalId: PrincipalId(AUTH.userId),
         organizationId: TenantId(AUTH.userId),
         placement: { authority: "global", partitionKey: AUTH.userId },
+        schemaEpoch: 1,
+        vshard: Number(vshardOf([AUTH.userId])),
         domainSchemaEpoch: 1,
         ref: registryEntries.__chardbRef,
         args: routed.args,
@@ -291,6 +314,9 @@ export default {
             subscribe(input: CdbSubscriptionRequest): Promise<unknown>;
             unsubscribe(input: LiveSubscriptionId): Promise<void>;
             queryRegistered(input: CdbRegisteredQueryRequest): Promise<unknown>;
+            prepareRoutingFence(input: RoutingFenceIdentity): Promise<unknown>;
+            activateRoutingFence(input: RoutingFenceIdentity): Promise<unknown>;
+            completeRoutingFenceCleanup(input: RoutingFenceIdentity): Promise<unknown>;
         };
         const url = new URL(request.url);
         if (url.pathname === "/state") return Response.json(await stub.inspectAtomicState());
@@ -306,6 +332,17 @@ export default {
         if (url.pathname === "/unsubscribe") {
             await stub.unsubscribe(subscribeRequest.subscription);
             return Response.json({ ok: true });
+        }
+        if (url.pathname.startsWith("/routing-fence/")) {
+            const body = (await request.json()) as RoutingFenceIdentity;
+            if (url.pathname === "/routing-fence/prepare") return Response.json(await stub.prepareRoutingFence(body));
+            if (url.pathname === "/routing-fence/activate") {
+                return Response.json(await stub.activateRoutingFence(body));
+            }
+            if (url.pathname === "/routing-fence/cleanup") {
+                return Response.json(await stub.completeRoutingFenceCleanup(body));
+            }
+            return Response.json({ ok: false }, { status: 404 });
         }
         if (url.pathname.startsWith("/registered/")) {
             const body = (await request.json()) as {
@@ -343,6 +380,8 @@ export default {
                             userId: body.forgedPrincipal ? "forged-principal" : AUTH.userId,
                             claims: { probe: "fresh-query-auth" },
                         },
+                        schemaEpoch: 1,
+                        vshard: Number(vshardOf([AUTH.userId])),
                         domainSchemaEpoch: 1,
                         placement: {
                             authority: body.forgedAuthority ? "organization" : "global",
@@ -357,11 +396,13 @@ export default {
         const ref =
             body.operation === "put"
                 ? putEntry.__chardbRef
-                : body.operation === "inspect"
-                  ? inspectEntries.__chardbRef
-                  : body.operation === "raw"
-                    ? rawAfterTyped.__chardbRef
-                    : "src/probe.ts#missing";
+                : body.operation === "routed"
+                  ? putRoutedEntry.__chardbRef
+                  : body.operation === "inspect"
+                    ? inspectEntries.__chardbRef
+                    : body.operation === "raw"
+                      ? rawAfterTyped.__chardbRef
+                      : "src/probe.ts#missing";
         const route = routeMutation(manifest, { ref, args: body.args as CdbMutationRequest["args"] }, () => 0);
         if (!route.ok) return Response.json(route);
         const mutationRequest: CdbMutationRequest = {
@@ -369,10 +410,21 @@ export default {
             mutId: body.mutId,
             ref,
             args: route.args,
+            ...(route.authority === null || route.partitionKey === null
+                ? {}
+                : { placement: { authority: route.authority, partitionKey: route.partitionKey } }),
             auth: AUTH,
-            schemaEpoch: 1,
+            schemaEpoch: body.schemaEpoch ?? 1,
             domainSchemaEpoch: 1,
         };
         return Response.json(await stub.mutate(mutationRequest));
     },
 };
+
+interface RoutingFenceIdentity {
+    readonly migrationId: string;
+    readonly rangeLo: number;
+    readonly rangeHi: number;
+    readonly sourceGeneration: number;
+    readonly destinationGeneration: number;
+}

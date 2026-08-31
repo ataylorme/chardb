@@ -25,19 +25,11 @@
         "types": ["bun-types", "@cloudflare/workers-types"],
         "baseUrl": ".",
         "paths": {
-            "chardb": ["./src/index.ts"],
-            "chardb/server": ["./src/server/index.ts"],
-            "chardb/drizzle": ["./src/drizzle/index.ts"],
-            "chardb/files": ["./src/files/index.ts"],
-            "chardb/files/zod": ["./src/files/validators/zod.ts"],
-            "chardb/files/typebox": ["./src/files/validators/typebox.ts"],
-            "chardb/files/valibot": ["./src/files/validators/valibot.ts"],
-            "chardb/files/arktype": ["./src/files/validators/arktype.ts"],
-            "chardb/auth": ["./src/auth/index.ts"],
-            "chardb/react": ["./src/react/index.ts"],
-            "chardb/cli": ["./src/cli/index.ts"],
-            "chardb/vite": ["./src/vite/index.ts"],
-            "chardb/miniflare-plugin": ["./src/miniflare-plugin/index.ts"]
+            "@chardb/core": ["./src/index.ts"],
+            "@chardb/core/server": ["./src/server/index.ts"],
+            "@chardb/core/files": ["./src/files/index.ts"],
+            "@chardb/core/react": ["./src/react/index.ts"],
+            "@chardb/core/vite": ["./src/vite/index.ts"]
         }
     },
     "include": ["src/**/*", "test/**/*"],

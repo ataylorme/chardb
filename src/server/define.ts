@@ -14,6 +14,7 @@ import type { StandardSchemaV1 } from "@standard-schema/spec";
 import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
 import { CdbError, type CdbErrorCode } from "../errors.ts";
 import type { Brand, RawJson } from "../types.ts";
+import type { VectorMutationApi } from "../vector.ts";
 import type { CdbIntent } from "../wire.ts";
 import { wrapDb } from "./cdb-db-proxy.ts";
 import { type PolicyDefinition, chardbPolicy } from "./policy.ts";
@@ -37,6 +38,8 @@ export type InferArgs<S> = S extends StandardSchemaV1<unknown, infer O>
 export interface MutationCtx<TDb> {
     readonly db: TDb;
     readonly auth: AuthCtx;
+    /** Transaction-bound Vectorize writes for organization vector columns. */
+    readonly vector: VectorMutationApi;
 }
 
 export interface QueryCtx<TDb> {
@@ -149,12 +152,6 @@ export type QueryFn<TDb, TArgs, TResult> = ((ctx: QueryCtx<TDb>, args: TArgs) =>
     readonly __chardbIntent?: (args: TArgs) => CdbIntent;
     /** Runtime-compiled plan for the single-source Drizzle query form. */
     readonly __chardbCompilePlan?: (args: TArgs) => RegisteredQueryPlan;
-};
-
-export type CronFn = (() => void) & {
-    readonly __chardbKind: "cron";
-    readonly __chardbRef: Brand<string, "ChardbRef">;
-    readonly __chardbCron: string;
 };
 
 export type StreamFn<TDb, TArgs, TChunk, TResult> = ((
@@ -332,8 +329,8 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
         const validated = validator ? runValidatorSync(validator, args) : args;
         return invokeValidated(ctx, validated);
     }) as MutationFn<TDb, TArgs, TResult>;
-    // Preserve the handler's identity for `autoRef` (dev/test path before the
-    // Vite plugin rewrites refs). Without this every wrapper collapses to
+    // Preserve the handler's identity for `autoRef` when no explicit ref is
+    // configured. Without this every wrapper collapses to
     // `Function.name === "fn"` and the manifest deduplicates everything.
     if (handler.name && handler.name !== "fn") {
         Object.defineProperty(fn, "name", { value: handler.name, configurable: true });
@@ -511,15 +508,13 @@ export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>
         throw new TypeError("chardb: planned queries require an explicit ref");
     }
     const invokeValidated = async (ctx: QueryCtx<TDb>, args: TArgs): Promise<TResult> => {
-        const wrappedCtx = wrapCtxDb(ctx) as QueryCtx<TDb>;
         if (plannedQuery) {
-            const builder = plannedQuery(wrappedCtx.db, args);
-            const all = (builder as unknown as { all(): unknown }).all;
-            if (typeof all !== "function") {
-                throw new TypeError("chardb: planned query callback did not return an executable select builder");
-            }
-            return (await all.call(builder)) as TResult;
+            throw new CdbError({
+                code: "CDB_UNSUPPORTED_FEATURE",
+                message: "planned query handles are dispatch-only; Cdb executes their compiled select plan",
+            });
         }
+        const wrappedCtx = wrapCtxDb(ctx) as QueryCtx<TDb>;
         return (handler as (ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>)(wrappedCtx, args);
     };
     const fn = (async (ctx: QueryCtx<TDb>, args: TArgs) => {
@@ -602,48 +597,6 @@ function valueFromValidationResult<T>(result: StandardSchemaV1.Result<T>): T {
         });
     }
     return result.value;
-}
-
-/**
- * Recurring schedule. The cron expression follows the Cloudflare Workers Cron
- * Triggers grammar
- * (https://developers.cloudflare.com/workers/configuration/cron-triggers/).
- * The wire id assigned by the bundler becomes the deterministic
- * `cronExportId` baked into `mutId = sha256(cronExportId ||
- * occurrenceMinute || canonicalArgs)` — backfills and replays remain
- * idempotent through the per-shard op-log dedup.
- */
-export function defineCron<TDb, TArgs extends Record<string, unknown>, TResult>(
-    cronExpr: string,
-    mutationOrHandler:
-        | MutationFn<TDb, TArgs, TResult>
-        | ((ctx: MutationCtx<TDb>, args: TArgs) => TResult | Promise<TResult>),
-    args: TArgs = {} as TArgs
-): CronFn {
-    // Whether the target was produced by `defineMutation` — informs whether
-    // op-log idempotency applies. The runtime entrypoint inspects this flag
-    // when the cron fires; non-mutation handlers run inline in the Worker
-    // isolate without per-shard transactional guarantees.
-    const isMutation = typeof (mutationOrHandler as { __chardbRef?: unknown }).__chardbRef === "string";
-    const invoke = async (): Promise<void> => {
-        try {
-            // The cron path has no shard ctx of its own — for plain handlers we
-            // pass an undefined ctx; users that need shard-bound semantics must
-            // wrap the work in `defineMutation` so the runtime routes it to a
-            // partition. Mutation-targets here are invoked directly so the
-            // entrypoint can later swap in a real shard-routed dispatch.
-            const ctx = undefined as unknown as MutationCtx<TDb>;
-            const target = mutationOrHandler as (ctx: MutationCtx<TDb>, args: TArgs) => TResult | Promise<TResult>;
-            await target(ctx, args);
-        } catch (err) {
-            console.error(`[chardb] cron handler ${cronExpr} failed`, err);
-        }
-    };
-    const fn = Object.assign(invoke, {
-        __chardbCron: cronExpr,
-        __chardbCronIsMutation: isMutation,
-    }) as unknown as CronFn;
-    return attachRef(fn, "cron") as CronFn;
 }
 
 /**
@@ -764,7 +717,7 @@ type RowFromTable<TTable> = TTable extends { readonly $inferSelect: infer R } ? 
  * ```ts
  * import { auth } from "./worker.ts";
  * import * as schema from "./schema.ts";
- * import { createApi } from "chardb/server";
+ * import { createApi } from "@chardb/core/server";
  *
  * const api = createApi({ ...auth, ...schema });
  *
@@ -774,7 +727,7 @@ type RowFromTable<TTable> = TTable extends { readonly $inferSelect: infer R } ? 
  * );
  * ```
  *
- * The `chardb/react` hooks derive their `TArgs` / `TResult` types from
+ * The `@chardb/core/react` hooks derive their `TArgs` / `TResult` types from
  * the returned function via `Parameters<typeof postMessage>[1]` and
  * `Awaited<ReturnType<typeof postMessage>>`, so the user never exports a
  * separate `*Args` type alias for the wire shape.
@@ -797,7 +750,7 @@ export function createApi<const TSchema extends Record<string, unknown>>(_schema
  * Ready-to-use `{ mutation, query, presence, policy }` factory bound
  * to an open schema. Drops the `createApi<typeof auth & typeof
  * domain>()` line every `api.ts` used to start with — the user just
- * does `import { api } from "chardb/server"` and writes `api.mutation
+ * does `import { api } from "@chardb/core/server"` and writes `api.mutation
  * ({...})` directly. Calls like `ctx.db.select().from(messages)`
  * still typecheck because Drizzle's `.from(table)` reads the table's
  * own row type rather than the bound schema generic.

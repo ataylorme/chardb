@@ -1,3 +1,4 @@
+import { type ChardbBindingSelect, type ChardbSelectPlanV1, createBindingSelect } from "./binding-plan.ts";
 import { snapshotMutationArguments, snapshotSubscriptionArguments } from "./client/serialized-json.ts";
 import { CdbError, isCdbErrorCode } from "./errors.ts";
 import type { RawJson } from "./types.ts";
@@ -17,6 +18,11 @@ export interface ChardbBindingQueryRequest extends ChardbBindingAuth {
 
 export interface ChardbBindingMutationRequest extends ChardbBindingQueryRequest {
     readonly mutId: string;
+}
+
+/** Bounded structured select request. It never carries SQL text or caller-owned authority. */
+export interface ChardbBindingPlanRequest extends ChardbBindingAuth {
+    readonly plan: ChardbSelectPlanV1;
 }
 
 export type ChardbBindingFailure = {
@@ -48,6 +54,8 @@ export type ChardbBindingMutationResponse =
 export interface ChardbBinding {
     executeQuery(request: ChardbBindingQueryRequest): Promise<ChardbBindingQueryResponse>;
     executeMutation(request: ChardbBindingMutationRequest): Promise<ChardbBindingMutationResponse>;
+    /** Optional for compatibility with bindings created before structured selects were added. */
+    executePlan?(request: ChardbBindingPlanRequest): Promise<ChardbBindingQueryResponse>;
 }
 
 interface QueryHandle<TArgs, TResult> {
@@ -68,6 +76,8 @@ export interface ChardbBindingMutationOptions {
 }
 
 export interface ChardbBindingClient {
+    /** Start one bounded, full-row, single-table Drizzle select. */
+    readonly select: ChardbBindingSelect;
     query<TArgs extends RawJson, TResult extends RawJson>(
         handle: QueryHandle<TArgs, TResult>,
         args: TArgs
@@ -186,7 +196,20 @@ export function client(binding: ChardbBinding, auth: ChardbBindingAuth): ChardbB
             inFlight--;
         }
     };
+    const select = createBindingSelect(plan =>
+        admitted(async () => {
+            if (typeof binding.executePlan !== "function") {
+                throw new CdbError({
+                    code: "CDB_UNSUPPORTED_FEATURE",
+                    message: "DB binding does not support structured select plans",
+                });
+            }
+            const response = await binding.executePlan({ ...auth, plan });
+            return queryResult(response);
+        })
+    );
     return {
+        select,
         async query(handle, args) {
             const ref = handleRef(handle, "query");
             const ownedArgs = snapshotSubscriptionArguments(args);

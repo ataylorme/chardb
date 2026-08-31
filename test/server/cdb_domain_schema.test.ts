@@ -1,10 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
+import { organization } from "better-auth/plugins/organization";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { renderSqliteTableDdl } from "../../src/auth/ddl.ts";
+import { defineAuth } from "../../src/auth/synthesize.ts";
+import { forOrg, forOrgUser, forUser, globalScope } from "../../src/server/cdb-tenant.ts";
 import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
-import { forOrg, forUser, globalScope } from "../../src/server/index.ts";
 import { manifestFromExports } from "../../src/server/manifest.ts";
 import { defineMigrations, migrationDigestAt } from "../../src/server/schema-migrations.ts";
 
@@ -31,20 +33,43 @@ function sqlStorage(db: Database) {
     };
 }
 
-function construct(CdbClass: typeof Cdb, db: Database): { readonly cdb: Cdb; readonly ready: Promise<unknown> } {
+function construct(
+    CdbClass: typeof Cdb,
+    db: Database
+): {
+    readonly cdb: Cdb;
+    readonly ready: Promise<unknown>;
+    readonly alarms: number[];
+    readonly failNextAlarm: () => void;
+} {
     let ready: Promise<unknown> = Promise.resolve();
+    let rejectNextAlarm = false;
+    const alarms: number[] = [];
     const state = {
         id: { toString: () => "domain-shard-1" },
         storage: {
             sql: sqlStorage(db),
             transactionSync: <T>(callback: () => T): T => db.transaction(callback)(),
-            setAlarm: async (): Promise<void> => {},
+            setAlarm: async (deadline: number): Promise<void> => {
+                if (rejectNextAlarm) {
+                    rejectNextAlarm = false;
+                    throw new Error("fixture dropped the post-activation alarm response");
+                }
+                alarms.push(deadline);
+            },
         },
         blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
             ready = callback();
         },
     } as unknown as DurableObjectState;
-    return { cdb: new CdbClass(state, {}), ready };
+    return {
+        cdb: new CdbClass(state, {}),
+        ready,
+        alarms,
+        failNextAlarm: () => {
+            rejectNextAlarm = true;
+        },
+    };
 }
 
 function domainSchema() {
@@ -116,9 +141,20 @@ describe("configured Cdb domain schema", () => {
                 return args.id;
             },
         });
+        let routedRuns = 0;
+        const createRoutedProject = api.mutation<{ id: string; slug: string }, string>({
+            ref: "cdb-domain-schema.ts#createRoutedProject",
+            authority: "global",
+            partitionKey: "id",
+            handler: (ctx, args: { id: string; slug: string }) => {
+                routedRuns += 1;
+                ctx.db.insert(schema.projects).values(args).run();
+                return args.id;
+            },
+        });
         const ConfiguredCdb = configureCdbRuntime({
             schema: () => schema,
-            manifest: () => manifestFromExports({ createProject }),
+            manifest: () => manifestFromExports({ createProject, createRoutedProject }),
         });
         const first = construct(ConfiguredCdb, db);
         await first.ready;
@@ -166,8 +202,39 @@ describe("configured Cdb domain schema", () => {
             domainSchemaEpoch: 1,
         });
         expect(result).toMatchObject({ ok: true, ran: true, result: "project-1" });
+        const routedBase = {
+            principalId: "user-1",
+            ref: createRoutedProject.__chardbRef,
+            args: { id: "project-routed", slug: "routed" },
+            auth: { userId: "user-1", role: "member", roles: ["member"], claims: {} },
+            schemaEpoch: 1,
+            domainSchemaEpoch: 1,
+        } as const;
+        await expect(
+            reconstructed.cdb.mutate({
+                ...routedBase,
+                mutId: "create-project-routed-omitted",
+            })
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVARIANT" } });
+        await expect(
+            reconstructed.cdb.mutate({
+                ...routedBase,
+                mutId: "create-project-routed-forged",
+                placement: { authority: "global", partitionKey: "project-forged" },
+            })
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVARIANT" } });
+        expect(routedRuns).toBe(0);
+        await expect(
+            reconstructed.cdb.mutate({
+                ...routedBase,
+                mutId: "create-project-routed-correct",
+                placement: { authority: "global", partitionKey: "project-routed" },
+            })
+        ).resolves.toMatchObject({ ok: true, ran: true, result: "project-routed" });
+        expect(routedRuns).toBe(1);
         expect(db.query('SELECT id, slug, priority FROM "domain_projects"').all()).toEqual([
             { id: "project-1", slug: "alpha", priority: 3 },
+            { id: "project-routed", slug: "routed", priority: 3 },
         ]);
         expect(() =>
             db.run('INSERT INTO "domain_projects" ("id", "slug") VALUES (\'project-2\', \'alpha\')')
@@ -331,7 +398,7 @@ describe("configured Cdb domain schema", () => {
         expect(handlerRuns).toBe(0);
         expect(db.query("SELECT COUNT(*) AS count FROM domain_projects").get()).toEqual({ count: 0 });
         expect(db.query("SELECT COUNT(*) AS count FROM _chardb_op_log").get()).toEqual({ count: 0 });
-        expect(() => pending.cdb.activateSchemaMigration({ migrationId: "deploy-2" })).toThrow(/incomplete/);
+        await expect(pending.cdb.activateSchemaMigration({ migrationId: "deploy-2" })).rejects.toThrow(/incomplete/);
         expect(pending.cdb.applySchemaMigration({ migrationId: "deploy-2", version: 1 })).toMatchObject({
             status: "migrating",
         });
@@ -345,22 +412,57 @@ describe("configured Cdb domain schema", () => {
         await reconstructed.ready;
         expect(reconstructed.cdb.schemaState()).toMatchObject({ status: "migrating", migrationId: "deploy-2" });
         db.run('CREATE TABLE "unexpected_migration_table" ("id" TEXT PRIMARY KEY)');
-        expect(() => reconstructed.cdb.activateSchemaMigration({ migrationId: "deploy-2" })).toThrow(
+        await expect(reconstructed.cdb.activateSchemaMigration({ migrationId: "deploy-2" })).rejects.toThrow(
             /unexpected_migration_table/
         );
         expect(reconstructed.cdb.schemaState()).toMatchObject({ status: "migrating", migrationId: "deploy-2" });
         db.run('DROP TABLE "unexpected_migration_table"');
-        expect(reconstructed.cdb.activateSchemaMigration({ migrationId: "deploy-2" })).toMatchObject({
+        db.run(
+            `INSERT INTO _chardb_live_subscriptions
+              (gateway_id, registration_id, connection_id, client_id, sub_id, state,
+               payload_hash, principal_id, organization_id, authority, schema_epoch, vshard,
+               domain_schema_epoch, ref, args_json, policy_digest, query_hash, tables_json, intervals_json)
+             VALUES ('gateway-schema', 'registration-schema', 'connection-schema', 'client-schema', 1, 'active',
+                     'payload', 'user-schema', 'organization-schema', 'global', 1, 0, 1,
+                     'queries.ts#schema', '{}', 'policy', 'query', '[]', '[]')`
+        );
+        const alarmsBeforeActivation = reconstructed.alarms.length;
+        reconstructed.failNextAlarm();
+        await expect(reconstructed.cdb.activateSchemaMigration({ migrationId: "deploy-2" })).rejects.toThrow(
+            /dropped the post-activation alarm response/
+        );
+        expect(reconstructed.cdb.schemaState()).toMatchObject({
             activeVersion: 1,
             activeEpoch: 2,
             activeDigest: futureJournal.digest,
             lastMigrationId: "deploy-2",
             status: "active",
         });
-        expect(reconstructed.cdb.activateSchemaMigration({ migrationId: "deploy-2" })).toMatchObject({
+        expect(
+            db
+                .query(
+                    `SELECT gateway_id, registration_id, change_seq, attempts, next_attempt_at
+                 FROM _chardb_invalidation_outbox`
+                )
+                .get()
+        ).toEqual({
+            gateway_id: "gateway-schema",
+            registration_id: "registration-schema",
+            change_seq: 1,
+            attempts: 0,
+            next_attempt_at: 0,
+        });
+        expect(reconstructed.alarms).toHaveLength(alarmsBeforeActivation);
+        await expect(reconstructed.cdb.activateSchemaMigration({ migrationId: "deploy-2" })).resolves.toMatchObject({
             activeVersion: 1,
             activeEpoch: 2,
         });
+        expect(reconstructed.alarms).toHaveLength(alarmsBeforeActivation + 1);
+        expect(db.query("SELECT change_seq FROM _chardb_change_clock WHERE singleton = 1").get()).toEqual({
+            change_seq: 1,
+        });
+        expect(db.query("SELECT COUNT(*) AS count FROM _chardb_invalidation_outbox").get()).toEqual({ count: 1 });
+        db.run("DELETE FROM _chardb_live_subscriptions WHERE registration_id = 'registration-schema'");
         expect(migrationDigestAt(futureJournal, 1)).toBe(futureJournal.digest);
         await expect(
             reconstructed.cdb.mutate({
@@ -464,7 +566,9 @@ describe("configured Cdb domain schema", () => {
 
         const reconstructed = construct(CdbV2, db);
         await reconstructed.ready;
-        expect(reconstructed.cdb.activateSchemaMigration({ migrationId: "rebuild-projects-v2" })).toMatchObject({
+        await expect(
+            reconstructed.cdb.activateSchemaMigration({ migrationId: "rebuild-projects-v2" })
+        ).resolves.toMatchObject({
             activeVersion: 1,
             activeEpoch: 2,
             status: "active",
@@ -524,7 +628,7 @@ describe("configured Cdb domain schema", () => {
             targetDigest: journal.digest,
         });
         fresh.cdb.applySchemaMigration({ migrationId: "fresh-v1", version: 1 });
-        expect(fresh.cdb.activateSchemaMigration({ migrationId: "fresh-v1" })).toMatchObject({
+        await expect(fresh.cdb.activateSchemaMigration({ migrationId: "fresh-v1" })).resolves.toMatchObject({
             activeVersion: 1,
             activeEpoch: 2,
             status: "active",
@@ -670,8 +774,13 @@ describe("configured Cdb domain schema", () => {
         });
         const schema = { organization, user, messages, notes };
         const api = createApi(schema);
-        const postMessage = api.mutation({
-            handler: (ctx, args: { id: string; body: string }) => {
+        let handlerRuns = 0;
+        const postMessage = api.mutation<{ id: string; organizationId: string; body: string }, string>({
+            ref: "cdb-domain-schema.ts#postOrganizationMessage",
+            authority: "organization",
+            partitionKey: "organizationId",
+            handler: (ctx, args: { id: string; organizationId: string; body: string }) => {
+                handlerRuns += 1;
                 ctx.db.insert(messages).values(args).run();
                 return args.id;
             },
@@ -693,14 +802,93 @@ describe("configured Cdb domain schema", () => {
                 principalId: "user-1",
                 mutId: "post-message-1",
                 ref: postMessage.__chardbRef,
-                args: { id: "message-1", body: "hello" },
+                args: { id: "message-1", organizationId: "org-1", body: "hello" },
                 auth: { userId: "user-1", tenantId: "org-1", role: "member", roles: ["member"], claims: {} },
                 schemaEpoch: 1,
                 domainSchemaEpoch: 1,
             })
         ).toMatchObject({ ok: true, ran: true, result: "message-1" });
+        expect(handlerRuns).toBe(1);
+        expect(
+            await configured.cdb.mutate({
+                principalId: "user-1",
+                mutId: "post-message-forged-placement",
+                ref: postMessage.__chardbRef,
+                args: { id: "message-forged", organizationId: "org-2", body: "forged" },
+                placement: { authority: "organization", partitionKey: "org-2" },
+                auth: { userId: "user-1", tenantId: "org-1", role: "member", roles: ["member"], claims: {} },
+                schemaEpoch: 1,
+                domainSchemaEpoch: 1,
+            })
+        ).toMatchObject({ ok: false, error: { code: "CDB_INVARIANT" } });
+        expect(handlerRuns).toBe(1);
         expect(db.query('SELECT * FROM "domain_messages"').all()).toEqual([
             { id: "message-1", organization_id: "org-1", author_id: "user-1", body: "hello" },
+        ]);
+    });
+
+    test("boots organization-user tables with multiple Catalog user FKs", async () => {
+        const db = new Database(":memory:");
+        databases.push(db);
+        const auth = defineAuth({ plugins: [organization()] });
+        const { cdbTable } = forOrgUser();
+        const documents = cdbTable(
+            "domain_org_user_documents",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => auth.organization.id),
+                ownerId: text("owner_id")
+                    .notNull()
+                    .references(() => auth.user.id),
+                reviewerId: text("reviewer_id")
+                    .notNull()
+                    .references(() => auth.user.id),
+                body: text("body").notNull(),
+            },
+            {
+                selfBy: "ownerId",
+                roles: { self: { create: ["id", "reviewerId", "body"], read: "*" } },
+            }
+        );
+        const schema = { organization: auth.organization, user: auth.user, documents };
+        const api = createApi(schema);
+        const createDocument = api.mutation({
+            handler: (ctx, args: { id: string; reviewerId: string; body: string }) => {
+                ctx.db.insert(documents).values(args).run();
+                return args.id;
+            },
+        });
+        const configured = construct(
+            configureCdbRuntime({
+                schema: () => schema,
+                manifest: () => manifestFromExports({ createDocument }),
+            }),
+            db
+        );
+        await configured.ready;
+
+        expect(db.query('PRAGMA foreign_key_list("domain_org_user_documents")').all()).toEqual([]);
+        expect(
+            await configured.cdb.mutate({
+                principalId: "owner-1",
+                mutId: "create-org-user-document-1",
+                ref: createDocument.__chardbRef,
+                args: { id: "document-1", reviewerId: "reviewer-1", body: "private" },
+                auth: { userId: "owner-1", tenantId: "org-1", role: "member", roles: ["member"], claims: {} },
+                schemaEpoch: 1,
+                domainSchemaEpoch: 1,
+            })
+        ).toMatchObject({ ok: true, ran: true, result: "document-1" });
+        expect(db.query('SELECT * FROM "domain_org_user_documents"').all()).toEqual([
+            {
+                id: "document-1",
+                organization_id: "org-1",
+                owner_id: "owner-1",
+                reviewer_id: "reviewer-1",
+                body: "private",
+            },
         ]);
     });
 });

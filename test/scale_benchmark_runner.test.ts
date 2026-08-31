@@ -3,6 +3,8 @@ import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+    BENCHMARK_SUITES,
+    PLANNED_QUERY_PROFILES,
     SCALE_PROFILES,
     collectRunMetadata,
     parseHarnessMetrics,
@@ -29,8 +31,21 @@ function harnessOutput(sample: number): string {
             initialMs: 10 * sample,
             mutationMs: 20 * sample,
             mutationsPerSecond: 400 / sample,
+            midConvergenceMs: 25 * sample,
+            churnMs: 26 * sample,
+            reconnectedClients: 2,
+            reconnectedClientsPerSecond: 70 / sample,
+            responseLossMutations: 4,
+            responseLossReplayMs: 27 * sample,
+            responseLossReplaysPerSecond: 60 / sample,
+            exactReplayResults: 4,
+            replayDuplicateRows: 0,
+            committedRows: 12,
+            opLogEntries: 12,
+            changeSeqAdvance: 12,
             convergenceMs: 30 * sample,
-            logicalRowDeliveries: 8,
+            deliveryMs: 31 * sample,
+            logicalRowDeliveries: 16,
             logicalRowDeliveriesPerSecond: 200 / sample,
         }),
         JSON.stringify({
@@ -41,6 +56,12 @@ function harnessOutput(sample: number): string {
             writes: 8,
             registrationMs: 40 * sample,
             registrationsPerSecond: 100 / sample,
+            recoveryMs: 45 * sample,
+            recoveredRegistrations: 4,
+            recoveredRegistrationsPerSecond: 90 / sample,
+            committedRows: 8,
+            opLogEntries: 8,
+            changeSeqAdvance: 8,
             writeMs: 50 * sample,
             writesPerSecond: 80 / sample,
             refreshMs: 60 * sample,
@@ -51,13 +72,61 @@ function harnessOutput(sample: number): string {
     ].join("\n");
 }
 
+function plannedQueryHarnessOutput(sample: number): string {
+    return [
+        "bun test v1.2.22",
+        JSON.stringify({
+            type: "chardb-workerd-benchmark",
+            scenario: "native-binding-structured-select-pages",
+            organizations: 2,
+            channels: 8,
+            rowsPerChannel: 100,
+            seededRows: 1_600,
+            queries: 32,
+            concurrency: 8,
+            pageLimit: 25,
+            exactOrderedIsolatedQueries: 32,
+            elapsedMs: 20 * sample,
+            queriesPerSecond: 1_600 / sample,
+            minimumRequestLatencyMs: sample,
+            p50RequestLatencyMs: 2 * sample,
+            p95RequestLatencyMs: 3 * sample,
+            maximumRequestLatencyMs: 4 * sample,
+        }),
+        JSON.stringify({
+            type: "chardb-workerd-benchmark",
+            scenario: "planned-query-registered-pages",
+            organizations: 2,
+            channels: 8,
+            rowsPerChannel: 100,
+            seededRows: 1_600,
+            registrations: 32,
+            pageLimit: 25,
+            exactOrderedIsolatedSnapshots: 32,
+            registrationAndMaterializationMs: 10 * sample,
+            registrationsPerSecond: 3_200 / sample,
+        }),
+        "1 pass",
+    ].join("\n");
+}
+
 describe("scale benchmark profiles", () => {
     test("profiles are named, deterministic, and inside the harness bounds", () => {
+        expect(Object.keys(BENCHMARK_SUITES)).toEqual(["live", "planned-query"]);
         expect(Object.keys(SCALE_PROFILES)).toEqual(["ci-smoke", "client-max-accepted", "throughput"]);
         for (const [name, profile] of Object.entries(SCALE_PROFILES)) {
             expect(validateProfile(name, profile.values)).toBe(profile.values);
         }
         expect(SCALE_PROFILES["client-max-accepted"]?.values).toMatchObject({ mutationBatch: 32, subscriptions: 64 });
+        expect(PLANNED_QUERY_PROFILES["ci-smoke"]).toMatchObject({
+            defaultSamples: 3,
+            values: { channels: 8, registrations: 32, bindingQueries: 32, bindingConcurrency: 8 },
+        });
+        expect(parseScaleArgs(["--suite", "planned-query"])).toMatchObject({
+            suiteName: "planned-query",
+            profileName: "ci-smoke",
+            samples: 3,
+        });
     });
 
     test("rejects an out-of-bound profile and CLI sample count before execution", () => {
@@ -74,6 +143,7 @@ describe("scale benchmark profiles", () => {
             "--samples must be an integer from 1 through 20"
         );
         expect(() => parseScaleArgs(["--profile", "missing"])).toThrow("Unknown scale profile");
+        expect(() => parseScaleArgs(["--suite", "missing"])).toThrow("Unknown scale suite");
     });
 
     test("keeps every accepted sample combination inside the workflow budget", () => {
@@ -128,6 +198,32 @@ describe("scale benchmark evidence", () => {
         expect(() => parseHarnessMetrics(`${harnessOutput(1)}\n${harnessOutput(1).split("\n")[1]}`)).toThrow(
             "Expected 2 benchmark records"
         );
+    });
+
+    test("binds every planned-query record to its required metrics and profile dimensions", () => {
+        const profile = PLANNED_QUERY_PROFILES["ci-smoke"];
+        if (!profile) throw new Error("missing planned-query ci-smoke profile");
+        const validation = { suiteName: "planned-query", profile: profile.values };
+        expect(
+            parseHarnessMetrics(plannedQueryHarnessOutput(1), BENCHMARK_SUITES["planned-query"]?.scenarios, validation)
+        ).toHaveLength(2);
+
+        const missingMetric = plannedQueryHarnessOutput(1).replace('"organizations":2,', "");
+        expect(() =>
+            parseHarnessMetrics(missingMetric, BENCHMARK_SUITES["planned-query"]?.scenarios, validation)
+        ).toThrow("must define exactly");
+
+        const wrongDimensions = plannedQueryHarnessOutput(1).replace('"channels":8', '"channels":7');
+        expect(() =>
+            parseHarnessMetrics(wrongDimensions, BENCHMARK_SUITES["planned-query"]?.scenarios, validation)
+        ).toThrow("channels must equal profile-derived value 8, received 7");
+
+        const emptyRecords = ["planned-query-registered-pages", "native-binding-structured-select-pages"]
+            .map(scenario => JSON.stringify({ type: "chardb-workerd-benchmark", scenario }))
+            .join("\n");
+        expect(() =>
+            parseHarnessMetrics(emptyRecords, BENCHMARK_SUITES["planned-query"]?.scenarios, validation)
+        ).toThrow("must define exactly");
     });
 
     test("writes comparison-ready samples and percentile summaries without thresholds", async () => {
@@ -203,6 +299,79 @@ describe("scale benchmark evidence", () => {
             run: { gitSha: "0123456789abcdef" },
             profile: { name: "ci-smoke", values: SCALE_PROFILES["ci-smoke"]?.values },
         });
+    });
+
+    test("runs repeated planned-query and binding-select samples with one workload identity", async () => {
+        const outputDirectory = await mkdtemp(path.join(tmpdir(), "chardb-planned-query-report-"));
+        temporaryDirectories.push(outputDirectory);
+        const profile = PLANNED_QUERY_PROFILES["ci-smoke"];
+        if (!profile) throw new Error("missing planned-query ci-smoke profile");
+        const invocations: Array<{ environment: Record<string, string | undefined>; suiteId: string }> = [];
+
+        const result = await runScaleBenchmark(
+            {
+                help: false,
+                suiteName: "planned-query",
+                profileName: "ci-smoke",
+                profile: profile.values,
+                samples: 3,
+                outputDirectory,
+            },
+            {
+                environment: { GITHUB_SHA: "planned-query-sha", GITHUB_REF: "refs/heads/main", CI: "true" },
+                runHarness: async input => {
+                    invocations.push({ environment: input.environment, suiteId: input.suite.id });
+                    const output = plannedQueryHarnessOutput(input.sampleIndex);
+                    await writeFile(input.logPath, output, "utf8");
+                    return output;
+                },
+            }
+        );
+
+        expect(invocations).toHaveLength(3);
+        expect(invocations[0]).toMatchObject({
+            suiteId: "planned-query-and-native-binding-select-v2",
+            environment: {
+                CDB_PLANNED_QUERY_BENCH_CHANNELS: "8",
+                CDB_PLANNED_QUERY_BENCH_ROWS_PER_CHANNEL: "100",
+                CDB_PLANNED_QUERY_BENCH_REGISTRATIONS: "32",
+                CDB_PLANNED_QUERY_BENCH_PAGE_LIMIT: "25",
+                CDB_PLANNED_QUERY_BENCH_BINDING_QUERIES: "32",
+                CDB_PLANNED_QUERY_BENCH_BINDING_CONCURRENCY: "8",
+                CDB_PLANNED_QUERY_BENCH_TEST_TIMEOUT_MS: "30000",
+            },
+        });
+        expect(result.records).toHaveLength(6);
+        expect(result.report).toMatchObject({
+            schema: "chardb.scale.report.v1",
+            suite: "planned-query-and-native-binding-select-v2",
+            samples: 3,
+            records: 6,
+            workload: {
+                suite: "planned-query",
+                id: "planned-query-and-native-binding-select-v2",
+                scenarios: ["planned-query-registered-pages", "native-binding-structured-select-pages"],
+                profile: { name: "ci-smoke", values: profile.values },
+            },
+        });
+        expect(result.report.summaries).toContainEqual(
+            expect.objectContaining({
+                scenario: "native-binding-structured-select-pages",
+                sampleCount: 3,
+                metrics: expect.objectContaining({
+                    elapsedMs: { minimum: 20, p50: 40, p95: 60, maximum: 60, mean: 40 },
+                    queriesPerSecond: {
+                        minimum: 533.3333333333334,
+                        p50: 800,
+                        p95: 1_600,
+                        maximum: 1_600,
+                        mean: 977.7778,
+                    },
+                }),
+            })
+        );
+        expect((await readFile(result.ndjsonPath, "utf8")).trim().split("\n")).toHaveLength(6);
+        expect(await readFile(path.join(outputDirectory, "sample-001.log"), "utf8")).toBe(plannedQueryHarnessOutput(1));
     });
 
     test("writes structured metadata before sample one and retains failure status", async () => {

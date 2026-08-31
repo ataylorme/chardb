@@ -7,18 +7,16 @@ export function Tenancy() {
         <Section id="tenancy" num="04" label="tenancy">
             <SectionHeading>Sharded the way your app already works.</SectionHeading>
             <SectionLead>
-                <InlineCode>forOrg()</InlineCode>, <InlineCode>forUser()</InlineCode>, and{" "}
-                <InlineCode>globalScope()</InlineCode> declare placement, transaction, and policy boundaries once.
-                Organization, user, and narrow global paths run through the binding, WebSocket live queries, Catalog
-                authority, and Cdb policy enforcement. A global operation names one exact application partition and runs
-                on one physical Cdb. Workerd and clean-tarball Miniflare tests prove cross-principal sharing,
-                neighboring-partition isolation, reconstruction, replay, and restart. Composite, replicated, and
-                cross-boundary operations remain closed.
+                <InlineCode>forOrg()</InlineCode> declares placement, transaction, and policy boundaries once. The
+                organization path runs through the binding, WebSocket live queries, current Catalog membership, and Cdb
+                policy enforcement. Organization isolation, reconstruction, replay, migration fencing, and restart all
+                follow that same schema boundary.
             </SectionLead>
 
             <div className="mt-10">
                 <CodeCard filename="schema.ts">
-                    <Kw>import</Kw> <P>{"{"}</P> <Id>forOrg</Id> <P>{"}"}</P> <Kw>from</Kw> <Str>"chardb/server"</Str>
+                    <Kw>import</Kw> <P>{"{"}</P> <Id>forOrg</Id> <P>{"}"}</P> <Kw>from</Kw>{" "}
+                    <Str>"@chardb/core/server"</Str>
                     <P>;</P>
                     {"\n"}
                     <Kw>const</Kw> <P>{"{"}</P> <Id>cdbTable</Id> <P>{"}"}</P> <P>=</P> <Fn>forOrg</Fn>

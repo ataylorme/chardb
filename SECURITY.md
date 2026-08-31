@@ -1,6 +1,6 @@
 # Security policy
 
-Chardb is an experimental database prototype, not a production-ready service. It has incomplete end-to-end authentication, authorization, query execution, migration, backup, and recovery paths. Do not use it with production data, live credentials, or systems that require tenant isolation or durability guarantees. See [STATUS.md](STATUS.md) for the current limits.
+Chardb is an experimental database prototype, not a production-ready service. The supported Better Auth organization path has end-to-end authentication, authorization, query, and forward-migration coverage. Backup, restore, failover, regional resilience, long failure runs, automatic resharding, and unsupported tenancy modes remain unproven. Do not use it with production data, live credentials, or systems that require tenant isolation or durability guarantees. See [OPERATIONS.md](OPERATIONS.md) for the current limits.
 
 ## Reporting a vulnerability
 

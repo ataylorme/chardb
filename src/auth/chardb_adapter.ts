@@ -14,15 +14,20 @@
  * one SQLite transaction. The adapter does not issue a second invalidation
  * RPC after the row has committed.
  *
- * Reads support `eq` and bounded `in` filters joined by AND. Writes use
- * equality predicates. The organization plugin uses `in` to load users
- * for a page of membership rows.
+ * Reads support Better Auth's full filter operator set joined by AND.
+ * Writes use equality predicates.
  */
 
 import type { AdapterFactory, CleanedWhere } from "@better-auth/core/db/adapter";
 import type { BetterAuthOptions } from "better-auth";
 import { createAdapterFactory } from "better-auth/adapters";
 import { CdbError } from "../errors.ts";
+import type {
+    CatalogAuthAdapterRpcRequest,
+    CatalogAuthAdapterRpcResult,
+    CatalogAuthIncrementResult,
+    CatalogAuthMutationResult,
+} from "../server/do/catalog-authority-store.ts";
 import type { RawJson } from "../types.ts";
 import { AUTH_READ_IN_MAX_VALUES, type AuthIncrementWhere, type AuthReadWhere } from "./sql.ts";
 
@@ -35,32 +40,17 @@ export interface ChardbAuthAdapterEnv {
 }
 
 interface CatalogRpc {
-    mutateAuth(args: {
-        model: string;
-        op: "create" | "update" | "delete";
-        where?: { [k: string]: RawJson };
-        payload?: { [k: string]: RawJson };
-        returnRow?: boolean;
-        limitOne?: boolean;
-    }): Promise<{ ok: true; row?: Record<string, RawJson> | null; affected?: number }>;
-    queryAuth(args: {
-        model: string;
-        where: readonly AuthReadWhere[];
-        limit?: number;
-        offset?: number;
-        sortBy?: { field: string; direction: "asc" | "desc" };
-    }): Promise<readonly Record<string, RawJson>[]>;
-    countAuth(args: { model: string; where: readonly AuthReadWhere[] }): Promise<number>;
-    incrementAuth(args: {
-        model: string;
-        where: readonly AuthIncrementWhere[];
-        increment: { readonly [k: string]: number };
-        set?: { readonly [k: string]: RawJson };
-    }): Promise<{ ok: true; row: Record<string, RawJson> | null; affected: number }>;
+    authAdapterRpc(args: CatalogAuthAdapterRpcRequest): Promise<CatalogAuthAdapterRpcResult>;
 }
 
 export interface ChardbAuthAdapterOptions {
     readonly env: ChardbAuthAdapterEnv;
+}
+
+async function callCatalog<T>(catalog: CatalogRpc, request: CatalogAuthAdapterRpcRequest): Promise<T> {
+    const response = await catalog.authAdapterRpc(request);
+    if (!response.ok) throw new CdbError(response.error);
+    return response.value as T;
 }
 
 export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactory<BetterAuthOptions> {
@@ -129,67 +119,88 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
             return {
                 async create({ model, data }) {
                     const payload = data as { [k: string]: RawJson };
-                    const r = await catalog().mutateAuth({ model, op: "create", payload });
+                    const r = await callCatalog<CatalogAuthMutationResult>(catalog(), {
+                        operation: "mutate",
+                        args: { model, op: "create", payload },
+                    });
                     return (r.row ?? payload) as never;
                 },
 
                 async findOne({ model, where }) {
                     const filters = whereToReadFilters(where);
-                    const rows = await catalog().queryAuth({ model, where: filters, limit: 1 });
+                    const rows = await callCatalog<readonly Record<string, RawJson>[]>(catalog(), {
+                        operation: "query",
+                        args: { model, where: filters, limit: 1 },
+                    });
                     return (rows[0] ?? null) as never;
                 },
 
                 async findMany({ model, where, limit, offset, sortBy }) {
                     const filters = where ? whereToReadFilters(where) : [];
-                    const rows = await catalog().queryAuth({
-                        model,
-                        where: filters,
-                        limit: limit ?? 100,
-                        ...(offset === undefined ? {} : { offset }),
-                        ...(sortBy === undefined ? {} : { sortBy }),
+                    const rows = await callCatalog<readonly Record<string, RawJson>[]>(catalog(), {
+                        operation: "query",
+                        args: {
+                            model,
+                            where: filters,
+                            limit: limit ?? 100,
+                            ...(offset === undefined ? {} : { offset }),
+                            ...(sortBy === undefined ? {} : { sortBy }),
+                        },
                     });
                     return rows as never;
                 },
 
                 async count({ model, where }) {
                     const filters = where ? whereToReadFilters(where) : [];
-                    return catalog().countAuth({ model, where: filters });
+                    return callCatalog<number>(catalog(), { operation: "count", args: { model, where: filters } });
                 },
 
                 async update({ model, where, update }) {
                     const flat = whereToFlat(where);
-                    const r = await catalog().mutateAuth({
-                        model,
-                        op: "update",
-                        where: flat,
-                        payload: update as { [k: string]: RawJson },
-                        returnRow: true,
-                        limitOne: true,
+                    const r = await callCatalog<CatalogAuthMutationResult>(catalog(), {
+                        operation: "mutate",
+                        args: {
+                            model,
+                            op: "update",
+                            where: flat,
+                            payload: update as { [k: string]: RawJson },
+                            returnRow: true,
+                            limitOne: true,
+                        },
                     });
                     return (r.row ?? null) as never;
                 },
 
                 async updateMany({ model, where, update }) {
                     const flat = whereToFlat(where);
-                    const r = await catalog().mutateAuth({
-                        model,
-                        op: "update",
-                        where: flat,
-                        payload: update as { [k: string]: RawJson },
-                        returnRow: false,
-                        limitOne: false,
+                    const r = await callCatalog<CatalogAuthMutationResult>(catalog(), {
+                        operation: "mutate",
+                        args: {
+                            model,
+                            op: "update",
+                            where: flat,
+                            payload: update as { [k: string]: RawJson },
+                            returnRow: false,
+                            limitOne: false,
+                        },
                     });
                     return r.affected ?? 0;
                 },
 
                 async delete({ model, where }) {
                     const flat = whereToFlat(where);
-                    await catalog().mutateAuth({ model, op: "delete", where: flat, limitOne: true });
+                    await callCatalog<CatalogAuthMutationResult>(catalog(), {
+                        operation: "mutate",
+                        args: { model, op: "delete", where: flat, limitOne: true },
+                    });
                 },
 
                 async deleteMany({ model, where }) {
                     const flat = whereToFlat(where);
-                    const r = await catalog().mutateAuth({ model, op: "delete", where: flat, limitOne: false });
+                    const r = await callCatalog<CatalogAuthMutationResult>(catalog(), {
+                        operation: "mutate",
+                        args: { model, op: "delete", where: flat, limitOne: false },
+                    });
                     return r.affected ?? 0;
                 },
 
@@ -197,7 +208,7 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                     const defaultModel = canonicalModelFor(model);
                     const defaultField = (field: string): string => canonicalFieldFor(defaultModel, field);
                     const guardedWhere = whereToIncrementGuards(where, defaultField);
-                    const ownedIncrement: Record<string, number> = Object.create(null);
+                    const incrementEntries: [string, number][] = [];
                     for (const [field, delta] of Object.entries(increment)) {
                         if (typeof delta !== "number" || !Number.isFinite(delta) || Object.is(delta, -0)) {
                             throw new CdbError({
@@ -205,20 +216,25 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                                 message: `chardb auth adapter: increment delta for "${field}" must be finite and not negative zero`,
                             });
                         }
-                        ownedIncrement[defaultField(field)] = delta;
+                        incrementEntries.push([defaultField(field), delta]);
                     }
-                    const ownedSet: Record<string, RawJson> | undefined =
-                        set === undefined ? undefined : Object.create(null);
-                    if (ownedSet) {
+                    const ownedIncrement = Object.fromEntries(incrementEntries);
+                    let ownedSet: Record<string, RawJson> | undefined;
+                    if (set !== undefined) {
+                        const setEntries: [string, RawJson][] = [];
                         for (const [field, value] of Object.entries(set ?? {})) {
-                            ownedSet[defaultField(field)] = value as RawJson;
+                            setEntries.push([defaultField(field), value as RawJson]);
                         }
+                        ownedSet = Object.fromEntries(setEntries);
                     }
-                    const r = await catalog().incrementAuth({
-                        model: defaultModel,
-                        where: guardedWhere,
-                        increment: ownedIncrement,
-                        ...(ownedSet === undefined ? {} : { set: ownedSet }),
+                    const r = await callCatalog<CatalogAuthIncrementResult>(catalog(), {
+                        operation: "increment",
+                        args: {
+                            model: defaultModel,
+                            where: guardedWhere,
+                            increment: ownedIncrement,
+                            ...(ownedSet === undefined ? {} : { set: ownedSet }),
+                        },
                     });
                     if (!r.row) return null;
                     const storageRow: Record<string, RawJson> = Object.create(null);
@@ -265,6 +281,24 @@ function whereToFlat(where: CleanedWhere[]): { [k: string]: RawJson } {
     return out;
 }
 
+const AUTH_READ_OPERATORS = new Set<string>([
+    "eq",
+    "ne",
+    "lt",
+    "lte",
+    "gt",
+    "gte",
+    "in",
+    "not_in",
+    "contains",
+    "starts_with",
+    "ends_with",
+]);
+
+function isAuthReadOperator(value: unknown): value is AuthReadWhere["operator"] {
+    return typeof value === "string" && AUTH_READ_OPERATORS.has(value);
+}
+
 function whereToReadFilters(where: CleanedWhere[]): AuthReadWhere[] {
     const out: AuthReadWhere[] = [];
     for (const condition of where) {
@@ -274,39 +308,80 @@ function whereToReadFilters(where: CleanedWhere[]): AuthReadWhere[] {
                 message: "chardb auth adapter: OR connectors are not supported in where clauses",
             });
         }
-        if (condition.mode !== "sensitive") {
+        const operator: unknown = condition.operator ?? "eq";
+        if (!isAuthReadOperator(operator)) {
             throw new CdbError({
                 code: "CDB_UNSUPPORTED_FEATURE",
-                message: "chardb auth adapter: case-insensitive where clauses are not supported",
+                message: `chardb auth adapter: where operator "${String(operator)}" is not supported`,
             });
         }
-        if (condition.operator === "eq") {
-            out.push({ field: condition.field, operator: "eq", value: normalize(condition.value) });
-            continue;
+        const requestedMode: unknown = condition.mode ?? "sensitive";
+        if (requestedMode !== "sensitive" && requestedMode !== "insensitive") {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: `chardb auth adapter: where mode "${String(requestedMode)}" is invalid`,
+            });
         }
-        if (condition.operator === "in") {
+        const mode = requestedMode;
+        if (operator === "in" || operator === "not_in") {
             if (!Array.isArray(condition.value)) {
                 throw new CdbError({
                     code: "CDB_INVALID_ARGS",
-                    message: "chardb auth adapter: in filter value must be an array",
+                    message: `chardb auth adapter: ${operator} filter value must be an array`,
                 });
             }
             if (condition.value.length > AUTH_READ_IN_MAX_VALUES) {
                 throw new CdbError({
                     code: "CDB_INVALID_ARGS",
-                    message: `chardb auth adapter: in filter exceeds ${AUTH_READ_IN_MAX_VALUES} values`,
+                    message: `chardb auth adapter: ${operator} filter exceeds ${AUTH_READ_IN_MAX_VALUES} values`,
+                });
+            }
+            if (mode === "insensitive") {
+                throw new CdbError({
+                    code: "CDB_UNSUPPORTED_FEATURE",
+                    message: `chardb auth adapter: case-insensitive ${operator} filters are not supported`,
                 });
             }
             out.push({
                 field: condition.field,
-                operator: "in",
+                operator,
                 value: condition.value.map(value => normalize(value)),
             });
             continue;
         }
-        throw new CdbError({
-            code: "CDB_UNSUPPORTED_FEATURE",
-            message: `chardb auth adapter: where operator "${condition.operator}" not supported`,
+        const value = normalize(condition.value);
+        if (value !== null && typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: `chardb auth adapter: ${operator} filter value must be scalar`,
+            });
+        }
+        if (mode === "insensitive" && typeof value !== "string") {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: `chardb auth adapter: case-insensitive ${operator} requires a string value`,
+            });
+        }
+        if (
+            (operator === "contains" || operator === "starts_with" || operator === "ends_with") &&
+            typeof value !== "string"
+        ) {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: `chardb auth adapter: ${operator} filter value must be a string`,
+            });
+        }
+        if (value === null && operator !== "eq" && operator !== "ne") {
+            throw new CdbError({
+                code: "CDB_INVALID_ARGS",
+                message: `chardb auth adapter: ${operator} does not accept null`,
+            });
+        }
+        out.push({
+            field: condition.field,
+            operator,
+            value,
+            ...(mode === "insensitive" ? { mode } : {}),
         });
     }
     return out;

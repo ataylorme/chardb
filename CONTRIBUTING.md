@@ -1,6 +1,6 @@
 # Contributing to Chardb
 
-Chardb is an experimental database prototype. Do not test it with production data, credentials, or infrastructure. Read [STATUS.md](STATUS.md) before starting work so that isolated components are not mistaken for a working end-to-end system. [ARCHITECTURE.md](ARCHITECTURE.md) describes the current component boundaries, and [PLAN.md](PLAN.md) lists the dependency order for unfinished work.
+Chardb is an experimental database prototype. Do not test it with production data, credentials, or infrastructure. The supported Better Auth organization path is exercised end to end; backup, restore, failover, regional resilience, long failure runs, automatic resharding, and unsupported tenancy modes remain unproven. Read [STATUS.md](https://github.com/zpg6/chardb/blob/main/STATUS.md) before starting work so internal and unsupported components are not mistaken for product guarantees. [ARCHITECTURE.md](ARCHITECTURE.md) describes the current component boundaries, and [PLAN.md](https://github.com/zpg6/chardb/blob/main/PLAN.md) lists the dependency order for unfinished work.
 
 ## Setup
 
@@ -25,7 +25,7 @@ bun run --cwd landing build
 npm pack --dry-run
 ```
 
-The repository's current known verification limits are recorded in [STATUS.md](STATUS.md). If a command fails, include the command and relevant output in the pull request. Do not hide an existing failure by weakening a check or skipping a test.
+The repository's current known verification limits are recorded in [STATUS.md](https://github.com/zpg6/chardb/blob/main/STATUS.md). If a command fails, include the command and relevant output in the pull request. Do not hide an existing failure by weakening a check or skipping a test.
 
 For a focused test run, pass its path to Bun:
 
@@ -51,6 +51,6 @@ Do not report vulnerabilities in a public issue. Follow [SECURITY.md](SECURITY.m
 
 Keep a pull request narrow enough to review against one claimed behavior. Explain the runtime path affected and name the Durable Object or boundary involved. Add or update tests at the level where the behavior runs. A helper-only test does not establish that a public Worker path works.
 
-Update [ARCHITECTURE.md](ARCHITECTURE.md) or [STATUS.md](STATUS.md) when a change moves a capability between missing, partial, isolated, and implemented. Describe readiness only to the extent supported by the tests and runtime path in the pull request.
+Update [ARCHITECTURE.md](ARCHITECTURE.md) or [STATUS.md](https://github.com/zpg6/chardb/blob/main/STATUS.md) when a change moves a capability between missing, partial, isolated, and implemented. Describe readiness only to the extent supported by the tests and runtime path in the pull request.
 
 Do not commit generated `dist` output, local `.chardb` state, logs, or test worker bundles.

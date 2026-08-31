@@ -1,17 +1,16 @@
 /**
- * Workerd-level integration test for the `Catalog` PITR barrier surface.
+ * Workerd-level integration test for the internal Catalog barrier records.
  *
  * Boots `miniflare@4` with a bundled test worker that exposes `Catalog`
- * (re-exported from `chardb/server`) and drives the `openBarrier` →
- * `ackBarrier` → `openBarriers` flow against real Durable Object
- * `SqlStorage`. This pairs with the pure-helper tests for the cron
- * dispatch path; together they cover what the entrypoint's
- * `runBarrierTick` + `runUserCrons` rely on, without booting the full
- * `WorkerEntrypoint`.
+ * and drives the `openBarrier` -> `ackBarrier` -> `openBarriers` flow
+ * against real Durable Object `SqlStorage`. The supported Worker does not
+ * schedule these methods and has no backup or restore path.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import { Miniflare } from "miniflare";
+import { disposeMiniflareBounded } from "../../scripts/miniflare-lifecycle.mjs";
+import { vshardOf } from "../../src/vshard.ts";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ENTRY = path.join(HERE, "catalog.entry.ts");
@@ -47,7 +46,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-    await mf?.dispose();
+    await disposeMiniflareBounded(mf, { label: "Catalog fixture final teardown" });
+    mf = undefined;
 });
 
 async function call(op: string, body?: unknown): Promise<unknown> {
@@ -63,6 +63,19 @@ async function call(op: string, body?: unknown): Promise<unknown> {
         throw new Error(`rpc ${op} → HTTP ${res.status}: ${text}`);
     }
     return res.json();
+}
+
+async function callFailure(op: string, body?: unknown): Promise<string> {
+    if (!mf) throw new Error("miniflare not initialized");
+    const res = await mf.dispatchFetch(`http://example.com/${op}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body ?? {}),
+    });
+    expect(res.status).toBe(500);
+    const payload = (await res.json()) as { readonly error?: unknown };
+    if (typeof payload.error !== "string") throw new Error(`rpc ${op} returned a malformed error`);
+    return payload.error;
 }
 
 interface OpenBarrierResult {
@@ -84,6 +97,7 @@ interface OrganizationAuthority {
     readonly organizationId: string;
     readonly role: string;
     readonly roles: readonly string[];
+    readonly userRole?: string;
     readonly authEpochs: {
         readonly global: number;
         readonly tenant: number;
@@ -121,13 +135,24 @@ describe("workerd Catalog barrier flow", () => {
     });
 
     test("openBarriers reports any barrier with at least one missing shard", async () => {
-        // Cutover synthesizes a second shard so we can have a barrier with multiple expected acks.
+        // An exact topology lease and cutover synthesize a second shard so we
+        // can have a barrier with multiple expected acknowledgements.
+        const before = (await call("route", { vshard: 0 })) as { readonly schemaEpoch: number };
+        await call("beginTopologyOperation", {
+            migId: "mig_pitr_1",
+            sourceShard: "ShardDO_0",
+            destinationShard: "ShardDO_1",
+            rangeLo: 0,
+            rangeHi: 8191,
+            startEpoch: before.schemaEpoch,
+        });
         await call("cutover", {
             migId: "mig_pitr_1",
             lo: 0,
             hi: 8191,
             fromShard: "ShardDO_0",
             toShard: "ShardDO_1",
+            startEpoch: before.schemaEpoch,
         });
         const opened = (await call("openBarrier", { now: 1_700_000_002_000 })) as OpenBarrierResult;
         expect(new Set(opened.expectedShards)).toEqual(new Set(["ShardDO_0", "ShardDO_1"]));
@@ -262,6 +287,7 @@ describe("workerd Catalog barrier flow", () => {
             organizationId: "restart-org",
             role: "member,owner",
             roles: ["member", "owner"],
+            userRole: "user",
         });
 
         const firstInstanceId = (await call("fixtureInstanceId")) as string;
@@ -270,5 +296,118 @@ describe("workerd Catalog barrier flow", () => {
         expect(secondInstanceId).not.toBe(firstInstanceId);
 
         expect(await readStoredAuth()).toEqual(before);
+    });
+
+    test("file-free organization deletion permanently retires the id and removes authority", async () => {
+        const now = Date.parse("2026-08-28T00:00:00Z");
+        await call("mutateAuth", {
+            model: "user",
+            op: "create",
+            payload: {
+                id: "retired-org-user",
+                name: "Retired Org User",
+                email: "retired-org-user@example.com",
+                emailVerified: true,
+                createdAt: now,
+                updatedAt: now,
+            },
+        });
+        await call("mutateAuth", {
+            model: "organization",
+            op: "create",
+            payload: {
+                id: "retired-org",
+                name: "Retired Org",
+                slug: "retired-org",
+                createdAt: now,
+            },
+        });
+        await call("mutateAuth", {
+            model: "member",
+            op: "create",
+            payload: {
+                id: "retired-org-member",
+                organizationId: "retired-org",
+                userId: "retired-org-user",
+                role: "owner",
+                createdAt: now,
+            },
+        });
+
+        expect(
+            await call("resolveOrganizationAuthority", {
+                principalId: "retired-org-user",
+                organizationId: "retired-org",
+            })
+        ).toMatchObject({ organizationId: "retired-org", roles: ["owner"] });
+        expect(
+            await call("resolveOrganizationAuthorityRoute", {
+                principalId: "retired-org-user",
+                organizationId: "retired-org",
+                vshard: Number(vshardOf(["retired-org"])),
+            })
+        ).toMatchObject({
+            authority: { organizationId: "retired-org", roles: ["owner"] },
+            route: { shardId: expect.any(String) },
+        });
+
+        await call("mutateAuth", {
+            model: "member",
+            op: "delete",
+            where: { id: "retired-org-member" },
+            limitOne: true,
+        });
+        await call("mutateAuth", {
+            model: "organization",
+            op: "delete",
+            where: { id: "retired-org" },
+            limitOne: true,
+        });
+
+        expect(
+            await call("resolveOrganizationAuthority", {
+                principalId: "retired-org-user",
+                organizationId: "retired-org",
+            })
+        ).toBeNull();
+        expect(
+            await call("resolveOrganizationAuthorityRoute", {
+                principalId: "retired-org-user",
+                organizationId: "retired-org",
+                vshard: Number(vshardOf(["retired-org"])),
+            })
+        ).toEqual({ authority: null });
+        await expect(
+            callFailure("mutateAuth", {
+                model: "organization",
+                op: "create",
+                payload: {
+                    id: "retired-org",
+                    name: "Replacement Org",
+                    slug: "replacement-org",
+                    createdAt: now + 1,
+                },
+            })
+        ).resolves.toContain("organization id was permanently retired after deletion");
+
+        await mf?.unsafeEvictDurableObject(WORKER_NAME, "Catalog", { name: "global" });
+        expect(
+            await call("resolveOrganizationAuthority", {
+                principalId: "retired-org-user",
+                organizationId: "retired-org",
+            })
+        ).toBeNull();
+        await expect(
+            callFailure("mutateAuth", {
+                model: "organization",
+                op: "create",
+                payload: {
+                    id: "retired-org",
+                    name: "Replacement Org After Restart",
+                    slug: "replacement-org-after-restart",
+                    createdAt: now + 2,
+                },
+            })
+        ).resolves.toContain("organization id was permanently retired after deletion");
     });
 });

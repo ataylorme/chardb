@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { exportJWK, generateKeyPair } from "jose";
-import { Catalog } from "../../src/server/do/catalog.ts";
+import { Catalog, configureCatalogRuntime } from "../../src/server/do/catalog.ts";
+import { defineMigrations } from "../../src/server/schema-migrations.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -26,7 +27,7 @@ function sqlStorage(db: Database) {
     };
 }
 
-async function catalogFixture(db: Database): Promise<Catalog> {
+async function catalogFixture(db: Database, CatalogClass: typeof Catalog = Catalog): Promise<Catalog> {
     let bootstrap = Promise.resolve();
     const state = {
         storage: {
@@ -37,7 +38,7 @@ async function catalogFixture(db: Database): Promise<Catalog> {
             bootstrap = callback().then(() => undefined);
         },
     } as unknown as DurableObjectState;
-    const catalog = new Catalog(state, {});
+    const catalog = new CatalogClass(state, {});
     await bootstrap;
     return catalog;
 }
@@ -54,6 +55,35 @@ afterEach(() => {
 });
 
 describe("Catalog-owned JWKS refresh", () => {
+    test("fences JWKS refresh without creating cooldown state while schema work is pending", async () => {
+        const db = new Database(":memory:");
+        try {
+            const journal = defineMigrations([{ version: 1, name: "pending_schema", statements: ["SELECT 1"] }]);
+            const ConfiguredCatalog = configureCatalogRuntime({ migrations: () => journal });
+            const catalog = await catalogFixture(db, ConfiguredCatalog);
+            let fetches = 0;
+            globalThis.fetch = (async () => {
+                fetches++;
+                return Response.json({ keys: [await publicJwk("key-1")] });
+            }) as unknown as typeof fetch;
+
+            await expect(
+                catalog.resolveJwk({ kid: "key-1", jwksUrl: "https://issuer.example/jwks" })
+            ).resolves.toMatchObject({ ok: false, retryAfterMs: 1_000 });
+            expect(fetches).toBe(0);
+            expect(db.query("SELECT COUNT(*) AS count FROM catalog_jwks_refresh").get()).toEqual({ count: 0 });
+
+            catalog.beginSchemaMigration({ migrationId: "pending-v1", targetVersion: 1 });
+            await expect(
+                catalog.resolveJwk({ kid: "key-1", jwksUrl: "https://issuer.example/jwks" })
+            ).resolves.toMatchObject({ ok: false, retryAfterMs: 1_000 });
+            expect(fetches).toBe(0);
+            expect(db.query("SELECT COUNT(*) AS count FROM catalog_jwks_refresh").get()).toEqual({ count: 0 });
+        } finally {
+            db.close();
+        }
+    });
+
     test("fails bootstrap when an internal refresh table has an incompatible shape", async () => {
         const db = new Database(":memory:");
         try {

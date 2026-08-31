@@ -1,135 +1,245 @@
-/**
- * `chardb/files` — `file()` / `fileArray()` Drizzle column types.
- *
- * `await handle.upload(blob)` auto-routes by size:
- *   ≤ 25 MB    → proxied PUT through the worker
- *   25–100 MB  → presigned PUT direct to R2
- *   > 100 MB   → R2 multipart upload
- *     (https://developers.cloudflare.com/r2/api/workers/workers-multipart-usage/)
- *
- * Server-allocated keys (`<tenantId>/<ulid>`); R2 etag verified before
- * `status='live'` flips on BlobMeta.
- */
+/** `@chardb/core/files` — first-class file columns and their same-origin HTTP client. */
 
-import type { Column } from "drizzle-orm";
+import { type Column, getTableName } from "drizzle-orm";
 import { customType } from "drizzle-orm/sqlite-core";
+import { CdbError, isCdbErrorCode } from "../errors.ts";
+import type { Brand } from "../types.ts";
 
-export const PROXIED_UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
-export const PRESIGNED_UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
+export const CDB_FILE_MAX_BYTES = 25 * 1_024 * 1_024;
+export const CDB_FILE_MAX_CONTENT_TYPES = 32;
+export const CDB_FILE_ID_MAX_LENGTH = 128;
 
-/** Brand stamped on `file()` / `fileArray()` columns; consumed by the validator factories. */
-export const FILE_DATATYPE = "ChardbFile" as const;
-export type FileDatatype = typeof FILE_DATATYPE;
+export type FileId = Brand<string, "FileId">;
+
+const FILE_ID = /^[A-Za-z0-9_-]+$/;
+const CONTENT_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
+
+export function FileId(value: string): FileId {
+    if (
+        typeof value !== "string" ||
+        value.length === 0 ||
+        value.length > CDB_FILE_ID_MAX_LENGTH ||
+        !FILE_ID.test(value)
+    ) {
+        throw new TypeError("invalid Chardb FileId");
+    }
+    return value as FileId;
+}
 
 export interface FileColumnConfig {
-    /** Max bytes accepted; emit CDB_VALIDATION on overflow. */
+    /** Maximum accepted object size. V1 is capped at the proxied-upload limit. */
     readonly maxSize?: number;
-    /** Whitelist of accepted content types; `*` accepts any. */
+    /** Exact accepted MIME types, or `*` to accept any declared type. */
     readonly contentTypes?: readonly string[] | "*";
-    /** Validator from the validator-adapter packages. */
-    readonly validator?: { readonly dataType: "custom" } | { readonly parse: (input: unknown) => unknown };
 }
 
-export interface FileMeta {
-    readonly id: string;
-    readonly bucket: string;
-    readonly key: string;
-    readonly size: number;
-    readonly contentType: string;
-    readonly sha256: string;
-    readonly status: "pending" | "live" | "quarantined";
+export interface NormalizedFileColumnConfig {
+    readonly maxSize: number;
+    readonly contentTypes: readonly string[] | "*";
 }
 
-export interface FileHandle {
-    readonly meta: FileMeta | null;
-    /** Upload a blob. Auto-routes proxied / presigned / multipart. */
-    upload(blob: Blob): Promise<FileMeta>;
-    /** Issue a presigned GET. */
-    url(opts?: { ttlMs?: number; download?: string }): Promise<string>;
-    delete(): Promise<void>;
-}
+export function normalizeFileColumnConfig(config: FileColumnConfig | undefined): NormalizedFileColumnConfig {
+    const maxSize = config?.maxSize ?? CDB_FILE_MAX_BYTES;
+    if (!Number.isSafeInteger(maxSize) || maxSize < 1 || maxSize > CDB_FILE_MAX_BYTES) {
+        throw new TypeError(`file maxSize must be an integer from 1 through ${CDB_FILE_MAX_BYTES}`);
+    }
 
-const fileToDriver = (value: FileHandle): string => (value.meta ? JSON.stringify(value.meta) : "");
-const fileFromDriver = (value: string): FileHandle => materializeHandle(value ? (JSON.parse(value) as FileMeta) : null);
-const fileArrayToDriver = (value: FileHandle[]): string =>
-    JSON.stringify(value.map(h => h.meta).filter((m): m is FileMeta => m !== null));
-const fileArrayFromDriver = (value: string): FileHandle[] =>
-    (value ? (JSON.parse(value) as FileMeta[]) : []).map(materializeHandle);
+    const requested = config?.contentTypes ?? "*";
+    if (requested === "*") return Object.freeze({ maxSize, contentTypes: "*" });
+    if (!Array.isArray(requested) || requested.length === 0 || requested.length > CDB_FILE_MAX_CONTENT_TYPES) {
+        throw new TypeError(`file contentTypes must contain 1 through ${CDB_FILE_MAX_CONTENT_TYPES} MIME types`);
+    }
+    if (requested.some(value => typeof value !== "string")) {
+        throw new TypeError("file contentTypes must be unique valid MIME types");
+    }
+    const contentTypes = [...new Set(requested.map(value => value.trim().toLowerCase()))].sort();
+    if (contentTypes.length !== requested.length || contentTypes.some(value => !CONTENT_TYPE.test(value))) {
+        throw new TypeError("file contentTypes must be unique valid MIME types");
+    }
+    return Object.freeze({ maxSize, contentTypes: Object.freeze(contentTypes) });
+}
 
 const fileTypeParams = {
-    dataType: () => "text",
-    toDriver: fileToDriver,
-    fromDriver: fileFromDriver,
+    dataType(config: FileColumnConfig | undefined): string {
+        normalizeFileColumnConfig(config);
+        return "text";
+    },
+    toDriver(value: FileId): string {
+        return FileId(value);
+    },
+    fromDriver(value: string): FileId {
+        return FileId(value);
+    },
 };
-
-const fileArrayTypeParams = {
-    dataType: () => "text",
-    toDriver: fileArrayToDriver,
-    fromDriver: fileArrayFromDriver,
-};
-
-// We can't read drizzle's protected `column.config` through the public type, so we
-// register the customTypeParams object identities and consult them in `isChardbFileColumn`.
-const FILE_PARAM_OBJECTS = new WeakSet<object>();
-FILE_PARAM_OBJECTS.add(fileTypeParams);
-FILE_PARAM_OBJECTS.add(fileArrayTypeParams);
-
-const ARRAY_PARAM_OBJECTS = new WeakSet<object>();
-ARRAY_PARAM_OBJECTS.add(fileArrayTypeParams);
 
 /**
- * `file('column_name', cfg?)` — single-file column. Stored as JSON-encoded
- * `FileMeta` in SQLite; the BlobMeta DO holds the refcount.
+ * An opaque, nullable file reference stored as one SQLite TEXT value. Bucket names,
+ * object keys, upload state, hashes, and URLs never enter application rows.
  */
 export const file = customType<{
-    data: FileHandle;
+    data: FileId;
     driverData: string;
     config: FileColumnConfig;
 }>(fileTypeParams);
 
-/**
- * `fileArray('column_name', cfg?)` — multi-file column.
- */
-export const fileArray = customType<{
-    data: FileHandle[];
-    driverData: string;
-    config: FileColumnConfig;
-}>(fileArrayTypeParams);
-
-/**
- * Returns true when `column` was produced by `file()` or `fileArray()`. Validator
- * adapters use this to substitute a string-id schema (the wire shape of a file).
- */
 export function isChardbFileColumn(column: Column): boolean {
     if (column.dataType !== "custom") return false;
-    // drizzle's `Column.config` is protected; reach through a single narrow cast.
-    const cfg = (column as unknown as { config?: { customTypeParams?: object } }).config;
-    return cfg?.customTypeParams ? FILE_PARAM_OBJECTS.has(cfg.customTypeParams) : false;
+    const config = (column as unknown as { config?: { customTypeParams?: object } }).config;
+    return config?.customTypeParams === fileTypeParams;
 }
 
-/** Returns true when `column` was produced by `fileArray()` specifically. */
-export function isChardbFileArrayColumn(column: Column): boolean {
-    if (column.dataType !== "custom") return false;
-    const cfg = (column as unknown as { config?: { customTypeParams?: object } }).config;
-    return cfg?.customTypeParams ? ARRAY_PARAM_OBJECTS.has(cfg.customTypeParams) : false;
+export function getChardbFileColumnConfig(column: Column): NormalizedFileColumnConfig | undefined {
+    if (!isChardbFileColumn(column)) return undefined;
+    const config = (column as unknown as { config?: { fieldConfig?: FileColumnConfig } }).config;
+    return normalizeFileColumnConfig(config?.fieldConfig);
 }
 
-function materializeHandle(meta: FileMeta | null): FileHandle {
-    // Real implementation is wired by chardb/server with R2 + BlobMeta bindings;
-    // the shape here is the user-facing surface.
-    return {
-        meta,
-        async upload(blob): Promise<FileMeta> {
-            throw new Error(`file.upload requires the chardb server runtime; got blob of ${blob.size}B`);
-        },
-        async url(): Promise<string> {
-            if (!meta) throw new Error("no file");
-            return `https://chardb.dev/_chardb/blob/${meta.id}`;
-        },
-        async delete(): Promise<void> {
-            throw new Error("file.delete requires the chardb server runtime");
-        },
+export interface FileUploadInput {
+    readonly organizationId: string;
+    readonly file: Blob;
+    /** Stable retry identity. A fresh UUID is generated when omitted. */
+    readonly idempotencyKey?: string;
+}
+
+export interface FileDownloadInput {
+    readonly organizationId: string;
+    readonly rowId: string;
+}
+
+export interface FileUploadResult {
+    readonly fileId: FileId;
+    readonly size: number;
+    readonly sha256: string;
+}
+
+export interface ChardbFileClient {
+    upload(input: FileUploadInput): Promise<FileUploadResult>;
+    download(input: FileDownloadInput): Promise<Response>;
+    downloadUrl(input: FileDownloadInput): string;
+}
+
+export interface FileRef {
+    readonly table: string;
+    readonly column: string;
+}
+
+interface FileResponseError {
+    readonly error?: {
+        readonly code?: unknown;
+        readonly message?: unknown;
+        readonly correlationId?: unknown;
+        readonly retryAfterMs?: unknown;
+        readonly hint?: unknown;
     };
 }
 
-export type { FileMeta as FileMetaShape };
+function locatorPart(value: string, label: string): string {
+    if (!value || new TextEncoder().encode(value).byteLength > 256) {
+        throw new TypeError(`file ${label} must contain 1 through 256 bytes`);
+    }
+    return value;
+}
+
+/** Browser-safe locator for schemas that import server-only Better Auth definitions. */
+export function fileRef(table: string, column: string): FileRef {
+    return Object.freeze({ table: locatorPart(table, "table"), column: locatorPart(column, "column") });
+}
+
+function fileLocator(column: Column | FileRef): { readonly table: string; readonly column: string } {
+    if (!(column instanceof Object) || !("dataType" in column)) {
+        return fileRef(column.table, column.column);
+    }
+    if (!isChardbFileColumn(column)) throw new TypeError("createFileClient requires a chardb file column or fileRef");
+    const value = column as Column & { readonly table: Parameters<typeof getTableName>[0]; readonly name: string };
+    return Object.freeze({ table: getTableName(value.table), column: value.name });
+}
+
+function requestPath(
+    action: "upload" | "download",
+    locator: { readonly table: string; readonly column: string },
+    input: FileDownloadInput | Pick<FileUploadInput, "organizationId">
+): string {
+    const query = new URLSearchParams({
+        organizationId: input.organizationId,
+        table: locator.table,
+        column: locator.column,
+    });
+    if ("rowId" in input) query.set("rowId", input.rowId);
+    return `/_chardb/files/${action}?${query}`;
+}
+
+async function fileRequestError(response: Response): Promise<Error> {
+    let error: FileResponseError["error"];
+    try {
+        error = ((await response.clone().json()) as FileResponseError).error;
+    } catch {
+        // The status remains useful when an intermediary replaces the JSON body.
+    }
+    if (isCdbErrorCode(error?.code)) {
+        return new CdbError({
+            code: error.code,
+            ...(typeof error.message === "string" ? { message: error.message } : {}),
+            ...(typeof error.correlationId === "string" ? { correlationId: error.correlationId } : {}),
+            ...(typeof error.retryAfterMs === "number" ? { retryAfterMs: error.retryAfterMs } : {}),
+            ...(typeof error.hint === "string" ? { hint: error.hint } : {}),
+        });
+    }
+    return new Error(`chardb file request failed (${response.status})`);
+}
+
+/**
+ * Bind one schema file column to Chardb's same-origin upload and download routes.
+ * Better Auth's session cookie is sent by the browser automatically.
+ */
+export function createFileClient(column: Column | FileRef): ChardbFileClient {
+    const locator = fileLocator(column);
+    const config = "dataType" in column ? getChardbFileColumnConfig(column) : undefined;
+    return Object.freeze({
+        async upload(input: FileUploadInput) {
+            if (!(input.file instanceof Blob) || input.file.size < 1 || !input.file.type) {
+                throw new TypeError("file must be a non-empty Blob with a content type");
+            }
+            const contentType = input.file.type.trim().toLowerCase();
+            if (config && input.file.size > config.maxSize)
+                throw new TypeError("file exceeds the configured column size");
+            if (config && config.contentTypes !== "*" && !config.contentTypes.includes(contentType)) {
+                throw new TypeError("file content type is not accepted by the column");
+            }
+            const response = await globalThis.fetch(requestPath("upload", locator, input), {
+                method: "PUT",
+                headers: {
+                    "content-type": contentType,
+                    "idempotency-key": input.idempotencyKey ?? crypto.randomUUID(),
+                },
+                body: input.file,
+            });
+            if (!response.ok) throw await fileRequestError(response);
+            const body = (await response.json()) as {
+                readonly file?: { readonly fileId?: unknown; readonly size?: unknown; readonly sha256?: unknown };
+            };
+            if (
+                !body.file ||
+                typeof body.file.fileId !== "string" ||
+                !Number.isSafeInteger(body.file.size) ||
+                body.file.size !== input.file.size ||
+                typeof body.file.sha256 !== "string" ||
+                !/^[0-9a-f]{64}$/.test(body.file.sha256)
+            ) {
+                throw new Error("chardb file upload returned an invalid response");
+            }
+            return Object.freeze({
+                fileId: FileId(body.file.fileId),
+                size: body.file.size as number,
+                sha256: body.file.sha256,
+            });
+        },
+        async download(input: FileDownloadInput) {
+            const response = await globalThis.fetch(requestPath("download", locator, input));
+            if (!response.ok) throw await fileRequestError(response);
+            return response;
+        },
+        downloadUrl(input: FileDownloadInput) {
+            return requestPath("download", locator, input);
+        },
+    });
+}

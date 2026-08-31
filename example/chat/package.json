@@ -3,16 +3,18 @@
     "private": true,
     "type": "module",
     "scripts": {
-        "test:e2e": "bun test test/e2e/",
+        "test": "bun test ./test/server/worker.test.ts",
+        "test:e2e": "bun test conformance/test/e2e/",
+        "test:conformance": "bun test conformance/test/",
         "typecheck": "tsc --noEmit",
-        "dev": "vite",
-        "dev:worker": "bun scripts/dev-worker.mjs",
+        "dev": "bun scripts/dev-worker.mjs",
+        "dev:web": "vite",
         "build": "vite build",
         "preview": "vite preview"
     },
     "dependencies": {
         "better-auth": "~1.6.30",
-        "chardb": "file:../..",
+        "@chardb/core": "file:../..",
         "drizzle-orm": "^0.45.2",
         "hono": "^4.13.3",
         "react": "^18.3.1",

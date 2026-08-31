@@ -10,8 +10,9 @@
  * Two parallel layers are modelled:
  *   - **Authoring types** (`CdbTableConfig`, `RoleValue`, `VerbValue`)
  *     constrain what the schema author can write inside a `cdbTable
- *     (...)` call. Discriminated on tenancy axis so `forUser()` rejects
- *     `selfBy:` (self is implicit there) and `global()` requires
+ *     (...)` call. Discriminated on factory scope so `forOrgUser()` can
+ *     require both organization and user ownership, `forUser()` rejects
+ *     `selfBy:` (self is implicit there), and `global()` requires
  *     `partitionBy:`.
  *   - **Resolved metadata** (`CdbTableMeta`) is the compile-once boot-
  *     time record stored in the WeakMap. It carries the auto-discovered
@@ -34,6 +35,9 @@ export const COL_VERBS: readonly ColVerb[] = Object.freeze(["read", "create", "u
 
 /** The tenancy axis a schema file is bound to via its factory. */
 export type TenantKind = "org" | "user" | "none";
+
+/** The schema authoring scope selected by a cdbTable factory. */
+export type CdbScopeKind = TenantKind | "orgUser";
 
 /**
  * The subset of role names with framework meaning. `self` is reserved
@@ -115,6 +119,18 @@ type SelfImplicit<TCols> = BaseConfigCommon<TCols> & {
     readonly columns?: { readonly [C in keyof TCols & string]?: ColumnSpec<TCols, RoleName> };
 };
 
+/**
+ * Organization-routed rows owned by a user inside that organization.
+ * `selfBy` is optional because forOrgUser auto-discovers the FK to the
+ * Better Auth user table. It remains available to disambiguate multiple
+ * user FKs.
+ */
+type OrgUserConfig<TCols> = BaseConfigCommon<TCols> & {
+    readonly selfBy?: keyof TCols & string;
+    readonly roles?: { readonly [R in RoleName]?: RoleValue<TCols> };
+    readonly columns?: { readonly [C in keyof TCols & string]?: ColumnSpec<TCols, RoleName> };
+};
+
 /** Global tables MUST set `partitionBy` (no implicit tenant column to default to). */
 type GlobalConfig<TCols> =
     | (BaseConfigCommon<TCols> & {
@@ -131,11 +147,13 @@ type GlobalConfig<TCols> =
       });
 
 /** The authoring config the user passes to `cdbTable`. */
-export type CdbTableConfig<TCols, K extends TenantKind> = K extends "org"
+export type CdbTableConfig<TCols, K extends CdbScopeKind> = K extends "org"
     ? WithOptionalSelf<TCols>
-    : K extends "user"
-      ? SelfImplicit<TCols>
-      : GlobalConfig<TCols>;
+    : K extends "orgUser"
+      ? OrgUserConfig<TCols>
+      : K extends "user"
+        ? SelfImplicit<TCols>
+        : GlobalConfig<TCols>;
 
 /**
  * The four canonical auth target tables we care about for tenancy
@@ -169,6 +187,8 @@ export interface CdbTableMeta {
     readonly tenantKind: TenantKind;
     /** Auth target the tenant column FKs into; null for `global()`. */
     readonly authTarget: AuthTargetKind;
+    /** Auth target used to auto-discover user ownership under `forOrgUser()`. */
+    readonly selfTarget: "user" | undefined;
     /**
      * Auto-discovered tenant column name (or the explicit `tenantBy`
      * override). Undefined under `global()`. Resolved lazily — the
@@ -188,7 +208,7 @@ export interface CdbTableMeta {
     readonly rawColumns: { readonly [colName: string]: ColumnSpec<Record<string, unknown>, RoleName> };
     /** Compiled column matrix (the union of role-axis + column-axis). */
     readonly matrix: ColumnMatrix;
-    /** Explicit `selfBy` column name (only set when self appears in a `forOrg`/`global` file). */
+    /** Explicit or auto-discovered user ownership column. */
     readonly selfBy: string | undefined;
     /** Source export key used for diagnostics (set by `attachExportKey` once the schema is walked). */
     readonly exportKey?: string;

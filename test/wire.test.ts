@@ -8,6 +8,8 @@ import {
     type Up,
     type WireMessage,
     checkProtocolV,
+    decodeDown,
+    decodeUp,
     decodeWire,
     encodeWire,
 } from "../src/wire.ts";
@@ -359,6 +361,13 @@ describe("wire envelope", () => {
     test("decodeWire rejects unknown tags (closed at protocolV=3)", () => {
         expect(() => decodeWire(JSON.stringify({ t: "haxx" }))).toThrow(/unknown tag "haxx"/);
         expect(() => decodeWire(JSON.stringify({ t: "MUT" }))).toThrow(/unknown tag/);
+    });
+
+    test("directional decoders reject valid messages sent the wrong way", () => {
+        expect(decodeUp(encodeWire(CASES.hello.valid))).toEqual(CASES.hello.valid);
+        expect(decodeDown(encodeWire(CASES.welcome.valid))).toEqual(CASES.welcome.valid);
+        expect(() => decodeUp(encodeWire(CASES.welcome.valid))).toThrow("not valid client-to-server");
+        expect(() => decodeDown(encodeWire(CASES.hello.valid))).toThrow("not valid server-to-client");
     });
 
     test("UP_TAGS and DOWN_TAGS are exhaustive over the actual sum types", () => {

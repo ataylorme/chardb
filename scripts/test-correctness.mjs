@@ -1,20 +1,37 @@
 import { readdir } from "node:fs/promises";
 import path from "node:path";
+import { ManagedProcessError, runManagedCommand } from "./process-lifecycle.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const TEST_ROOT = path.join(ROOT, "test");
 const WORKERD_ROOT = path.join(TEST_ROOT, "workerd");
 const WORKERD_SUFFIX = ".harness.test.ts";
+const RESTART_IN_PLACE_HARNESS = "file-store.harness.test.ts";
 const TERMINATION_GRACE_MS = 2_000;
+const WORKERD_PROCESS_SETTLE_MS = 5_000;
+const OUTPUT_TAIL_LIMIT = 64 * 1024;
 
 export class ChildProcessFailure extends Error {
-    constructor(message, { exitCode = null, signalCode = null, timedOut = false } = {}) {
+    constructor(
+        message,
+        { exitCode = null, signalCode = null, timedOut = false, stdoutTail = "", stderrTail = "" } = {}
+    ) {
         super(message);
         this.name = "ChildProcessFailure";
         this.exitCode = exitCode;
         this.signalCode = signalCode;
         this.timedOut = timedOut;
+        this.stdoutTail = stdoutTail;
+        this.stderrTail = stderrTail;
     }
+}
+
+export function isTransientWorkerdStartupFailure(error) {
+    if (!(error instanceof ChildProcessFailure)) return false;
+    const output = `${error.stdoutTail}\n${error.stderrTail}`;
+    return /(?:broken pipe|\bEPIPE\b|address already in use|failed to start (?:the )?server|workers runtime failed to start|workerd[^\n]*(?:failed to start|startup failure))/i.test(
+        output
+    );
 }
 
 function outerTimeoutMs() {
@@ -23,6 +40,17 @@ function outerTimeoutMs() {
     if (!Number.isSafeInteger(value) || value <= 0) {
         throw new Error(
             `CHARDB_WORKERD_TEST_TIMEOUT_MS must be a positive safe integer, received ${JSON.stringify(raw)}`
+        );
+    }
+    return value;
+}
+
+function workerdAttempts() {
+    const raw = process.env.CHARDB_WORKERD_TEST_ATTEMPTS ?? "3";
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < 1 || value > 3) {
+        throw new Error(
+            `CHARDB_WORKERD_TEST_ATTEMPTS must be an integer from 1 through 3, received ${JSON.stringify(raw)}`
         );
     }
     return value;
@@ -43,145 +71,76 @@ function relative(file) {
     return path.relative(ROOT, file).split(path.sep).join("/");
 }
 
-function isMissingProcess(error) {
-    return error !== null && typeof error === "object" && "code" in error && error.code === "ESRCH";
-}
-
-function isPermissionDenied(error) {
-    return error !== null && typeof error === "object" && "code" in error && error.code === "EPERM";
-}
-
-function signalProcessGroup(child, signal) {
-    if (process.platform === "win32") {
-        child.kill(signal);
-        return true;
-    }
-    try {
-        process.kill(-child.pid, signal);
-        return true;
-    } catch (error) {
-        if (isMissingProcess(error)) return false;
-        throw error;
-    }
-}
-
-function processGroupExists(pid) {
-    if (process.platform === "win32") return false;
-    try {
-        process.kill(-pid, 0);
-        return true;
-    } catch (error) {
-        if (isMissingProcess(error)) return false;
-        if (isPermissionDenied(error)) return true;
-        throw error;
-    }
-}
-
-async function waitForProcessGroupExit(pid, waitMs) {
-    const deadline = performance.now() + waitMs;
-    while (processGroupExists(pid) && performance.now() < deadline) {
-        await Bun.sleep(10);
-    }
-    return !processGroupExists(pid);
-}
-
-async function terminateProcessTree(child, signal, graceMs) {
-    if (!signalProcessGroup(child, signal)) return;
-    if (process.platform === "win32") {
-        await Promise.race([child.exited, Bun.sleep(graceMs)]);
-        if (child.exitCode === null) child.kill("SIGKILL");
-        return;
-    }
-    if (await waitForProcessGroupExit(child.pid, graceMs)) return;
-    signalProcessGroup(child, "SIGKILL");
-    if (!(await waitForProcessGroupExit(child.pid, graceMs))) {
-        throw new Error(`process group ${child.pid} survived SIGKILL`);
-    }
+export function compareWorkerdHarnesses(left, right) {
+    const leftRestarts = path.basename(left) === RESTART_IN_PLACE_HARNESS;
+    const rightRestarts = path.basename(right) === RESTART_IN_PLACE_HARNESS;
+    if (leftRestarts !== rightRestarts) return leftRestarts ? -1 : 1;
+    return left.localeCompare(right);
 }
 
 export async function run(label, args, timeoutMs, options = {}) {
     console.log(`\n> ${label}`);
-    const child = Bun.spawn(args, {
-        cwd: options.cwd ?? ROOT,
-        env: options.env ?? process.env,
-        stdin: options.stdin ?? "inherit",
-        stdout: options.stdout ?? "inherit",
-        stderr: options.stderr ?? "inherit",
-        detached: process.platform !== "win32",
-    });
-    const signalSource = options.signalSource ?? process;
-    const graceMs = options.terminationGraceMs ?? TERMINATION_GRACE_MS;
-    let timedOut = false;
-    let forwardedSignal = null;
-    let termination;
-    let timeout;
-    const requestTermination = signal => {
-        if (termination === undefined) {
-            termination = terminateProcessTree(child, signal, graceMs);
-            // Signal handlers cannot await; the main run path awaits and
-            // rethrows this same promise after the child exits.
-            void termination.catch(() => {});
-        }
-        return termination;
-    };
-    const clearOuterTimeout = () => {
-        if (timeout !== undefined) clearTimeout(timeout);
-        timeout = undefined;
-    };
-    const onSigint = () => {
-        forwardedSignal ??= "SIGINT";
-        clearOuterTimeout();
-        void requestTermination("SIGINT");
-    };
-    const onSigterm = () => {
-        forwardedSignal ??= "SIGTERM";
-        clearOuterTimeout();
-        void requestTermination("SIGTERM");
-    };
-    signalSource.on("SIGINT", onSigint);
-    signalSource.on("SIGTERM", onSigterm);
-    timeout =
-        timeoutMs === undefined
-            ? undefined
-            : setTimeout(() => {
-                  timedOut = true;
-                  void requestTermination("SIGTERM");
-              }, timeoutMs);
+    if (options.captureOutput && (options.stdout !== undefined || options.stderr !== undefined)) {
+        throw new Error("captureOutput cannot be combined with explicit stdout or stderr options");
+    }
     try {
-        const exitCode = await child.exited;
-        let cleanupFailure;
-        if (termination !== undefined) {
-            await termination;
-        } else if (process.platform !== "win32") {
-            try {
-                await terminateProcessTree(child, "SIGTERM", graceMs);
-            } catch (error) {
-                cleanupFailure = error;
-            }
-        }
-        if (timedOut) {
-            throw new ChildProcessFailure(`${label} exceeded its ${timeoutMs} ms outer timeout`, { timedOut: true });
-        }
-        if (forwardedSignal !== null) {
-            throw new ChildProcessFailure(`${label} interrupted by ${forwardedSignal}`, {
-                signalCode: forwardedSignal,
-            });
-        }
-        if (exitCode !== 0 || child.signalCode !== null) {
-            const failure = new ChildProcessFailure(
-                child.signalCode === null
-                    ? `${label} exited with code ${exitCode}`
-                    : `${label} exited from signal ${child.signalCode}`,
-                { exitCode, signalCode: child.signalCode }
+        await runManagedCommand(args[0], args.slice(1), {
+            label,
+            timeoutMs,
+            cwd: options.cwd ?? ROOT,
+            env: options.env ?? process.env,
+            stdin: options.stdin ?? "inherit",
+            ...(options.captureOutput
+                ? {}
+                : { stdout: options.stdout ?? "inherit", stderr: options.stderr ?? "inherit" }),
+            captureOutput: options.captureOutput ?? false,
+            mirrorOutput: options.captureOutput ?? false,
+            outputLimit: OUTPUT_TAIL_LIMIT,
+            graceMs: options.terminationGraceMs ?? TERMINATION_GRACE_MS,
+            signalSource: options.signalSource ?? process,
+        });
+    } catch (error) {
+        if (!(error instanceof ManagedProcessError)) throw error;
+        const failure = new ChildProcessFailure(error.message, {
+            exitCode: error.timedOut || error.signalCode !== null ? null : error.exitCode,
+            signalCode: error.timedOut ? null : error.signalCode,
+            timedOut: error.timedOut,
+            stdoutTail: error.stdout,
+            stderrTail: error.stderr,
+        });
+        if (error.cause !== undefined) failure.cause = error.cause;
+        throw failure;
+    }
+}
+
+export async function runWithRetries(label, args, timeoutMs, options = {}) {
+    const { attempts = 1, retryDelayMs = 250, shouldRetry = () => true, ...runOptions } = options;
+    if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > 3) {
+        throw new Error(`attempts must be an integer from 1 through 3, received ${JSON.stringify(attempts)}`);
+    }
+    if (!Number.isFinite(retryDelayMs) || retryDelayMs < 0) {
+        throw new Error(`retryDelayMs must be a non-negative finite number, received ${JSON.stringify(retryDelayMs)}`);
+    }
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+            return await run(
+                attempt === 1 ? label : `${label} (retry ${attempt}/${attempts})`,
+                args,
+                timeoutMs,
+                runOptions
             );
-            if (cleanupFailure !== undefined) failure.cause = cleanupFailure;
-            throw failure;
+        } catch (error) {
+            const retryable =
+                error instanceof ChildProcessFailure &&
+                !error.timedOut &&
+                error.signalCode === null &&
+                error.exitCode !== null &&
+                shouldRetry(error) &&
+                attempt < attempts;
+            if (!retryable) throw error;
+            console.warn(`${label} hit a recognized startup failure; retrying from a clean process group`);
+            if (retryDelayMs > 0) await Bun.sleep(retryDelayMs);
         }
-        if (cleanupFailure !== undefined) throw cleanupFailure;
-    } finally {
-        clearOuterTimeout();
-        signalSource.off("SIGINT", onSigint);
-        signalSource.off("SIGTERM", onSigterm);
     }
 }
 
@@ -190,9 +149,9 @@ export async function main(argv = process.argv.slice(2)) {
     const allTests = (await filesUnder(TEST_ROOT))
         .filter(file => file.endsWith(".test.ts") || file.endsWith(".test.tsx"))
         .sort();
-    const workerdTests = allTests.filter(
-        file => file.startsWith(`${WORKERD_ROOT}${path.sep}`) && file.endsWith(WORKERD_SUFFIX)
-    );
+    const workerdTests = allTests
+        .filter(file => file.startsWith(`${WORKERD_ROOT}${path.sep}`) && file.endsWith(WORKERD_SUFFIX))
+        .sort(compareWorkerdHarnesses);
     const nonWorkerdTests = allTests.filter(file => !workerdTests.includes(file));
 
     if (nonWorkerdTests.length === 0) throw new Error("No non-workerd correctness tests found");
@@ -207,9 +166,16 @@ export async function main(argv = process.argv.slice(2)) {
 
     if (!watch) {
         const timeoutMs = outerTimeoutMs();
-        for (const harness of workerdTests) {
+        const attempts = workerdAttempts();
+        for (const [index, harness] of workerdTests.entries()) {
             const file = relative(harness);
-            await run(file, ["bun", "test", file], timeoutMs);
+            await runWithRetries(file, ["bun", "test", file], timeoutMs, {
+                attempts,
+                retryDelayMs: WORKERD_PROCESS_SETTLE_MS,
+                captureOutput: true,
+                shouldRetry: isTransientWorkerdStartupFailure,
+            });
+            if (index + 1 < workerdTests.length) await Bun.sleep(WORKERD_PROCESS_SETTLE_MS);
         }
     }
 }

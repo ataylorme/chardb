@@ -1,11 +1,10 @@
 /**
  * Function-reference identity for `defineMutation` / `defineQuery` / etc.
  *
- * The Vite plugin walks the user's bundle, finds every `defineXxx(...)` call
- * assigned to a named export, and rewrites the returned function to set
- * `fn.__chardbRef = "<exportPath>#<exportName>"`. Clients pass the function
- * itself (`useMutation(postMessage)`); the SDK reads `__chardbRef` to fill
- * the wire field. **Users never type a wire identifier.**
+ * Definitions with an explicit `ref` use it in Worker and browser builds.
+ * The Vite plugin also stamps a module-and-export ref on older definitions
+ * that omit one. Clients pass the function itself (`useMutation(postMessage)`);
+ * the SDK reads `__chardbRef` to fill the wire field.
  *
  * For tests/dev (no bundler), refs are auto-derived from `Function.name` so
  * the helpers work end-to-end before the plugin runs.
@@ -15,7 +14,7 @@ import { ChardbRef } from "../types.ts";
 
 const REF_KEY = "__chardbRef" as const;
 
-export type ChardbFunctionKind = "mutation" | "query" | "ledger" | "cron" | "stream" | "gsi" | "presenceKey";
+export type ChardbFunctionKind = "mutation" | "query" | "ledger" | "stream" | "gsi" | "presenceKey";
 
 /** Marker carried on every helper-produced value. */
 export interface ChardbRefMarker {
@@ -40,7 +39,7 @@ export function readRef(target: unknown): ChardbRef {
     }
     const ref = (target as Record<string, unknown>)[REF_KEY];
     if (typeof ref !== "string") {
-        throw new TypeError("readRef: target has no __chardbRef (was it defined with chardb/server?)");
+        throw new TypeError("readRef: target has no __chardbRef (was it defined with @chardb/core/server?)");
     }
     return ChardbRef(ref);
 }

@@ -39,13 +39,15 @@ describe("native loopback binding resolution", () => {
         const catalog = namespace("catalog");
         const cdb = namespace("cdb");
         const gateway = namespace("gateway");
+        const resharder = namespace("resharder");
 
         const resolved = withChardbLoopbacks(rawEnv, {
-            exports: { Catalog: catalog, Cdb: cdb, Gateway: gateway },
+            exports: { Catalog: catalog, Cdb: cdb, Gateway: gateway, Resharder: resharder },
         }) as typeof rawEnv & {
             CDB_CATALOG: DurableObjectNamespace;
             CDB_SHARD: DurableObjectNamespace;
             CDB_GATEWAY: DurableObjectNamespace;
+            CDB_RESHARD: DurableObjectNamespace;
         };
 
         expect(resolved).not.toBe(rawEnv);
@@ -53,6 +55,7 @@ describe("native loopback binding resolution", () => {
         expect(resolved.CDB_CATALOG).toBe(catalog);
         expect(resolved.CDB_SHARD).toBe(cdb);
         expect(resolved.CDB_GATEWAY).toBe(gateway);
+        expect(resolved.CDB_RESHARD).toBe(resharder);
         expect(sourceChardbEnv(resolved)).toBe(rawEnv);
     });
 
@@ -95,5 +98,22 @@ describe("native loopback binding resolution", () => {
         });
 
         expect(resolved).toBe(rawEnv);
+    });
+
+    test("only synthesizes the supported internal Durable Object classes", () => {
+        const rawEnv = {};
+        const resolved = withChardbLoopbacks(rawEnv, {
+            exports: {
+                BlobMeta: namespace("blobmeta"),
+                Resharder: namespace("resharder"),
+                GsiShard: namespace("gsi"),
+            },
+        });
+
+        expect(resolved).not.toBe(rawEnv);
+        expect(resolved).not.toHaveProperty("CDB_BLOBMETA");
+        expect(resolved).toHaveProperty("CDB_RESHARD");
+        expect(resolved).not.toHaveProperty("CDB_RESHARDER");
+        expect(resolved).not.toHaveProperty("CDB_GSI");
     });
 });

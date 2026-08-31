@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { CdbError, docsUrlFor, isCdbError, isRetryable } from "../src/errors.ts";
+import {
+    CdbError,
+    docsUrlFor,
+    isCdbError,
+    isRetryable,
+    rehydrateCdbRpcError,
+    throwCdbRpcError,
+} from "../src/errors.ts";
 
 describe("CdbError", () => {
     test("retryable polarity is part of the locked surface", () => {
@@ -38,5 +45,20 @@ describe("CdbError", () => {
         expect(isCdbError(new Error("vanilla"))).toBe(false);
         expect(isCdbError("string")).toBe(false);
         expect(isCdbError(null)).toBe(false);
+    });
+
+    test("round-trips the code through the message-only Workers RPC error boundary", () => {
+        let transported: unknown;
+        try {
+            throwCdbRpcError(new CdbError({ code: "CDB_INVALID_ARGS", message: "file type denied" }));
+        } catch (error) {
+            transported = new Error((error as Error).message);
+        }
+        expect(rehydrateCdbRpcError(transported)).toMatchObject({
+            code: "CDB_INVALID_ARGS",
+            message: "file type denied",
+        });
+        const unknown = new Error("untrusted remote failure");
+        expect(rehydrateCdbRpcError(unknown)).toBe(unknown);
     });
 });

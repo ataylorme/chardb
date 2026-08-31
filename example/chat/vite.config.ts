@@ -2,47 +2,34 @@
  * Vite config for the chardb chat example.
  *
  * The chardb Vite plugin scans server exports and stamps their wire refs.
- * This config consumes the plugin through the package's public `chardb/vite`
- * export. The browser shim below is temporary: query handles still share a
- * module graph with workerd-only server code.
+ * This config consumes the plugin through the package's public `@chardb/core/vite`
+ * export. Query and mutation modules become ref-only browser handles.
  */
 
-import { fileURLToPath } from "node:url";
+import { chardb as chardbVitePlugin } from "@chardb/core/vite";
 import react from "@vitejs/plugin-react";
-import { chardb as chardbVitePlugin } from "chardb/vite";
 import { defineConfig } from "vite";
 
+const workerOrigin = process.env.CHARDB_URL ?? "http://127.0.0.1:8787";
+const workerSocket = workerOrigin.replace(/^http/, "ws");
+
 export default defineConfig({
-    plugins: [
-        react(),
-        chardbVitePlugin({
-            schema: "./src/server/schema.ts",
-            migrations: "./src/server/worker.ts",
-            serverModuleGlob: "./src/server/**/*.ts",
-        }),
-    ],
+    plugins: [react(), chardbVitePlugin()],
     build: {
         outDir: "dist",
         emptyOutDir: true,
     },
     resolve: {
         preserveSymlinks: true,
-        // Query handles currently share a module graph with the Worker. Vite
-        // needs a browser-safe stand-in for workerd's built-in module while it
-        // tree-shakes the server-only classes from the SPA build.
-        alias: [
-            {
-                find: "cloudflare:workers",
-                replacement: fileURLToPath(new URL("./src/web/cloudflare-workers-shim.ts", import.meta.url)),
-            },
-        ],
     },
     server: {
+        host: "127.0.0.1",
         port: 5173,
+        strictPort: true,
         proxy: {
-            "/ws": { target: "ws://localhost:8787", ws: true },
-            "/_chardb": "http://localhost:8787",
-            "/api": "http://localhost:8787",
+            "/ws": { target: workerSocket, ws: true, changeOrigin: true },
+            "/_chardb": workerOrigin,
+            "/api": workerOrigin,
         },
     },
 });

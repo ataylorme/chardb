@@ -61,19 +61,14 @@ class FakeWS {
 }
 
 const realWS = globalThis.WebSocket;
-const realBC = (globalThis as { BroadcastChannel?: unknown }).BroadcastChannel;
-
 beforeEach(() => {
     FakeWS.instances.length = 0;
     FakeWS.autoOpen = true;
     (globalThis as { WebSocket: unknown }).WebSocket = FakeWS;
-    // BroadcastChannel exists in Bun by default. Disable cross-tab in client opts
-    // (crossTab: false) below so the test stays hermetic.
 });
 
 afterEach(() => {
     (globalThis as { WebSocket: unknown }).WebSocket = realWS;
-    if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
 });
 
 function client(overrides: Partial<ChardbClientOptions> = {}) {
@@ -81,7 +76,6 @@ function client(overrides: Partial<ChardbClientOptions> = {}) {
         endpoint: "wss://example.com/ws",
         getJwt: async () => "jwt-stub",
         clientId: "c-test",
-        crossTab: false,
         ...overrides,
     });
 }
@@ -125,6 +119,37 @@ function sentSubscriptions(ws: FakeWS): Extract<Up, { t: "sub" }>[] {
         .filter((message): message is Extract<Up, { t: "sub" }> => message.t === "sub");
 }
 
+const RETRYABLE_SUBSCRIPTION_CODES = [
+    "CDB_STALE_EPOCH",
+    "CDB_TXN_ABORTED_EVICTION",
+    "CDB_RATE_LIMITED",
+    "CDB_SHARD_UNAVAILABLE",
+    "CDB_CATALOG_UNAVAILABLE",
+    "CDB_STREAM_ABORTED",
+] as const;
+
+function subscriptionError(
+    code: (typeof RETRYABLE_SUBSCRIPTION_CODES)[number],
+    subId = SubId(1)
+): Extract<Down, { t: "error" }> {
+    return {
+        t: "error",
+        code,
+        subId,
+        retryable: true,
+        correlationId: `corr-${code.toLowerCase()}` as never,
+        docs: `https://chardb.dev/errors/${code.toLowerCase()}`,
+    };
+}
+
+function jwtWithClaims(subject: string, expiresAtSeconds: number): string {
+    const payload = btoa(JSON.stringify({ sub: subject, exp: expiresAtSeconds }))
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/, "");
+    return `e30.${payload}.signature`;
+}
+
 function nestedJson(depth: number): RawJson {
     let value: RawJson = null;
     for (let level = 0; level < depth; level++) value = { value };
@@ -147,20 +172,6 @@ function keyedRowsAtBytes(bytes: number, rowKey: string): RawJson[] {
     const overhead = JSON.stringify(empty).length;
     if (bytes < overhead) throw new RangeError("serialized keyed row array is too small");
     return [{ __key: rowKey, value: "x".repeat(bytes - overhead) }];
-}
-
-function protoRowsAtBytes(bytes: number): RawJson[] {
-    const row: Record<string, RawJson> = {};
-    Object.defineProperty(row, "__proto__", { value: "", enumerable: true, writable: true, configurable: true });
-    const overhead = JSON.stringify([row]).length;
-    if (bytes < overhead) throw new RangeError("serialized __proto__ row array is too small");
-    Object.defineProperty(row, "__proto__", {
-        value: "x".repeat(bytes - overhead),
-        enumerable: true,
-        writable: true,
-        configurable: true,
-    });
-    return [row];
 }
 
 function streamChunkRawAtBytes(bytes: number, multibyte = false): string {
@@ -241,7 +252,6 @@ describe("createChardbClient — wire round-trip", () => {
                 return "jwt-stub";
             },
             clientId: "c-deferred-subscription",
-            crossTab: false,
         });
 
         expect(subscriptionJwtCalls).toBe(0);
@@ -267,7 +277,6 @@ describe("createChardbClient — wire round-trip", () => {
                 return "jwt-stub";
             },
             clientId: "c-deferred-mutation",
-            crossTab: false,
         });
         const mutationError = mutationController.client.mutate("mutations.ts#deferred", {}).catch(error => error);
         mutationController.start();
@@ -287,7 +296,6 @@ describe("createChardbClient — wire round-trip", () => {
                 return "jwt-stub";
             },
             clientId: "c-deferred-closed",
-            crossTab: false,
         });
 
         controller.client.close();
@@ -301,6 +309,43 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
         expect(getJwtCalls).toBe(0);
         expect(FakeWS.instances).toHaveLength(0);
+    });
+
+    test("lets an auth-aware owner hold queued work until it explicitly starts the deferred client", async () => {
+        const timers = installManualTimers();
+        let getJwtCalls = 0;
+        const controller = createDeferredChardbClientController(
+            {
+                endpoint: "wss://example.com/ws",
+                getJwt: async () => {
+                    getJwtCalls += 1;
+                    return "jwt-stub";
+                },
+                clientId: "c-deferred-auth",
+                mutationTimeoutMs: 1_000,
+            },
+            { autoStartOnOperation: false }
+        );
+        const mutation = controller.client.mutate("mutations.ts#held-auth", {}).catch(error => error);
+        try {
+            controller.client.subscribe("queries.ts#held-auth", {}, () => {});
+            await flush();
+            expect(getJwtCalls).toBe(0);
+            expect(FakeWS.instances).toHaveLength(0);
+
+            controller.start();
+            await flush();
+            const ws = fakeWebSocket();
+            expect(getJwtCalls).toBe(1);
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+
+            await welcome(ws);
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello", "sub", "mut"]);
+        } finally {
+            controller.client.close();
+            await mutation;
+            timers.restore();
+        }
     });
 
     test("rejects mutation timeout values that cannot produce a bounded timer", () => {
@@ -325,6 +370,390 @@ describe("createChardbClient — wire round-trip", () => {
         expect(sent.clientId).toBe(ClientId("c-test"));
         expect(sent.jwt).toBe("jwt-stub");
         expect(sent.protocolV).toBe(PROTOCOL_V);
+    });
+
+    test("refreshes an expiring JWT on the existing socket without disturbing a live subscription", async () => {
+        const timers = installManualTimers();
+        const nowMs = 2_000_000_000_000;
+        setSystemTime(nowMs);
+        const initial = jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + 120);
+        const refreshed = jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + 240);
+        let getJwtCalls = 0;
+        const c = client({
+            getJwt: async () => {
+                getJwtCalls += 1;
+                return getJwtCalls === 1 ? initial : refreshed;
+            },
+        });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const states: string[] = [];
+            c.subscribe("queries.ts#refresh", {}, (_rows, state) => states.push(state ?? "missing"));
+            ws.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-refresh:1"), rows: [] });
+            await flush();
+
+            expect(states).toEqual(["live"]);
+            expect(timers.scheduledDelays()).toEqual([60_000]);
+            timers.runDelay(60_000);
+            await flush();
+
+            expect(getJwtCalls).toBe(2);
+            expect(FakeWS.instances).toHaveLength(1);
+            expect(ws.sent.map(raw => JSON.parse(raw) as Up)).toContainEqual({ t: "updateAuth", jwt: refreshed });
+            expect(states).toEqual(["live"]);
+            expect(c.state).toBe("open");
+            expect(timers.scheduledDelays()).toEqual([120_000]);
+
+            ws.emit({ t: "mustRefetch", subIds: [], reason: "authChanged" });
+            await flush();
+            expect(states).toEqual(["live"]);
+            expect(timers.scheduledDelays()).toEqual([180_000]);
+        } finally {
+            c.close();
+            timers.restore();
+            setSystemTime();
+        }
+    });
+
+    test("retries a transient proactive JWT read failure while the current token remains valid", async () => {
+        const timers = installManualTimers();
+        const nowMs = 2_000_000_000_000;
+        setSystemTime(nowMs);
+        let getJwtCalls = 0;
+        const diagnostics: unknown[] = [];
+        const refreshed = jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + 180);
+        const c = client({
+            getJwt: async () => {
+                getJwtCalls += 1;
+                if (getJwtCalls === 2) throw new Error("transient token-store failure");
+                return getJwtCalls === 1 ? jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + 61) : refreshed;
+            },
+            onSessionError: diagnostic => diagnostics.push(diagnostic),
+        });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const states: string[] = [];
+            c.subscribe("queries.ts#refresh-failure", {}, (_rows, state) => states.push(state ?? "missing"));
+            ws.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-refresh-failure:1"), rows: [] });
+            await flush();
+
+            timers.runDelay(1_000);
+            await flush();
+
+            expect(getJwtCalls).toBe(2);
+            expect(c.state).toBe("open");
+            expect(ws.readyState).toBe(FakeWS.OPEN);
+            expect(states).toEqual(["live"]);
+            expect(diagnostics).toEqual([]);
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).not.toContain("updateAuth");
+            expect(timers.scheduledDelays().sort((left, right) => left - right)).toEqual([1_000, 61_000]);
+
+            timers.runDelay(1_000);
+            await flush();
+
+            expect(getJwtCalls).toBe(3);
+            expect(ws.sent.map(raw => JSON.parse(raw) as Up)).toContainEqual({ t: "updateAuth", jwt: refreshed });
+            expect(c.state).toBe("open");
+            expect(states).toEqual(["live"]);
+            expect(diagnostics).toEqual([]);
+            expect(timers.scheduledDelays()).toEqual([61_000]);
+        } finally {
+            c.close();
+            timers.restore();
+            setSystemTime();
+        }
+    });
+
+    test("closes at the current JWT expiry when a proactive token read never settles", async () => {
+        const timers = installManualTimers();
+        const nowMs = 2_000_000_000_000;
+        setSystemTime(nowMs);
+        let getJwtCalls = 0;
+        let releaseJwt: (jwt: string) => void = () => {};
+        const heldJwt = new Promise<string>(resolve => {
+            releaseJwt = resolve;
+        });
+        const diagnostics: unknown[] = [];
+        const c = client({
+            getJwt: () => {
+                getJwtCalls += 1;
+                return getJwtCalls === 1
+                    ? Promise.resolve(jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + 61))
+                    : heldJwt;
+            },
+            onSessionError: diagnostic => diagnostics.push(diagnostic),
+        });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+
+            timers.runDelay(1_000);
+            await flush();
+            expect(getJwtCalls).toBe(2);
+            expect(timers.scheduledDelays()).toEqual([61_000]);
+
+            setSystemTime(nowMs + 61_000);
+            timers.runDelay(61_000);
+            await flush();
+            expect(c.state).toBe("closed");
+            expect(ws.readyState).toBe(FakeWS.CLOSED);
+            expect(diagnostics).toEqual([{ code: "CDB_FORBIDDEN", reason: "auth-refresh-read" }]);
+            expect(timers.scheduledDelays()).toEqual([]);
+
+            releaseJwt(jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + 180));
+            await flush();
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+            expect(diagnostics).toHaveLength(1);
+            expect(timers.scheduledDelays()).toEqual([]);
+        } finally {
+            c.close();
+            timers.restore();
+            setSystemTime();
+        }
+    });
+
+    test("closes at the current JWT expiry when updateAuth is never acknowledged", async () => {
+        const timers = installManualTimers();
+        const nowMs = 2_000_000_000_000;
+        setSystemTime(nowMs);
+        let getJwtCalls = 0;
+        const diagnostics: unknown[] = [];
+        const refreshed = jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + 180);
+        const c = client({
+            getJwt: async () => {
+                getJwtCalls += 1;
+                return getJwtCalls === 1 ? jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + 61) : refreshed;
+            },
+            onSessionError: diagnostic => diagnostics.push(diagnostic),
+        });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+
+            timers.runDelay(1_000);
+            await flush();
+            expect(ws.sent.map(raw => JSON.parse(raw) as Up)).toContainEqual({ t: "updateAuth", jwt: refreshed });
+            expect(timers.scheduledDelays()).toEqual([61_000]);
+
+            setSystemTime(nowMs + 61_000);
+            timers.runDelay(61_000);
+            await flush();
+            expect(c.state).toBe("closed");
+            expect(ws.readyState).toBe(FakeWS.CLOSED);
+            expect(diagnostics).toEqual([{ code: "CDB_FORBIDDEN", reason: "auth-refresh-close" }]);
+            expect(timers.scheduledDelays()).toEqual([]);
+
+            ws.emit({ t: "mustRefetch", subIds: [], reason: "authChanged" });
+            await flush();
+            expect(diagnostics).toHaveLength(1);
+            expect(timers.scheduledDelays()).toEqual([]);
+        } finally {
+            c.close();
+            timers.restore();
+            setSystemTime();
+        }
+    });
+
+    test("closes after proactive JWT reads keep failing through the current token expiry", async () => {
+        const timers = installManualTimers();
+        const nowMs = 2_000_000_000_000;
+        setSystemTime(nowMs);
+        let getJwtCalls = 0;
+        const diagnostics: unknown[] = [];
+        const c = client({
+            getJwt: async () => {
+                getJwtCalls += 1;
+                if (getJwtCalls > 1) throw new Error("token store unavailable");
+                return jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + 61);
+            },
+            onSessionError: diagnostic => diagnostics.push(diagnostic),
+        });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+
+            timers.runDelay(1_000);
+            await flush();
+            expect(timers.scheduledDelays().sort((left, right) => left - right)).toEqual([1_000, 61_000]);
+
+            setSystemTime(nowMs + 61_000);
+            timers.runDelay(1_000);
+            await flush();
+
+            expect(getJwtCalls).toBe(3);
+            expect(c.state).toBe("closed");
+            expect(ws.readyState).toBe(FakeWS.CLOSED);
+            expect(diagnostics).toEqual([{ code: "CDB_FORBIDDEN", reason: "auth-refresh-read" }]);
+            expect(timers.scheduledDelays()).toEqual([]);
+        } finally {
+            c.close();
+            timers.restore();
+            setSystemTime();
+        }
+    });
+
+    test("closes before sending updateAuth when a refreshed JWT changes principal", async () => {
+        const timers = installManualTimers();
+        const nowMs = 2_000_000_000_000;
+        setSystemTime(nowMs);
+        let getJwtCalls = 0;
+        const diagnostics: unknown[] = [];
+        const c = client({
+            getJwt: async () => {
+                getJwtCalls += 1;
+                return jwtWithClaims(
+                    getJwtCalls === 1 ? "user-1" : "user-2",
+                    Math.floor(nowMs / 1_000) + (getJwtCalls === 1 ? 61 : 180)
+                );
+            },
+            onSessionError: diagnostic => {
+                diagnostics.push(diagnostic);
+                throw new Error("diagnostic listener failure");
+            },
+        });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            timers.runDelay(1_000);
+            await flush();
+
+            expect(c.state).toBe("closed");
+            expect(ws.readyState).toBe(FakeWS.CLOSED);
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+            expect(FakeWS.instances).toHaveLength(1);
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(diagnostics).toEqual([{ code: "CDB_FORBIDDEN", reason: "auth-refresh-principal-changed" }]);
+        } finally {
+            c.close();
+            timers.restore();
+            setSystemTime();
+        }
+    });
+
+    test("closes when the Gateway rejects a structurally valid refreshed JWT", async () => {
+        const timers = installManualTimers();
+        const nowMs = 2_000_000_000_000;
+        setSystemTime(nowMs);
+        let getJwtCalls = 0;
+        const c = client({
+            getJwt: async () => {
+                getJwtCalls += 1;
+                return jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + (getJwtCalls === 1 ? 61 : 180));
+            },
+        });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            timers.runDelay(1_000);
+            await flush();
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello", "updateAuth"]);
+
+            ws.emit({
+                t: "error",
+                code: "CDB_FORBIDDEN",
+                retryable: false,
+                correlationId: "corr-refresh" as never,
+                docs: "https://chardb.dev/errors/cdb_forbidden",
+            });
+            await flush();
+
+            expect(c.state).toBe("closed");
+            expect(ws.readyState).toBe(FakeWS.CLOSED);
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(FakeWS.instances).toHaveLength(1);
+        } finally {
+            c.close();
+            timers.restore();
+            setSystemTime();
+        }
+    });
+
+    test("a stream-scoped error cannot reject an auth refresh awaiting verification", async () => {
+        const timers = installManualTimers();
+        const nowMs = 2_000_000_000_000;
+        setSystemTime(nowMs);
+        let getJwtCalls = 0;
+        const c = client({
+            getJwt: async () => {
+                getJwtCalls += 1;
+                return jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + (getJwtCalls === 1 ? 61 : 180));
+            },
+        });
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            timers.runDelay(1_000);
+            await flush();
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello", "updateAuth"]);
+
+            ws.emit({
+                t: "error",
+                code: "CDB_UNSUPPORTED_FEATURE",
+                streamReqId: 7,
+                retryable: false,
+                correlationId: "corr-stream" as never,
+                docs: "https://chardb.dev/errors/cdb_unsupported_feature",
+            });
+            await flush();
+
+            expect(c.state).toBe("open");
+            expect(ws.readyState).toBe(FakeWS.OPEN);
+            expect(timers.scheduledDelays()).toEqual([61_000]);
+
+            ws.emit({ t: "mustRefetch", subIds: [], reason: "authChanged" });
+            await flush();
+            expect(c.state).toBe("open");
+            expect(timers.scheduledDelays()).toEqual([120_000]);
+        } finally {
+            c.close();
+            timers.restore();
+            setSystemTime();
+        }
+    });
+
+    test("reconnects when the socket closes while an auth refresh is awaiting verification", async () => {
+        const timers = installManualTimers();
+        const nowMs = 2_000_000_000_000;
+        setSystemTime(nowMs);
+        let jwtCalls = 0;
+        const c = client({
+            getJwt: async () => {
+                jwtCalls += 1;
+                return jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + 60 + jwtCalls * 120);
+            },
+        });
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+            timers.runDelay(120_000);
+            await flush();
+            expect(first.sent.map(raw => (JSON.parse(raw) as Up).t)).toContain("updateAuth");
+
+            first.close();
+            await flush();
+            expect(c.state).toBe("reconnecting");
+            expect(timers.scheduledDelays()).toEqual([250]);
+
+            timers.runDelay(250);
+            await flush();
+            expect(FakeWS.instances).toHaveLength(2);
+            expect(c.state).toBe("connecting");
+        } finally {
+            c.close();
+            timers.restore();
+            setSystemTime();
+        }
     });
 
     test("reconnects queued work when the hello send throws", async () => {
@@ -439,6 +868,7 @@ describe("createChardbClient — wire round-trip", () => {
     });
 
     test("getJwt rejection terminates queued work without opening a socket", async () => {
+        const diagnostics: unknown[] = [];
         let rejectJwt: ((reason: unknown) => void) | undefined;
         const jwt = new Promise<string>((_resolve, reject) => {
             rejectJwt = reject;
@@ -447,7 +877,7 @@ describe("createChardbClient — wire round-trip", () => {
             endpoint: "wss://example.com/ws",
             getJwt: () => jwt,
             clientId: "c-jwt-failure",
-            crossTab: false,
+            onSessionError: diagnostic => diagnostics.push(diagnostic),
         });
         let subscriptionNotifications = 0;
         c.subscribe("queries.ts#listMessages", {}, () => subscriptionNotifications++);
@@ -459,24 +889,62 @@ describe("createChardbClient — wire round-trip", () => {
         expect(c.state).toBe("closed");
         expect(FakeWS.instances).toHaveLength(0);
         expect(subscriptionNotifications).toBe(1);
+        expect(diagnostics).toEqual([{ code: "CDB_INVARIANT", reason: "connect" }]);
         await expect(mutationError).resolves.toMatchObject({
             code: "CDB_INVARIANT",
             message: "failed to establish Chardb client session",
         });
     });
 
+    test("retries a transient getJwt failure while reconnecting an established session", async () => {
+        const timers = installManualTimers();
+        let jwtCalls = 0;
+        const c = client({
+            getJwt: async () => {
+                jwtCalls += 1;
+                if (jwtCalls === 2) throw new Error("token endpoint unavailable");
+                return "jwt-stub";
+            },
+        });
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+
+            first.close();
+            await flush();
+            timers.runDelay(250);
+            await flush();
+
+            expect(c.state).toBe("reconnecting");
+            expect(jwtCalls).toBe(2);
+            expect(FakeWS.instances).toHaveLength(1);
+            expect(timers.scheduledDelays()).toEqual([500]);
+
+            timers.runDelay(500);
+            await flush();
+            expect(jwtCalls).toBe(3);
+            expect(FakeWS.instances).toHaveLength(2);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
     test("invalid connection setup terminates queued work without retrying", async () => {
+        const diagnostics: unknown[] = [];
         const c = createChardbClient({
             endpoint: "not a websocket URL",
             getJwt: async () => "jwt-stub",
             clientId: "c-setup-failure",
-            crossTab: false,
+            onSessionError: diagnostic => diagnostics.push(diagnostic),
         });
         const mutationError = c.mutate("src/api.ts#post", {}).catch(error => error);
         await flush();
 
         expect(c.state).toBe("closed");
         expect(FakeWS.instances).toHaveLength(0);
+        expect(diagnostics).toEqual([{ code: "CDB_INVARIANT", reason: "connect" }]);
         await expect(mutationError).resolves.toMatchObject({
             code: "CDB_INVARIANT",
             message: "failed to establish Chardb client session",
@@ -503,32 +971,26 @@ describe("createChardbClient — wire round-trip", () => {
         });
     });
 
-    test("a malformed established-session message settles in-flight work instead of escaping the callback", async () => {
-        class MalformedBroadcastChannel {
-            static instance: MalformedBroadcastChannel | undefined;
-            onmessage: ((event: { data: unknown }) => void) | null = null;
-            closeCalls = 0;
+    test("a valid client-to-server message received from the server fails the session", async () => {
+        const c = client();
+        await flush();
+        const ws = fakeWebSocket();
+        const mutationError = c.mutate("src/api.ts#post", {}).catch(error => error);
 
-            constructor(_name: string) {
-                MalformedBroadcastChannel.instance = this;
-            }
+        ws.emitRaw(encodeWire({ t: "ping" } satisfies Up));
+        await flush();
 
-            close(): void {
-                this.closeCalls += 1;
-            }
-            emit(data: unknown): void {
-                this.onmessage?.({ data });
-            }
-        }
-
-        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = MalformedBroadcastChannel;
-        const timeoutSpy = spyOnClearTimeout();
-        const c = createChardbClient({
-            endpoint: "wss://example.com/ws",
-            getJwt: async () => "jwt-stub",
-            clientId: "c-malformed-session",
-            logicalDb: "malformed-session",
+        expect(c.state).toBe("closed");
+        expect(ws.readyState).toBe(FakeWS.CLOSED);
+        await expect(mutationError).resolves.toMatchObject({
+            code: "CDB_INVARIANT",
+            message: "server sent an invalid Chardb handshake message",
         });
+    });
+
+    test("a malformed established-session message settles in-flight work instead of escaping the callback", async () => {
+        const timeoutSpy = spyOnClearTimeout();
+        const c = client({ clientId: "c-malformed-session" });
         try {
             await flush();
             const ws = fakeWebSocket();
@@ -541,37 +1003,29 @@ describe("createChardbClient — wire round-trip", () => {
                 cookie: Cookie("c-malformed:1"),
                 rows: [{ secret: "authoritative" }],
             });
-            MalformedBroadcastChannel.instance?.emit({
-                kind: "optimistic",
-                patches: [{ op: "put", subId: 1, rowKey: "local", row: { secret: "optimistic" } }],
-            });
             const mutationError = c.mutate("src/api.ts#post", {}).catch(error => error);
-            expect(seen.at(-1)).toEqual([{ secret: "authoritative" }, { secret: "optimistic", __key: "local" }]);
+            expect(seen.at(-1)).toEqual([{ secret: "authoritative" }]);
 
             ws.onmessage?.({ data: "{" });
             await flush();
 
             expect(c.state).toBe("closed");
             expect(seen.at(-1)).toEqual([]);
-            expect(seen).toHaveLength(3);
+            expect(seen).toHaveLength(2);
             await expect(mutationError).resolves.toMatchObject({
                 code: "CDB_INVARIANT",
                 message: "server sent an invalid Chardb session message",
             });
             expect(timeoutSpy.calls).toHaveLength(1);
             expect(ws.readyState).toBe(FakeWS.CLOSED);
-            expect(MalformedBroadcastChannel.instance?.closeCalls).toBe(1);
 
             ws.onmessage?.({ data: "{" });
             ws.onclose?.();
             await flush();
-            expect(seen).toHaveLength(3);
-            expect(MalformedBroadcastChannel.instance?.closeCalls).toBe(1);
+            expect(seen).toHaveLength(2);
         } finally {
             c.close();
             timeoutSpy.restore();
-            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
-            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
         }
     });
 
@@ -617,30 +1071,9 @@ describe("createChardbClient — wire round-trip", () => {
     });
 
     test("an oversized inbound frame performs terminal cleanup once and never reconnects", async () => {
-        class ClosingBroadcastChannel {
-            static instance: ClosingBroadcastChannel | undefined;
-            onmessage: ((event: { data: unknown }) => void) | null = null;
-            closeCalls = 0;
-
-            constructor(_name: string) {
-                ClosingBroadcastChannel.instance = this;
-            }
-
-            postMessage(): void {}
-            close(): void {
-                this.closeCalls += 1;
-            }
-        }
-
-        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = ClosingBroadcastChannel;
         const timers = installManualTimers();
         try {
-            const c = createChardbClient({
-                endpoint: "wss://example.com/ws",
-                getJwt: async () => "jwt-stub",
-                clientId: "c-inbound-cleanup",
-                logicalDb: "inbound-cleanup",
-            });
+            const c = client({ clientId: "c-inbound-cleanup" });
             await flush();
             const ws = fakeWebSocket();
             await welcome(ws);
@@ -660,7 +1093,6 @@ describe("createChardbClient — wire round-trip", () => {
             });
             expect(timers.scheduledDelays()).toEqual([]);
             expect(ws.readyState).toBe(FakeWS.CLOSED);
-            expect(ClosingBroadcastChannel.instance?.closeCalls).toBe(1);
             expect(FakeWS.instances).toHaveLength(1);
 
             ws.emitRaw(new ArrayBuffer(1));
@@ -668,13 +1100,10 @@ describe("createChardbClient — wire round-trip", () => {
             await flush();
 
             expect(subscriptionNotifications).toBe(1);
-            expect(ClosingBroadcastChannel.instance?.closeCalls).toBe(1);
             expect(timers.scheduledDelays()).toEqual([]);
             expect(FakeWS.instances).toHaveLength(1);
         } finally {
             timers.restore();
-            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
-            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
         }
     });
 
@@ -1086,32 +1515,9 @@ describe("createChardbClient — wire round-trip", () => {
     });
 
     test("finishes terminal cleanup when a subscription listener throws", async () => {
-        class ClosingBroadcastChannel {
-            static instance: ClosingBroadcastChannel | undefined;
-            onmessage: ((event: { data: unknown }) => void) | null = null;
-            closeCalls = 0;
-
-            constructor(_name: string) {
-                ClosingBroadcastChannel.instance = this;
-            }
-
-            close(): void {
-                this.closeCalls += 1;
-            }
-            emit(data: unknown): void {
-                this.onmessage?.({ data });
-            }
-        }
-
-        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = ClosingBroadcastChannel;
         const timeoutSpy = spyOnClearTimeout();
         try {
-            const c = createChardbClient({
-                endpoint: "wss://example.com/ws",
-                getJwt: async () => "jwt-stub",
-                clientId: "c-listener-cleanup",
-                logicalDb: "listener-cleanup",
-            });
+            const c = client({ clientId: "c-listener-cleanup" });
             await flush();
             const ws = fakeWebSocket();
             await welcome(ws);
@@ -1126,32 +1532,21 @@ describe("createChardbClient — wire round-trip", () => {
                 cookie: Cookie("c-listener-cleanup:1"),
                 rows: [{ secret: "authoritative" }],
             });
-            ClosingBroadcastChannel.instance?.emit({
-                kind: "optimistic",
-                patches: [{ op: "put", subId: 2, rowKey: "local", row: { secret: "optimistic" } }],
-            });
-            expect(remainingSeen.at(-1)).toEqual([
-                { secret: "authoritative" },
-                { secret: "optimistic", __key: "local" },
-            ]);
+            expect(remainingSeen.at(-1)).toEqual([{ secret: "authoritative" }]);
             const mutationError = c.mutate("mutations.ts#pending", {}).catch(error => error);
 
             expect(() => c.close()).not.toThrow();
             await expect(mutationError).resolves.toMatchObject({ code: "CDB_STREAM_ABORTED" });
             expect(remainingSeen.at(-1)).toEqual([]);
-            expect(remainingSeen).toHaveLength(3);
+            expect(remainingSeen).toHaveLength(2);
             expect(timeoutSpy.calls).toHaveLength(1);
             expect(ws.readyState).toBe(FakeWS.CLOSED);
-            expect(ClosingBroadcastChannel.instance?.closeCalls).toBe(1);
 
             c.close();
             ws.onclose?.();
-            expect(remainingSeen).toHaveLength(3);
-            expect(ClosingBroadcastChannel.instance?.closeCalls).toBe(1);
+            expect(remainingSeen).toHaveLength(2);
         } finally {
             timeoutSpy.restore();
-            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
-            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
         }
     });
 
@@ -1315,7 +1710,7 @@ describe("createChardbClient — wire round-trip", () => {
         c.close();
     });
 
-    test("caps aggregate retained query state at exactly 8 MiB and releases it on unsubscribe", async () => {
+    test("caps aggregate retained query rows at exactly 8 MiB and releases on unsubscribe", async () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
@@ -1324,7 +1719,7 @@ describe("createChardbClient — wire round-trip", () => {
             c.subscribe(`queries.ts#aggregate-${index}`, {}, () => {})
         );
         const fullRows = stringRowsAtBytes(512 * 1_024);
-        for (let subId = 1; subId <= 15; subId++) {
+        for (let subId = 1; subId <= 16; subId++) {
             ws.emit({
                 t: "snapshot",
                 subId: SubId(subId),
@@ -1332,61 +1727,26 @@ describe("createChardbClient — wire round-trip", () => {
                 rows: fullRows,
             });
         }
-        const finalRows = protoRowsAtBytes(524_256);
-        ws.emit({
-            t: "snapshot",
-            subId: SubId(16),
-            cookie: Cookie("c-test:aggregate-final"),
-            rows: finalRows,
-        });
         await flush();
         expect(c.state).toBe("open");
 
-        const oneOverFinalRows = protoRowsAtBytes(524_257);
-        ws.emit({
-            t: "snapshot",
-            subId: SubId(16),
-            cookie: Cookie("c-test:aggregate-final"),
-            rows: oneOverFinalRows,
+        expect(captureCdbError(() => c.subscribe("queries.ts#aggregate-over", {}, () => {}))).toMatchObject({
+            code: "CDB_RATE_LIMITED",
         });
-        await flush();
         expect(c.state).toBe("open");
-        expect(
-            ws.sent
-                .map(raw => JSON.parse(raw) as Up)
-                .filter(message => message.t === "ack" && message.cookie === Cookie("c-test:aggregate-final"))
-        ).toHaveLength(2);
 
         subscriptions[0]?.unsubscribe();
-        ws.emit({
-            t: "snapshot",
-            subId: SubId(16),
-            cookie: Cookie("c-test:aggregate-replacement"),
-            rows: oneOverFinalRows,
-        });
         const released = c.subscribe("queries.ts#aggregate-released", {}, () => {});
         ws.emit({
             t: "snapshot",
             subId: SubId(17),
             cookie: Cookie("c-test:aggregate-refilled"),
-            rows: stringRowsAtBytes(524_287),
+            rows: fullRows,
         });
         await flush();
         expect(c.state).toBe("open");
-
-        ws.emit({
-            t: "snapshot",
-            subId: SubId(17),
-            cookie: Cookie("c-test:aggregate-over"),
-            rows: stringRowsAtBytes(524_288),
-        });
-        await flush();
-        expect(c.state).toBe("closed");
-        expect(ws.sent.map(raw => JSON.parse(raw) as Up)).not.toContainEqual({
-            t: "ack",
-            cookie: Cookie("c-test:aggregate-over"),
-        });
         released.unsubscribe();
+        c.close();
     });
 
     test("rejects an aggregate-overflowing multi-sub patch before either subscription commits", async () => {
@@ -1422,7 +1782,7 @@ describe("createChardbClient — wire round-trip", () => {
             t: "snapshot",
             subId: SubId(18),
             cookie: Cookie("c-test:aggregate-atomic-filler"),
-            rows: stringRowsAtBytes(164_252),
+            rows: stringRowsAtBytes(164_288),
         });
         await flush();
         expect(c.state).toBe("open");
@@ -1611,7 +1971,7 @@ describe("createChardbClient — wire round-trip", () => {
         expect(malformed.state).toBe("closed");
     });
 
-    test("a throwing listener does not block later terminal empty notifications", async () => {
+    test("a throwing listener does not terminate the session or block other subscription notifications", async () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
@@ -1631,8 +1991,9 @@ describe("createChardbClient — wire round-trip", () => {
             ],
         });
         await flush();
-        expect(c.state).toBe("closed");
-        expect(secondSeen).toEqual([[]]);
+        expect(c.state).toBe("open");
+        expect(secondSeen).toEqual([[{ value: 2, __key: "second" }]]);
+        c.close();
     });
 
     test("a duplicate snapshot is re-acknowledged before sizing and does not regress the connection cookie", async () => {
@@ -1679,253 +2040,6 @@ describe("createChardbClient — wire round-trip", () => {
         if (!hello || hello.t !== "hello") throw new Error("expected hello on reconnect");
         expect(hello.resumeFromCookie).toBe(Cookie("c-1:2"));
         c.close();
-    });
-
-    test("a duplicate snapshot preserves an optimistic row until a newer snapshot replaces it", async () => {
-        class TestBroadcastChannel {
-            static instance: TestBroadcastChannel | undefined;
-            onmessage: ((event: { data: unknown }) => void) | null = null;
-
-            constructor(_name: string) {
-                TestBroadcastChannel.instance = this;
-            }
-
-            postMessage(): void {}
-            close(): void {}
-            emit(data: unknown): void {
-                this.onmessage?.({ data });
-            }
-        }
-
-        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = TestBroadcastChannel;
-        try {
-            const c = createChardbClient({
-                endpoint: "wss://example.com/ws",
-                getJwt: async () => "jwt-stub",
-                clientId: "c-test",
-                logicalDb: "snapshot-dedupe",
-            });
-            await flush();
-            const ws = fakeWebSocket();
-            await welcome(ws);
-            const seen: unknown[][] = [];
-            c.subscribe("queries.ts#listMessages", {}, rows => seen.push([...rows]));
-            await flush();
-
-            ws.emit({
-                t: "snapshot",
-                subId: SubId(1),
-                cookie: Cookie("c-1:1"),
-                rows: [{ id: "base" }],
-            });
-            ws.emit({
-                t: "snapshot",
-                subId: SubId(1),
-                cookie: Cookie("c-1:1"),
-                rows: [{ id: "duplicate-before-patch-must-not-apply" }],
-            });
-            await flush();
-            expect(seen).toEqual([[{ id: "base" }]]);
-            expect(ws.sent.filter(raw => (JSON.parse(raw) as Up).t === "ack")).toHaveLength(2);
-
-            TestBroadcastChannel.instance?.emit({
-                kind: "optimistic",
-                patches: [{ op: "put", subId: SubId(1), rowKey: "local", row: { id: "optimistic" } }],
-            });
-            await flush();
-            expect(seen.at(-1)).toEqual([{ id: "base" }, { id: "optimistic", __key: "local" }]);
-
-            ws.emit({
-                t: "snapshot",
-                subId: SubId(1),
-                cookie: Cookie("c-1:1"),
-                rows: [{ id: "duplicate-must-not-apply" }],
-            });
-            await flush();
-            expect(seen).toHaveLength(2);
-            expect(seen.at(-1)).toEqual([{ id: "base" }, { id: "optimistic", __key: "local" }]);
-            expect(ws.sent.filter(raw => (JSON.parse(raw) as Up).t === "ack")).toHaveLength(3);
-
-            ws.emit({
-                t: "snapshot",
-                subId: SubId(1),
-                cookie: Cookie("c-1:2"),
-                rows: [{ id: "replacement" }],
-            });
-            await flush();
-            expect(seen).toHaveLength(3);
-            expect(seen.at(-1)).toEqual([{ id: "replacement" }]);
-            expect(
-                ws.sent
-                    .map(raw => JSON.parse(raw) as Up)
-                    .filter((message): message is Extract<Up, { t: "ack" }> => message.t === "ack")
-                    .map(message => message.cookie)
-            ).toEqual([Cookie("c-1:1"), Cookie("c-1:1"), Cookie("c-1:1"), Cookie("c-1:2")]);
-            c.close();
-        } finally {
-            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
-            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
-        }
-    });
-
-    test("caller mutation of an optimistic patch cannot alter retained rows or history", async () => {
-        class IsolatedBroadcastChannel {
-            static instance: IsolatedBroadcastChannel | undefined;
-            onmessage: ((event: { data: unknown }) => void) | null = null;
-
-            constructor(_name: string) {
-                IsolatedBroadcastChannel.instance = this;
-            }
-
-            postMessage(): void {}
-            close(): void {}
-            emit(data: unknown): void {
-                this.onmessage?.({ data });
-            }
-        }
-
-        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = IsolatedBroadcastChannel;
-        try {
-            const c = createChardbClient({
-                endpoint: "wss://example.com/ws",
-                getJwt: async () => "jwt-stub",
-                clientId: "c-optimistic-isolation",
-                logicalDb: "optimistic-isolation",
-            });
-            await flush();
-            const ws = fakeWebSocket();
-            await welcome(ws);
-            const seen: RawJson[][] = [];
-            c.subscribe("queries.ts#optimistic-isolation", {}, rows => seen.push(rows));
-            const row: Record<string, RawJson> = { nested: { value: "original" } };
-            const patch = { op: "put" as const, subId: SubId(1), rowKey: "optimistic", row };
-            IsolatedBroadcastChannel.instance?.emit({ kind: "optimistic", patches: [patch] });
-
-            (row.nested as Record<string, RawJson>).value = "caller-mutated";
-            row.cycle = row as RawJson;
-            patch.rowKey = "caller-mutated-key";
-            ws.emit({
-                t: "poke",
-                cookie: Cookie("c-test:optimistic-isolation"),
-                patches: [{ op: "del", subId: SubId(1), rowKey: "missing" }],
-            });
-            await flush();
-
-            expect(c.state).toBe("open");
-            expect(seen.at(-1)).toEqual([{ nested: { value: "original" }, __key: "optimistic" }]);
-            c.close();
-        } finally {
-            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
-            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
-        }
-    });
-
-    test("bounds cross-tab optimistic patch history without partial row application", async () => {
-        class BoundedBroadcastChannel {
-            static instance: BoundedBroadcastChannel | undefined;
-            onmessage: ((event: { data: unknown }) => void) | null = null;
-            closeCalls = 0;
-
-            constructor(_name: string) {
-                BoundedBroadcastChannel.instance = this;
-            }
-
-            postMessage(): void {}
-            close(): void {
-                this.closeCalls += 1;
-            }
-            emit(data: unknown): void {
-                this.onmessage?.({ data });
-            }
-        }
-
-        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = BoundedBroadcastChannel;
-        try {
-            const c = createChardbClient({
-                endpoint: "wss://example.com/ws",
-                getJwt: async () => "jwt-stub",
-                clientId: "c-optimistic-bound",
-                logicalDb: "optimistic-bound",
-            });
-            await flush();
-            const ws = fakeWebSocket();
-            await welcome(ws);
-            const seen: RawJson[][] = [];
-            c.subscribe("queries.ts#bounded-optimistic", {}, rows => seen.push([...rows]));
-            BoundedBroadcastChannel.instance?.emit({
-                kind: "optimistic",
-                patches: Array.from({ length: 4_096 }, (_, index) => ({
-                    op: "put",
-                    subId: 1,
-                    rowKey: "same-row",
-                    row: { value: index },
-                })),
-            });
-            expect(c.state).toBe("open");
-            expect(seen).toHaveLength(1);
-            expect(seen.at(-1)).toEqual([{ value: 4_095, __key: "same-row" }]);
-
-            BoundedBroadcastChannel.instance?.emit({
-                kind: "optimistic",
-                patches: [{ op: "put", subId: 1, rowKey: "same-row", row: { value: "must-not-apply" } }],
-            });
-            expect(c.state).toBe("closed");
-            expect(ws.readyState).toBe(FakeWS.CLOSED);
-            expect(seen.at(-2)).toEqual([{ value: 4_095, __key: "same-row" }]);
-            expect(seen.at(-1)).toEqual([]);
-            expect(seen).toHaveLength(2);
-            expect(BoundedBroadcastChannel.instance?.closeCalls).toBe(1);
-        } finally {
-            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
-            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
-        }
-    });
-
-    test("preflights raw cross-tab patch batches before wire decoding or subscription lookup", async () => {
-        class RawBroadcastChannel {
-            static instance: RawBroadcastChannel | undefined;
-            onmessage: ((event: { data: unknown }) => void) | null = null;
-            closeCalls = 0;
-
-            constructor(_name: string) {
-                RawBroadcastChannel.instance = this;
-            }
-
-            close(): void {
-                this.closeCalls += 1;
-            }
-            emit(data: unknown): void {
-                this.onmessage?.({ data });
-            }
-        }
-
-        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = RawBroadcastChannel;
-        try {
-            const c = createChardbClient({
-                endpoint: "wss://example.com/ws",
-                getJwt: async () => "jwt-stub",
-                clientId: "c-raw-cross-tab",
-                logicalDb: "raw-cross-tab",
-            });
-            await flush();
-            const ws = fakeWebSocket();
-            await welcome(ws);
-            RawBroadcastChannel.instance?.emit({
-                kind: "optimistic",
-                patches: Array.from({ length: 4_097 }, () => ({
-                    op: "put",
-                    subId: 999,
-                    rowKey: "same-unknown-row",
-                    row: { value: true },
-                })),
-            });
-            expect(c.state).toBe("closed");
-            expect(ws.readyState).toBe(FakeWS.CLOSED);
-            expect(RawBroadcastChannel.instance?.closeCalls).toBe(1);
-        } finally {
-            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
-            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
-        }
     });
 
     test("snapshots for unknown or unsubscribed subscriptions are not acknowledged", async () => {
@@ -2723,6 +2837,92 @@ describe("createChardbClient — wire round-trip", () => {
         expect(seen.at(-1)).toEqual({ rows: [], state: "live" });
     });
 
+    test("shardsChanged coalesces per subscription with capped backoff and snapshot reset", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const states: string[] = [];
+            c.subscribe("queries.ts#shardBackoff", { organizationId: "org-1" }, (_rows, state) => {
+                states.push(state ?? "missing");
+            });
+            await flush();
+            ws.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-shards:1"), rows: [{ id: "one" }] });
+            await flush();
+
+            const initialSubscriptions = sentSubscriptions(ws).length;
+            ws.emit({ t: "mustRefetch", subIds: [SubId(1)], reason: "shardsChanged" });
+            ws.emit({ t: "mustRefetch", subIds: [SubId(1)], reason: "shardsChanged" });
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([100]);
+            expect(sentSubscriptions(ws)).toHaveLength(initialSubscriptions);
+            expect(states.filter(value => value === "refetching")).toHaveLength(1);
+
+            let refetches = 0;
+            for (const delay of [100, 200, 400, 800, 1_600, 2_000]) {
+                timers.runDelay(delay);
+                refetches++;
+                expect(sentSubscriptions(ws)).toHaveLength(initialSubscriptions + refetches);
+                ws.emit({ t: "mustRefetch", subIds: [SubId(1)], reason: "shardsChanged" });
+                await flush();
+                expect(timers.scheduledDelays()).toEqual([Math.min(delay * 2, 2_000)]);
+            }
+
+            ws.emit({ t: "snapshot", subId: SubId(1), cookie: Cookie("c-shards:2"), rows: [{ id: "two" }] });
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([]);
+            ws.emit({ t: "mustRefetch", subIds: [SubId(1)], reason: "shardsChanged" });
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([100]);
+
+            const beforeImmediate = sentSubscriptions(ws).length;
+            ws.emit({ t: "mustRefetch", subIds: [SubId(1)], reason: "schemaChanged" });
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(sentSubscriptions(ws)).toHaveLength(beforeImmediate + 1);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("shardsChanged timers cannot resurrect an unsubscribed sub and are cleared on reconnect", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+            const subscription = c.subscribe("queries.ts#shardCleanup", { organizationId: "org-1" }, () => {});
+            await flush();
+            first.emit({ t: "mustRefetch", subIds: [SubId(1)], reason: "shardsChanged" });
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([100]);
+            subscription.unsubscribe();
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(sentSubscriptions(first)).toHaveLength(1);
+
+            c.subscribe("queries.ts#shardReconnect", { organizationId: "org-2" }, () => {});
+            first.emit({ t: "mustRefetch", subIds: [SubId(2)], reason: "shardsChanged" });
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([100]);
+            first.close();
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([250]);
+            timers.runDelay(250);
+            await flush();
+            const second = fakeWebSocket(1);
+            await welcome(second, "c-shards:reconnected");
+            expect(sentSubscriptions(second)).toHaveLength(1);
+            expect(timers.scheduledDelays()).toEqual([]);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
     test("mustRefetch does not resurrect a subscription removed by its refetch listener", async () => {
         const c = client();
         await flush();
@@ -2777,6 +2977,356 @@ describe("createChardbClient — wire round-trip", () => {
         await flush();
 
         expect(seen.at(-1)).toEqual({ rows: [], state: "error" });
+    });
+
+    for (const code of RETRYABLE_SUBSCRIPTION_CODES) {
+        test(`${code} retries the same subscription and accepts a same-cookie replacement snapshot`, async () => {
+            const timers = installManualTimers();
+            const c = client();
+            try {
+                await flush();
+                const ws = fakeWebSocket();
+                await welcome(ws);
+                const seen: Array<{ readonly rows: RawJson[]; readonly state: string }> = [];
+                c.subscribe("queries.ts#retryable", { organizationId: "org-1" }, (rows, state) => {
+                    seen.push({ rows, state: state ?? "missing" });
+                });
+                const cookie = Cookie(`c-retryable:${code}`);
+                ws.emit({ t: "snapshot", subId: SubId(1), cookie, rows: [{ id: "before" }] });
+                await flush();
+                const initialSubscription = sentSubscriptions(ws)[0];
+                if (!initialSubscription) throw new Error("expected initial subscription");
+
+                ws.emit(subscriptionError(code));
+                await flush();
+                expect(seen.at(-1)).toEqual({ rows: [], state: "refetching" });
+                expect(timers.scheduledDelays()).toEqual([100]);
+                expect(sentSubscriptions(ws)).toHaveLength(1);
+
+                timers.runDelay(100);
+                expect(sentSubscriptions(ws)).toEqual([initialSubscription, initialSubscription]);
+                ws.emit({ t: "snapshot", subId: SubId(1), cookie, rows: [{ id: "after" }] });
+                await flush();
+                expect(seen.at(-1)).toEqual({ rows: [{ id: "after" }], state: "live" });
+                expect(timers.scheduledDelays()).toEqual([]);
+
+                ws.emit(subscriptionError(code));
+                await flush();
+                expect(timers.scheduledDelays()).toEqual([100]);
+            } finally {
+                c.close();
+                timers.restore();
+            }
+        });
+    }
+
+    test("retryable subscription errors coalesce and back off through the two second cap", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const states: string[] = [];
+            c.subscribe("queries.ts#retry-backoff", {}, (_rows, state) => states.push(state ?? "missing"));
+            ws.emit({
+                t: "snapshot",
+                subId: SubId(1),
+                cookie: Cookie("c-retry-backoff:1"),
+                rows: [{ id: "before" }],
+            });
+            await flush();
+
+            let sends = sentSubscriptions(ws).length;
+            for (const delay of [100, 200, 400, 800, 1_600, 2_000, 2_000]) {
+                ws.emit(subscriptionError("CDB_SHARD_UNAVAILABLE"));
+                ws.emit(subscriptionError("CDB_SHARD_UNAVAILABLE"));
+                await flush();
+                expect(timers.scheduledDelays()).toEqual([delay]);
+                expect(states.filter(value => value === "refetching")).toHaveLength(1);
+                timers.runDelay(delay);
+                sends += 1;
+                expect(sentSubscriptions(ws)).toHaveLength(sends);
+            }
+
+            ws.emit({
+                t: "snapshot",
+                subId: SubId(1),
+                cookie: Cookie("c-retry-backoff:2"),
+                rows: [{ id: "after" }],
+            });
+            await flush();
+            ws.emit(subscriptionError("CDB_SHARD_UNAVAILABLE"));
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([100]);
+            expect(states.filter(value => value === "refetching")).toHaveLength(2);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("a refetch listener can unsubscribe before a retry timer is created", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const subscription = c.subscribe("queries.ts#unsubscribe-in-retry", {}, (_rows, state) => {
+                if (state === "refetching") subscription.unsubscribe();
+            });
+            ws.emit(subscriptionError("CDB_CATALOG_UNAVAILABLE"));
+            await flush();
+
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello", "sub", "unsub"]);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("unsubscribe clears an already scheduled subscription retry", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const subscription = c.subscribe("queries.ts#unsubscribe-scheduled-retry", {}, () => {});
+            ws.emit(subscriptionError("CDB_RATE_LIMITED"));
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([100]);
+
+            subscription.unsubscribe();
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(sentSubscriptions(ws)).toHaveLength(1);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("closing from a retry listener cannot schedule or send a subscription retry", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const ws = fakeWebSocket();
+            await welcome(ws);
+            const states: string[] = [];
+            c.subscribe("queries.ts#close-in-retry", {}, (_rows, state) => {
+                states.push(state ?? "missing");
+                if (state === "refetching") c.close();
+            });
+            ws.emit(subscriptionError("CDB_TXN_ABORTED_EVICTION"));
+            await flush();
+
+            expect(states).toEqual(["refetching", "closed"]);
+            expect(timers.scheduledDelays()).toEqual([]);
+            expect(sentSubscriptions(ws)).toHaveLength(1);
+            expect(c.state).toBe("closed");
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("socket reconnect replaces a pending subscription retry with one welcome resend", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+            c.subscribe("queries.ts#retry-reconnect", {}, () => {});
+            first.emit(subscriptionError("CDB_SHARD_UNAVAILABLE"));
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([100]);
+            const lateMessage = first.onmessage;
+
+            first.close();
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([250]);
+            timers.runDelay(250);
+            await flush();
+            const second = fakeWebSocket(1);
+            await welcome(second, "c-retry-reconnect:1");
+            expect(sentSubscriptions(second)).toHaveLength(1);
+            expect(timers.scheduledDelays()).toEqual([]);
+
+            lateMessage?.({ data: encodeWire(subscriptionError("CDB_SHARD_UNAVAILABLE")) });
+            await flush();
+            expect(sentSubscriptions(second)).toHaveLength(1);
+            expect(timers.scheduledDelays()).toEqual([]);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("a terminal subscription error is absorbing across later frames and reconnect", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first);
+            const seen: Array<{ readonly rows: RawJson[]; readonly state: string }> = [];
+            c.subscribe("queries.ts#terminal-error", {}, (rows, state) => {
+                seen.push({ rows, state: state ?? "missing" });
+            });
+            first.emit({
+                t: "snapshot",
+                subId: SubId(1),
+                cookie: Cookie("c-terminal:1"),
+                rows: [{ id: "before" }],
+            });
+            first.emit(subscriptionError("CDB_SHARD_UNAVAILABLE"));
+            await flush();
+            expect(seen.at(-1)).toEqual({ rows: [], state: "refetching" });
+            expect(timers.scheduledDelays()).toEqual([100]);
+            first.emit({
+                t: "error",
+                code: "CDB_FORBIDDEN",
+                retryable: false,
+                correlationId: "corr-terminal" as never,
+                docs: "https://chardb.dev/errors/cdb_forbidden",
+                subId: SubId(1),
+            });
+            await flush();
+            expect(seen.at(-1)).toEqual({ rows: [], state: "error" });
+            expect(timers.scheduledDelays()).toEqual([]);
+            const observations = seen.length;
+            const sentBefore = first.sent.length;
+
+            first.emit({
+                t: "snapshot",
+                subId: SubId(1),
+                cookie: Cookie("c-terminal:2"),
+                rows: [{ id: "must-not-return" }],
+            });
+            first.emit({
+                t: "poke",
+                cookie: Cookie("c-terminal:3"),
+                patches: [{ op: "put", subId: SubId(1), rowKey: "late", row: { id: "must-not-return" } }],
+            });
+            first.emit({ t: "mustRefetch", subIds: [SubId(1)], reason: "schemaChanged" });
+            first.emit(subscriptionError("CDB_SHARD_UNAVAILABLE"));
+            await flush();
+            expect(seen).toHaveLength(observations);
+            expect(first.sent).toHaveLength(sentBefore);
+            expect(timers.scheduledDelays()).toEqual([]);
+
+            first.close();
+            await flush();
+            expect(timers.scheduledDelays()).toEqual([250]);
+            timers.runDelay(250);
+            await flush();
+            const second = fakeWebSocket(1);
+            await welcome(second, "c-terminal:reconnect");
+            expect(sentSubscriptions(second)).toEqual([]);
+            expect(seen).toHaveLength(observations);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("a retryable session error reconnects before welcome instead of stalling", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            first.emit({
+                t: "error",
+                code: "CDB_RATE_LIMITED",
+                retryable: true,
+                correlationId: "corr-session-retry" as never,
+                docs: "https://chardb.dev/errors/cdb_rate_limited",
+            });
+            await flush();
+            expect(c.state).toBe("reconnecting");
+            expect(first.readyState).toBe(FakeWS.CLOSED);
+            expect(timers.scheduledDelays()).toEqual([250]);
+
+            timers.runDelay(250);
+            await flush();
+            expect(FakeWS.instances).toHaveLength(2);
+            expect(fakeWebSocket(1).sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello"]);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("an open retryable session error uses reconnect and retained-state resume", async () => {
+        const timers = installManualTimers();
+        const c = client();
+        try {
+            await flush();
+            const first = fakeWebSocket();
+            await welcome(first, "c-session-retry:1");
+            const seen: Array<{ readonly rows: RawJson[]; readonly state: string }> = [];
+            c.subscribe("queries.ts#session-retry", {}, (rows, state) => {
+                seen.push({ rows, state: state ?? "missing" });
+            });
+            first.emit({
+                t: "snapshot",
+                subId: SubId(1),
+                cookie: Cookie("c-session-retry:2"),
+                rows: [{ id: "retained" }],
+            });
+            await flush();
+            first.emit({
+                t: "error",
+                code: "CDB_SHARD_UNAVAILABLE",
+                retryable: true,
+                correlationId: "corr-session-open" as never,
+                docs: "https://chardb.dev/errors/cdb_shard_unavailable",
+            });
+            await flush();
+            expect(c.state).toBe("reconnecting");
+            expect(seen.at(-1)).toEqual({ rows: [{ id: "retained" }], state: "live" });
+            expect(timers.scheduledDelays()).toEqual([30_000, 250]);
+
+            timers.runDelay(250);
+            await flush();
+            const second = fakeWebSocket(1);
+            const hello = second.sent.map(raw => JSON.parse(raw) as Up).find(message => message.t === "hello");
+            expect(hello).toMatchObject({ resumeFromCookie: Cookie("c-session-retry:2") });
+            await welcome(second, "c-session-retry:new");
+            expect(sentSubscriptions(second)).toHaveLength(1);
+            expect(seen).toHaveLength(1);
+        } finally {
+            c.close();
+            timers.restore();
+        }
+    });
+
+    test("an open nonretryable session error terminates subscriptions and mutations", async () => {
+        const c = client({ mutationTimeoutMs: 1_000 });
+        await flush();
+        const ws = fakeWebSocket();
+        await welcome(ws);
+        const states: string[] = [];
+        c.subscribe("queries.ts#session-terminal", {}, (_rows, state) => states.push(state ?? "missing"));
+        const mutation = c.mutate("mutations.ts#session-terminal", {});
+        ws.emit({
+            t: "error",
+            code: "CDB_FORBIDDEN",
+            retryable: false,
+            correlationId: "corr-session-terminal" as never,
+            docs: "https://chardb.dev/errors/cdb_forbidden",
+        });
+        await flush();
+
+        expect(c.state).toBe("closed");
+        expect(states).toEqual(["error"]);
+        await expect(mutation).rejects.toMatchObject({ code: "CDB_FORBIDDEN" });
+        expect(ws.readyState).toBe(FakeWS.CLOSED);
     });
 
     test("reconnect within RYW window resumes from lastCookie via Up.hello.resumeFromCookie", async () => {
@@ -3108,25 +3658,10 @@ describe("createChardbClient — wire round-trip", () => {
     });
 
     test("fences every queued socket callback after terminal close", async () => {
-        class ClosingBroadcastChannel {
-            static instance: ClosingBroadcastChannel | undefined;
-            onmessage: ((event: { data: unknown }) => void) | null = null;
-            closeCalls = 0;
-
-            constructor(_name: string) {
-                ClosingBroadcastChannel.instance = this;
-            }
-
-            close(): void {
-                this.closeCalls += 1;
-            }
-        }
-
-        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = ClosingBroadcastChannel;
         const timers = installManualTimers();
         FakeWS.autoOpen = false;
         try {
-            const c = client({ mutationTimeoutMs: 1_000, crossTab: true, logicalDb: "late-terminal" });
+            const c = client({ mutationTimeoutMs: 1_000 });
             await flush();
             const ws = fakeWebSocket();
             const lateOpen = ws.onopen;
@@ -3177,13 +3712,10 @@ describe("createChardbClient — wire round-trip", () => {
             expect(timers.scheduledDelays()).toEqual([]);
             expect(ws.sent).toEqual([]);
             expect(ws.closeCalls).toBe(1);
-            expect(ClosingBroadcastChannel.instance?.closeCalls).toBe(1);
             expect(FakeWS.instances).toHaveLength(1);
         } finally {
             FakeWS.autoOpen = true;
             timers.restore();
-            if (realBC === undefined) Reflect.deleteProperty(globalThis, "BroadcastChannel");
-            else (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBC;
         }
     });
 

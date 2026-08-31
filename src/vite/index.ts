@@ -1,32 +1,11 @@
 /**
- * `@chardb/vite-plugin` — composes on `@cloudflare/vite-plugin`.
+ * Keep Chardb query and mutation handles safe to import from browser code.
  *
- * Responsibilities:
- *   - Walk each module's TypeScript AST (via the `typescript` peer dep), find
- *     every direct `defineMutation/defineQuery/defineCron/defineStream/
- *     defineGsi/defineLedger/definePresenceKey` call, plus `api.mutation`
- *     and `api.query`, assigned to a named export, and
- *     emit a `<modulePath>#<exportName>` → wire-id mapping for the registry
- *     virtual module.
- *   - Append a non-enumerable `__chardbRef` property to every such export so
- *     the runtime helpers (`readRef`, `manifestFromExports`) can recover the
- *     wire id from the value alone.
- *   - Provide virtual modules:
- *       virtual:chardb/schema, virtual:chardb/migrations,
- *       virtual:chardb/dashboard-config, virtual:chardb/registry,
- *       virtual:chardb/manifest
- *   - Schema HMR (partial): on `handleHotUpdate` the plugin fires a
- *     `chardb:schemaChanged` event on Vite's own dev-server WebSocket so
- *     a connected client can refresh. Emitting a wire-level
- *     `mustRefetch:'schemaChanged'` envelope and orchestrating the full
- *     DO restart on destructive diffs is future work — the dev-server
- *     ping is the foundation for both.
- *
- * The AST walk handles `export const x = defineMutation(...)`, API objects
- * returned by `createApi()`, namespace imports, and aliased imports
- * (`import { defineMutation as dm } from "chardb/server"`). It falls back to
- * a regex pre-scan when the `typescript` peer is missing so the foundation
- * still builds in environments without it.
+ * Browser builds receive ref-only handles. Query callbacks, mutation
+ * handlers, validators, schema imports, and every other server dependency
+ * disappear from the emitted module. Server builds keep the original module.
+ * The transform also stamps stable refs on older definitions that omit one
+ * and rejects duplicate refs seen during a build.
  */
 
 /**
@@ -34,27 +13,26 @@
  * vite install. We avoid a hard `import type { Plugin } from "vite"` so the
  * package builds even without vite present in the dependency closure.
  */
-export interface VitePluginLike {
+interface VitePluginLike {
     name: string;
     enforce?: "pre" | "post";
-    resolveId?(source: string): string | null;
-    load?(id: string): string | null;
-    transform?(code: string, id: string): { code: string; map: null } | null;
-    handleHotUpdate?(ctx: {
-        file: string;
-        server: { ws: { send(payload: unknown): void } };
-    }): unknown;
+    transform?(
+        this: ViteTransformContextLike,
+        code: string,
+        id: string,
+        options?: ViteTransformOptionsLike
+    ): { code: string; map: null } | null;
 }
 type Plugin = VitePluginLike;
 
-/**
- * Resolve the `typescript` peer dependency at runtime. The plugin only runs
- * during `vite build` / `vite dev`, both of which execute in Node; we use
- * `createRequire(import.meta.url)` so the published ESM bundle doesn't ship
- * a `require()` call that strict bundlers (e.g. tsup, rolldown) would
- * complain about. Returns `null` when `typescript` isn't installed; the
- * caller falls back to the regex export-scan path.
- */
+interface ViteTransformContextLike {
+    readonly environment?: { readonly name?: string };
+}
+
+interface ViteTransformOptionsLike {
+    readonly ssr?: boolean;
+}
+
 import { createRequire as nodeCreateRequire } from "node:module";
 
 /**
@@ -76,113 +54,68 @@ function loadTypeScript(): typeof import("typescript") | null {
     return cachedTs;
 }
 
-export interface ChardbVitePluginOptions {
-    readonly schema?: string;
-    readonly migrations?: string;
-    readonly serverModuleGlob?: string;
-    readonly registryOut?: string;
-}
+const DEFINE_HELPERS = ["defineMutation", "defineQuery"] as const;
 
-const VIRTUAL_PREFIX = "virtual:chardb/";
-const VIRTUAL_RESOLVED = "\0virtual:chardb/";
-
-const DEFINE_HELPERS = [
-    "defineMutation",
-    "defineQuery",
-    "defineCron",
-    "defineStream",
-    "defineLedger",
-    "defineGsi",
-    "definePresenceKey",
-] as const;
-
-interface RegistryEntry {
+interface SeenExport {
     readonly module: string;
     readonly exportName: string;
     readonly kind: (typeof DEFINE_HELPERS)[number];
     readonly ref: string;
 }
 
-export function chardb(options: ChardbVitePluginOptions = {}): Plugin {
-    const registry: RegistryEntry[] = [];
+export function chardb(): Plugin {
+    const seenExports: SeenExport[] = [];
 
     return {
         name: "chardb",
         enforce: "pre",
-        resolveId(source) {
-            if (source.startsWith(VIRTUAL_PREFIX)) return `\0${source}`;
-            return null;
-        },
-        load(id) {
-            if (!id.startsWith(VIRTUAL_RESOLVED)) return null;
-            const which = id.slice(VIRTUAL_RESOLVED.length);
-            switch (which) {
-                case "registry":
-                    return `export const registry = ${JSON.stringify(registry, null, 2)};`;
-                case "manifest": {
-                    const grouped = new Map<string, RegistryEntry[]>();
-                    for (const e of registry) {
-                        const arr = grouped.get(e.module) ?? [];
-                        arr.push(e);
-                        grouped.set(e.module, arr);
-                    }
-                    let src = `import { manifestFromExports } from "chardb/server";\n`;
-                    const collectors: string[] = [];
-                    let i = 0;
-                    for (const [mod, entries] of grouped) {
-                        const ns = `__cdb_m${i++}`;
-                        const names = entries.map(e => `${e.exportName}: ${ns}.${e.exportName}`).join(", ");
-                        src += `import * as ${ns} from ${JSON.stringify(mod)};\n`;
-                        collectors.push(`{ ${names} }`);
-                    }
-                    src += `\nexport const manifest = manifestFromExports(Object.assign({}, ${collectors.join(", ")}));\n`;
-                    return src;
-                }
-                case "schema":
-                    return options.schema ? `export * from ${JSON.stringify(options.schema)};` : "export {};";
-                case "migrations":
-                    return options.migrations
-                        ? `export { migrations } from ${JSON.stringify(options.migrations)};`
-                        : 'import { defineMigrations } from "chardb/server";\nexport const migrations = defineMigrations([]);';
-                case "dashboard-config":
-                    return "export const dashboardConfig = { version: 1 };";
-                default:
-                    return null;
-            }
-        },
-        transform(code, id) {
+        transform(code, id, transformOptions) {
             const moduleId = cleanModuleId(id);
             if (!/\.(t|j)sx?$/.test(moduleId)) return null;
             const found = collectExports(code, moduleId);
-            const nextRegistry = registry.filter(entry => entry.module !== moduleId);
+            const nextSeenExports = seenExports.filter(entry => entry.module !== moduleId);
             if (found.length === 0) {
-                registry.splice(0, registry.length, ...nextRegistry);
+                seenExports.splice(0, seenExports.length, ...nextSeenExports);
                 return null;
             }
             const refsInModule = new Set<string>();
             for (const entry of found) {
                 if (refsInModule.has(entry.ref)) {
                     throw new Error(
-                        `[chardb/vite] Duplicate stable ref ${JSON.stringify(entry.ref)} in ${JSON.stringify(moduleId)}`
+                        `[@chardb/core/vite] Duplicate stable ref ${JSON.stringify(entry.ref)} in ${JSON.stringify(moduleId)}`
                     );
                 }
                 refsInModule.add(entry.ref);
-                const duplicate = nextRegistry.find(candidate => candidate.ref === entry.ref);
+                const duplicate = nextSeenExports.find(candidate => candidate.ref === entry.ref);
                 if (duplicate) {
                     throw new Error(
-                        `[chardb/vite] Duplicate stable ref ${JSON.stringify(entry.ref)} from ` +
+                        `[@chardb/core/vite] Duplicate stable ref ${JSON.stringify(entry.ref)} from ` +
                             `${JSON.stringify(duplicate.module)}#${duplicate.exportName} and ` +
                             `${JSON.stringify(moduleId)}#${entry.exportName}`
                     );
                 }
-                nextRegistry.push({
+                nextSeenExports.push({
                     module: moduleId,
                     exportName: entry.exportName,
                     kind: entry.kind,
                     ref: entry.ref,
                 });
             }
-            registry.splice(0, registry.length, ...nextRegistry);
+            seenExports.splice(0, seenExports.length, ...nextSeenExports);
+            const hasPlannedQuery = found.some(entry => entry.plannedQuery);
+            const hasApiMutation = found.some(entry => entry.apiMutation);
+            if (hasPlannedQuery || hasApiMutation) {
+                const target = viteTransformTarget(this, transformOptions);
+                if (target === "unknown") {
+                    const description = hasApiMutation ? "api.mutation" : "planned-query";
+                    throw new Error(
+                        `[@chardb/core/vite] Cannot determine the Vite environment for ${description} module ${JSON.stringify(moduleId)}`
+                    );
+                }
+                if (target === "browser") {
+                    return { code: eraseBrowserHandleModule(code, moduleId, found), map: null };
+                }
+            }
             let mutated = code;
             for (const e of found) {
                 const stamp = `;if (!${e.exportName}.__chardbExplicitRef) Object.defineProperty(${e.exportName}, "__chardbRef", { value: ${JSON.stringify(e.ref)}, enumerable: false, configurable: true });`;
@@ -190,16 +123,6 @@ export function chardb(options: ChardbVitePluginOptions = {}): Plugin {
                 mutated += `\n${stamp}`;
             }
             return mutated === code ? null : { code: mutated, map: null };
-        },
-        handleHotUpdate(ctx) {
-            if (ctx.file.endsWith("/schema.ts") || ctx.file.endsWith("/schema.tsx")) {
-                ctx.server.ws.send({
-                    type: "custom",
-                    event: "chardb:schemaChanged",
-                    data: { reason: "schemaChanged" },
-                });
-            }
-            return undefined;
         },
     };
 }
@@ -210,18 +133,23 @@ interface FoundExport {
     readonly exportName: string;
     readonly kind: (typeof DEFINE_HELPERS)[number];
     readonly ref: string;
+    readonly explicitRef: boolean;
+    readonly plannedQuery: boolean;
+    readonly apiMutation: boolean;
+    readonly browserErasableMutation: boolean;
 }
 
 /**
  * Discover `export const x = defineXxx(...)` bindings in a single TS/JS
  * source. Uses the TypeScript compiler API when available so renamed
  * (`import { defineMutation as dm }`) and namespaced (`import * as cdb`)
- * helpers are picked up; otherwise falls back to a regex pre-scan.
+ * helpers are picked up. If TypeScript is unavailable, the transform fails
+ * closed instead of stamping lookalike local functions by name.
  */
 function collectExports(code: string, id: string): FoundExport[] {
     const refOf = (name: string): string => `${modulePath(id)}#${name}`;
     const ts = loadTypeScript();
-    if (!ts) return regexCollect(code, refOf);
+    if (!ts) return [];
 
     const aliases = new Map<string, (typeof DEFINE_HELPERS)[number]>();
     const apiObjects = new Set<string>();
@@ -234,7 +162,7 @@ function collectExports(code: string, id: string): FoundExport[] {
         true,
         /\.tsx?$/.test(id) ? ts.ScriptKind.TSX : ts.ScriptKind.TS
     );
-    const isFromChardbServer = (mod: string): boolean => mod === "chardb/server" || mod === "chardb";
+    const isFromChardbServer = (mod: string): boolean => mod === "@chardb/core/server" || mod === "@chardb/core";
 
     const walkImports = (node: import("typescript").Node): void => {
         if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
@@ -317,6 +245,22 @@ function collectExports(code: string, id: string): FoundExport[] {
         );
     };
 
+    const isPlannedQueryCall = (
+        call: import("typescript").CallExpression,
+        kind: (typeof DEFINE_HELPERS)[number]
+    ): boolean => {
+        if (kind !== "defineQuery") return false;
+        const config = call.arguments[0];
+        if (!config || !ts.isObjectLiteralExpression(config)) return false;
+        return config.properties.some(candidate => {
+            if (!("name" in candidate) || !candidate.name) return false;
+            return (
+                (ts.isIdentifier(candidate.name) || ts.isStringLiteral(candidate.name)) &&
+                candidate.name.text === "query"
+            );
+        });
+    };
+
     const explicitConfigRef = (
         call: import("typescript").CallExpression,
         kind: (typeof DEFINE_HELPERS)[number],
@@ -333,12 +277,12 @@ function collectExports(code: string, id: string): FoundExport[] {
             !ts.isArrowFunction(first) &&
             !ts.isFunctionExpression(first)
         ) {
-            throw new Error(`[chardb/vite] ${exportName} must use an inline config object`);
+            throw new Error(`[@chardb/core/vite] ${exportName} must use an inline config object`);
         }
         const config = positional ? call.arguments[1] : first;
         if (!config || !ts.isObjectLiteralExpression(config)) return undefined;
         if (config.properties.some(property => ts.isSpreadAssignment(property))) {
-            throw new Error(`[chardb/vite] ${exportName} config cannot spread ref metadata`);
+            throw new Error(`[@chardb/core/vite] ${exportName} config cannot spread ref metadata`);
         }
         const exactNamedProperty = (name: string) =>
             config.properties.find(candidate => {
@@ -358,13 +302,17 @@ function collectExports(code: string, id: string): FoundExport[] {
         const plannedQuery = kind === "defineQuery" && exactNamedProperty("query") !== undefined;
         if (plannedQuery) {
             if (computedProperty) {
-                throw new Error(`[chardb/vite] Planned query ${exportName} config cannot use computed properties`);
+                throw new Error(
+                    `[@chardb/core/vite] Planned query ${exportName} config cannot use computed properties`
+                );
             }
             const mixed = ["handler", "authority", "partitionKey", "intent"].filter(
                 name => exactNamedProperty(name) !== undefined
             );
             if (mixed.length > 0) {
-                throw new Error(`[chardb/vite] Planned query ${exportName} cannot mix query with ${mixed.join(", ")}`);
+                throw new Error(
+                    `[@chardb/core/vite] Planned query ${exportName} cannot mix query with ${mixed.join(", ")}`
+                );
             }
         }
         const refProperty = namedProperty("ref");
@@ -376,7 +324,7 @@ function collectExports(code: string, id: string): FoundExport[] {
                 ts.isComputedPropertyName(authorityProperty.name) ||
                 !ts.isStringLiteralLike(authorityProperty.initializer)
             ) {
-                throw new Error(`[chardb/vite] Authority for ${exportName} must be a string literal`);
+                throw new Error(`[@chardb/core/vite] Authority for ${exportName} must be a string literal`);
             }
             declaredAuthority = authorityProperty.initializer.text;
         }
@@ -389,11 +337,11 @@ function collectExports(code: string, id: string): FoundExport[] {
             : undefined;
         if (!refProperty) {
             if (plannedQuery) {
-                throw new Error(`[chardb/vite] Planned query ${exportName} requires a literal ref`);
+                throw new Error(`[@chardb/core/vite] Planned query ${exportName} requires a literal ref`);
             }
             if (authorityLabel) {
                 throw new Error(
-                    `[chardb/vite] ${authorityLabel} ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires a literal ref`
+                    `[@chardb/core/vite] ${authorityLabel} ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires a literal ref`
                 );
             }
             return undefined;
@@ -407,19 +355,19 @@ function collectExports(code: string, id: string): FoundExport[] {
         );
         if (!property) return undefined;
         if (!ts.isPropertyAssignment(property) || ts.isComputedPropertyName(property.name)) {
-            throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a string literal`);
+            throw new Error(`[@chardb/core/vite] Explicit ref for ${exportName} must be a string literal`);
         }
         if (!ts.isStringLiteralLike(property.initializer)) {
-            throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a string literal`);
+            throw new Error(`[@chardb/core/vite] Explicit ref for ${exportName} must be a string literal`);
         }
         const explicitRef = validExplicitRef(property.initializer.text, exportName);
         if (stableAuthority === "global" && !namedProperty("partitionKey")) {
             throw new Error(
-                `[chardb/vite] Global ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires an explicit partitionKey extractor`
+                `[@chardb/core/vite] Global ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires an explicit partitionKey extractor`
             );
         }
         if (stableAuthority === "global" && kind === "defineQuery" && !namedProperty("intent")) {
-            throw new Error(`[chardb/vite] Global query ${exportName} requires an explicit intent extractor`);
+            throw new Error(`[@chardb/core/vite] Global query ${exportName} requires an explicit intent extractor`);
         }
         return explicitRef;
     };
@@ -434,293 +382,138 @@ function collectExports(code: string, id: string): FoundExport[] {
                 const kind = kindOf(init.expression);
                 if (!kind) continue;
                 const exportName = decl.name.text;
+                const apiFactoryCall = isApiFactoryCall(init.expression);
+                const explicitRef = explicitConfigRef(init, kind, exportName, apiFactoryCall);
                 out.push({
                     exportName,
                     kind,
-                    ref:
-                        explicitConfigRef(init, kind, exportName, isApiFactoryCall(init.expression)) ??
-                        refOf(exportName),
+                    plannedQuery: isPlannedQueryCall(init, kind),
+                    apiMutation: kind === "defineMutation" && apiFactoryCall,
+                    browserErasableMutation:
+                        kind === "defineMutation" &&
+                        apiFactoryCall &&
+                        init.arguments[0] !== undefined &&
+                        ts.isObjectLiteralExpression(init.arguments[0]),
+                    ref: explicitRef ?? refOf(exportName),
+                    explicitRef: explicitRef !== undefined,
                 });
             }
         }
         ts.forEachChild(node, visit);
     };
     sf.forEachChild(visit);
-    if (out.length === 0) return regexCollect(code, refOf);
-    return out;
-}
-
-function regexCollect(code: string, refOf: (name: string) => string): FoundExport[] {
-    const out: FoundExport[] = [];
-    const exportRe =
-        /export\s+(?:const|let|var)\s+(\w+)\s*=\s*(defineMutation|defineQuery|defineCron|defineStream|defineLedger|defineGsi|definePresenceKey)\b/g;
-    for (const match of code.matchAll(exportRe)) {
-        const exportName = match[1] as string;
-        const kind = match[2] as (typeof DEFINE_HELPERS)[number];
-        out.push({
-            exportName,
-            kind,
-            ref:
-                regexExplicitConfigRef(code, (match.index ?? 0) + match[0].length, exportName, kind, false) ??
-                refOf(exportName),
-        });
-    }
-    const apiExportRe = /export\s+(?:const|let|var)\s+(\w+)\s*=\s*api\.(mutation|query)\b/g;
-    for (const match of code.matchAll(apiExportRe)) {
-        const exportName = match[1] as string;
-        const method = match[2] as "mutation" | "query";
-        const kind = method === "mutation" ? "defineMutation" : "defineQuery";
-        out.push({
-            exportName,
-            kind,
-            ref:
-                regexExplicitConfigRef(code, (match.index ?? 0) + match[0].length, exportName, kind, true) ??
-                refOf(exportName),
-        });
-    }
     return out;
 }
 
 function validExplicitRef(ref: string, exportName: string): string {
     if (ref.length === 0 || !ref.includes("#")) {
-        throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a nonempty string containing #`);
+        throw new Error(`[@chardb/core/vite] Explicit ref for ${exportName} must be a nonempty string containing #`);
     }
     return ref;
 }
 
-function regexExplicitConfigRef(
-    code: string,
-    callEnd: number,
-    exportName: string,
-    kind: (typeof DEFINE_HELPERS)[number],
-    apiFactoryCall: boolean
-): string | undefined {
-    let cursor = callEnd;
-    while (/\s/.test(code[cursor] ?? "")) cursor++;
-    if (code[cursor] !== "(") return undefined;
-    const args: string[] = [];
-    let start = cursor + 1;
-    let parens = 1;
-    let braces = 0;
-    let brackets = 0;
-    let quote: '"' | "'" | "`" | null = null;
-    let escaped = false;
-    for (cursor++; cursor < code.length; cursor++) {
-        const character = code[cursor] as string;
-        if (quote) {
-            if (escaped) escaped = false;
-            else if (character === "\\") escaped = true;
-            else if (character === quote) quote = null;
-            continue;
-        }
-        if (character === '"' || character === "'" || character === "`") {
-            quote = character;
-            continue;
-        }
-        if (character === "(") parens++;
-        else if (character === ")") {
-            parens--;
-            if (parens === 0) {
-                args.push(code.slice(start, cursor).trim());
-                break;
-            }
-        } else if (character === "{") braces++;
-        else if (character === "}") braces--;
-        else if (character === "[") brackets++;
-        else if (character === "]") brackets--;
-        else if (character === "," && parens === 1 && braces === 0 && brackets === 0) {
-            args.push(code.slice(start, cursor).trim());
-            start = cursor + 1;
-        }
-    }
-    const firstIsConfig = args[0]?.startsWith("{") === true;
-    if (
-        apiFactoryCall &&
-        !firstIsConfig &&
-        !args[1] &&
-        !/^(?:async\s*)?(?:function\b|\(?[\w\s,:{}<>?\[\]|&.]*\)?\s*=>)/.test(args[0] ?? "")
-    ) {
-        throw new Error(`[chardb/vite] ${exportName} must use an inline config object`);
-    }
-    const config = kind === "defineMutation" && !firstIsConfig ? args[1] : args[0];
-    if (!config?.startsWith("{")) return undefined;
-    const propertyNames = topLevelObjectPropertyNames(config);
-    const plannedQuery = kind === "defineQuery" && propertyNames.has("query");
-    if ((plannedQuery && propertyNames.has("<spread>")) || (!plannedQuery && /\.\.\./.test(config))) {
-        throw new Error(`[chardb/vite] ${exportName} config cannot spread ref metadata`);
-    }
-    if (plannedQuery) {
-        if (propertyNames.has("<computed>")) {
-            throw new Error(`[chardb/vite] Planned query ${exportName} config cannot use computed properties`);
-        }
-        const mixed = ["handler", "authority", "partitionKey", "intent"].filter(name => propertyNames.has(name));
-        if (mixed.length > 0) {
-            throw new Error(`[chardb/vite] Planned query ${exportName} cannot mix query with ${mixed.join(", ")}`);
-        }
-        if (!propertyNames.has("ref")) {
-            throw new Error(`[chardb/vite] Planned query ${exportName} requires a literal ref`);
-        }
-        const literal = /\bref\s*:\s*(["'])([^"'\\]*)\1/.exec(config);
-        if (!literal?.[2]) throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a string literal`);
-        return validExplicitRef(literal[2], exportName);
-    }
-    const hasAuthority = /\bauthority\s*:/.test(config);
-    const literalAuthority = /\bauthority\s*:\s*(["'])([^"'\\]*)\1/.exec(config);
-    if (hasAuthority && !literalAuthority) {
-        throw new Error(`[chardb/vite] Authority for ${exportName} must be a string literal`);
-    }
-    const declaredAuthority = literalAuthority?.[2];
-    const stableAuthority =
-        declaredAuthority === "organization" || declaredAuthority === "user" || declaredAuthority === "global"
-            ? declaredAuthority
-            : undefined;
-    const authorityLabel = stableAuthority
-        ? `${stableAuthority[0]?.toUpperCase()}${stableAuthority.slice(1)}`
-        : undefined;
-    if (!/\bref\s*:/.test(config)) {
-        if (authorityLabel) {
-            throw new Error(
-                `[chardb/vite] ${authorityLabel} ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires a literal ref`
-            );
-        }
-        return undefined;
-    }
-    const literal = /\bref\s*:\s*(["'])([^"'\\]*)\1/.exec(config);
-    if (!literal?.[2]) throw new Error(`[chardb/vite] Explicit ref for ${exportName} must be a string literal`);
-    const explicitRef = validExplicitRef(literal[2], exportName);
-    if (stableAuthority === "global" && !/\bpartitionKey\s*:/.test(config)) {
-        throw new Error(
-            `[chardb/vite] Global ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires an explicit partitionKey extractor`
-        );
-    }
-    if (stableAuthority === "global" && kind === "defineQuery" && !/\bintent\s*:/.test(config)) {
-        throw new Error(`[chardb/vite] Global query ${exportName} requires an explicit intent extractor`);
-    }
-    return explicitRef;
+type ViteTransformTarget = "browser" | "server" | "unknown";
+
+function viteTransformTarget(
+    context: ViteTransformContextLike,
+    options: ViteTransformOptionsLike | undefined
+): ViteTransformTarget {
+    const environmentName = context.environment?.name;
+    if (environmentName === "client") return "browser";
+    if (environmentName !== undefined || options?.ssr === true) return "server";
+    // `ssr: false` also describes Worker transforms. Erasing on that signal
+    // alone would remove the callback from Cloudflare's server bundle.
+    return "unknown";
 }
 
-/**
- * Read only the keys in an inline config object's outermost level. The
- * fallback scanner must not mistake object literals inside a query callback
- * for Chardb metadata.
- */
-function topLevelObjectPropertyNames(source: string): Set<string> {
-    const names = new Set<string>();
-    let braces = 0;
-    let parens = 0;
-    let brackets = 0;
-    let quote: '"' | "'" | "`" | null = null;
-    let escaped = false;
-    let lineComment = false;
-    let blockComment = false;
-    let expectProperty = false;
-
-    for (let cursor = 0; cursor < source.length; cursor++) {
-        const character = source[cursor] as string;
-        const next = source[cursor + 1] ?? "";
-        if (lineComment) {
-            if (character === "\n") lineComment = false;
-            continue;
-        }
-        if (blockComment) {
-            if (character === "*" && next === "/") {
-                blockComment = false;
-                cursor++;
-            }
-            continue;
-        }
-        if (quote) {
-            if (escaped) escaped = false;
-            else if (character === "\\") escaped = true;
-            else if (character === quote) quote = null;
-            continue;
-        }
-        if (character === "/" && next === "/") {
-            lineComment = true;
-            cursor++;
-            continue;
-        }
-        if (character === "/" && next === "*") {
-            blockComment = true;
-            cursor++;
-            continue;
-        }
-        if (
-            (character === '"' || character === "'") &&
-            braces === 1 &&
-            parens === 0 &&
-            brackets === 0 &&
-            expectProperty
-        ) {
-            let end = cursor + 1;
-            let propertyEscaped = false;
-            for (; end < source.length; end++) {
-                const candidate = source[end] as string;
-                if (propertyEscaped) propertyEscaped = false;
-                else if (candidate === "\\") propertyEscaped = true;
-                else if (candidate === character) break;
-            }
-            names.add(source.slice(cursor + 1, end));
-            expectProperty = false;
-            cursor = end;
-            continue;
-        }
-        if (character === '"' || character === "'" || character === "`") {
-            quote = character;
-            continue;
-        }
-        if (character === "{") {
-            braces++;
-            if (braces === 1 && parens === 0 && brackets === 0) expectProperty = true;
-            continue;
-        }
-        if (character === "}") {
-            braces--;
-            continue;
-        }
-        if (character === "(") {
-            parens++;
-            continue;
-        }
-        if (character === ")") {
-            parens--;
-            continue;
-        }
-        if (character === "[") {
-            if (braces === 1 && parens === 0 && brackets === 0 && expectProperty) {
-                names.add("<computed>");
-                expectProperty = false;
-            }
-            brackets++;
-            continue;
-        }
-        if (character === "]") {
-            brackets--;
-            continue;
-        }
-        if (braces !== 1 || parens !== 0 || brackets !== 0) continue;
-        if (character === ",") {
-            expectProperty = true;
-            continue;
-        }
-        if (!expectProperty || /\s/.test(character)) continue;
-        if (character === "." && source.slice(cursor, cursor + 3) === "...") {
-            names.add("<spread>");
-            expectProperty = false;
-            cursor += 2;
-            continue;
-        }
-        if (!/[A-Za-z_$]/.test(character)) {
-            expectProperty = false;
-            continue;
-        }
-        let end = cursor + 1;
-        while (/[A-Za-z0-9_$]/.test(source[end] ?? "")) end++;
-        names.add(source.slice(cursor, end));
-        expectProperty = false;
-        cursor = end - 1;
+function eraseBrowserHandleModule(code: string, id: string, found: readonly FoundExport[]): string {
+    const handles = found.filter(entry => entry.plannedQuery || entry.browserErasableMutation);
+    const hasMutation = handles.some(entry => entry.browserErasableMutation);
+    const handleNames = new Set(handles.map(entry => entry.exportName));
+    if (found.some(entry => entry.apiMutation && !entry.browserErasableMutation)) {
+        throw new Error(
+            `[@chardb/core/vite] Browser mutation module ${JSON.stringify(id)} supports only inline api.mutation({ ... }) exports`
+        );
     }
-    return names;
+    const implicit = handles.find(entry => !entry.explicitRef);
+    if (implicit) {
+        throw new Error(
+            `[@chardb/core/vite] Browser ${implicit.kind === "defineMutation" ? "mutation" : "query"} ${implicit.exportName} requires a literal ref because Wrangler builds the Worker separately from Vite`
+        );
+    }
+    if (handles.length === 0) return code;
+    if (found.some(entry => !entry.plannedQuery && !entry.browserErasableMutation)) {
+        const message = hasMutation
+            ? `[@chardb/core/vite] Browser handle module ${JSON.stringify(id)} cannot mix erased and runtime exports`
+            : `[@chardb/core/vite] Browser planned-query module ${JSON.stringify(id)} cannot mix planned and legacy runtime exports`;
+        throw new Error(message);
+    }
+
+    const ts = loadTypeScript();
+    if (!ts) {
+        throw new Error(`[@chardb/core/vite] Browser handle erasure for ${JSON.stringify(id)} requires TypeScript`);
+    }
+    const sf = ts.createSourceFile(
+        id,
+        code,
+        ts.ScriptTarget.Latest,
+        true,
+        /\.tsx?$/.test(id) ? ts.ScriptKind.TSX : ts.ScriptKind.TS
+    );
+    const hasExportModifier = (statement: import("typescript").Statement): boolean =>
+        ts.canHaveModifiers(statement) &&
+        ts.getModifiers(statement)?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword) === true;
+    const typeOnlyExport = (statement: import("typescript").ExportDeclaration): boolean =>
+        statement.isTypeOnly ||
+        (statement.exportClause !== undefined &&
+            ts.isNamedExports(statement.exportClause) &&
+            statement.exportClause.elements.every(element => element.isTypeOnly));
+    const exportFailure = (): Error =>
+        new Error(
+            hasMutation
+                ? `[@chardb/core/vite] Browser handle module ${JSON.stringify(id)} may export only erased handles and types`
+                : `[@chardb/core/vite] Browser planned-query module ${JSON.stringify(id)} may export only planned queries and types`
+        );
+
+    for (const statement of sf.statements) {
+        if (ts.isExportDeclaration(statement)) {
+            if (typeOnlyExport(statement)) continue;
+            throw exportFailure();
+        }
+        if (ts.isExportAssignment(statement)) {
+            throw exportFailure();
+        }
+        if (!hasExportModifier(statement)) continue;
+        if (ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) continue;
+        if (ts.isVariableStatement(statement)) {
+            const names = statement.declarationList.declarations.map(declaration =>
+                ts.isIdentifier(declaration.name) ? declaration.name.text : undefined
+            );
+            if (names.length > 0 && names.every(name => name !== undefined && handleNames.has(name))) continue;
+        }
+        throw exportFailure();
+    }
+
+    const definitions = handles
+        .map(entry => {
+            const kind = entry.plannedQuery ? "query" : "mutation";
+            return `export const ${entry.exportName} = __chardbBrowserHandle(${JSON.stringify(kind)}, ${JSON.stringify(entry.ref)});`;
+        })
+        .join("\n");
+    return [
+        "const __chardbBrowserHandle = (kind, ref) => Object.defineProperties(",
+        "  function chardbBrowserHandle() {",
+        "    throw new Error(`Chardb ${kind} handles cannot execute in the browser; pass the handle to the Chardb client or React hook`);",
+        "  },",
+        "  {",
+        "    __chardbKind: { value: kind, enumerable: false, configurable: true },",
+        "    __chardbRef: { value: ref, enumerable: false, configurable: true },",
+        "    __chardbExplicitRef: { value: true, enumerable: false, configurable: true }",
+        "  }",
+        ");",
+        definitions,
+        "",
+    ].join("\n");
 }
 
 function cleanModuleId(id: string): string {

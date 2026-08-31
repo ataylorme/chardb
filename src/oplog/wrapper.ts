@@ -131,6 +131,8 @@ export interface RunWrappedMutationArgs<R> {
     /** Canonical JSON of `{ ref, args }`; the dedup hash basis. */
     readonly canonicalRequest: string;
     readonly schemaEpoch: number;
+    /** Durable placement identity used to transfer retained replay outcomes during a vshard move. */
+    readonly placementVshard?: number;
     readonly nowMs: number;
     /** `() => R` runs at most once per `(principal_id, mut_id)` inside the same tx. */
     readonly run: () => MutationOutcome<R>;
@@ -173,8 +175,9 @@ export function runWrappedMutation<R>(args: RunWrappedMutationArgs<R>): RunWrapp
     const incomingHashBytes = hexToBytes(incomingHash);
 
     args.sql.exec(
-        `INSERT OR IGNORE INTO _chardb_op_log (principal_id, mut_id, payload_hash, payload_enc, committed_at, schema_epoch, touched_keys, byte_size)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO _chardb_op_log
+         (principal_id, mut_id, payload_hash, payload_enc, committed_at, schema_epoch, touched_keys, byte_size, placement_vshard)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args.principalId,
         args.mutId,
         incomingHashBytes,
@@ -182,7 +185,8 @@ export function runWrappedMutation<R>(args: RunWrappedMutationArgs<R>): RunWrapp
         args.nowMs,
         args.schemaEpoch,
         "[]",
-        0
+        0,
+        args.placementVshard ?? null
     );
 
     if (args.sql.changes() === 0) {

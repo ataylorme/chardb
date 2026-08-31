@@ -1,11 +1,12 @@
 import { CdbError, type CdbErrorCode } from "../errors.ts";
+import { CDB_ARGUMENT_MAX_BYTES, CDB_ARGUMENT_MAX_DEPTH, CDB_ARGUMENT_MAX_MEMBERS } from "../json-limits.ts";
 import type { RawJson } from "../types.ts";
 
 export const CDB_RESULT_MAX_BYTES = 512 * 1_024;
 export const CDB_QUERY_RESULT_MAX_ROWS = 4_096;
-export const CDB_MUTATION_ARGS_MAX_BYTES = 512 * 1_024;
-export const CDB_JSON_MAX_AGGREGATE_MEMBERS = 4_096;
-export const CDB_MUTATION_ARGS_MAX_DEPTH = 99;
+export const CDB_MUTATION_ARGS_MAX_BYTES = CDB_ARGUMENT_MAX_BYTES;
+export const CDB_JSON_MAX_AGGREGATE_MEMBERS = CDB_ARGUMENT_MAX_MEMBERS;
+export const CDB_MUTATION_ARGS_MAX_DEPTH = CDB_ARGUMENT_MAX_DEPTH;
 export const CDB_QUERY_ARGS_MAX_BYTES = CDB_MUTATION_ARGS_MAX_BYTES;
 export const CDB_QUERY_ARGS_MAX_DEPTH = CDB_MUTATION_ARGS_MAX_DEPTH;
 

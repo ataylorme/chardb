@@ -1,9 +1,12 @@
 {
-    "name": "chardb",
+    "name": "@chardb/core",
     "version": "0.1.0",
     "description": "Cloudflare-native SQL with per-tenant ACID and live Drizzle queries",
     "type": "module",
     "license": "MIT",
+    "publishConfig": {
+        "access": "public"
+    },
     "homepage": "https://chardb.dev",
     "repository": {
         "type": "git",
@@ -17,30 +20,52 @@
         "bun": ">=1.2.22"
     },
     "bin": {
-        "chardb": "./dist/cli/bin.mjs"
+        "chardb": "./dist/cli/bin.mjs",
+        "core": "./dist/cli/bin.mjs"
     },
-    "files": [
-        "dist",
-        "README.md",
-        "STATUS.md",
-        "ARCHITECTURE.md",
-        "PLAN.md",
-        "NEXT_SCOPE.md",
-        "SECURITY.md",
-        "CONTRIBUTING.md"
-    ],
+    "files": ["dist", "README.md", "COST.md", "ARCHITECTURE.md", "OPERATIONS.md", "SECURITY.md"],
     "workspaces": ["landing"],
     "scripts": {
         "build": "unbuild",
         "build:stub": "unbuild --stub",
         "prepack": "bun run build",
         "smoke:package": "bun scripts/smoke-packed-package.mjs",
+        "smoke:org-user": "bun scripts/smoke-packed-org-user.mjs",
+        "smoke:browser": "bun scripts/smoke-packed-browser.mjs",
+        "smoke:vector:browser": "bun scripts/smoke-packed-public-vector.mjs",
         "test": "bun scripts/test-correctness.mjs",
         "test:correctness": "bun scripts/test-correctness.mjs",
         "test:watch": "bun scripts/test-correctness.mjs --watch",
         "test:scale": "bun test test/workerd/gateway-live.harness.test.ts --test-name-pattern 'scaled SDK'",
-        "bench:planned-query": "bun test test/workerd/planned-query.harness.test.ts --test-name-pattern 'scales exact ordered'",
+        "bench:planned-query": "bun scripts/run-scale-benchmark.mjs --suite planned-query",
+        "bench:binding-select": "bun scripts/run-scale-benchmark.mjs --suite planned-query",
         "bench:live": "bun scripts/run-scale-benchmark.mjs",
+        "bench:vector:sqlite": "bun scripts/produce-vector-sqlite-benchmark.mjs",
+        "bench:vector:workerd": "bun scripts/produce-native-vectorize-benchmark.mjs",
+        "bench:vector:organization-deletion": "bun scripts/produce-vector-organization-deletion-benchmark.mjs",
+        "bench:vector:public": "bun scripts/run-public-vector-benchmark.mjs --producer scripts/produce-public-vector-benchmark.mjs",
+        "bench:vector:public:compare": "bun scripts/compare-public-vector-benchmark.mjs",
+        "bench:compare": "bun scripts/compare-scale-benchmark.mjs",
+        "bench:chat": "bun scripts/run-chat-benchmark.mjs",
+        "bench:chat:compare": "bun scripts/compare-chat-benchmark.mjs",
+        "bench:files": "bun scripts/run-file-benchmark.mjs",
+        "bench:files:compare": "bun scripts/compare-file-benchmark.mjs",
+        "bench:files:verify": "bun scripts/verify-file-benchmark.mjs",
+        "bench:reshard": "bun scripts/run-reshard-benchmark.mjs --producer scripts/produce-native-reshard-benchmark.mjs",
+        "bench:reshard:compare": "bun scripts/compare-reshard-benchmark.mjs",
+        "bench:reshard:files": "bun scripts/run-file-reshard-benchmark.mjs --producer scripts/produce-native-file-reshard-benchmark.mjs",
+        "bench:reshard:vectors:snapshot": "bun scripts/produce-vector-reshard-snapshot-benchmark.mjs",
+        "proof:reshard:vectors:workerd": "bun test test/workerd/vector-reshard-e2e.harness.test.ts",
+        "proof:cloudflare:vectors": "bun scripts/cloudflare-vectorize-proof-orchestrator.mjs",
+        "proof:cloudflare:files": "bun scripts/run-cloudflare-file-proof.mjs",
+        "proof:cloudflare:reshard:prepare": "bun scripts/prepare-file-reshard-deployment-proof.mjs",
+        "proof:cloudflare:reshard": "bun scripts/file-reshard-proof-orchestrator.mjs",
+        "preview:gate": "bun scripts/run-preview-gate.mjs",
+        "preview:prepare": "bun scripts/prepare-preview-chat.mjs",
+        "preview:upgrade": "bun scripts/prepare-preview-upgrade.mjs",
+        "preview:finalize": "bun scripts/finalize-preview-evidence.mjs",
+        "release:admit": "bun scripts/release-admission.mjs",
+        "preview:cloudflare": "bun scripts/run-cloudflare-promotion.mjs",
         "security:history": "bun scripts/scan-git-history.mjs",
         "typecheck": "tsc --noEmit",
         "lint": "biome check .",
@@ -55,105 +80,29 @@
             "types": "./dist/server/index.d.mts",
             "import": "./dist/server/index.mjs"
         },
-        "./drizzle": {
-            "types": "./dist/drizzle/index.d.mts",
-            "import": "./dist/drizzle/index.mjs"
+        "./react": {
+            "types": "./dist/react/index.d.mts",
+            "import": "./dist/react/index.mjs"
         },
         "./files": {
             "types": "./dist/files/index.d.mts",
             "import": "./dist/files/index.mjs"
         },
-        "./files/zod": {
-            "types": "./dist/files/validators/zod.d.mts",
-            "import": "./dist/files/validators/zod.mjs"
-        },
-        "./files/typebox": {
-            "types": "./dist/files/validators/typebox.d.mts",
-            "import": "./dist/files/validators/typebox.mjs"
-        },
-        "./files/valibot": {
-            "types": "./dist/files/validators/valibot.d.mts",
-            "import": "./dist/files/validators/valibot.mjs"
-        },
-        "./files/arktype": {
-            "types": "./dist/files/validators/arktype.d.mts",
-            "import": "./dist/files/validators/arktype.mjs"
-        },
-        "./auth": {
-            "types": "./dist/auth/index.d.mts",
-            "import": "./dist/auth/index.mjs"
-        },
-        "./react": {
-            "types": "./dist/react/index.d.mts",
-            "import": "./dist/react/index.mjs"
-        },
-        "./cli": {
-            "types": "./dist/cli/index.d.mts",
-            "import": "./dist/cli/index.mjs"
-        },
         "./vite": {
             "types": "./dist/vite/index.d.mts",
             "import": "./dist/vite/index.mjs"
-        },
-        "./miniflare-plugin": {
-            "types": "./dist/miniflare-plugin/index.d.mts",
-            "import": "./dist/miniflare-plugin/index.mjs"
-        },
-        "./observability": {
-            "types": "./dist/observability/index.d.mts",
-            "import": "./dist/observability/index.mjs"
-        },
-        "./reshard": {
-            "types": "./dist/reshard/index.d.mts",
-            "import": "./dist/reshard/index.mjs"
-        },
-        "./eslint-plugin": {
-            "types": "./dist/eslint-plugin/index.d.mts",
-            "import": "./dist/eslint-plugin/index.mjs"
         }
     },
     "peerDependencies": {
         "drizzle-orm": ">=0.36.0",
         "better-auth": "~1.6.30",
-        "react": ">=18.0.0",
-        "drizzle-zod": ">=0.8.0",
-        "drizzle-typebox": ">=0.1.0",
-        "drizzle-valibot": ">=0.2.0",
-        "drizzle-arktype": ">=0.1.0",
-        "zod": ">=3.25.0",
-        "@sinclair/typebox": ">=0.32.0",
-        "valibot": ">=0.30.0",
-        "arktype": ">=2.0.0"
+        "react": ">=18.0.0"
     },
     "peerDependenciesMeta": {
         "react": {
             "optional": true
         },
         "better-auth": {
-            "optional": true
-        },
-        "drizzle-zod": {
-            "optional": true
-        },
-        "drizzle-typebox": {
-            "optional": true
-        },
-        "drizzle-valibot": {
-            "optional": true
-        },
-        "drizzle-arktype": {
-            "optional": true
-        },
-        "zod": {
-            "optional": true
-        },
-        "@sinclair/typebox": {
-            "optional": true
-        },
-        "valibot": {
-            "optional": true
-        },
-        "arktype": {
             "optional": true
         }
     },
@@ -174,6 +123,7 @@
         "drizzle-orm": "^0.45.2",
         "drizzle-zod": "0.8.3",
         "miniflare": "^4.20260730.0",
+        "playwright-core": "^1.49.0",
         "react": "^18.3.1",
         "react-dom": "^18.3.1",
         "@types/react-dom": "^18.3.0",

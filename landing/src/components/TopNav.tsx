@@ -1,40 +1,16 @@
-import { useEffect, useState } from "react";
 import { GITHUB_URL } from "../lib/constants";
 
-const SECTIONS = ["today", "binding", "scale", "tenancy", "auth", "files"] as const;
+type TopNavProps = {
+    homeHref?: string;
+    storyActive?: boolean;
+};
 
-export function TopNav() {
-    const [scrolled, setScrolled] = useState(false);
-    const [active, setActive] = useState<string | null>(null);
-
-    useEffect(() => {
-        const onScroll = () => setScrolled(window.scrollY > 4);
-        onScroll();
-        window.addEventListener("scroll", onScroll, { passive: true });
-        return () => window.removeEventListener("scroll", onScroll);
-    }, []);
-
-    useEffect(() => {
-        if (!("IntersectionObserver" in window)) return;
-        const els = SECTIONS.map(id => document.getElementById(id)).filter((e): e is HTMLElement => Boolean(e));
-        if (!els.length) return;
-        const io = new IntersectionObserver(
-            entries => {
-                for (const e of entries) {
-                    if (e.isIntersecting) setActive(e.target.id);
-                }
-            },
-            { rootMargin: "-40% 0px -55% 0px", threshold: 0 }
-        );
-        for (const el of els) io.observe(el);
-        return () => io.disconnect();
-    }, []);
-
+export function TopNav({ homeHref = "#top", storyActive = false }: TopNavProps) {
     return (
-        <header id="topnav" className={`sticky top-0 z-40 border-b border-transparent${scrolled ? " scrolled" : ""}`}>
+        <header id="topnav" className="sticky top-0 z-40 border-b border-line bg-ink-950/80 backdrop-blur">
             <div className="mx-auto max-w-page px-5 sm:px-8 h-14 flex items-center justify-between">
                 <a
-                    href="#top"
+                    href={homeHref}
                     className="font-mono text-[19px] sm:text-[20px] font-medium tracking-tight text-fg lowercase"
                     aria-label="chardb home"
                 >
@@ -42,18 +18,21 @@ export function TopNav() {
                 </a>
 
                 <nav aria-label="Primary" className="flex items-center gap-5">
-                    <ul className="hidden lg:flex items-center gap-5 text-sm text-fg-muted">
-                        {SECTIONS.map(id => (
-                            <li key={id}>
-                                <a
-                                    href={`#${id}`}
-                                    className="nav-link hover:text-fg transition-colors capitalize"
-                                    data-active={active === id ? "true" : undefined}
-                                >
-                                    {id}
-                                </a>
-                            </li>
-                        ))}
+                    <ul className="hidden sm:flex items-center gap-5 text-sm text-fg-muted">
+                        <li>
+                            <a
+                                href="/why/"
+                                className="nav-link hover:text-fg transition-colors"
+                                data-active={storyActive ? "true" : undefined}
+                            >
+                                why
+                            </a>
+                        </li>
+                        <li>
+                            <span className="text-fg-dim" aria-label="Documentation coming soon">
+                                docs soon
+                            </span>
+                        </li>
                     </ul>
                     <a
                         href={GITHUB_URL}

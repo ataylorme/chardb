@@ -5,7 +5,7 @@
  *
  * This is the only place we touch Drizzle internals; the surface is
  * `defineChardbConfig({ schema })` (writes the `dbCredentials.proxy`) and
- * `chardb/drizzle/migrate` (runtime migrations).
+ * the internal runtime migration module.
  */
 
 import type { SQL } from "drizzle-orm/sql";

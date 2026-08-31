@@ -1,12 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { CdbError } from "../../src/errors.ts";
+import type { VerifiedGwAttachment } from "../../src/server/do/gateway-auth-dispatch.ts";
 import {
     GATEWAY_ABANDONED_REGISTRATION_BATCH_SIZE,
-    Gateway,
-    type GatewayEnv,
-    type VerifiedGwAttachment,
-} from "../../src/server/do/gateway.ts";
+    GATEWAY_AUTH_REFRESH_PENDING_ERROR,
+} from "../../src/server/do/gateway-registration-store.ts";
+import { GATEWAY_AUTH_REFRESH_GRACE_MS, Gateway, type GatewayEnv } from "../../src/server/do/gateway.ts";
 import type { QueryRouteResponse } from "../../src/server/manifest.ts";
 import type { CdbSubscriptionRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, type RawJson, ShardId, SubId, TenantId } from "../../src/types.ts";
@@ -18,6 +18,7 @@ interface Cursor<T> extends Iterable<T> {
 
 interface GatewaySchedulerInternals {
     scheduleGatewayWork: (nowMs: number) => Promise<void>;
+    scheduleGatewayAuthRetirement: (nowMs: number) => Promise<void>;
 }
 
 function sqlStorage(db: Database) {
@@ -41,10 +42,12 @@ function sqlStorage(db: Database) {
 class FakeSocket {
     readonly sent: string[] = [];
     readonly closed: { code: number; reason: string }[] = [];
+    deserializeCalls = 0;
 
     constructor(public attachment: VerifiedGwAttachment) {}
 
     deserializeAttachment(): VerifiedGwAttachment {
+        this.deserializeCalls += 1;
         return this.attachment;
     }
 
@@ -81,6 +84,7 @@ describe("Gateway public durable registration", () => {
     let routeCalls: number;
     let routeBehavior: () => QueryRouteResponse | Promise<QueryRouteResponse>;
     let subscribeBehavior: (request: CdbSubscriptionRequest) => unknown | Promise<unknown>;
+    let waitUntilTasks: Promise<unknown>[];
 
     const route: QueryRouteResponse = {
         ok: true,
@@ -109,6 +113,7 @@ describe("Gateway public durable registration", () => {
         unsubscribeCalls = [];
         finalizeCalls = [];
         registeredQueryCalls = [];
+        waitUntilTasks = [];
         routeCalls = 0;
         routeBehavior = () => route;
         socket = new FakeSocket({
@@ -216,6 +221,9 @@ describe("Gateway public durable registration", () => {
                 },
             },
             getWebSockets: () => (socketConnected ? [socket] : []) as unknown as WebSocket[],
+            waitUntil: (task: Promise<unknown>): void => {
+                waitUntilTasks.push(task);
+            },
             blockConcurrencyWhile: (callback: () => Promise<unknown>) => {
                 ready = callback();
             },
@@ -224,7 +232,10 @@ describe("Gateway public durable registration", () => {
         await ready;
     });
 
-    afterEach(() => db.close());
+    afterEach(async () => {
+        await Promise.allSettled(waitUntilTasks);
+        db.close();
+    });
 
     function createGateway(): Gateway {
         class TestGateway extends Gateway {
@@ -736,7 +747,7 @@ describe("Gateway public durable registration", () => {
         expect(unsubscribeCalls).toEqual([subscription]);
     });
 
-    test("a stale verified attachment does not protect an abandoned head", async () => {
+    test("an expired attached socket keeps its durable head available for updateAuth", async () => {
         await subscribe();
         await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
         const subscription = subscribeCalls[0]?.subscription;
@@ -747,9 +758,69 @@ describe("Gateway public durable registration", () => {
 
         await gateway.alarm();
 
+        expect(head()).not.toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "active", cdb_state: "active" });
+        expect(unsubscribeCalls).toEqual([]);
+    });
+
+    test("a clean idle head keeps its auth deadline armed and retires exactly when grace ends", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        currentAlarm = null;
+        await gateway.alarm();
+        const snapshot = socket.sent
+            .map(message => JSON.parse(message) as { t: string; cookie?: Cookie })
+            .find(message => message.t === "snapshot");
+        if (!snapshot?.cookie) throw new Error("initial snapshot was not delivered");
+        await gateway.webSocketMessage(
+            socket as unknown as WebSocket,
+            JSON.stringify({ t: "ack", cookie: snapshot.cookie })
+        );
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(generation()).toMatchObject({
+            lifecycle: "active",
+            initial_snapshot_pending: 0,
+            dirty_version: 0,
+            delivered_version: 0,
+            retry_at: null,
+        });
+        expect(db.query("SELECT * FROM _gw_snapshot_outbox").get()).toBeNull();
+
+        socket.attachment = { ...socket.attachment, jwtExp: 1 };
+        clock = 101;
+        currentAlarm = null;
+        await gateway.alarm();
+
+        const deadline = 1_000 + GATEWAY_AUTH_REFRESH_GRACE_MS;
+        expect(head()).not.toBeNull();
+        expect(currentAlarm as number | null).toBe(deadline);
+        expect(unsubscribeCalls).toEqual([]);
+
+        clock = deadline;
+        currentAlarm = null;
+        await gateway.alarm();
+
         expect(head()).toBeNull();
         expect(generation()).toBeNull();
-        expect(unsubscribeCalls).toEqual([subscription]);
+        expect(unsubscribeCalls).toHaveLength(1);
+        expect(finalizeCalls).toEqual(unsubscribeCalls);
+        expect(currentAlarm).toBeNull();
+    });
+
+    test("auth retirement indexes each socket once across multiple active heads", async () => {
+        await subscribe(SubId(1));
+        await subscribe(SubId(2));
+        await waitFor(
+            () =>
+                (db.query("SELECT COUNT(*) AS count FROM _gw_registration_heads").get() as { count: number }).count ===
+                2,
+            "two subscription activations"
+        );
+        socket.deserializeCalls = 0;
+
+        await (gateway as unknown as GatewaySchedulerInternals).scheduleGatewayAuthRetirement(clock);
+
+        expect(socket.deserializeCalls).toBe(1);
     });
 
     test("abandoned-head reconciliation re-arms until it passes the batch cap", async () => {
@@ -970,6 +1041,29 @@ describe("Gateway public durable registration", () => {
         expect(generation()).toBeNull();
     });
 
+    test("a typed source routing fence rejection removes the absent install and requests fresh placement", async () => {
+        subscribeBehavior = request => ({
+            ok: false,
+            registrationState: "absent",
+            subscription: request.subscription,
+            error: new CdbError({
+                code: "CDB_STALE_EPOCH",
+                message: "routing generation is no longer admitted by this source",
+            }).toJSON(),
+        });
+
+        await subscribe();
+
+        expect(head()).toBeNull();
+        expect(generation()).toBeNull();
+        expect(unsubscribeCalls).toEqual([]);
+        expect(JSON.parse(socket.sent.at(-1) as string)).toEqual({
+            t: "mustRefetch",
+            subIds: [1],
+            reason: "shardsChanged",
+        });
+    });
+
     test("unsubscribe during ambiguous settlement suppresses the stale response-loss error", async () => {
         subscribeBehavior = () => {
             throw new Error("response lost");
@@ -1154,13 +1248,151 @@ describe("Gateway public durable registration", () => {
         expect(currentAlarm).toBeNull();
     });
 
-    test("auth refresh retires durable registrations and returns their subIds in mustRefetch", async () => {
+    test("same-principal auth refresh within grace resumes deferred durable work", async () => {
         await subscribe();
         await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
+        const registrationId = generation()?.registration_id;
+        if (typeof registrationId !== "string") throw new Error("active registration ID is missing");
+        const queryCallsBeforeRefresh = registeredQueryCalls.length;
+        socket.attachment = { ...socket.attachment, jwtExp: 0 };
+        db.query(
+            `UPDATE _gw_registration_generations
+             SET dirty_version = delivered_version + 1, retry_at = 60_000, retry_error = ?
+             WHERE registration_id = ?`
+        ).run(GATEWAY_AUTH_REFRESH_PENDING_ERROR, registrationId);
         const replacement: VerifiedGwAttachment = {
             ...socket.attachment,
-            principalId: PrincipalId("principal-2"),
+            jwtExp: 1_000,
         };
+        const internals = gateway as unknown as {
+            verifyAttachment: () => Promise<VerifiedGwAttachment>;
+        };
+        internals.verifyAttachment = async () => replacement;
+
+        await gateway.webSocketMessage(
+            socket as unknown as WebSocket,
+            JSON.stringify({ t: "updateAuth", jwt: "replacement" })
+        );
+        await Promise.allSettled(waitUntilTasks);
+
+        expect(head()).not.toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "active", cdb_state: "active" });
+        expect(socket.attachment.jwtExp).toBe(replacement.jwtExp);
+        expect(registeredQueryCalls).toHaveLength(queryCallsBeforeRefresh + 1);
+        expect(unsubscribeCalls).toEqual([]);
+        const mustRefetch = socket.sent
+            .map(message => JSON.parse(message) as Record<string, unknown>)
+            .find(message => message.t === "mustRefetch" && message.reason === "authChanged");
+        expect(mustRefetch).toMatchObject({ t: "mustRefetch", subIds: [], reason: "authChanged" });
+    });
+
+    test("a held auth refresh neither hot-loops nor claims due query and snapshot work", async () => {
+        await subscribe(SubId(1));
+        await subscribe(SubId(2));
+        await waitFor(
+            () =>
+                (
+                    db
+                        .query("SELECT COUNT(*) AS count FROM _gw_registration_generations WHERE lifecycle = 'active'")
+                        .get() as { count: number }
+                ).count === 2,
+            "two active subscriptions"
+        );
+
+        currentAlarm = null;
+        await gateway.alarm();
+        const initialSnapshots = socket.sent
+            .map(message => JSON.parse(message) as Record<string, unknown>)
+            .filter(message => message.t === "snapshot");
+        expect(initialSnapshots).toHaveLength(2);
+        const acknowledged = initialSnapshots.find(message => message.subId === 2);
+        if (typeof acknowledged?.cookie !== "string") throw new Error("second snapshot cookie is missing");
+        await gateway.webSocketMessage(
+            socket as unknown as WebSocket,
+            JSON.stringify({ t: "ack", cookie: acknowledged.cookie })
+        );
+
+        const dirtyRegistration = db
+            .query("SELECT registration_id FROM _gw_registration_generations WHERE sub_id = 2")
+            .get() as { registration_id: string } | null;
+        const stagedRegistration = db
+            .query("SELECT registration_id FROM _gw_registration_generations WHERE sub_id = 1")
+            .get() as { registration_id: string } | null;
+        if (!dirtyRegistration || !stagedRegistration) throw new Error("test registrations are missing");
+        db.query(
+            `UPDATE _gw_registration_generations
+             SET dirty_version = delivered_version + 1, retry_at = ?
+             WHERE registration_id = ?`
+        ).run(clock, dirtyRegistration.registration_id);
+        db.query(
+            `UPDATE _gw_snapshot_outbox
+             SET claim_token = NULL, claim_expires_at = NULL, next_attempt_at = ?
+             WHERE registration_id = ?`
+        ).run(clock, stagedRegistration.registration_id);
+
+        let releaseVerification: (attachment: VerifiedGwAttachment) => void = () => {};
+        const internals = gateway as unknown as {
+            authRefreshDrainConnections: Set<string>;
+            verifyAttachment: () => Promise<VerifiedGwAttachment>;
+        };
+        internals.verifyAttachment = () =>
+            new Promise(resolve => {
+                releaseVerification = resolve;
+            });
+        const queryCallsBeforeRefresh = registeredQueryCalls.length;
+        const sentBeforeRefresh = socket.sent.length;
+        const sendAttemptsBeforeRefresh = (
+            db
+                .query("SELECT send_attempts FROM _gw_snapshot_outbox WHERE registration_id = ?")
+                .get(stagedRegistration.registration_id) as { send_attempts: number }
+        ).send_attempts;
+
+        const refresh = gateway.webSocketMessage(
+            socket as unknown as WebSocket,
+            JSON.stringify({ t: "updateAuth", jwt: "replacement" })
+        );
+        await waitFor(() => internals.authRefreshDrainConnections.has("connection-1"), "authentication refresh drain");
+        currentAlarm = null;
+        await gateway.alarm();
+
+        const heldAlarm = await state.storage.getAlarm();
+        expect(heldAlarm).not.toBeNull();
+        if (heldAlarm === null) throw new Error("held refresh lost its auth-retirement alarm");
+        expect(heldAlarm).toBeGreaterThan(clock + 1);
+        expect(registeredQueryCalls).toHaveLength(queryCallsBeforeRefresh);
+        expect(socket.sent).toHaveLength(sentBeforeRefresh);
+        expect(
+            db
+                .query("SELECT run_token FROM _gw_registration_generations WHERE registration_id = ?")
+                .get(dirtyRegistration.registration_id)
+        ).toEqual({ run_token: null });
+        expect(
+            db
+                .query("SELECT claim_token, send_attempts FROM _gw_snapshot_outbox WHERE registration_id = ?")
+                .get(stagedRegistration.registration_id)
+        ).toEqual({ claim_token: null, send_attempts: sendAttemptsBeforeRefresh });
+
+        releaseVerification({ ...socket.attachment, jwtExp: socket.attachment.jwtExp + 60 });
+        await refresh;
+        await Promise.allSettled(waitUntilTasks);
+
+        expect(registeredQueryCalls).toHaveLength(queryCallsBeforeRefresh + 1);
+        expect(
+            db
+                .query("SELECT send_attempts FROM _gw_snapshot_outbox WHERE registration_id = ?")
+                .get(stagedRegistration.registration_id)
+        ).toEqual({ send_attempts: sendAttemptsBeforeRefresh + 1 });
+        expect(
+            socket.sent
+                .slice(sentBeforeRefresh)
+                .map(message => JSON.parse(message) as Record<string, unknown>)
+                .filter(message => message.t === "snapshot")
+        ).toHaveLength(2);
+    });
+
+    test("auth refresh rejects a principal change without retiring live subscriptions", async () => {
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
         const internals = gateway as unknown as {
             verifyAttachment: () => Promise<VerifiedGwAttachment>;
             performUpdateAuth: (
@@ -1169,19 +1401,22 @@ describe("Gateway public durable registration", () => {
                 message: { t: "updateAuth"; jwt: string }
             ) => Promise<boolean>;
         };
-        internals.verifyAttachment = async () => replacement;
+        internals.verifyAttachment = async () => ({
+            ...socket.attachment,
+            principalId: PrincipalId("principal-2"),
+        });
 
         expect(
             await internals.performUpdateAuth(socket as unknown as WebSocket, "connection-1", {
                 t: "updateAuth",
                 jwt: "replacement",
             })
-        ).toBe(true);
+        ).toBe(false);
 
-        expect(head()).toBeNull();
-        expect(generation()).toMatchObject({ lifecycle: "retiring", cdb_state: "retiring" });
-        const mustRefetch = socket.sent.map(message => JSON.parse(message) as Record<string, unknown>).at(-1);
-        expect(mustRefetch).toMatchObject({ t: "mustRefetch", subIds: [1], reason: "authChanged" });
+        expect(head()).not.toBeNull();
+        expect(generation()).toMatchObject({ lifecycle: "active", cdb_state: "active" });
+        expect(unsubscribeCalls).toEqual([]);
+        expect(socket.closed).toEqual([{ code: 1008, reason: "CDB_FORBIDDEN" }]);
     });
 
     test("the updateAuth WebSocket event owns its full refresh barrier", async () => {

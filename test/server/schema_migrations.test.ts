@@ -1,7 +1,9 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { organization } from "better-auth/plugins/organization";
 import { text } from "drizzle-orm/sqlite-core";
-import { defineAuth } from "../../src/auth/synthesize.ts";
-import { globalScope } from "../../src/server/cdb-tenant.ts";
+import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
+import { forOrgUser, globalScope } from "../../src/server/cdb-tenant.ts";
 import {
     defineMigrations,
     defineSchemaBaseline,
@@ -10,6 +12,39 @@ import {
 } from "../../src/server/schema-migrations.ts";
 
 describe("packaged schema migration journal", () => {
+    test("omits every configured auth FK from an organization-user baseline", () => {
+        const authOptions = { plugins: [organization()] };
+        const auth = synthesizeAuthSchema(authOptions);
+        const { cdbTable } = forOrgUser();
+        const documents = cdbTable(
+            "baseline_org_user_documents",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => auth.organization.id),
+                ownerId: text("owner_id")
+                    .notNull()
+                    .references(() => auth.user.id),
+                reviewerId: text("reviewer_id")
+                    .notNull()
+                    .references(() => auth.user.id),
+            },
+            { selfBy: "ownerId", roles: { self: { read: "*" } } }
+        );
+        const baseline = defineSchemaBaseline({
+            version: 1,
+            name: "org_user_baseline",
+            domainSchema: { documents },
+            authOptions,
+        });
+
+        const shard = new Database(":memory:");
+        for (const statement of baseline.statements) shard.run(statement);
+        expect(shard.query('PRAGMA foreign_key_list("baseline_org_user_documents")').all()).toEqual([]);
+        shard.close();
+    });
+
     test("owns, freezes, hashes, and selects a contiguous migration suffix", () => {
         const statements = ["CREATE TABLE projects (id TEXT PRIMARY KEY)"];
         const catalogStatements = ["ALTER TABLE user ADD COLUMN nickname TEXT"];
@@ -118,5 +153,44 @@ describe("packaged schema migration journal", () => {
                 },
             ])
         ).toThrow(/more than 4096 SQL statements/);
+    });
+
+    test("accepts exactly 1024 migrations and rejects the next entry before hashing", () => {
+        const migrations = Array.from({ length: 1_024 }, (_, index) => ({
+            version: index + 1,
+            name: `migration_${index + 1}`,
+            statements: ["SELECT 1"],
+        }));
+
+        expect(defineMigrations(migrations).version).toBe(1_024);
+        expect(() =>
+            defineMigrations([...migrations, { version: 1_025, name: "migration_1025", statements: ["SELECT 1"] }])
+        ).toThrow(/more than 1024 migrations/);
+    });
+
+    test("counts the 16 MiB journal cap in encoded UTF-8 bytes", () => {
+        const oneMiB = "x".repeat(1_024 * 1_024);
+        const atLimit = [{ version: 1, name: "exact_journal_limit", statements: Array(16).fill(oneMiB) }];
+
+        expect(defineMigrations(atLimit).version).toBe(1);
+        expect(() =>
+            defineMigrations([
+                {
+                    version: 1,
+                    name: "over_journal_limit",
+                    statements: [...Array(16).fill(oneMiB), "x"],
+                },
+            ])
+        ).toThrow(/SQL exceeds 16777216 total UTF-8 bytes/);
+    });
+
+    test("uses TextEncoder replacement semantics for lone-surrogate journal accounting", () => {
+        const surrogate = "\ud800";
+        expect(new TextEncoder().encode(surrogate)).toHaveLength(3);
+
+        const journal = defineMigrations([
+            { version: 1, name: "lone_surrogate", statements: [`SELECT '${surrogate}'`] },
+        ]);
+        expect(journal.migrations[0]?.statements).toEqual([`SELECT '${surrogate}'`]);
     });
 });

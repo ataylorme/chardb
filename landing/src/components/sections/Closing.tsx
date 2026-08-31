@@ -22,7 +22,7 @@ export function Closing() {
                         rel="noopener"
                         className="inline-flex items-center gap-1 text-sm text-fg-muted hover:text-fg transition-colors"
                     >
-                        Read the proof and the remaining work <span aria-hidden="true">→</span>
+                        Read the source <span aria-hidden="true">→</span>
                     </a>
                 </div>
             </div>

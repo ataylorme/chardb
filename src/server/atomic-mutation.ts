@@ -2,6 +2,7 @@ import { type DrizzleSqliteDODatabase, drizzle } from "drizzle-orm/durable-sqlit
 import { CdbError } from "../errors.ts";
 import { type MutationOutcome, type SyncSql, canonicalRequest, runWrappedMutation } from "../oplog/wrapper.ts";
 import { Cookie, MutId, PrincipalId, type RawJson } from "../types.ts";
+import { vshardOf } from "../vshard.ts";
 import { type CdbDbPlacement, type MutationDbTransactionGuard, wrapMutationDb } from "./cdb-db-proxy.ts";
 import type { AuthCtx, MutationCtx } from "./define.ts";
 import { adaptSqlStorage } from "./do/sql_adapter.ts";
@@ -11,6 +12,21 @@ export type AtomicMutationDb<TSchema extends Record<string, unknown>> = DrizzleS
 
 export const CDB_MUTATION_MAX_WRITE_OPERATIONS = 256;
 export const CDB_MUTATION_MAX_ROWS_WRITTEN = 4_096;
+
+const unavailableVectorMutation: MutationCtx<unknown>["vector"] = Object.freeze({
+    set(): never {
+        throw new CdbError({
+            code: "CDB_UNSUPPORTED_FEATURE",
+            message: "vector mutations require a configured Cdb mutation context",
+        });
+    },
+    delete(): never {
+        throw new CdbError({
+            code: "CDB_UNSUPPORTED_FEATURE",
+            message: "vector mutations require a configured Cdb mutation context",
+        });
+    },
+});
 
 export interface AtomicMutationRequest<TArgs extends RawJson> {
     readonly principalId: string;
@@ -40,6 +56,7 @@ interface AtomicMutationWriteSet {
 
 type AtomicMutationWriteSetHook = (writeSet: AtomicMutationWriteSet) => void;
 type AtomicMutationAdmissionHook = (sql: SyncSql) => void;
+type AtomicMutationOutcomeHook = (outcome: { readonly sql: SyncSql; readonly ran: boolean }) => void;
 
 export interface ExecuteAtomicMutationInput<TSchema extends Record<string, unknown>, TArgs extends RawJson, TResult> {
     readonly storage: DurableObjectStorage;
@@ -52,7 +69,15 @@ export interface ExecuteAtomicMutationInput<TSchema extends Record<string, unkno
     readonly nowMs?: number;
     /** Internal synchronous fence evaluated inside the mutation transaction before op-log lookup or handler SQL. */
     readonly beforeRun?: AtomicMutationAdmissionHook;
+    /** Internal synchronous hook after the final op-log envelope exists, before the transaction commits. */
+    readonly onOutcome?: AtomicMutationOutcomeHook;
     readonly onWriteSet?: AtomicMutationWriteSetHook;
+    /** Private same-isolate context fields whose lifetime is bounded by this SQLite transaction. */
+    readonly extendContext?: (
+        ctx: MutationCtx<AtomicMutationDb<TSchema>>,
+        sql: SyncSql,
+        isTransactionActive: () => boolean
+    ) => MutationCtx<AtomicMutationDb<TSchema>>;
 }
 
 export interface AtomicMutationResult {
@@ -79,6 +104,7 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
 ): AtomicMutationResult {
     assertSynchronousHandler(input.handler);
     if (input.onWriteSet) assertSynchronousWriteSetHook(input.onWriteSet);
+    if (input.onOutcome) assertSynchronousOutcomeHook(input.onOutcome);
 
     const cookie = Cookie(input.cookie);
     const sql = adaptSqlStorage(input.storage.sql);
@@ -106,10 +132,20 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
                 mutId: MutId(input.request.mutId),
                 canonicalRequest: canonicalRequest(input.request.ref, input.request.args as RawJson),
                 schemaEpoch: input.request.schemaEpoch,
+                ...(input.placement === undefined
+                    ? {}
+                    : { placementVshard: Number(vshardOf([input.placement.partitionKey])) }),
                 nowMs: input.nowMs ?? Date.now(),
                 cookie,
                 run: (): MutationOutcome<TResult> => {
-                    const result = input.handler({ db, auth: input.request.auth }, input.request.args);
+                    const baseContext: MutationCtx<AtomicMutationDb<TSchema>> = {
+                        db,
+                        auth: input.request.auth,
+                        vector: unavailableVectorMutation,
+                    };
+                    const context =
+                        input.extendContext?.(baseContext, sql, () => transactionGuard.active) ?? baseContext;
+                    const result = input.handler(context, input.request.args);
                     if (isThenable(result)) {
                         throw asyncHandlerError();
                     }
@@ -133,6 +169,8 @@ export function executeAtomicMutation<TSchema extends Record<string, unknown>, T
                     "return less data from the mutation and read larger results with a paginated query"
                 );
             }
+            const outcomeHookResult = input.onOutcome?.({ sql, ran: wrappedResult.ran });
+            if (isThenable(outcomeHookResult)) throw asyncOutcomeHookError();
             if (wrappedResult.ran && wrappedResult.envelope.status === "ok" && touchedTables.size > 0) {
                 const sortedTables = Object.freeze([...touchedTables].sort());
                 const hookResult = input.onWriteSet?.({ touchedTables: sortedTables, sql });
@@ -294,5 +332,16 @@ function asyncWriteSetHookError(): CdbError {
     return new CdbError({
         code: "CDB_INTERACTIVE_TXN_UNSUPPORTED",
         message: "atomic write-set hooks must be synchronous; Durable Object SQLite transactions cannot span await",
+    });
+}
+
+function assertSynchronousOutcomeHook(hook: AtomicMutationOutcomeHook): void {
+    if (hook.constructor?.name === "AsyncFunction") throw asyncOutcomeHookError();
+}
+
+function asyncOutcomeHookError(): CdbError {
+    return new CdbError({
+        code: "CDB_INTERACTIVE_TXN_UNSUPPORTED",
+        message: "atomic outcome hooks must be synchronous; Durable Object SQLite transactions cannot span await",
     });
 }

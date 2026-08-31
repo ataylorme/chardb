@@ -1,5 +1,5 @@
 /**
- * Lifecycle tests for `chardb/react` hooks. We render through
+ * Lifecycle tests for `@chardb/core/react` hooks. We render through
  * `react-test-renderer` with a stub `ChardbClient` so we can observe the
  * subscribe → patch → unsubscribe contract without booting a real
  * WebSocket. Covers what the audit flagged: hooks were entirely unverified.
@@ -9,7 +9,7 @@ import * as React from "react";
 import * as TestRenderer from "react-test-renderer";
 import type { ChardbClient } from "../src/client/index.ts";
 import * as ChardbReact from "../src/react/index.ts";
-import { ChardbProvider, useChardb, useMutation, useQuery, useSession } from "../src/react/index.ts";
+import { ChardbProvider, useChardb, useMutation, useQuery } from "../src/react/index.ts";
 import { PROTOCOL_V, type RawJson } from "../src/wire.ts";
 
 type TestSubState = "pending" | "live" | "refetching" | "error" | "closed";
@@ -86,9 +86,9 @@ function sessionAuth(userId: string, token: string) {
         isPending: false,
     };
     const auth: ChardbReact.AuthClientLike = {
-        async $fetch<T>() {
+        async $fetch<_T>() {
             activity.fetchCalls += 1;
-            return { data: { token } as T, error: null };
+            return { data: { token } as _T, error: null };
         },
         useSession: {
             get: () => snapshot,
@@ -96,6 +96,47 @@ function sessionAuth(userId: string, token: string) {
         },
     };
     return { auth, activity };
+}
+
+function mutableSessionAuth() {
+    const activity = { fetchCalls: 0 };
+    const listeners = new Set<() => void>();
+    let userId: string | null = null;
+    let sessionId: string | null = null;
+    const sessionAtom: ChardbReact.AuthSessionAtom = {
+        get: () => ({
+            data: userId === null ? null : { user: { id: userId }, session: { id: sessionId ?? "missing" } },
+            isPending: false,
+        }),
+        subscribe(listener) {
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+        },
+    };
+    const dynamicClient = {
+        async $fetch<_T>(path: string) {
+            if (path !== "/token") throw new Error(`unexpected Better Auth path ${path}`);
+            activity.fetchCalls += 1;
+            return { data: { token: `jwt-${userId ?? "missing"}` } as _T, error: null };
+        },
+        async getToken() {
+            throw new Error("dynamic Better Auth actions must not be feature-detected by property access");
+        },
+        useSession: () => {
+            throw new Error("the provider must not call Better Auth's React hook");
+        },
+        $store: { atoms: { session: sessionAtom } },
+    };
+    const auth: ChardbReact.AuthClientLike = dynamicClient;
+    return {
+        auth,
+        activity,
+        setUser(nextUserId: string | null, nextSessionId: string | null = nextUserId && `session-${nextUserId}`) {
+            userId = nextUserId;
+            sessionId = nextSessionId;
+            for (const listener of listeners) listener();
+        },
+    };
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -109,12 +150,12 @@ function nestedEmptyJson(depth: number): RawJson {
     return value;
 }
 
-describe("chardb/react — hook lifecycle", () => {
+describe("@chardb/core/react — hook lifecycle", () => {
     test("exports only supported hooks", () => {
-        for (const name of ["ChardbProvider", "useChardb", "useQuery", "useMutation", "useSession"]) {
+        for (const name of ["ChardbProvider", "useChardb", "useQuery", "useMutation", "useFile"]) {
             expect(name in ChardbReact).toBe(true);
         }
-        for (const name of ["usePresence", "useUpload", "useStream", "useVectorSearch"]) {
+        for (const name of ["useSession", "usePresence", "useUpload", "useStream", "useVectorSearch"]) {
             expect(name in ChardbReact).toBe(false);
         }
     });
@@ -285,7 +326,6 @@ describe("chardb/react — hook lifecycle", () => {
                         endpoint: "wss://example.com/first",
                         getJwt: async () => "jwt-stub",
                         clientId: "provider-owned",
-                        crossTab: false,
                     })
                 );
                 await flushMicrotasks();
@@ -300,7 +340,6 @@ describe("chardb/react — hook lifecycle", () => {
                         endpoint: "wss://example.com/second",
                         getJwt: async () => "jwt-stub",
                         clientId: "provider-owned",
-                        crossTab: false,
                     })
                 );
                 await flushMicrotasks();
@@ -336,7 +375,6 @@ describe("chardb/react — hook lifecycle", () => {
             return "explicit-jwt";
         };
         let capturedClient: ChardbClient | undefined;
-        let capturedUserId: string | null | undefined;
         let tree: TestRenderer.ReactTestRenderer | undefined;
         let mutationOutcome:
             | Promise<{ readonly ok: true; readonly value: RawJson } | { readonly ok: false }>
@@ -344,7 +382,6 @@ describe("chardb/react — hook lifecycle", () => {
 
         function Probe() {
             capturedClient = useChardb();
-            capturedUserId = useSession().userId;
             useQuery(query, {});
             return null;
         }
@@ -357,7 +394,6 @@ describe("chardb/react — hook lifecycle", () => {
                     getJwt,
                     auth,
                     clientId: "provider-auth-context",
-                    crossTab: false,
                 },
                 React.createElement(Probe)
             );
@@ -388,7 +424,6 @@ describe("chardb/react — hook lifecycle", () => {
                 await flushMicrotasks();
             });
             expect(capturedClient).toBe(originalClient);
-            expect(capturedUserId).toBe("user-b");
             expect(getJwtCalls).toBe(1);
             expect(firstAuth.activity.fetchCalls).toBe(0);
             expect(secondAuth.activity.fetchCalls).toBe(0);
@@ -458,7 +493,6 @@ describe("chardb/react — hook lifecycle", () => {
                     endpoint: "wss://example.com/auth-derived",
                     auth,
                     clientId: "provider-auth-derived",
-                    crossTab: false,
                 },
                 React.createElement(CaptureClient)
             );
@@ -497,23 +531,85 @@ describe("chardb/react — hook lifecycle", () => {
         }
     });
 
-    test("does not start a provider client for a render that never commits", async () => {
-        class DormantBroadcastChannel {
-            static constructions = 0;
-            onmessage: ((event: { data: unknown }) => void) | null = null;
-
-            constructor(_name: string) {
-                DormantBroadcastChannel.constructions += 1;
-            }
-
-            close(): void {}
-        }
-
+    test("re-authenticates when one Better Auth client changes principal", async () => {
         const realWebSocket = globalThis.WebSocket;
-        const realBroadcastChannel = globalThis.BroadcastChannel;
         ProviderWebSocket.instances.length = 0;
         (globalThis as { WebSocket: unknown }).WebSocket = ProviderWebSocket;
-        (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = DormantBroadcastChannel;
+        const session = mutableSessionAuth();
+        const query = Object.assign(async (_ctx: never, _args: Record<string, never>) => [], {
+            __chardbRef: { toString: () => "queries.ts#signed-out" },
+        });
+        let tree: TestRenderer.ReactTestRenderer | undefined;
+
+        function Probe() {
+            useQuery(query, {});
+            return null;
+        }
+
+        try {
+            await TestRenderer.act(async () => {
+                tree = TestRenderer.create(
+                    React.createElement(
+                        ChardbProvider,
+                        {
+                            endpoint: "wss://example.com/auth-session",
+                            auth: session.auth,
+                            clientId: "provider-auth-session",
+                        },
+                        React.createElement(Probe)
+                    )
+                );
+                await flushMicrotasks();
+            });
+            expect(ProviderWebSocket.instances).toHaveLength(0);
+            expect(session.activity.fetchCalls).toBe(0);
+
+            await TestRenderer.act(async () => {
+                session.setUser("user-a");
+                await flushMicrotasks();
+            });
+            expect(ProviderWebSocket.instances).toHaveLength(1);
+            expect(session.activity.fetchCalls).toBe(1);
+            const firstSocket = ProviderWebSocket.instances[0];
+            if (!firstSocket) throw new Error("expected the first authenticated socket");
+
+            await TestRenderer.act(async () => {
+                session.setUser("user-b");
+                await flushMicrotasks();
+            });
+            expect(ProviderWebSocket.instances).toHaveLength(2);
+            expect(session.activity.fetchCalls).toBe(2);
+            expect(firstSocket.closeCalls).toBe(1);
+            const secondSocket = ProviderWebSocket.instances[1];
+            if (!secondSocket) throw new Error("expected the replacement authenticated socket");
+
+            await TestRenderer.act(async () => {
+                session.setUser("user-b", "session-user-b-replacement");
+                await flushMicrotasks();
+            });
+            expect(ProviderWebSocket.instances).toHaveLength(3);
+            expect(session.activity.fetchCalls).toBe(3);
+            expect(secondSocket.closeCalls).toBe(1);
+            const thirdSocket = ProviderWebSocket.instances[2];
+            if (!thirdSocket) throw new Error("expected the same-user replacement session socket");
+
+            await TestRenderer.act(async () => {
+                session.setUser(null);
+                await flushMicrotasks();
+            });
+            expect(ProviderWebSocket.instances).toHaveLength(3);
+            expect(session.activity.fetchCalls).toBe(3);
+            expect(thirdSocket.closeCalls).toBe(1);
+        } finally {
+            tree?.unmount();
+            (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;
+        }
+    });
+
+    test("does not start a provider client for a render that never commits", async () => {
+        const realWebSocket = globalThis.WebSocket;
+        ProviderWebSocket.instances.length = 0;
+        (globalThis as { WebSocket: unknown }).WebSocket = ProviderWebSocket;
         let getJwtCalls = 0;
         function AbortRender(): React.ReactElement {
             throw new Error("abort render");
@@ -531,7 +627,6 @@ describe("chardb/react — hook lifecycle", () => {
                                 return "jwt-stub";
                             },
                             clientId: "provider-aborted",
-                            logicalDb: "provider-aborted",
                         },
                         React.createElement(AbortRender)
                     )
@@ -540,10 +635,8 @@ describe("chardb/react — hook lifecycle", () => {
             await flushMicrotasks();
             expect(getJwtCalls).toBe(0);
             expect(ProviderWebSocket.instances).toHaveLength(0);
-            expect(DormantBroadcastChannel.constructions).toBe(0);
         } finally {
             (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;
-            (globalThis as { BroadcastChannel: unknown }).BroadcastChannel = realBroadcastChannel;
         }
     });
 
@@ -566,7 +659,6 @@ describe("chardb/react — hook lifecycle", () => {
                                 return "jwt-stub";
                             },
                             clientId: "provider-strict",
-                            crossTab: false,
                         })
                     )
                 );
@@ -576,6 +668,60 @@ describe("chardb/react — hook lifecycle", () => {
             expect(ProviderWebSocket.instances).toHaveLength(1);
             const socket = ProviderWebSocket.instances[0];
             if (!socket) throw new Error("expected the StrictMode provider socket");
+            expect(socket.closeCalls).toBe(0);
+
+            TestRenderer.act(() => tree?.unmount());
+            await flushMicrotasks();
+            expect(socket.closeCalls).toBe(1);
+        } finally {
+            tree?.unmount();
+            (globalThis as { WebSocket: unknown }).WebSocket = realWebSocket;
+        }
+    });
+
+    test("keeps a StrictMode provider open when its first query mounts after authentication", async () => {
+        const realWebSocket = globalThis.WebSocket;
+        ProviderWebSocket.instances.length = 0;
+        (globalThis as { WebSocket: unknown }).WebSocket = ProviderWebSocket;
+        const session = mutableSessionAuth();
+        session.setUser("user-a", "session-a");
+        const query = Object.assign(async (_ctx: never, _args: { organizationId: string }) => [], {
+            __chardbRef: { toString: () => "queries.ts#delayed-organization" },
+        });
+        let tree: TestRenderer.ReactTestRenderer | undefined;
+
+        function QueryProbe() {
+            useQuery(query, { organizationId: "org-a" });
+            return null;
+        }
+        const render = (showQuery: boolean) =>
+            React.createElement(
+                React.StrictMode,
+                null,
+                React.createElement(
+                    ChardbProvider,
+                    {
+                        endpoint: "wss://example.com/strict-delayed-query",
+                        auth: session.auth,
+                        clientId: "provider-strict-delayed-query",
+                    },
+                    showQuery ? React.createElement(QueryProbe) : null
+                )
+            );
+
+        try {
+            await TestRenderer.act(async () => {
+                tree = TestRenderer.create(render(false), { unstable_strictMode: true } as never);
+                await flushMicrotasks();
+            });
+            const socket = ProviderWebSocket.instances[0];
+            if (!socket) throw new Error("expected the authenticated StrictMode socket");
+            expect(socket.closeCalls).toBe(0);
+
+            await TestRenderer.act(async () => {
+                tree?.update(render(true));
+                await flushMicrotasks();
+            });
             expect(socket.closeCalls).toBe(0);
 
             TestRenderer.act(() => tree?.unmount());
@@ -608,7 +754,6 @@ describe("chardb/react — hook lifecycle", () => {
                             endpoint: "wss://example.com/handoff",
                             getJwt,
                             clientId: "provider-handoff",
-                            crossTab: false,
                         },
                         React.createElement(CaptureClient)
                     )

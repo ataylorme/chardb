@@ -1,13 +1,13 @@
 /**
- * Bundler-emitted registry of `chardb/server` exports.
+ * Runtime registry of `@chardb/core/server` exports.
  *
  * Every helper attaches `__chardbRef` and `__chardbKind` markers (see
- * `src/server/refs.ts`). The Vite plugin walks the user's worker entry, pulls
- * each named export through `manifestFromExports`, and the result is supplied
- * to `defineChardb({ manifest })`. The configured Cdb class retains this
- * registry in its own isolate and resolves mutation refs locally. The
+ * `src/server/refs.ts`). The application passes its API module namespaces to
+ * `chardb({ api })`, which builds this manifest in each Worker and Durable
+ * Object isolate. The configured Cdb class retains this registry and resolves
+ * mutation refs locally. The
  * configured Gateway retains the same manifest for mutation and query
- * routing, while `scheduled()` invokes user `defineCron` callbacks.
+ * routing.
  *
  * The manifest contains functions and Maps and must never cross RPC. Only
  * serializable mutation and subscription requests cross into Cdb.
@@ -29,19 +29,21 @@
  * threading `TArgs` through would force every dispatch through a generic
  * lookup that can't be resolved at the wire boundary anyway. Validation
  * (Zod / TypeBox / Valibot / ArkType) lives one level up in the user's
- * handler — `chardb/files/{zod,…}` is wired so the user can refine `args`
+ * handler. The user can refine `args` with a standard-schema validator.
  * before calling into business logic. See `src/server/define.ts` for the
  * forward direction (typed → erased) and the routing functions in this file
  * for the consumers that need the erased shape.
  */
 
+import { type ChardbSelectPlanV1, validateChardbSelectPlanV1 } from "../binding-plan.ts";
 import { CdbError } from "../errors.ts";
-import type { Brand, ChardbRef, RawJson } from "../types.ts";
-import { stableJson } from "../util/canonical.ts";
+import type { ChardbRef, RawJson } from "../types.ts";
+import { stableHashHex, stableJson } from "../util/canonical.ts";
+import { CDB_VECTOR_SEARCH_MAX_RESULTS } from "../vector.ts";
 import type { CdbIntent } from "../wire.ts";
 import type { MutationAuthority } from "./define.ts";
-import type { ChardbFunctionKind } from "./refs.ts";
-import type { RegisteredQueryPlan } from "./registered-query-plan.ts";
+import type { RegisteredQueryPlan, RegisteredVectorQueryPlan } from "./registered-query-plan.ts";
+import { isChardbVectorResourceDescriptor, normalizeChardbResourceDescriptor } from "./resource-descriptors.ts";
 import {
     CDB_JSON_MAX_AGGREGATE_MEMBERS,
     CDB_QUERY_ARGS_MAX_BYTES,
@@ -50,35 +52,6 @@ import {
     snapshotCdbMutationArgs,
     snapshotCdbQueryArgs,
 } from "./result_limits.ts";
-
-interface RefMarked {
-    readonly __chardbRef: Brand<string, "ChardbRef">;
-    readonly __chardbKind: ChardbFunctionKind;
-}
-
-interface MutationMarked extends RefMarked {
-    readonly __chardbKind: "mutation";
-    readonly __chardbPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
-    readonly __chardbSinglePartition?: boolean;
-    readonly __chardbAuthority?: MutationAuthority;
-    readonly __chardbInvokeValidated?: (ctx: unknown, args: RawJson) => unknown;
-    readonly __chardbValidateArgs?: (args: unknown) => RawJson;
-}
-
-interface QueryMarked extends RefMarked {
-    readonly __chardbKind: "query";
-    readonly __chardbIntent?: (args: RawJson) => CdbIntent;
-    readonly __chardbValidateArgs?: (args: unknown) => Promise<RawJson>;
-    readonly __chardbAuthority?: MutationAuthority;
-    readonly __chardbPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
-    readonly __chardbInvokeValidated?: (ctx: unknown, args: RawJson) => Promise<unknown>;
-    readonly __chardbCompilePlan?: (args: RawJson) => RegisteredQueryPlan;
-}
-
-interface CronMarked extends RefMarked {
-    readonly __chardbKind: "cron";
-    readonly __chardbCron: string;
-}
 
 export interface MutationDescriptor {
     readonly ref: ChardbRef;
@@ -110,14 +83,12 @@ export type QueryRouteResponse =
           readonly queryHash: string;
           readonly authority: MutationAuthority | null;
           readonly partitionKey: string | null;
+          /** Present only for registered planned selects compiled from this manifest's packaged callback. */
+          readonly selectPlan?: ChardbSelectPlanV1 | undefined;
+          /** Present only for registered organization vector searches. */
+          readonly vectorPlan?: RegisteredVectorQueryPlan | undefined;
       }
     | { readonly ok: false; readonly error: ReturnType<CdbError["toJSON"]> };
-
-export interface CronDescriptor {
-    readonly ref: ChardbRef;
-    readonly cronExpr: string;
-    readonly invoke: () => void | Promise<void>;
-}
 
 export interface LedgerDescriptor {
     readonly ref: ChardbRef;
@@ -127,14 +98,12 @@ export interface LedgerDescriptor {
 export interface ChardbManifest {
     readonly mutations: ReadonlyMap<ChardbRef, MutationDescriptor>;
     readonly queries: ReadonlyMap<ChardbRef, QueryDescriptor>;
-    readonly crons: readonly CronDescriptor[];
     readonly ledgers: ReadonlyMap<ChardbRef, LedgerDescriptor>;
 }
 
 const EMPTY: ChardbManifest = {
     mutations: new Map(),
     queries: new Map(),
-    crons: [],
     ledgers: new Map(),
 };
 
@@ -142,89 +111,7 @@ export function emptyManifest(): ChardbManifest {
     return EMPTY;
 }
 
-function isRefMarked(v: unknown): v is RefMarked {
-    if (v === null) return false;
-    if (typeof v !== "function" && typeof v !== "object") return false;
-    const r = v as { __chardbRef?: unknown; __chardbKind?: unknown };
-    return typeof r.__chardbRef === "string" && typeof r.__chardbKind === "string";
-}
-
-/**
- * Walk an object of named exports and produce a `ChardbManifest`. Anything
- * without a `__chardbRef` marker is silently ignored — the user's worker
- * exports schemas, types, and miscellanea alongside chardb-marked values.
- */
-export function manifestFromExports(exports: Record<string, unknown>): ChardbManifest {
-    const mutations = new Map<ChardbRef, MutationDescriptor>();
-    const queries = new Map<ChardbRef, QueryDescriptor>();
-    const crons: CronDescriptor[] = [];
-    const ledgers = new Map<ChardbRef, LedgerDescriptor>();
-    const seenRefs = new Map<ChardbRef, { readonly kind: string; readonly value: unknown }>();
-
-    for (const value of Object.values(exports)) {
-        if (!isRefMarked(value)) continue;
-        const ref = value.__chardbRef as ChardbRef;
-        const seen = seenRefs.get(ref);
-        if (seen && seen.value !== value) {
-            throw new CdbError({
-                code: "CDB_INVARIANT",
-                message: `duplicate ref across ${seen.kind} and ${value.__chardbKind}: ${ref}`,
-            });
-        }
-        if (seen) continue;
-        seenRefs.set(ref, { kind: value.__chardbKind, value });
-        switch (value.__chardbKind) {
-            case "mutation": {
-                const m = value as MutationMarked & ((ctx: unknown, args: RawJson) => unknown);
-                const duplicate = mutations.get(ref);
-                if (duplicate && duplicate.invoke !== m) {
-                    throw new CdbError({ code: "CDB_INVARIANT", message: `duplicate mutation ref: ${ref}` });
-                }
-                mutations.set(ref, {
-                    ref,
-                    invoke: m,
-                    invokeValidated: m.__chardbInvokeValidated ?? m,
-                    ...(m.__chardbValidateArgs ? { validateArgs: m.__chardbValidateArgs } : {}),
-                    ...(m.__chardbPartitionKey ? { extractPartitionKey: m.__chardbPartitionKey } : {}),
-                    singlePartition: m.__chardbSinglePartition === true,
-                    ...(m.__chardbAuthority ? { authority: m.__chardbAuthority } : {}),
-                });
-                break;
-            }
-            case "query": {
-                const query = value as QueryMarked & ((ctx: unknown, args: RawJson) => Promise<unknown>);
-                const duplicate = queries.get(ref);
-                if (duplicate && duplicate.invoke !== query) {
-                    throw new CdbError({ code: "CDB_INVARIANT", message: `duplicate query ref: ${ref}` });
-                }
-                queries.set(ref, {
-                    ref,
-                    invoke: query,
-                    invokeValidated: query.__chardbInvokeValidated ?? query,
-                    ...(query.__chardbValidateArgs ? { validateArgs: query.__chardbValidateArgs } : {}),
-                    ...(query.__chardbIntent ? { extractIntent: query.__chardbIntent } : {}),
-                    ...(query.__chardbAuthority ? { authority: query.__chardbAuthority } : {}),
-                    ...(query.__chardbPartitionKey ? { extractPartitionKey: query.__chardbPartitionKey } : {}),
-                    ...(query.__chardbCompilePlan ? { compilePlan: query.__chardbCompilePlan } : {}),
-                });
-                break;
-            }
-            case "cron": {
-                const c = value as CronMarked & (() => void | Promise<void>);
-                crons.push({ ref, cronExpr: c.__chardbCron, invoke: c });
-                break;
-            }
-            case "ledger": {
-                const l = value as RefMarked & { readonly tableName?: string };
-                ledgers.set(ref, { ref, tableName: l.tableName ?? ref });
-                break;
-            }
-            default:
-                break;
-        }
-    }
-    return { mutations, queries, crons, ledgers };
-}
+export { manifestFromExports } from "../vite/manifest.ts";
 
 /**
  * Resolve a mutation by ref, raising `CDB_REF_NOT_FOUND` if the manifest
@@ -260,6 +147,84 @@ function requireAuthorityPartition(
     });
 }
 
+function registeredSelectPlan(compiled: RegisteredQueryPlan | undefined, ref: string): ChardbSelectPlanV1 | undefined {
+    if (!compiled || compiled.kind !== "select") return undefined;
+    const plan = validateChardbSelectPlanV1(compiled.plan);
+    const orderBy = plan.orderBy ?? [];
+    const metadataMatches =
+        plan.cardinality === "many" &&
+        plan.limit === compiled.limit &&
+        compiled.intent.tables.length === 1 &&
+        compiled.intent.tables[0] === plan.table &&
+        orderBy.length === compiled.orderBy.length &&
+        orderBy.every(
+            (item, index) =>
+                item.column === compiled.orderBy[index]?.column && item.direction === compiled.orderBy[index]?.direction
+        );
+    if (!metadataMatches) {
+        throw new CdbError({
+            code: "CDB_INVARIANT",
+            message: `query ${ref} canonical select plan disagrees with its legacy compiler metadata`,
+        });
+    }
+    return plan;
+}
+
+function registeredVectorPlan(
+    compiled: RegisteredQueryPlan | undefined,
+    ref: string
+): RegisteredVectorQueryPlan | undefined {
+    if (!compiled || compiled.kind !== "searchVector") return undefined;
+    const resource = normalizeChardbResourceDescriptor(compiled.resource);
+    const expectedIntent: CdbIntent = {
+        kind: "select",
+        tables: [compiled.resource.table],
+        partitionKey: {
+            table: compiled.resource.table,
+            column: compiled.resource.organizationColumn,
+            values: [compiled.partitionKey],
+        },
+    };
+    const hashInput = {
+        version: 1,
+        kind: "searchVector",
+        authority: "organization",
+        partitionKey: compiled.partitionKey,
+        intent: compiled.intent,
+        resource: compiled.resource,
+        values: compiled.values,
+        limit: compiled.limit,
+    } as const;
+    const metadataMatches =
+        isChardbVectorResourceDescriptor(resource) &&
+        stableJson(resource) === stableJson(compiled.resource) &&
+        compiled.authority === "organization" &&
+        typeof compiled.partitionKey === "string" &&
+        compiled.partitionKey.length > 0 &&
+        new TextEncoder().encode(compiled.partitionKey).byteLength <= 256 &&
+        stableJson(compiled.intent as unknown as RawJson) === stableJson(expectedIntent as unknown as RawJson) &&
+        Array.isArray(compiled.values) &&
+        compiled.values.length === compiled.resource.dimensions &&
+        compiled.values.every(
+            value =>
+                typeof value === "number" &&
+                Number.isFinite(value) &&
+                Math.fround(value) === value &&
+                !Object.is(value, -0)
+        ) &&
+        Number.isSafeInteger(compiled.limit) &&
+        compiled.limit >= 1 &&
+        compiled.limit <= CDB_VECTOR_SEARCH_MAX_RESULTS &&
+        compiled.planHash === stableHashHex(hashInput);
+    if (!metadataMatches) {
+        throw new CdbError({
+            code: "CDB_INVARIANT",
+            message: `query ${ref} vector plan disagrees with its organization resource metadata`,
+        });
+    }
+    return compiled;
+}
+
 /** Re-derive query placement from arguments that Gateway already validated. */
 export function routeValidatedQuery(
     manifest: ChardbManifest,
@@ -275,6 +240,8 @@ export function routeValidatedQuery(
         });
     }
     const plan = descriptor.compilePlan?.(callbackArgs);
+    const selectPlan = registeredSelectPlan(plan, input.ref);
+    const vectorPlan = registeredVectorPlan(plan, input.ref);
     const intentCandidate = plan?.intent ?? descriptor.extractIntent?.(callbackArgs);
     if (!intentCandidate) {
         throw new CdbError({
@@ -311,6 +278,8 @@ export function routeValidatedQuery(
         }),
         authority: authority ?? null,
         partitionKey: key === undefined ? null : String(key),
+        ...(selectPlan ? { selectPlan } : {}),
+        ...(vectorPlan ? { vectorPlan } : {}),
     };
 }
 

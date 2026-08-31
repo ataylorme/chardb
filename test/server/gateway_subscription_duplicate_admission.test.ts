@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { Gateway, type GatewayEnv, type VerifiedGwAttachment } from "../../src/server/do/gateway.ts";
+import type { VerifiedGwAttachment } from "../../src/server/do/gateway-auth-dispatch.ts";
+import { Gateway, type GatewayEnv } from "../../src/server/do/gateway.ts";
 import { ClientId, Cookie, PrincipalId } from "../../src/types.ts";
 import type { RawJson } from "../../src/wire.ts";
 

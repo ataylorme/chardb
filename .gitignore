@@ -11,9 +11,7 @@ dist
 chardb-*.tgz
 bun.lockb
 *.log
+artifacts/
 .DS_Store
-test/workerd/.test-worker.bundle.mjs
-test/workerd/.test-catalog.bundle.mjs
-test/workerd/.test-atomic-mutation.bundle.mjs
-test/workerd/.test-registry-mutation.bundle.mjs
+test/workerd/.test-*.bundle.mjs
 landing/.tsbuild/

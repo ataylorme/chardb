@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { text } from "drizzle-orm/sqlite-core";
 import { isCdbError } from "../../src/errors.ts";
 import { globalScope } from "../../src/server/cdb-tenant.ts";
-import { createApi, defineCron, defineMutation, defineQuery } from "../../src/server/define.ts";
+import { createApi, defineMutation, defineQuery } from "../../src/server/define.ts";
 import {
     manifestFromExports,
     resolveMutation,
@@ -31,14 +31,11 @@ const listOrganizationPosts = defineQuery({
     handler: async () => [],
 });
 
-const nightly = defineCron<unknown, Record<string, never>, void>("0 0 * * *", async () => {});
-
 describe("manifestFromExports", () => {
-    test("collects mutations / queries / crons by ref", () => {
-        const m = manifestFromExports({ createPost, listPosts, nightly, junk: 42, schema: {} });
+    test("collects mutations and queries by ref", () => {
+        const m = manifestFromExports({ createPost, listPosts, junk: 42, schema: {} });
         expect(m.mutations.size).toBe(1);
         expect(m.queries.size).toBe(1);
-        expect(m.crons).toHaveLength(1);
         const ref = createPost.__chardbRef as ChardbRef;
         const desc = resolveMutation(m, ref);
         expect(desc.singlePartition).toBe(true);
@@ -47,7 +44,6 @@ describe("manifestFromExports", () => {
         expect(desc.invoke({ db: {}, auth: { userId: "u1", claims: {} } }, { authorId: "u1", body: "hi" })).toEqual({
             id: "post-u1",
         });
-        expect(m.crons[0]?.cronExpr).toBe("0 0 * * *");
     });
 
     test("resolveMutation throws CDB_REF_NOT_FOUND for unknown ref", () => {
@@ -100,7 +96,30 @@ describe("manifestFromExports", () => {
             () => "policy"
         );
         expect(route).toMatchObject({ authority: "global", partitionKey: "shared" });
+        expect(route.selectPlan).toEqual(query.__chardbCompilePlan?.({ scope: "shared" }).plan);
         expect(route.queryHash).toContain("planHash");
+
+        const legacyRoute = routeValidatedQuery(
+            manifestFromExports({ listOrganizationPosts }),
+            { ref: listOrganizationPosts.__chardbRef, args: { organizationId: "org-1" } },
+            () => "policy"
+        );
+        expect(legacyRoute.selectPlan).toBeUndefined();
+
+        const descriptor = resolveQuery(manifest, query.__chardbRef);
+        const compilePlan = descriptor.compilePlan;
+        if (!compilePlan) throw new Error("planned descriptor omitted its compiler");
+        (manifest.queries as Map<ChardbRef, typeof descriptor>).set(query.__chardbRef, {
+            ...descriptor,
+            compilePlan: args => {
+                const compiled = compilePlan(args);
+                if (compiled.kind !== "select") throw new Error("select fixture compiled a vector plan");
+                return { ...compiled, plan: { ...compiled.plan, limit: compiled.limit - 1 } };
+            },
+        });
+        expect(() =>
+            routeValidatedQuery(manifest, { ref: query.__chardbRef, args: { scope: "shared" } }, () => "policy")
+        ).toThrow("canonical select plan disagrees with its legacy compiler metadata");
     });
 
     test("preserves and routes global mutation and query placement", () => {

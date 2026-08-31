@@ -190,31 +190,36 @@ export function encodeWire(msg: WireMessage): string {
  * not in one of these sets is rejected — the wire format is closed; new tags
  * require a `protocolV` bump per the locked-surface contract.
  */
-export const UP_TAGS = [
-    "hello",
-    "sub",
-    "unsub",
-    "mut",
-    "updateAuth",
-    "ack",
-    "presencePub",
-    "presenceSub",
-    "streamReq",
-    "ping",
-] as const satisfies readonly Up["t"][];
+const UP_TAG_RECORD = {
+    hello: true,
+    sub: true,
+    unsub: true,
+    mut: true,
+    updateAuth: true,
+    ack: true,
+    presencePub: true,
+    presenceSub: true,
+    streamReq: true,
+    ping: true,
+} as const satisfies Record<Up["t"], true>;
 
-export const DOWN_TAGS = [
-    "welcome",
-    "poke",
-    "snapshot",
-    "mustRefetch",
-    "presence",
-    "streamChunk",
-    "streamEnd",
-    "error",
-] as const satisfies readonly Down["t"][];
+const DOWN_TAG_RECORD = {
+    welcome: true,
+    poke: true,
+    snapshot: true,
+    mustRefetch: true,
+    presence: true,
+    streamChunk: true,
+    streamEnd: true,
+    error: true,
+} as const satisfies Record<Down["t"], true>;
+
+export const UP_TAGS = Object.freeze(Object.keys(UP_TAG_RECORD)) as readonly Up["t"][];
+export const DOWN_TAGS = Object.freeze(Object.keys(DOWN_TAG_RECORD)) as readonly Down["t"][];
 
 const ALL_TAGS = new Set<string>([...UP_TAGS, ...DOWN_TAGS]);
+const UP_TAG_SET = new Set<string>(UP_TAGS);
+const DOWN_TAG_SET = new Set<string>(DOWN_TAGS);
 
 type WireObject = Record<string, unknown>;
 
@@ -537,6 +542,24 @@ export function decodeWire(raw: string): WireMessage {
     }
     validateMessage(parsed as WireObject, tag);
     return parsed as WireMessage;
+}
+
+/** Decode one client-to-server message and reject a valid tag sent in the wrong direction. */
+export function decodeUp(raw: string): Up {
+    const message = decodeWire(raw);
+    if (!UP_TAG_SET.has(message.t)) {
+        throw new TypeError(`malformed wire message: tag "${message.t}" is not valid client-to-server`);
+    }
+    return message as Up;
+}
+
+/** Decode one server-to-client message and reject a valid tag sent in the wrong direction. */
+export function decodeDown(raw: string): Down {
+    const message = decodeWire(raw);
+    if (!DOWN_TAG_SET.has(message.t)) {
+        throw new TypeError(`malformed wire message: tag "${message.t}" is not valid server-to-client`);
+    }
+    return message as Down;
 }
 
 /**

@@ -1,5 +1,5 @@
 /**
- * `chardb/observability` — auxiliary surface for an optional `chardb-tail`
+ * Internal support for an optional `chardb-tail`
  * Worker. Cloudflare Workers Tail consumers receive `TraceItem` events on
  * every parent invocation; this module normalizes the chardb-relevant fields
  * and routes them to the user's chosen sink.
@@ -182,7 +182,7 @@ export function resolveTailSink(env: ChardbTailEnv): TailSink {
  * Default `chardb-tail` Worker entry. Drop into a sibling Worker:
  *
  * ```ts
- * import { defaultChardbTail } from "chardb/observability";
+ * import { defaultChardbTail } from "./observability/index.ts";
  * export default defaultChardbTail();
  * ```
  *

@@ -1,10 +1,19 @@
 import type { BetterAuthOptions } from "better-auth";
 import { renderSqliteTableDdl } from "../auth/ddl.ts";
-import { synthesizeAuthSchema } from "../auth/synthesize.ts";
+import { synthesizeAuthSchema, synthesizedAuthTableNames } from "../auth/synthesize.ts";
 import { CdbError } from "../errors.ts";
 import { stableHashHex } from "../util/canonical.ts";
 import { collectCdbTables } from "./cdb-table-registry.ts";
 import { resolveCdbMeta } from "./cdb-table.ts";
+import { renderFileAttachmentTriggers } from "./file-triggers.ts";
+import {
+    type ChardbResourceDescriptor,
+    collectSchemaResourceDescriptors,
+    isChardbFileResourceDescriptor,
+    isChardbVectorResourceDescriptor,
+    normalizeChardbResourceDescriptors,
+} from "./resource-descriptors.ts";
+import { renderVectorMutationTriggers } from "./vector-triggers.ts";
 
 const MIGRATION_NAME = /^[a-z0-9][a-z0-9_-]{0,127}$/;
 const MAX_MIGRATIONS = 1_024;
@@ -19,6 +28,8 @@ export interface ChardbMigrationInput {
     readonly statements: readonly string[];
     /** SQL applied once to Catalog-owned auth tables. */
     readonly catalogStatements?: readonly string[];
+    /** Normalized native-resource identity active after this migration. Later entries replace the same locator. */
+    readonly resources?: readonly ChardbResourceDescriptor[];
 }
 
 export interface ChardbMigration {
@@ -26,6 +37,7 @@ export interface ChardbMigration {
     readonly name: string;
     readonly statements: readonly string[];
     readonly catalogStatements: readonly string[];
+    readonly resources: readonly ChardbResourceDescriptor[];
     readonly digest: string;
 }
 
@@ -72,7 +84,9 @@ export function defineSchemaBaseline(input: ChardbBaselineInput): ChardbMigratio
         left.meta.name.localeCompare(right.meta.name)
     );
     const domainNames = new Set(domain.map(entry => entry.meta.name));
-    const statements = domain.flatMap(({ table }) => {
+    const authSchema = synthesizeAuthSchema(input.authOptions as never) as unknown as Record<string, unknown>;
+    const authNames = synthesizedAuthTableNames(authSchema);
+    const tableStatements = domain.flatMap(({ table }) => {
         const meta = resolveCdbMeta(table);
         const authorityColumns = new Set([meta.tenantBy, meta.selfBy].filter(value => value !== undefined));
         const ddl = renderSqliteTableDdl(table, {
@@ -81,7 +95,11 @@ export function defineSchemaBaseline(input: ChardbBaselineInput): ChardbMigratio
             hint: "use SQLite-compatible cdbTable definitions",
             includeForeignKey: reference => {
                 if (domainNames.has(reference.foreignTableName)) return true;
-                if (reference.columns.some(column => authorityColumns.has(column))) return false;
+                if (
+                    authNames.has(reference.foreignTableName) ||
+                    reference.columns.some(column => authorityColumns.has(column))
+                )
+                    return false;
                 throw new CdbError({
                     code: "CDB_NONLOCAL_FK",
                     message: `domain migration baseline references non-cdbTable "${reference.foreignTableName}"`,
@@ -90,16 +108,22 @@ export function defineSchemaBaseline(input: ChardbBaselineInput): ChardbMigratio
         });
         return [ddl.createTable, ...ddl.indexes];
     });
-    const authSchema = synthesizeAuthSchema(input.authOptions as never) as unknown as Record<string, unknown>;
     const catalogStatements = Object.values(authSchema).flatMap(table => {
         const ddl = renderSqliteTableDdl(table as never);
         return [ddl.createTable, ...ddl.indexes];
     });
+    const resources = collectSchemaResourceDescriptors(input.domainSchema);
+    const statements = [
+        ...tableStatements,
+        ...resources.filter(isChardbFileResourceDescriptor).flatMap(renderFileAttachmentTriggers),
+        ...resources.filter(isChardbVectorResourceDescriptor).flatMap(renderVectorMutationTriggers),
+    ];
     return {
         version: input.version,
         name: input.name,
         statements,
         catalogStatements,
+        ...(resources.length > 0 ? { resources } : {}),
     };
 }
 
@@ -117,11 +141,16 @@ export function defineMigrations(input: readonly ChardbMigrationInput[]): Chardb
         }
         const descriptors = Object.getOwnPropertyDescriptors(raw);
         const keys = Object.keys(descriptors).sort();
+        const allowed = new Set(["catalogStatements", "name", "resources", "statements", "version"]);
         if (
-            JSON.stringify(keys) !== JSON.stringify(["name", "statements", "version"]) &&
-            JSON.stringify(keys) !== JSON.stringify(["catalogStatements", "name", "statements", "version"])
+            !keys.includes("name") ||
+            !keys.includes("statements") ||
+            !keys.includes("version") ||
+            keys.some(key => !allowed.has(key))
         ) {
-            invalidJournal(`migration ${index + 1} must contain only name, statements, catalogStatements, and version`);
+            invalidJournal(
+                `migration ${index + 1} must contain only name, statements, catalogStatements, resources, and version`
+            );
         }
         for (const key of keys) {
             if (!("value" in (descriptors[key] as PropertyDescriptor))) {
@@ -132,6 +161,7 @@ export function defineMigrations(input: readonly ChardbMigrationInput[]): Chardb
         const name = descriptors.name?.value as unknown;
         const rawStatements = descriptors.statements?.value as unknown;
         const rawCatalogStatements = descriptors.catalogStatements?.value as unknown;
+        const rawResources = descriptors.resources?.value as unknown;
         if (version !== index + 1) invalidJournal(`versions must be contiguous from 1; expected ${index + 1}`);
         if (typeof name !== "string" || !MIGRATION_NAME.test(name)) {
             invalidJournal(`migration ${version} has an invalid name`);
@@ -167,12 +197,23 @@ export function defineMigrations(input: readonly ChardbMigrationInput[]): Chardb
         }
         const ownedStatements = Object.freeze([...statements]);
         const ownedCatalogStatements = Object.freeze([...catalogStatements]);
+        const resources =
+            rawResources === undefined
+                ? (Object.freeze([]) as readonly ChardbResourceDescriptor[])
+                : normalizeChardbResourceDescriptors(
+                      ownArray(rawResources as readonly unknown[], `migration ${version} resources`)
+                  );
         return Object.freeze({
             version,
             name,
             statements: ownedStatements,
             catalogStatements: ownedCatalogStatements,
-            digest: stableHashHex([version, name, ownedStatements, ownedCatalogStatements]),
+            resources,
+            digest: stableHashHex(
+                resources.length === 0
+                    ? [version, name, ownedStatements, ownedCatalogStatements]
+                    : [version, name, ownedStatements, ownedCatalogStatements, resources]
+            ),
         });
     });
     const version = migrations.length;

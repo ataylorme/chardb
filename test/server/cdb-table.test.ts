@@ -9,27 +9,17 @@
  *   - column matrix compilation: role-axis, column-axis, contradictions
  *   - PolicyDefinition emission parity with the old helpers' shapes
  *   - column mask + writability check
- *   - AccessControl materialization including `user:` prefix routing
  */
 
 import { describe, expect, test } from "bun:test";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { CdbError, type CdbErrorCode } from "../../src/errors.ts";
-import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
-import {
-    applyColumnMask,
-    applyPoliciesToWhere,
-    applyRowPolicies,
-    assertColumnsWritable,
-    buildAccessControl,
-    compileCdbPolicies,
-    forOrg,
-    forUser,
-    getCdbMeta,
-    globalScope,
-    isCdbTable,
-    resolveCdbMeta,
-} from "../../src/server/index.ts";
+import { applyColumnMask, assertColumnsWritable } from "../../src/server/cdb-cls.ts";
+import { cdbPolicyDigest, compileCdbPolicies } from "../../src/server/cdb-policy.ts";
+import { getCdbMeta, isCdbTable } from "../../src/server/cdb-table-registry.ts";
+import { resolveCdbMeta } from "../../src/server/cdb-table.ts";
+import { forOrg, forOrgUser, forUser, globalScope } from "../../src/server/cdb-tenant.ts";
+import { applyPoliciesToWhere, applyRowPolicies } from "../../src/server/policy.ts";
 
 function expectCdbError(fn: () => unknown, expectedCode: CdbErrorCode): void {
     let caught: unknown;
@@ -166,6 +156,322 @@ describe("forOrg() / cdbTable", () => {
     });
 });
 
+describe("forOrgUser() / cdbTable", () => {
+    const { cdbTable } = forOrgUser();
+
+    test("auto-discovers organization routing and user ownership", () => {
+        const rows = cdbTable(
+            "tbl_forOrgUser_autodiscover",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
+                body: text("body").notNull(),
+            },
+            { roles: { admin: "*", self: { read: "*", update: ["body"] } } }
+        );
+
+        expect(resolveCdbMeta(rows)).toMatchObject({
+            tenantKind: "org",
+            tenantBy: "organization_id",
+            selfBy: "user_id",
+            selfTarget: "user",
+        });
+    });
+
+    test("requires one unambiguous user FK unless selfBy selects one", () => {
+        const missing = cdbTable(
+            "tbl_forOrgUser_missing_user",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+            },
+            { roles: { self: { read: "*" } } }
+        );
+        expectCdbError(() => resolveCdbMeta(missing), "CDB_INVALID_SELF");
+
+        const selected = cdbTable(
+            "tbl_forOrgUser_selected_user",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                ownerId: text("owner_id")
+                    .notNull()
+                    .references(() => userTable.id),
+                reviewerId: text("reviewer_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { selfBy: "ownerId", roles: { self: { read: "*" } } }
+        );
+        expect(resolveCdbMeta(selected).selfBy).toBe("owner_id");
+    });
+
+    test("requires selfBy for nonconventional owners and verifies that it targets user", () => {
+        const implicitOwner = cdbTable(
+            "tbl_forOrgUser_implicit_owner",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                ownerId: text("owner_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { roles: { self: { read: "*" } } }
+        );
+        expectCdbError(() => resolveCdbMeta(implicitOwner), "CDB_INVALID_SELF");
+
+        const invalidOwner = cdbTable(
+            "tbl_forOrgUser_invalid_owner",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                ownerId: text("owner_id").notNull(),
+                reviewerId: text("reviewer_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { selfBy: "ownerId", roles: { self: { read: "*" } } }
+        );
+        expectCdbError(() => resolveCdbMeta(invalidOwner), "CDB_INVALID_SELF");
+    });
+
+    test("keeps managed insert columns aligned with what TypeScript can infer", () => {
+        const conventional = cdbTable(
+            "tbl_forOrgUser_conventional_insert",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { roles: { self: { create: "*" } } }
+        );
+        const conventionalInsert: typeof conventional.$inferInsert = { id: "conventional" };
+
+        const implicitOwner = cdbTable(
+            "tbl_forOrgUser_implicit_owner_insert",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                ownerId: text("owner_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { roles: { self: { create: "*" } } }
+        );
+        // @ts-expect-error ownerId stays required until selfBy marks it as managed.
+        const missingImplicitOwner: typeof implicitOwner.$inferInsert = { id: "implicit" };
+
+        const explicitOwner = cdbTable(
+            "tbl_forOrgUser_explicit_owner_insert",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                ownerId: text("owner_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { selfBy: "ownerId", roles: { self: { create: "*" } } }
+        );
+        const explicitInsert: typeof explicitOwner.$inferInsert = { id: "explicit" };
+
+        expect([conventionalInsert.id, missingImplicitOwner.id, explicitInsert.id]).toEqual([
+            "conventional",
+            "implicit",
+            "explicit",
+        ]);
+    });
+
+    test("keeps the organization floor while allowing org roles and self grants", () => {
+        const rows = cdbTable(
+            "tbl_forOrgUser_policy",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { roles: { admin: { read: "*" }, self: { read: "*" } } }
+        );
+        const policies = compileCdbPolicies(rows);
+        const mine = { id: "mine", organization_id: "org-A", user_id: "user-A" };
+        const peer = { id: "peer", organization_id: "org-A", user_id: "user-B" };
+        const otherOrg = { id: "other-org", organization_id: "org-B", user_id: "user-A" };
+        const data = [mine, peer, otherOrg];
+
+        expect(
+            applyRowPolicies({
+                op: "select",
+                auth: { userId: "user-A", tenantId: "org-A", role: "member", claims: {} },
+                rows: data,
+                policies,
+            })
+        ).toEqual([mine]);
+        expect(
+            applyRowPolicies({
+                op: "select",
+                auth: { userId: "admin-A", tenantId: "org-A", role: "admin", claims: {} },
+                rows: data,
+                policies,
+            })
+        ).toEqual([mine, peer]);
+    });
+
+    test("keeps organization and user role namespaces separate for rows and columns", () => {
+        const userAdminRows = cdbTable(
+            "tbl_forOrgUser_user_admin_rows",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
+            },
+            { roles: { "user:admin": { read: "*" } } }
+        );
+        const row = { id: "row", organization_id: "org-A", user_id: "owner" };
+        const orgAdmin = {
+            userId: "org-admin",
+            tenantId: "org-A",
+            role: "admin",
+            roles: ["admin"],
+            claims: { userRole: "member" },
+        };
+        const userAdmin = {
+            userId: "user-admin",
+            tenantId: "org-A",
+            role: "member",
+            roles: ["member"],
+            claims: { userRole: "admin" },
+        };
+        const forgedUserNamespace = {
+            userId: "forged-user-admin",
+            tenantId: "org-A",
+            role: "user:admin",
+            roles: ["user:admin"],
+            claims: { userRole: "member" },
+        };
+
+        expect(
+            applyRowPolicies({
+                op: "select",
+                auth: orgAdmin,
+                rows: [row],
+                policies: compileCdbPolicies(userAdminRows),
+            })
+        ).toEqual([]);
+        expect(
+            applyRowPolicies({
+                op: "select",
+                auth: userAdmin,
+                rows: [row],
+                policies: compileCdbPolicies(userAdminRows),
+            })
+        ).toEqual([row]);
+        expect(
+            applyRowPolicies({
+                op: "select",
+                auth: forgedUserNamespace,
+                rows: [row],
+                policies: compileCdbPolicies(userAdminRows),
+            })
+        ).toEqual([]);
+
+        const roleColumns = cdbTable(
+            "tbl_forOrgUser_role_columns",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
+                organizationSecret: text("organization_secret").notNull(),
+                userSecret: text("user_secret").notNull(),
+            },
+            {
+                roles: {
+                    admin: { read: ["id", "organizationSecret"] },
+                    "user:admin": { read: ["id", "userSecret"] },
+                },
+            }
+        );
+        const visible: Record<string, string | null> = {
+            id: "row",
+            organization_id: "org-A",
+            user_id: "owner",
+            organization_secret: "organization-only",
+            user_secret: "user-only",
+        };
+
+        expect(applyColumnMask({ rows: [visible], table: roleColumns, auth: orgAdmin })).toEqual([
+            {
+                id: "row",
+                organization_id: null,
+                user_id: null,
+                organization_secret: "organization-only",
+                user_secret: null,
+            },
+        ]);
+        expect(applyColumnMask({ rows: [visible], table: roleColumns, auth: userAdmin })).toEqual([
+            {
+                id: "row",
+                organization_id: null,
+                user_id: null,
+                organization_secret: null,
+                user_secret: "user-only",
+            },
+        ]);
+        expect(
+            applyColumnMask({
+                rows: [visible],
+                table: roleColumns,
+                auth: {
+                    userId: "both-admins",
+                    tenantId: "org-A",
+                    role: "admin",
+                    roles: ["admin"],
+                    claims: { userRole: "admin" },
+                },
+            })
+        ).toEqual([
+            {
+                id: "row",
+                organization_id: null,
+                user_id: null,
+                organization_secret: "organization-only",
+                user_secret: "user-only",
+            },
+        ]);
+    });
+});
+
 describe("forUser() / cdbTable", () => {
     const { cdbTable } = forUser();
 
@@ -201,6 +507,31 @@ describe("forUser() / cdbTable", () => {
                 ),
             "CDB_INVALID_SELF"
         );
+    });
+
+    test("a bare table gives its owning user the implicit self grant", () => {
+        const owned = cdbTable(
+            "tbl_forUser_implicit_self",
+            {
+                id: text("id").primaryKey(),
+                userId: text("user_id")
+                    .notNull()
+                    .references(() => userTable.id),
+                body: text("body").notNull(),
+            },
+            {}
+        );
+        const auth = { userId: "user-a", claims: {} };
+        const row = { id: "row-a", user_id: "user-a", body: "owned" };
+        const policies = compileCdbPolicies(owned);
+
+        for (const op of ["select", "insert", "update", "delete"] as const) {
+            expect(applyRowPolicies({ op, auth, rows: [row], policies })).toEqual([row]);
+        }
+        expect(applyColumnMask({ rows: [row], table: owned, auth })).toEqual([row]);
+        expect(() =>
+            assertColumnsWritable({ values: { body: "changed" }, table: owned, auth, verb: "update" })
+        ).not.toThrow();
     });
 });
 
@@ -434,6 +765,24 @@ describe("compileCdbPolicies — RLS shape parity", () => {
         expect(() => cdbPolicyDigest({ messages }, ["missing_table"])).toThrow("unknown cdbTable missing_table");
     });
 
+    test("policy identity reuses the digest for one stable runtime schema and table set", () => {
+        let schemaReads = 0;
+        const schema: Record<string, unknown> = {};
+        Object.defineProperty(schema, "messages", {
+            enumerable: true,
+            get: () => {
+                schemaReads += 1;
+                return messages;
+            },
+        });
+
+        const first = cdbPolicyDigest(schema, ["messages_for_compile"]);
+        const second = cdbPolicyDigest(schema, ["messages_for_compile", "messages_for_compile"]);
+
+        expect(second).toBe(first);
+        expect(schemaReads).toBe(1);
+    });
+
     test("policy identity uses locale-independent Unicode name ordering", () => {
         const makeTable = (roles: Record<string, { readonly read: "*" }>) =>
             cdbTable(
@@ -538,56 +887,39 @@ describe("CLS — applyColumnMask + assertColumnsWritable", () => {
             })
         ).not.toThrow();
     });
-});
 
-describe("buildAccessControl", () => {
-    const { cdbTable } = forOrg();
-    const channels = cdbTable(
-        "channels_for_ac",
-        {
-            id: text("id").primaryKey(),
-            organizationId: text("organization_id")
-                .notNull()
-                .references(() => orgTable.id),
-        },
-        { roles: { admin: "*", member: { read: "*" } } }
-    );
-    const messages = cdbTable(
-        "messages_for_ac",
-        {
-            id: text("id").primaryKey(),
-            organizationId: text("organization_id")
-                .notNull()
-                .references(() => orgTable.id),
-            authorId: text("author_id")
-                .notNull()
-                .references(() => userTable.id),
-            body: text("body").notNull(),
-        },
-        {
-            selfBy: "authorId",
-            roles: {
-                admin: "*",
-                member: { create: ["body"] },
-                self: { update: ["body"] },
-                "user:superadmin": "*",
+    test("publicRead does not erase an authenticated caller's column mask", () => {
+        const publicMessages = cdbTable(
+            "public_messages_for_cls",
+            {
+                id: text("id").primaryKey(),
+                organizationId: text("organization_id")
+                    .notNull()
+                    .references(() => orgTable.id),
+                body: text("body").notNull(),
+                moderationNote: text("moderation_note"),
             },
-        }
-    );
-    const built = buildAccessControl({ channels, messages });
+            {
+                publicRead: true,
+                roles: { member: { read: { exclude: ["moderationNote"] } } },
+            }
+        );
+        const row: Record<string, string | null> = {
+            id: "1",
+            organization_id: "org",
+            body: "hello",
+            moderation_note: "private",
+        };
 
-    test("emits org-scope roles for unprefixed names", () => {
-        expect(built.roles.admin).toBeDefined();
-        expect(built.roles.member).toBeDefined();
-    });
-
-    test("emits user-scope roles for `user:`-prefixed names", () => {
-        expect(built.userRoles.superadmin).toBeDefined();
-    });
-
-    test("admin authorizes every verb on every cdbTable", () => {
-        const admin = built.roles.admin;
-        if (!admin) throw new Error("expected buildAccessControl to create the admin role");
-        expect(admin.authorize({ messages_for_ac: ["read", "create", "update", "delete"] }).success).toBe(true);
+        expect(
+            applyColumnMask({
+                rows: [row],
+                table: publicMessages,
+                auth: { userId: "member", role: "member", claims: {} },
+            })
+        ).toEqual([{ ...row, moderation_note: null }]);
+        expect(applyColumnMask({ rows: [row], table: publicMessages, auth: { userId: "", claims: {} } })).toEqual([
+            row,
+        ]);
     });
 });

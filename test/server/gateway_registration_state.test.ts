@@ -12,12 +12,12 @@ import {
     ensureGatewayRegistrationColumns,
     installGatewayRegistration,
     listCurrentGatewayRegistrationsForConnection,
-    projectCdbSubscriptionResponse,
     retireCurrentGatewayRegistration,
     retireCurrentGatewayRegistrationsForConnection,
     retireGatewayRegistration,
     settleInitialGatewaySnapshot,
-} from "../../src/server/do/gateway.ts";
+} from "../../src/server/do/gateway-registration-store.ts";
+import { projectCdbSubscriptionResponse } from "../../src/server/do/gateway.ts";
 import type { LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 

@@ -1,6 +1,6 @@
 /**
- * bun:test preload. `chardb/server` re-exports the DO base classes
- * (`Cdb`, `Catalog`, `Gateway`, `BlobMeta`, `Resharder`, `GsiShard`),
+ * bun:test preload. `@chardb/core/server` re-exports the DO base classes
+ * (`Cdb`, `Catalog`, `Gateway`),
  * which transitively import `cloudflare:workers` for `WorkerEntrypoint`
  * and `DurableObject`. Outside workerd that module doesn't exist; pure-
  * layer tests just need the shapes for type assertion / structural

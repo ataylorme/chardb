@@ -85,6 +85,31 @@ describe("mountChardb", () => {
         expect(await res.text()).toBe("chardb-reserved");
     });
 
+    test("the private file handler owns only its reserved subtree", async () => {
+        const userApp = {
+            async fetch(): Promise<Response> {
+                return new Response("user-app", { status: 200 });
+            },
+        };
+        const mounted = mountChardb(StubChardb as never, userApp, {
+            fileHandler: async request => new Response(`file:${new URL(request.url).pathname}`),
+        });
+        const upload = await mounted.fetch(
+            new Request("https://example.com/_chardb/files/upload"),
+            FAKE_ENV,
+            FAKE_CTX as unknown as ExecutionContext
+        );
+        expect(await upload.text()).toBe("file:/_chardb/files/upload");
+        expect(upload.headers.get("Cf-Chardb-Server-Version")).toBe("0.1.0");
+
+        const dashboard = await mounted.fetch(
+            new Request("https://example.com/_chardb/health"),
+            FAKE_ENV,
+            FAKE_CTX as unknown as ExecutionContext
+        );
+        expect(await dashboard.text()).toBe("chardb-reserved");
+    });
+
     test("former placeholder prefixes fall through to application routes", async () => {
         const userApp = {
             async fetch(req: Request): Promise<Response> {

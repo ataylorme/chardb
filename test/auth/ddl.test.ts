@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { organization } from "better-auth/plugins/organization";
-import { renderSqliteTableDdl } from "../../src/auth/ddl.ts";
+import { describeSqliteTableDdl, renderSqliteTableDdl, renderSqliteTableDdlDescriptor } from "../../src/auth/ddl.ts";
 import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 
 function install(schema: Record<string, unknown>): Database {
@@ -15,7 +15,7 @@ function install(schema: Record<string, unknown>): Database {
     return db;
 }
 
-function schemaFor(options = defineAuth({}).options): Record<string, unknown> {
+function schemaFor(options = defineAuth({ plugins: [organization()] }).options): Record<string, unknown> {
     return synthesizeAuthSchema(options as never) as unknown as Record<string, unknown>;
 }
 
@@ -31,6 +31,31 @@ function indexColumns(db: Database, table: string, unique?: boolean): string[][]
 }
 
 describe("auth SQLite DDL", () => {
+    test("renders the existing byte-exact DDL through one static descriptor", () => {
+        const table = schemaFor().session as never;
+        const descriptor = describeSqliteTableDdl(table);
+        const direct = renderSqliteTableDdl(table);
+        const staticRender = renderSqliteTableDdlDescriptor(descriptor);
+
+        expect(staticRender).toEqual(direct);
+        expect(descriptor.tableName).toBe("session");
+        expect(descriptor.columns.map(column => column.name)).toEqual([
+            "id",
+            "expiresAt",
+            "token",
+            "createdAt",
+            "updatedAt",
+            "ipAddress",
+            "userAgent",
+            "userId",
+            "activeOrganizationId",
+        ]);
+        expect(direct.createTable).toStartWith(
+            'CREATE TABLE "session" ("id" text PRIMARY KEY NOT NULL, "expiresAt" integer NOT NULL'
+        );
+        expect(direct.indexes).toEqual(descriptor.indexes.map(index => index.sql));
+    });
+
     test("executes core and organization DDL with columns, defaults, FKs, and indexes intact", () => {
         const db = install(schemaFor());
 

@@ -40,22 +40,29 @@ export function applyColumnMask<TRow extends Record<string, unknown>>(args: {
     readonly auth: AuthCtx;
 }): TRow[] {
     const meta = resolveCdbMeta(args.table);
-    if (meta.publicRead) return [...args.rows];
+    const hasConfiguredReadGrant = [...meta.matrix.allowed.values()].some(byVerb => {
+        const columns = byVerb.get("read");
+        return columns === null || (columns !== undefined && columns.size > 0);
+    });
+    if (meta.publicRead && (!args.auth.userId || !hasConfiguredReadGrant)) return [...args.rows];
     const callerRoleColumns = callerColumns(meta, args.auth, "read");
     const selfBy = meta.selfBy;
     const selfReadCols = selfColumns(meta, "read");
     const selfHasFullRead = selfReadCols === null;
+    const implicitSelf = meta.tenantKind === "user";
     // Fast path: caller's role grants every column AND self can't widen
     // (because self is null = "*" or unset). Skip the per-row projection.
     if (
         callerRoleColumns.size === meta.matrix.allColumns.length &&
-        (!selfBy || selfHasFullRead || (selfReadCols && selfReadCols.size === meta.matrix.allColumns.length))
+        ((!selfBy && !implicitSelf) ||
+            selfHasFullRead ||
+            (selfReadCols && selfReadCols.size === meta.matrix.allColumns.length))
     ) {
         return [...args.rows];
     }
     return args.rows.map(row => {
         const allowed = new Set(callerRoleColumns);
-        if (selfBy && row[selfBy] === args.auth.userId) {
+        if (implicitSelf || (selfBy && row[selfBy] === args.auth.userId)) {
             if (selfHasFullRead) {
                 for (const c of meta.matrix.allColumns) allowed.add(c);
             } else if (selfReadCols) {
@@ -93,6 +100,7 @@ export function assertColumnsWritable(args: {
         // post-write rows, so for create we accept self only when
         // selfBy === auth.userId is in the payload).
         if (meta.selfBy && col === meta.selfBy && args.values[col] === args.auth.userId) continue;
+        if (meta.tenantKind === "user" && isColumnAllowed(meta, "self", args.verb, col)) continue;
         if (meta.selfBy && isColumnAllowed(meta, "self", args.verb, col)) {
             const incomingSelf = args.values[meta.selfBy];
             if (incomingSelf === args.auth.userId) continue;

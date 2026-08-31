@@ -1,14 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { SyncSql } from "../../src/oplog/wrapper.ts";
+import type { VerifiedGwAttachment } from "../../src/server/do/gateway-auth-dispatch.ts";
 import {
-    Gateway,
-    type GatewayEnv,
     type GatewayRegistrationInstall,
-    MAX_INITIAL_SNAPSHOTS_PER_CONNECTION,
-    type VerifiedGwAttachment,
     installGatewayRegistration,
-} from "../../src/server/do/gateway.ts";
+} from "../../src/server/do/gateway-registration-store.ts";
+import { Gateway, type GatewayEnv, MAX_INITIAL_SNAPSHOTS_PER_CONNECTION } from "../../src/server/do/gateway.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 
 interface Cursor<T> extends Iterable<T> {
@@ -71,6 +69,7 @@ class FakeSocket {
 
 interface GatewayInternals {
     settleSubscription: () => Promise<void>;
+    routeQuery: () => Promise<{ readonly ok: false; readonly error: { readonly code: "CDB_REF_NOT_FOUND" } }>;
     pendingSubscriptions: Map<string, { cancelled: boolean }>;
 }
 
@@ -270,13 +269,13 @@ describe("Gateway aggregate live-query admission", () => {
         expect(db.query("SELECT COUNT(*) AS count FROM _gw_registration_heads").get()).toEqual({ count: 256 });
     });
 
-    test("admits one bounded replay lookup before a resumed subscription falls back", async () => {
+    test("bounds resumed subscription candidates without consuming replay state before settlement", async () => {
         const held = holdSettlements();
         const socket = new FakeSocket({ ...attachment(0), resumeRefetchPendingSubIds: [] });
 
         const replayLookup = subscribe(gateway, socket, 7);
         expect(held.calls()).toBe(1);
-        expect(socket.attachment.resumeRefetchPendingSubIds).toEqual([SubId(7)]);
+        expect(socket.attachment.resumeRefetchPendingSubIds).toEqual([]);
         held.releases[0]?.();
         await replayLookup;
         expect(socket.sent).toEqual([]);
@@ -301,6 +300,21 @@ describe("Gateway aggregate live-query admission", () => {
             subId: MAX_INITIAL_SNAPSHOTS_PER_CONNECTION,
             code: "CDB_RATE_LIMITED",
             retryable: true,
+        });
+    });
+
+    test("does not consume a resume replay attempt when routing rejects the subscription", async () => {
+        const socket = new FakeSocket({ ...attachment(0), resumeRefetchPendingSubIds: [] });
+        const internals = gateway as unknown as GatewayInternals;
+        internals.routeQuery = async () => ({ ok: false, error: { code: "CDB_REF_NOT_FOUND" } });
+
+        await subscribe(gateway, socket, 7);
+
+        expect(socket.attachment.resumeRefetchPendingSubIds).toEqual([]);
+        expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
+            t: "error",
+            subId: 7,
+            code: "CDB_REF_NOT_FOUND",
         });
     });
 

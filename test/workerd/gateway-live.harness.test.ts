@@ -3,7 +3,9 @@ import { rm } from "node:fs/promises";
 import * as path from "node:path";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { Miniflare } from "miniflare";
+import { disposeMiniflareBounded } from "../../scripts/miniflare-lifecycle.mjs";
 import { type ChardbClient, createChardbClient } from "../../src/client/index.ts";
+import { GATEWAY_BUCKET_COUNT, gatewayBucketName } from "../../src/server/gateway-bucket.ts";
 import { type ChardbRef, ClientId, MutId, type RawJson, SubId } from "../../src/types.ts";
 import { type Down, PROTOCOL_V, type Up, decodeWire, encodeWire } from "../../src/wire.ts";
 
@@ -173,24 +175,117 @@ async function openSocket(clientId: string, jwt: string, immediate?: Up): Promis
     return { socket, welcome: await welcome, closed };
 }
 
-function nextDown(socket: WebSocket, timeoutMs = 3_000): Promise<Down> {
-    return new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error("timed out waiting for Gateway message")), timeoutMs);
-        const onClose = (event: CloseEvent) => {
-            clearTimeout(timeout);
-            reject(new Error(`Gateway closed before replying (${event.code}: ${event.reason})`));
-        };
-        socket.addEventListener("close", onClose, { once: true });
-        socket.addEventListener(
-            "message",
-            event => {
-                clearTimeout(timeout);
-                socket.removeEventListener("close", onClose);
-                resolve(decodeWire(String(event.data)) as Down);
-            },
-            { once: true }
-        );
+interface DownWaiter {
+    readonly resolve: (message: Down) => void;
+    readonly reject: (error: Error) => void;
+    readonly timeout: ReturnType<typeof setTimeout>;
+}
+
+const downInboxes = new WeakMap<WebSocket, { readonly queued: Down[]; readonly waiters: DownWaiter[] }>();
+
+function downInbox(socket: WebSocket): { readonly queued: Down[]; readonly waiters: DownWaiter[] } {
+    const existing = downInboxes.get(socket);
+    if (existing) return existing;
+    const inbox = { queued: [] as Down[], waiters: [] as DownWaiter[] };
+    downInboxes.set(socket, inbox);
+    socket.addEventListener("message", event => {
+        const message = decodeWire(String(event.data)) as Down;
+        const waiter = inbox.waiters.shift();
+        if (!waiter) {
+            inbox.queued.push(message);
+            return;
+        }
+        clearTimeout(waiter.timeout);
+        waiter.resolve(message);
     });
+    socket.addEventListener(
+        "close",
+        event => {
+            for (const waiter of inbox.waiters.splice(0)) {
+                clearTimeout(waiter.timeout);
+                waiter.reject(new Error(`Gateway closed before replying (${event.code}: ${event.reason})`));
+            }
+        },
+        { once: true }
+    );
+    return inbox;
+}
+
+function nextDown(socket: WebSocket, timeoutMs = 3_000): Promise<Down> {
+    const inbox = downInbox(socket);
+    const queued = inbox.queued.shift();
+    if (queued) return Promise.resolve(queued);
+    return new Promise((resolve, reject) => {
+        const waiter = {
+            resolve,
+            reject,
+            timeout: setTimeout(() => {
+                const index = inbox.waiters.indexOf(waiter);
+                if (index >= 0) inbox.waiters.splice(index, 1);
+                reject(new Error("timed out waiting for Gateway message"));
+            }, timeoutMs),
+        };
+        inbox.waiters.push(waiter);
+    });
+}
+
+async function nextDownMatching<T extends Down>(
+    socket: WebSocket,
+    predicate: (message: Down) => message is T,
+    label: string,
+    timeoutMs = 3_000
+): Promise<T> {
+    const deadline = Date.now() + timeoutMs;
+    const skipped: Down[] = [];
+    try {
+        while (Date.now() < deadline) {
+            const message = await nextDown(socket, Math.max(1, deadline - Date.now()));
+            if (predicate(message)) return message;
+            skipped.push(message);
+        }
+        throw new Error(`timed out waiting for ${label}`);
+    } finally {
+        if (skipped.length > 0) downInbox(socket).queued.unshift(...skipped);
+    }
+}
+
+function nextMutationResult(
+    socket: WebSocket,
+    mutId: string,
+    timeoutMs = 3_000
+): Promise<Extract<Down, { t: "poke" }>> {
+    return nextDownMatching(
+        socket,
+        (message): message is Extract<Down, { t: "poke" }> =>
+            message.t === "poke" && message.mutResults?.some(result => result.mutId === mutId) === true,
+        `mutation result ${mutId}`,
+        timeoutMs
+    );
+}
+
+async function nextAfterAcknowledgedSnapshot(
+    socket: WebSocket,
+    acknowledged: Extract<Down, { t: "snapshot" }>,
+    timeoutMs = 3_000
+): Promise<Down> {
+    const deadline = Date.now() + timeoutMs;
+    const acknowledgedRows = JSON.stringify(acknowledged.rows);
+    while (Date.now() < deadline) {
+        const message = await nextDown(socket, Math.max(1, deadline - Date.now()));
+        // A fixture drain and a WebSocket acknowledgement use separate event
+        // sources. A second pre-mutation materialization can already be in
+        // flight with a new cookie when durable delivery state becomes idle.
+        if (
+            message.t !== "snapshot" ||
+            message.subId !== acknowledged.subId ||
+            JSON.stringify(message.rows) !== acknowledgedRows
+        ) {
+            return message;
+        }
+        expect(message).toMatchObject({ t: "snapshot", subId: acknowledged.subId, rows: acknowledged.rows });
+        acknowledge(socket, message);
+    }
+    throw new Error(`timed out after acknowledged rows for subscription ${acknowledged.subId}`);
 }
 
 async function fixtureFetch<T>(pathname: string, search: Record<string, string>): Promise<T> {
@@ -216,6 +311,80 @@ async function mutateMembership(action: "delete" | "upsert", role?: string): Pro
     });
     if (!response.ok) throw new Error(`membership mutation failed: ${response.status} ${await response.text()}`);
     return (await response.json()) as { readonly affected?: number };
+}
+
+async function drainAuthInvalidations(additionalShardIds: readonly string[] = []): Promise<void> {
+    await fixtureFetch("/live-catalog-drain", {});
+    await fixtureFetch("/live-cdb-drain", { shardId });
+    for (const additionalShardId of additionalShardIds) {
+        await fixtureFetch("/live-cdb-drain", { shardId: additionalShardId });
+    }
+}
+
+async function settleAuthInvalidations(additionalShardIds: readonly string[] = []): Promise<void> {
+    let lastState:
+        | {
+              readonly targets: number;
+              readonly principals: number;
+              readonly global: number;
+              readonly nextTargetAt: number | null;
+              readonly lastTargetError: string | null;
+          }
+        | undefined;
+    for (let turn = 0; turn < 256; turn++) {
+        const state = await fixtureFetch<{
+            readonly targets: number;
+            readonly principals: number;
+            readonly global: number;
+            readonly nextTargetAt: number | null;
+            readonly lastTargetError: string | null;
+        }>("/live-auth-invalidation-state", {});
+        lastState = state;
+        if (state.targets === 0 && state.principals === 0 && state.global === 0) {
+            await fixtureFetch("/live-cdb-drain", { shardId });
+            for (const additionalShardId of additionalShardIds) {
+                await fixtureFetch("/live-cdb-drain", { shardId: additionalShardId });
+            }
+            return;
+        }
+        await fixtureFetch("/live-catalog-drain", {});
+        await Bun.sleep(1);
+    }
+    throw new Error(`Catalog auth invalidation work exceeded 256 bounded fixture turns: ${JSON.stringify(lastState)}`);
+}
+
+async function mutateFixtureMembership(
+    organizationId: string,
+    userId: string,
+    action: "delete" | "upsert" = "upsert"
+): Promise<void> {
+    if (!mf) throw new Error("Miniflare is not initialized");
+    const response = await mf.dispatchFetch("http://example.com/live-membership", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action, organizationId, userId, role: "member" }),
+    });
+    if (!response.ok) throw new Error(`membership mutation failed: ${response.status} ${await response.text()}`);
+}
+
+async function mutateFixtureOrganization(id: string, action: "create" | "delete"): Promise<void> {
+    if (!mf) throw new Error("Miniflare is not initialized");
+    const response = await mf.dispatchFetch("http://example.com/live-organization", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id, action }),
+    });
+    if (!response.ok) throw new Error(`organization mutation failed: ${response.status} ${await response.text()}`);
+}
+
+async function routeFixtureOrganization(organizationId: string, shardId: string): Promise<void> {
+    if (!mf) throw new Error("Miniflare is not initialized");
+    const response = await mf.dispatchFetch("http://example.com/live-route-organization", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ organizationId, shardId }),
+    });
+    if (!response.ok) throw new Error(`organization route failed: ${response.status} ${await response.text()}`);
 }
 
 async function createFixtureUser(userId: string): Promise<void> {
@@ -244,6 +413,22 @@ async function gatewayState(clientId: string): Promise<GatewayLiveState> {
 
 async function drainGateway(clientId: string): Promise<void> {
     await fixtureFetch("/live-gateway-drain", { clientId });
+}
+
+function collocatedGatewayClientIds(prefix: string, count: number): string[] {
+    const clientIds: string[] = [];
+    let bucketName: string | undefined;
+    const searchLimit = GATEWAY_BUCKET_COUNT * count * 8;
+    for (let index = 0; index < searchLimit && clientIds.length < count; index++) {
+        const clientId = `${prefix}-${index.toString().padStart(6, "0")}`;
+        const candidateBucket = gatewayBucketName(clientId);
+        bucketName ??= candidateBucket;
+        if (candidateBucket === bucketName) clientIds.push(clientId);
+    }
+    if (clientIds.length !== count) {
+        throw new Error(`could not find ${count} deterministic client ids for one Gateway bucket`);
+    }
+    return clientIds;
 }
 
 async function stageGateway(clientId: string): Promise<void> {
@@ -327,7 +512,7 @@ async function mutateGlobal(
     input: { readonly id: string; readonly namespace: string; readonly storedNamespace: string; readonly value: string }
 ): Promise<Down> {
     if (!globalMutationRef) throw new Error("global mutation ref was not seeded");
-    const result = nextDown(opened.socket);
+    const result = nextMutationResult(opened.socket, mutId);
     opened.socket.send(
         encodeWire({
             t: "mut",
@@ -435,7 +620,6 @@ async function createSdkClient(clientId: string, subject: string): Promise<Chard
         endpoint: sdkEndpoint(),
         clientId,
         getJwt: async () => jwt,
-        crossTab: false,
         mutationTimeoutMs: SCALE_WAIT_MS,
     });
 }
@@ -522,7 +706,6 @@ async function createSdkClientWithTrackedClose(
             endpoint: sdkEndpoint(),
             clientId,
             getJwt: async () => jwt,
-            crossTab: false,
             mutationTimeoutMs: SCALE_WAIT_MS,
         });
         await Promise.race([
@@ -696,7 +879,6 @@ async function createSdkClientWithMutationResponseLoss(
             endpoint: sdkEndpoint(),
             clientId,
             getJwt: async () => jwt,
-            crossTab: false,
             mutationTimeoutMs: SCALE_WAIT_MS,
         });
     } catch (error) {
@@ -877,7 +1059,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-    await mf?.dispose();
+    await disposeMiniflareBounded(mf, { label: "Gateway live fixture final teardown" });
+    mf = undefined;
 });
 
 describe("public durable live queries in real workerd", () => {
@@ -992,7 +1175,7 @@ describe("public durable live queries in real workerd", () => {
             false
         );
 
-        const mutationA = nextDown(openedA.socket);
+        const mutationA = nextMutationResult(openedA.socket, "user-axis-write-a");
         openedA.socket.send(
             encodeWire({
                 t: "mut",
@@ -1025,7 +1208,7 @@ describe("public durable live queries in real workerd", () => {
         const gatewayBeforeEviction = await gatewayState(clientA);
         const cdbBeforeEviction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
         await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", {
-            name: clientA.slice(0, 12),
+            name: gatewayBucketName(clientA),
             webSockets: "hibernate",
         });
         await mf.unsafeEvictDurableObject(WORKER_NAME, "Cdb", { name: shardId });
@@ -1035,7 +1218,7 @@ describe("public durable live queries in real workerd", () => {
         expect(cdbAfterEviction.instanceId).not.toBe(cdbBeforeEviction.instanceId);
         expect(gatewayAfterEviction.registrations).toEqual(gatewayBeforeEviction.registrations);
 
-        const mutationAfterEviction = nextDown(openedA.socket);
+        const mutationAfterEviction = nextMutationResult(openedA.socket, "user-axis-write-after-eviction");
         openedA.socket.send(
             encodeWire({
                 t: "mut",
@@ -1082,7 +1265,7 @@ describe("public durable live queries in real workerd", () => {
         if (initialMessageB.t !== "snapshot") throw new Error("expected isolated user snapshot");
         acknowledge(openedB.socket, initialMessageB);
 
-        const forgedMutation = nextDown(openedA.socket);
+        const forgedMutation = nextMutationResult(openedA.socket, "user-axis-forged-write");
         openedA.socket.send(
             encodeWire({
                 t: "mut",
@@ -1178,7 +1361,7 @@ describe("public durable live queries in real workerd", () => {
         const gatewayBeforeEviction = await gatewayState(clientA);
         const cdbBeforeEviction = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
         await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", {
-            name: clientA.slice(0, 12),
+            name: gatewayBucketName(clientA),
             webSockets: "hibernate",
         });
         await mf.unsafeEvictDurableObject(WORKER_NAME, "Cdb", { name: shardId });
@@ -1340,103 +1523,103 @@ describe("public durable live queries in real workerd", () => {
             (_, index) => `user-bench-${index.toString().padStart(2, "0")}`
         );
         await Promise.all(subjects.map(createFixtureUser));
+        await settleAuthInvalidations();
+        const clientIds = subjects.map((_, index) => `user-bench-client-${index.toString().padStart(2, "0")}`);
 
         const registrationStartedAt = performance.now();
         const opened = await Promise.all(
-            subjects.map(async (subject, index) =>
-                openSocket(`user-bench-client-${index.toString().padStart(2, "0")}`, await signed(subject))
-            )
+            subjects.map(async (subject, index) => openSocket(clientIds[index] as string, await signed(subject)))
         );
-        const initialSnapshots = opened.map((connection, index) => {
-            const snapshot = nextDown(connection.socket);
-            connection.socket.send(
-                encodeWire({
-                    t: "sub",
-                    subId: SubId(40),
-                    ref: readRef,
-                    args: { userId: subjects[index] as string },
+        try {
+            const initialSnapshots = opened.map((connection, index) => {
+                const snapshot = nextDown(connection.socket);
+                connection.socket.send(
+                    encodeWire({
+                        t: "sub",
+                        subId: SubId(40),
+                        ref: readRef,
+                        args: { userId: subjects[index] as string },
+                    })
+                );
+                return snapshot;
+            });
+            await Promise.all(clientIds.map(clientId => currentRegistration(clientId, 40)));
+            await Promise.all(clientIds.map(drainGateway));
+            const initialMessages = await Promise.all(initialSnapshots);
+            initialMessages.forEach((message, index) => {
+                expect(message).toMatchObject({ t: "snapshot", subId: 40, rows: [] });
+                if (message.t === "snapshot") acknowledge((opened[index] as OpenedSocket).socket, message);
+            });
+            await Promise.all(clientIds.map(clientId => drainUntilSettled(clientId, [40])));
+            const registrationMs = performance.now() - registrationStartedAt;
+
+            const writeStartedAt = performance.now();
+            const mutationResults = opened.map((connection, index) => {
+                const result = nextMutationResult(connection.socket, `user-bench-mut-${index}`);
+                connection.socket.send(
+                    encodeWire({
+                        t: "mut",
+                        mutId: MutId(`user-bench-mut-${index}`),
+                        ref: writeRef,
+                        args: {
+                            id: `user-bench-row-${index}`,
+                            userId: subjects[index] as string,
+                            value: `value-${index}`,
+                        },
+                    })
+                );
+                return result;
+            });
+            const mutationMessages = await Promise.all(mutationResults);
+            mutationMessages.forEach((message, index) => {
+                expect(message).toMatchObject({
+                    t: "poke",
+                    mutResults: [{ mutId: `user-bench-mut-${index}`, ok: true }],
+                });
+            });
+            const replacements = opened.map((connection, index) =>
+                nextAfterAcknowledgedSnapshot(
+                    connection.socket,
+                    initialMessages[index] as Extract<Down, { t: "snapshot" }>
+                )
+            );
+            await Promise.all(clientIds.map(drainGateway));
+            const replacementMessages = await Promise.all(replacements);
+            replacementMessages.forEach((message, index) => {
+                expect(message).toMatchObject({
+                    t: "snapshot",
+                    subId: 40,
+                    rows: [
+                        {
+                            id: `user-bench-row-${index}`,
+                            userId: subjects[index],
+                            value: `value-${index}`,
+                        },
+                    ],
+                });
+                if (message.t === "snapshot") acknowledge((opened[index] as OpenedSocket).socket, message);
+            });
+            const writeAndConvergenceMs = performance.now() - writeStartedAt;
+
+            console.log(
+                JSON.stringify({
+                    type: "chardb-workerd-benchmark",
+                    scenario: "user-axis-concurrent-principal-fanout",
+                    principals: subjects.length,
+                    registrations: subjects.length,
+                    registrationMs: Number(registrationMs.toFixed(2)),
+                    registrationsPerSecond: rate(subjects.length, registrationMs),
+                    writes: subjects.length,
+                    writeAndConvergenceMs: Number(writeAndConvergenceMs.toFixed(2)),
+                    writesPerSecond: rate(subjects.length, writeAndConvergenceMs),
+                    exactIsolatedSnapshots: replacementMessages.length,
                 })
             );
-            return snapshot;
-        });
-        await Promise.all(
-            opened.map((_, index) => currentRegistration(`user-bench-client-${index.toString().padStart(2, "0")}`, 40))
-        );
-        await Promise.all(
-            opened.map((_, index) => drainGateway(`user-bench-client-${index.toString().padStart(2, "0")}`))
-        );
-        const initialMessages = await Promise.all(initialSnapshots);
-        initialMessages.forEach((message, index) => {
-            expect(message).toMatchObject({ t: "snapshot", subId: 40, rows: [] });
-            if (message.t === "snapshot") acknowledge((opened[index] as OpenedSocket).socket, message);
-        });
-        const registrationMs = performance.now() - registrationStartedAt;
-
-        const writeStartedAt = performance.now();
-        const mutationResults = opened.map((connection, index) => {
-            const result = nextDown(connection.socket);
-            connection.socket.send(
-                encodeWire({
-                    t: "mut",
-                    mutId: MutId(`user-bench-mut-${index}`),
-                    ref: writeRef,
-                    args: {
-                        id: `user-bench-row-${index}`,
-                        userId: subjects[index] as string,
-                        value: `value-${index}`,
-                    },
-                })
-            );
-            return result;
-        });
-        const mutationMessages = await Promise.all(mutationResults);
-        mutationMessages.forEach((message, index) => {
-            expect(message).toMatchObject({
-                t: "poke",
-                mutResults: [{ mutId: `user-bench-mut-${index}`, ok: true }],
-            });
-        });
-        const replacements = opened.map(connection => nextDown(connection.socket));
-        await Promise.all(
-            opened.map((_, index) => drainGateway(`user-bench-client-${index.toString().padStart(2, "0")}`))
-        );
-        const replacementMessages = await Promise.all(replacements);
-        replacementMessages.forEach((message, index) => {
-            expect(message).toMatchObject({
-                t: "snapshot",
-                subId: 40,
-                rows: [
-                    {
-                        id: `user-bench-row-${index}`,
-                        userId: subjects[index],
-                        value: `value-${index}`,
-                    },
-                ],
-            });
-            if (message.t === "snapshot") acknowledge((opened[index] as OpenedSocket).socket, message);
-        });
-        const writeAndConvergenceMs = performance.now() - writeStartedAt;
-
-        console.log(
-            JSON.stringify({
-                type: "chardb-workerd-benchmark",
-                scenario: "user-axis-concurrent-principal-fanout",
-                principals: subjects.length,
-                registrations: subjects.length,
-                registrationMs: Number(registrationMs.toFixed(2)),
-                registrationsPerSecond: rate(subjects.length, registrationMs),
-                writes: subjects.length,
-                writeAndConvergenceMs: Number(writeAndConvergenceMs.toFixed(2)),
-                writesPerSecond: rate(subjects.length, writeAndConvergenceMs),
-                exactIsolatedSnapshots: replacementMessages.length,
-            })
-        );
-
-        for (const connection of opened) connection.socket.close();
-        await Promise.all(opened.map(connection => connection.closed));
-        await Promise.all(
-            opened.map((_, index) => drainGateway(`user-bench-client-${index.toString().padStart(2, "0")}`))
-        );
+        } finally {
+            for (const connection of opened) connection.socket.close();
+            await Promise.all(opened.map(connection => connection.closed));
+            await Promise.all(clientIds.map(drainGateway));
+        }
     });
 
     test("two clients receive a committed replacement while another organization stays isolated", async () => {
@@ -1447,7 +1630,7 @@ describe("public durable live queries in real workerd", () => {
         const mutatorId = "live-mutator-04";
         const [a1, a2, b, mutator] = await Promise.all([
             openSocket(clientA1, await signed("workerd-user")),
-            openSocket(clientA2, await signed("workerd-user-2")),
+            openSocket(clientA2, await signed("workerd-user")),
             openSocket(clientB, await signed("workerd-user-b")),
             openSocket(mutatorId, await signed("workerd-user")),
         ]);
@@ -1475,7 +1658,7 @@ describe("public durable live queries in real workerd", () => {
         expect(beforeA2.deliveredVersion).toBe(beforeA2.dirtyVersion);
         expect(beforeB.deliveredVersion).toBe(beforeB.dirtyVersion);
 
-        const mutationResult = nextDown(mutator.socket);
+        const mutationResult = nextMutationResult(mutator.socket, "live-proof-write");
         mutator.socket.send(
             encodeWire({
                 t: "mut",
@@ -1514,7 +1697,7 @@ describe("public durable live queries in real workerd", () => {
         expect(snapshotA2).toMatchObject({
             t: "snapshot",
             subId: 1,
-            rows: [{ id: "live-proof-row", organizationId: ORGANIZATION_A, viewerId: "workerd-user-2" }],
+            rows: [{ id: "live-proof-row", organizationId: ORGANIZATION_A, viewerId: "workerd-user" }],
         });
         expect(snapshotB).toMatchObject({ t: "snapshot", subId: 1, rows: [] });
         if (snapshotA1.t !== "snapshot" || snapshotA2.t !== "snapshot" || snapshotB.t !== "snapshot") {
@@ -1602,7 +1785,7 @@ describe("public durable live queries in real workerd", () => {
         acknowledge(opened.socket, initial);
 
         const beforeMutation = await currentRegistration(clientId, 9);
-        const mutationResult = nextDown(opened.socket);
+        const mutationResult = nextMutationResult(opened.socket, "live-restart-write");
         opened.socket.send(
             encodeWire({
                 t: "mut",
@@ -1652,7 +1835,7 @@ describe("public durable live queries in real workerd", () => {
         if (!cdbRegistration) throw new Error("Cdb did not retain the live subscription");
 
         await mf.unsafeEvictDurableObject(WORKER_NAME, "Gateway", {
-            name: clientId.slice(0, 12),
+            name: gatewayBucketName(clientId),
             webSockets: "hibernate",
         });
         await mf.unsafeEvictDurableObject(WORKER_NAME, "Cdb", { name: shardId });
@@ -1663,7 +1846,7 @@ describe("public durable live queries in real workerd", () => {
         expect(afterEviction.registrations).toEqual(beforeEviction.registrations);
         expect(cdbAfterEviction.instanceId).not.toBe(cdbBeforeEviction.instanceId);
         expect(cdbAfterEviction.subscriptions).toEqual(cdbBeforeEviction.subscriptions);
-        expect(cdbAfterEviction.invalidations).toEqual(cdbBeforeEviction.invalidations);
+        expect(cdbAfterEviction.invalidations).toEqual(expect.arrayContaining(cdbBeforeEviction.invalidations));
         expect(
             cdbAfterEviction.subscriptions.find(
                 subscription => subscription.registrationId === cdbRegistration.registrationId
@@ -1704,18 +1887,41 @@ describe("public durable live queries in real workerd", () => {
         expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
     });
 
-    test("a dirty rerun re-reads membership authority on a long-lived socket", async () => {
+    test("an idle long-lived socket re-reads membership authority after durable auth invalidation", async () => {
         if (!mutationRef) throw new Error("mutation ref was not seeded");
         const writeRef = mutationRef;
         const clientId = "live-revoke-06";
         const writerId = "authority-writer-07";
+        const isolatedClientId = "live-revoke-isolated-08";
+        const crossShardOrganizationId = "workerd-principal-cross-shard-org";
+        const crossShardId = "ShardDO_auth_cross";
+        const crossShardClientId = "live-revoke-cross-shard-09";
+        await routeFixtureOrganization(crossShardOrganizationId, crossShardId);
+        await mutateFixtureOrganization(crossShardOrganizationId, "create");
+        await mutateFixtureMembership(crossShardOrganizationId, "workerd-user");
+        await drainAuthInvalidations([crossShardId]);
         const opened = await openSocket(clientId, await signed("workerd-user"));
-        const writer = await openSocket(writerId, await signed("workerd-user-2"));
+        const writer = await openSocket(writerId, await signed("workerd-writer"));
+        const isolated = await openSocket(isolatedClientId, await signed("workerd-user-b"));
+        const crossShard = await openSocket(crossShardClientId, await signed("workerd-user"));
         expect(opened.welcome.t).toBe("welcome");
         expect(writer.welcome.t).toBe("welcome");
+        expect(isolated.welcome.t).toBe("welcome");
+        expect(crossShard.welcome.t).toBe("welcome");
+
+        const isolatedInitial = await subscribe(isolated, isolatedClientId, 13, ORGANIZATION_B, "authority-isolation");
+        acknowledge(isolated.socket, isolatedInitial);
+        const crossShardInitial = await subscribe(
+            crossShard,
+            crossShardClientId,
+            14,
+            crossShardOrganizationId,
+            "authority-cross-shard"
+        );
+        acknowledge(crossShard.socket, crossShardInitial);
 
         const write = async (mutId: string, id: string): Promise<void> => {
-            const result = nextDown(writer.socket);
+            const result = nextMutationResult(writer.socket, mutId);
             writer.socket.send(
                 encodeWire({
                     t: "mut",
@@ -1775,9 +1981,35 @@ describe("public durable live queries in real workerd", () => {
         if (restored.t !== "snapshot") throw new Error("expected restored-role replacement snapshot");
         acknowledge(opened.socket, restored);
 
+        // Force and fully settle one fresh auth epoch so no prior test's
+        // Catalog alarm can hold an object reference during the eviction proof.
+        expect((await mutateMembership("upsert", "member")).affected).toBe(1);
+        const settledPrimaryPromise = nextDown(opened.socket);
+        const settledCrossShardPromise = nextDown(crossShard.socket);
+        await settleAuthInvalidations([crossShardId]);
+        await Promise.all([drainGateway(clientId), drainGateway(crossShardClientId)]);
+        const settledPrimary = await settledPrimaryPromise;
+        const settledCrossShard = await settledCrossShardPromise;
+        expect(settledPrimary).toMatchObject({ t: "snapshot", subId: 12 });
+        expect(settledCrossShard).toMatchObject({ t: "snapshot", subId: 14 });
+        if (settledPrimary.t !== "snapshot" || settledCrossShard.t !== "snapshot") {
+            throw new Error("expected settled auth replacement snapshots before eviction");
+        }
+        acknowledge(opened.socket, settledPrimary);
+        acknowledge(crossShard.socket, settledCrossShard);
+
+        await fixtureFetch("/live-cdb-lose-auth-response", { shardId: crossShardId });
         expect((await mutateMembership("delete")).affected).toBe(1);
-        await write("live-authority-revoke", "live-authority-row-4");
         const revokedMessage = nextDown(opened.socket);
+        const isolatedNoChange = expectNoDown(isolated.socket);
+        const crossShardRefresh = nextDown(crossShard.socket);
+        await drainAuthInvalidations([crossShardId]);
+        expect(
+            await fixtureFetch<{ readonly state: Record<string, unknown> | null }>(
+                "/live-principal-invalidation-state",
+                { principalId: "workerd-user" }
+            )
+        ).toMatchObject({ state: { scopeId: "workerd-user", attempts: 1, cursorShardId: null } });
         await drainGateway(clientId);
         await expect(revokedMessage).resolves.toMatchObject({
             t: "error",
@@ -1788,37 +2020,111 @@ describe("public durable live queries in real workerd", () => {
         expect((await gatewayState(clientId)).registrations.some(row => row.subId === 12 && row.currentHead)).toBe(
             false
         );
+        await drainGateway(isolatedClientId);
+        await isolatedNoChange;
+        expect(
+            (await gatewayState(isolatedClientId)).registrations.some(row => row.subId === 13 && row.currentHead)
+        ).toBe(true);
+        await drainGateway(crossShardClientId);
+        await expect(crossShardRefresh).resolves.toMatchObject({ t: "snapshot", subId: 14, rows: [] });
+        expect(
+            (await gatewayState(crossShardClientId)).registrations.some(row => row.subId === 14 && row.currentHead)
+        ).toBe(true);
+        await fixtureFetch("/live-principal-invalidation-due", { principalId: "workerd-user" });
+        await fixtureFetch("/live-catalog-drain", {});
+        await fixtureFetch("/live-catalog-drain", {});
+        expect(
+            await fixtureFetch<{ readonly state: Record<string, unknown> | null }>(
+                "/live-principal-invalidation-state",
+                { principalId: "workerd-user" }
+            )
+        ).toEqual({ state: null });
 
         const noReplacement = expectNoDown(opened.socket);
-        await write("live-authority-after-revoke", "live-authority-row-5");
+        await write("live-authority-after-revoke", "live-authority-row-4");
         await drainGateway(clientId);
         await noReplacement;
 
         expect((await mutateMembership("upsert", "member")).affected).toBe(1);
         const fresh = await subscribe(opened, clientId, 12, ORGANIZATION_A, "authority-proof");
-        expect(fresh.rows).toHaveLength(5);
+        expect(fresh.rows).toHaveLength(4);
         expect(fresh.rows).toEqual(
             expect.arrayContaining([
                 expect.objectContaining({ id: "live-authority-row-1", viewerId: "workerd-user" }),
-                expect.objectContaining({ id: "live-authority-row-5", viewerId: "workerd-user" }),
+                expect.objectContaining({ id: "live-authority-row-4", viewerId: "workerd-user" }),
             ])
         );
         acknowledge(opened.socket, fresh);
 
         opened.socket.close();
         writer.socket.close();
-        await Promise.all([opened.closed, writer.closed]);
-        await Promise.all([drainGateway(clientId), drainGateway(writerId)]);
+        isolated.socket.close();
+        crossShard.socket.close();
+        await Promise.all([opened.closed, writer.closed, isolated.closed, crossShard.closed]);
+        await Promise.all([
+            drainGateway(clientId),
+            drainGateway(writerId),
+            drainGateway(isolatedClientId),
+            drainGateway(crossShardClientId),
+        ]);
         expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
+    });
+
+    test("organization deletion clears its idle client without touching another organization", async () => {
+        const deletedOrganizationId = "workerd-idle-delete-org";
+        await mutateFixtureOrganization(deletedOrganizationId, "create");
+        await mutateFixtureMembership(deletedOrganizationId, "workerd-user");
+
+        const deletedClientId = "idle-org-delete-client";
+        const isolatedClientId = "idle-org-delete-isolated";
+        const deleted = await openSocket(deletedClientId, await signed("workerd-user"));
+        const isolated = await openSocket(isolatedClientId, await signed("workerd-user-b"));
+        const deletedInitial = await subscribe(deleted, deletedClientId, 61, deletedOrganizationId, "idle-delete");
+        const isolatedInitial = await subscribe(isolated, isolatedClientId, 62, ORGANIZATION_B, "idle-delete-isolated");
+        acknowledge(deleted.socket, deletedInitial);
+        acknowledge(isolated.socket, isolatedInitial);
+
+        const deletedFailure = nextDown(deleted.socket);
+        const isolatedNoChange = expectNoDown(isolated.socket);
+        await mutateFixtureMembership(deletedOrganizationId, "workerd-user", "delete");
+        await mutateFixtureOrganization(deletedOrganizationId, "delete");
+        await drainAuthInvalidations();
+        await drainGateway(deletedClientId);
+        await expect(deletedFailure).resolves.toMatchObject({
+            t: "error",
+            subId: 61,
+            code: "CDB_FORBIDDEN",
+            retryable: false,
+        });
+        expect(
+            (await gatewayState(deletedClientId)).registrations.some(row => row.subId === 61 && row.currentHead)
+        ).toBe(false);
+        await drainGateway(isolatedClientId);
+        await isolatedNoChange;
+        expect(
+            (await gatewayState(isolatedClientId)).registrations.some(row => row.subId === 62 && row.currentHead)
+        ).toBe(true);
+
+        deleted.socket.close();
+        isolated.socket.close();
+        await Promise.all([deleted.closed, isolated.closed]);
+        await Promise.all([drainGateway(deletedClientId), drainGateway(isolatedClientId)]);
     });
 
     test("one configured Gateway enforces the exact 256-registration boundary and readmits after release", async () => {
         if (!mf || !queryRef) throw new Error("live fixture was not initialized");
         const readRef = queryRef;
         const gatewayPrefix = "quota-shared";
-        const expectedClientIds = Array.from(
-            { length: 4 },
-            (_, index) => `${gatewayPrefix}-${index.toString().padStart(2, "0")}`
+        const collocatedClientIds = collocatedGatewayClientIds(gatewayPrefix, 6);
+        const expectedClientIds = collocatedClientIds.slice(0, 4);
+        const rejectedClientId = collocatedClientIds[4];
+        const replacementClientId = collocatedClientIds[5];
+        const gatewayClientId = expectedClientIds[0];
+        if (!gatewayClientId || !rejectedClientId || !replacementClientId) {
+            throw new Error("quota fixture did not produce all collocated client ids");
+        }
+        expect(new Set(collocatedClientIds.map(gatewayBucketName))).toEqual(
+            new Set([gatewayBucketName(gatewayClientId)])
         );
         const clients: Array<{
             readonly clientId: string;
@@ -1836,8 +2142,8 @@ describe("public durable live queries in real workerd", () => {
             let lastGatewayCount = -1;
             let lastCdbCount = -1;
             while (Date.now() < deadline) {
-                await drainGateway(expectedClientIds[0] as string);
-                const state = await gatewayState(expectedClientIds[0] as string);
+                await drainGateway(gatewayClientId);
+                const state = await gatewayState(gatewayClientId);
                 const gatewayRows = quotaRows(state);
                 const cdb = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
                 const activeCdbRows = cdb.subscriptions.filter(
@@ -1891,7 +2197,6 @@ describe("public durable live queries in real workerd", () => {
                 expect(fullRows.filter(row => row.clientId === clientId)).toHaveLength(64);
             }
 
-            const rejectedClientId = `${gatewayPrefix}-rejected`;
             rejectedSocket = await openSocket(rejectedClientId, await signed("workerd-user"));
             expect(rejectedSocket.welcome).toMatchObject({ t: "welcome" });
             const rejection = nextDown(rejectedSocket.socket, Math.max(SCALE_WAIT_MS, 5_000));
@@ -1929,7 +2234,6 @@ describe("public durable live queries in real workerd", () => {
             released.unsubscribe();
             await waitForCounts(255, 255);
 
-            const replacementClientId = `${gatewayPrefix}-replacement`;
             const replacementClient = await createSdkClient(replacementClientId, "workerd-user");
             const replacementSubscriptions: Array<{ unsubscribe: () => void }> = [];
             clients.push({

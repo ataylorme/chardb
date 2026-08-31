@@ -1,0 +1,24 @@
+name = "chardb-reshard-benchmark"
+main = "worker.ts"
+compatibility_date = "2026-08-27"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name = "CDB_CATALOG"
+class_name = "Catalog"
+
+[[durable_objects.bindings]]
+name = "CDB_SHARD"
+class_name = "Cdb"
+
+[[durable_objects.bindings]]
+name = "CDB_GATEWAY"
+class_name = "Gateway"
+
+[[durable_objects.bindings]]
+name = "CDB_RESHARD"
+class_name = "Resharder"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Catalog", "Cdb", "Gateway", "Resharder"]

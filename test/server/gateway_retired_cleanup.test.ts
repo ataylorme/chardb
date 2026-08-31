@@ -1,18 +1,17 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { SyncSql } from "../../src/oplog/wrapper.ts";
+import type { VerifiedGwAttachment } from "../../src/server/do/gateway-auth-dispatch.ts";
 import {
     GATEWAY_CLEANUP_MAX_ERROR_LENGTH,
     GATEWAY_CLEANUP_MAX_RETRY_COUNT,
     GATEWAY_CLEANUP_MAX_RETRY_MS,
     GATEWAY_REGISTRATION_DDL,
-    Gateway,
-    type GatewayEnv,
     type GatewayRegistrationInstall,
-    type VerifiedGwAttachment,
     installGatewayRegistration,
     retireGatewayRegistration,
-} from "../../src/server/do/gateway.ts";
+} from "../../src/server/do/gateway-registration-store.ts";
+import { Gateway, type GatewayEnv } from "../../src/server/do/gateway.ts";
 import type { LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 
@@ -103,6 +102,7 @@ describe("Gateway retired-generation cleanup", () => {
     let sockets: { deserializeAttachment: () => VerifiedGwAttachment }[];
     let state: DurableObjectState;
     let env: GatewayEnv;
+    let waitUntilTasks: Promise<unknown>[];
 
     async function reconstruct(): Promise<void> {
         class TestGateway extends Gateway {
@@ -128,6 +128,7 @@ describe("Gateway retired-generation cleanup", () => {
         unsubscribeBehavior = () => undefined;
         finalizeBehavior = () => undefined;
         sockets = [];
+        waitUntilTasks = [];
         const cdb = {
             async unsubscribe(subscription: LiveSubscriptionId): Promise<unknown> {
                 unsubscribeCalls.push(subscription);
@@ -164,6 +165,9 @@ describe("Gateway retired-generation cleanup", () => {
                 },
             },
             getWebSockets: () => sockets as unknown as WebSocket[],
+            waitUntil: (task: Promise<unknown>): void => {
+                waitUntilTasks.push(task);
+            },
             blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
                 ready = callback();
             },
@@ -171,7 +175,10 @@ describe("Gateway retired-generation cleanup", () => {
         await reconstruct();
     });
 
-    afterEach(() => db.close());
+    afterEach(async () => {
+        await Promise.allSettled(waitUntilTasks);
+        db.close();
+    });
 
     function install(input: GatewayRegistrationInstall): void {
         db.transaction(() => installGatewayRegistration(sql, input))();
@@ -381,7 +388,8 @@ describe("Gateway retired-generation cleanup", () => {
         expect(cleanupState(legacy.registrationId)).toBeNull();
         expect(stringLookups).toEqual([]);
         expect(unsubscribeCalls).toEqual([]);
-        expect(alarms).toEqual([]);
+        expect(alarms).toEqual([clock + 1]);
+        expect(currentAlarm).toBeNull();
     });
 
     test("deletes a superseded migrated generation without touching its replacement head", async () => {
@@ -411,7 +419,8 @@ describe("Gateway retired-generation cleanup", () => {
         ]);
         expect(stringLookups).toEqual([]);
         expect(unsubscribeCalls).toEqual([]);
-        expect(alarms).toEqual([]);
+        expect(alarms).toEqual([clock + 1]);
+        expect(currentAlarm).toBeNull();
     });
 
     test("bounds each cleanup pass and schedules immediately when due rows remain", async () => {
@@ -515,10 +524,14 @@ describe("Gateway retired-generation cleanup", () => {
             }),
         });
         let failUnsubscribe: (error: Error) => void = () => {};
-        unsubscribeBehavior = () =>
-            new Promise((_resolve, reject) => {
+        unsubscribeBehavior = subscription => {
+            if (subscription.registrationId !== retired.registrationId) {
+                throw new Error("newly retired registration is unavailable");
+            }
+            return new Promise((_resolve, reject) => {
                 failUnsubscribe = reject;
             });
+        };
 
         const cleanup = fireCleanupAlarm();
         await waitForUnsubscribe();
@@ -538,6 +551,7 @@ describe("Gateway retired-generation cleanup", () => {
                 },
             ],
         });
+        expect(unsubscribeCalls.filter(call => call.registrationId === retired.registrationId)).toHaveLength(1);
         failUnsubscribe(new Error("cleanup unavailable"));
         await cleanup;
 
@@ -553,5 +567,7 @@ describe("Gateway retired-generation cleanup", () => {
                 .query("SELECT dirty_version FROM _gw_registration_generations WHERE registration_id = ?")
                 .get(active.registrationId)
         ).toEqual({ dirty_version: 5 });
+        expect(unsubscribeCalls.filter(call => call.registrationId === retired.registrationId)).toHaveLength(1);
+        expect(waitUntilTasks).toHaveLength(1);
     });
 });

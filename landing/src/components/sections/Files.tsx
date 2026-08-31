@@ -7,32 +7,30 @@ export function Files() {
         <Section id="files" num="06" label="files + vectors">
             <SectionHeading>Files and vectors belong in the schema.</SectionHeading>
             <SectionLead>
-                The destination keeps R2 objects and Vectorize records behind typed columns, tenant policy, and the same
-                query surface as SQL. <InlineCode>file()</InlineCode>, <InlineCode>fileArray()</InlineCode>, and{" "}
-                <InlineCode>vector()</InlineCode> exist as experimental schema primitives. Their storage, indexing,
-                cleanup, and live-query paths are not supported yet.
+                R2 objects and Vectorize records stay behind typed columns and organization policy.
+                <InlineCode>file()</InlineCode> stores an opaque file identity; <InlineCode>vector()</InlineCode> stores
+                one logical vector head. Application code never needs an R2 key or a physical Vectorize ID.
             </SectionLead>
 
             <BulletList
                 items={[
-                    "target: upload, validate, retain, and authorize a file through one column type",
-                    "target: index and query embeddings without a second application data model",
-                    "required before support: end-to-end lifecycle, quota, failure, and tenant-isolation proofs",
+                    "upload, attach, authorize, replace, download, restart, and delete an organization file",
+                    "transaction-bound vector set and delete, bounded search, and live-query invalidation",
+                    "range movement preserves file and vector identity beside ordinary rows",
                 ]}
             />
 
             <div className="mt-10">
                 <CodeCard
                     filename="schema.ts"
-                    header={
-                        <span className="font-mono text-[11px] text-accent">target runtime · experimental types</span>
-                    }
+                    header={<span className="font-mono text-[11px] text-accent">schema-native</span>}
                 >
-                    <Kw>import</Kw> <P>{"{"}</P> <Id>file</Id>
-                    <P>,</P> <Id>fileArray</Id> <P>{"}"}</P> <Kw>from</Kw> <Str>"chardb/files"</Str>
+                    <Kw>import</Kw> <P>{"{"}</P> <Id>file</Id> <P>{"}"}</P> <Kw>from</Kw>{" "}
+                    <Str>"@chardb/core/files"</Str>
                     <P>;</P>
                     {"\n"}
-                    <Kw>import</Kw> <P>{"{"}</P> <Id>vector</Id> <P>{"}"}</P> <Kw>from</Kw> <Str>"chardb/server"</Str>
+                    <Kw>import</Kw> <P>{"{"}</P> <Id>vector</Id> <P>{"}"}</P> <Kw>from</Kw>{" "}
+                    <Str>"@chardb/core/server"</Str>
                     <P>;</P>
                     {"\n\n"}
                     <Kw>export const</Kw> <Id>messages</Id> <P>=</P> <Fn>cdbTable</Fn>
@@ -47,18 +45,16 @@ export function Files() {
                     <P>, {"{"}</P> <Id>maxSize</Id>
                     <P>:</P> <Num>25</Num> <P>*</P> <Num>1024</Num> <P>*</P> <Num>1024</Num> <P>{"}"}),</P>
                     {"\n  "}
-                    <Id>images</Id>
-                    <P>:</P> <Fn>fileArray</Fn>
-                    <P>(</P>
-                    <Str>"images"</Str>
-                    <P>),</P>
-                    {"\n  "}
                     <Id>embedding</Id>
                     <P>:</P> <Fn>vector</Fn>
                     <P>(</P>
                     <Str>"embedding"</Str>
                     <P>, {"{"}</P> <Id>dim</Id>
-                    <P>:</P> <Num>1536</Num> <P>{"}"}),</P>
+                    <P>:</P> <Num>768</Num>
+                    <P>,</P> <Id>binding</Id>
+                    <P>:</P> <Str>"VECTORS"</Str>
+                    <P>,</P> <Id>metric</Id>
+                    <P>:</P> <Str>"cosine"</Str> <P>{"}"}),</P>
                     {"\n"}
                     <P>{"}"});</P>
                 </CodeCard>

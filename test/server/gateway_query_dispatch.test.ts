@@ -4,7 +4,7 @@ import {
     type TrustedQueryDispatchDeps,
     dispatchTrustedQuery,
     projectCdbQueryResponse,
-} from "../../src/server/do/gateway.ts";
+} from "../../src/server/do/gateway-auth-dispatch.ts";
 import type { CdbQueryRequest } from "../../src/server/rpc.ts";
 import { ChardbRef, PrincipalId, type RawJson, ShardId, TenantId } from "../../src/types.ts";
 import { vshardOf } from "../../src/vshard.ts";
@@ -73,6 +73,7 @@ function workingDeps(): TrustedQueryDispatchDeps {
                             authEpochs: { global: 2, tenant: 3, principal: 4 },
                             claims: {},
                         },
+                        schemaEpoch: 9,
                         domainSchemaEpoch: 5,
                     });
                     return { ok: true, result: [{ id: "message-1" }] };
@@ -83,6 +84,178 @@ function workingDeps(): TrustedQueryDispatchDeps {
 }
 
 describe("trusted one-shot query dispatch", () => {
+    test("refreshes Catalog authority and placement once after a typed stale-route response", async () => {
+        const attempts: CdbQueryRequest[] = [];
+        let catalogCalls = 0;
+        const result = await dispatchTrustedQuery(
+            {
+                ...workingDeps(),
+                catalog: {
+                    async resolveOrganizationAuthority() {
+                        throw new Error("combined authority-route RPC must be used");
+                    },
+                    async route() {
+                        throw new Error("combined authority-route RPC must be used");
+                    },
+                    async resolveOrganizationAuthorityRoute() {
+                        catalogCalls += 1;
+                        return {
+                            authority: {
+                                ...authority,
+                                role: catalogCalls === 1 ? "member" : "admin",
+                                roles: [catalogCalls === 1 ? "member" : "admin"],
+                            },
+                            route: {
+                                shardId: ShardId(catalogCalls === 1 ? "source" : "destination"),
+                                schemaEpoch: catalogCalls,
+                                domainSchemaEpoch: 5,
+                            },
+                        };
+                    },
+                },
+                cdb: shardId => ({
+                    async query(input) {
+                        attempts.push(input);
+                        return shardId === "source"
+                            ? {
+                                  ok: false,
+                                  error: new CdbError({
+                                      code: "CDB_STALE_EPOCH",
+                                      message: "source cut over",
+                                  }).toJSON(),
+                              }
+                            : { ok: true, result: [{ id: "destination-row" }] };
+                    },
+                }),
+            },
+            request
+        );
+
+        expect(result).toEqual({ ok: true, result: [{ id: "destination-row" }] });
+        expect(catalogCalls).toBe(2);
+        expect(attempts.map(attempt => [attempt.args, attempt.schemaEpoch, attempt.auth.role])).toEqual([
+            [request.args, 1, "member"],
+            [request.args, 2, "admin"],
+        ]);
+    });
+
+    test("stops after two stale query attempts and does not retry terminal or unavailable failures", async () => {
+        const stale = new CdbError({ code: "CDB_STALE_EPOCH", message: "still stale" }).toJSON();
+        let staleCalls = 0;
+        const staleResult = await dispatchTrustedQuery(
+            {
+                ...workingDeps(),
+                cdb: () => ({
+                    async query() {
+                        staleCalls += 1;
+                        return { ok: false, error: stale };
+                    },
+                }),
+            },
+            request
+        );
+        expect(staleResult).toEqual({ ok: false, error: stale });
+        expect(staleCalls).toBe(2);
+
+        for (const failure of [
+            { kind: "terminal", response: new CdbError({ code: "CDB_FORBIDDEN", message: "denied" }).toJSON() },
+            { kind: "unavailable", response: null },
+        ] as const) {
+            let calls = 0;
+            const result = await dispatchTrustedQuery(
+                {
+                    ...workingDeps(),
+                    cdb: () => ({
+                        async query() {
+                            calls += 1;
+                            if (failure.response === null) throw new Error("offline");
+                            return { ok: false, error: failure.response };
+                        },
+                    }),
+                },
+                request
+            );
+            expect(result).toMatchObject({
+                ok: false,
+                error: { code: failure.kind === "terminal" ? "CDB_FORBIDDEN" : "CDB_SHARD_UNAVAILABLE" },
+            });
+            expect(calls).toBe(1);
+        }
+    });
+
+    test("uses one Catalog RPC for organization authority and placement", async () => {
+        const base = workingDeps();
+        let combinedCalls = 0;
+        const result = await dispatchTrustedQuery(
+            {
+                ...base,
+                catalog: {
+                    async resolveOrganizationAuthority() {
+                        throw new Error("legacy authority RPC must not run");
+                    },
+                    async route() {
+                        throw new Error("legacy route RPC must not run");
+                    },
+                    async resolveOrganizationAuthorityRoute(input) {
+                        combinedCalls += 1;
+                        expect(input).toEqual({
+                            principalId: PrincipalId("user-1"),
+                            organizationId: TenantId("org-1"),
+                            vshard: Number(vshardOf(["org-1"])),
+                        });
+                        return {
+                            authority,
+                            route: { shardId: ShardId("shard-a"), schemaEpoch: 9, domainSchemaEpoch: 5 },
+                        };
+                    },
+                },
+            },
+            request
+        );
+
+        expect(result).toEqual({ ok: true, result: [{ id: "message-1" }] });
+        expect(combinedCalls).toBe(1);
+    });
+
+    test("preserves the retryable migration fence from the combined Catalog boundary", async () => {
+        const base = workingDeps();
+        let cdbCalls = 0;
+        const result = await dispatchTrustedQuery(
+            {
+                ...base,
+                catalog: {
+                    async resolveOrganizationAuthority() {
+                        throw new Error("legacy authority RPC must not run");
+                    },
+                    async route() {
+                        throw new Error("legacy route RPC must not run");
+                    },
+                    async resolveOrganizationAuthorityRoute() {
+                        throw new CdbError({
+                            code: "CDB_STALE_EPOCH",
+                            message: "schema migration deploy-7 is in progress",
+                        });
+                    },
+                },
+                cdb() {
+                    cdbCalls += 1;
+                    return base.cdb("shard-a");
+                },
+            },
+            request
+        );
+
+        expect(result).toMatchObject({
+            ok: false,
+            error: {
+                code: "CDB_STALE_EPOCH",
+                retryable: true,
+                message: "schema migration deploy-7 is in progress",
+            },
+        });
+        expect(cdbCalls).toBe(0);
+    });
+
     test("derives organization auth and placement before executing Cdb", async () => {
         await expect(dispatchTrustedQuery(workingDeps(), request)).resolves.toEqual({
             ok: true,

@@ -10,8 +10,8 @@ import {
     CDB_MUTATION_MAX_WRITE_OPERATIONS,
     executeAtomicMutation,
 } from "../../src/server/atomic-mutation.ts";
+import { globalScope } from "../../src/server/cdb-tenant.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
-import { globalScope } from "../../src/server/index.ts";
 import { CDB_RESULT_MAX_BYTES } from "../../src/server/result_limits.ts";
 import { Cookie, MutId, PrincipalId, type RawJson } from "../../src/types.ts";
 
