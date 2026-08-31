@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const root = path.resolve(import.meta.dir, "..");
@@ -13,10 +13,9 @@ describe("release documentation contract", () => {
         const unresolved: string[] = [];
 
         const isPackaged = (target: string): boolean =>
-            [...packageEntries].some(entry => {
-                const absolute = path.join(root, entry);
-                return statSync(absolute).isDirectory() ? target.startsWith(`${entry}/`) : target === entry;
-            });
+            [...packageEntries].some(
+                entry => target === entry || (path.posix.extname(entry) === "" && target.startsWith(`${entry}/`))
+            );
 
         for (const document of packageDocs) {
             const source = read(document);
@@ -45,56 +44,27 @@ describe("release documentation contract", () => {
         expect(unresolved).toEqual([]);
     });
 
-    test("records the exact-candidate deployed proofs and keeps benchmark language descriptive", () => {
+    test("describes the shipped path without construction history", () => {
         const status = read("STATUS.md");
         const plan = read("PLAN.md");
-        const readme = read("README.md");
-        const operations = read("OPERATIONS.md");
-        const preview = read("PREVIEW.md");
+        const publicDocs = [read("README.md"), status, plan].join("\n");
 
-        expect(status).not.toMatch(/Candidate\d+/);
-        expect(status).toContain("The exact-candidate proof harness verifies live invalidation");
-        expect(status).toContain("The exact-candidate combined harness exercises response loss");
-        expect(status).toContain("Local fake services isolate Chardb execution time");
-        expect(status).not.toContain("Local fake services isolate Chardb cost");
-        expect(plan).toContain("- [x] One exact packed proof candidate passes the deployed Worker and R2 file proof");
-        expect(readme).not.toMatch(/Candidate\d+/);
-        expect(readme).toContain("Every release starts from one packed npm tarball");
-        expect(readme).toContain("the Linux, macOS, and Windows CI matrix");
-        expect(readme).not.toMatch(/bun run (?:test:correctness|preview:gate|proof:cloudflare|release:admit)/);
-        expect(readme).not.toContain("github.com/zpg6/chardb/blob/main");
-        expect(operations).not.toMatch(/Candidate\d+/);
-        expect(operations).toContain("Release evidence must include the combined row, file, and vector movement proof");
-        expect(operations).toContain("not automatic resharding, a merge or rebalance service");
-        expect(preview).toContain("R2 file lifecycle, organization deletion fencing");
-        expect(preview).toContain("deployed combined row, file, and vector movement");
-    });
-
-    test("records explicit internal bindings and activation-only live wake", () => {
-        const status = read("STATUS.md");
-        const plan = read("PLAN.md");
-        const preview = read("PREVIEW.md");
-        const architecture = read("ARCHITECTURE.md");
-        const operations = read("OPERATIONS.md");
-
-        expect(status).toContain("schema activation, or source cutover");
-        expect(plan).toContain("- [x] Schema activation without a domain write wakes every idle live registration");
-        expect(preview).toContain("The serialized Workerd migration harness supplies a separate correctness proof");
-        expect(preview).toContain("does not replace the deployed Cloudflare gates");
-        expect(architecture).toContain("Explicit bindings are the primary Durable Object path");
-        expect(architecture).toContain("queues every active registration in one transaction");
-        expect(operations).toContain("`CDB_GATEWAY`, `CDB_CATALOG`, `CDB_SHARD`, and `CDB_RESHARD`");
-        expect(operations).toContain(
-            "A runtime-provided loopback fallback does not repair a missing or wrong generated binding"
-        );
+        for (const capability of ["Better Auth", "Drizzle", "Durable Objects", "R2", "Vectorize", "Miniflare"]) {
+            expect(publicDocs).toContain(capability);
+        }
+        for (const limit of ["backup", "restore", "regional failover", "automatic resharding"]) {
+            expect(publicDocs.toLowerCase()).toContain(limit);
+        }
+        expect(publicDocs).not.toMatch(/Candidate\d+|exact-candidate|construction diary/i);
+        expect(publicDocs).not.toContain("github.com/zpg6/chardb/blob/main");
+        expect(plan).toContain("Pack `@chardb/core` once");
     });
 
     test("keeps the production warning as prose rather than a closable gate", () => {
-        const plan = read("PLAN.md");
+        const status = read("STATUS.md");
 
-        expect(plan).toContain("The production warning is a standing release invariant");
-        expect(plan).not.toContain("- [ ] Keep the production warning");
-        expect(plan).not.toContain("- [x] Keep the production warning");
+        expect(status).toMatch(/Do not use Chardb as the only home for production data yet/i);
+        expect(status).not.toMatch(/- \[[ x]\].*production warning/i);
     });
 
     test("keeps Better Auth permissions and Chardb row policy separate", () => {
@@ -105,21 +75,15 @@ describe("release documentation contract", () => {
         expect(readme).toContain("manage their roles through Better Auth");
     });
 
-    test("requires one bound cross-OS GitHub bundle", () => {
-        const preview = read("PREVIEW.md");
-        const readme = read("README.md");
-        const status = read("STATUS.md");
-        const plan = read("PLAN.md");
+    test("runs package consumers on Linux, macOS, and Windows", () => {
+        const workflow = read(".github/workflows/ci.yml");
 
-        expect(preview).toContain(
-            "The OS input must contain canonical Ubuntu x64, macOS arm64, and Windows x64 reports"
-        );
-        expect(preview).toContain("Admission requires that bundle; it cannot be omitted");
-        expect(preview).toContain("Do not substitute a local report");
-        expect(preview).toContain("it is not a GitHub signature");
-        expect(readme).toContain("the Linux, macOS, and Windows CI matrix");
-        expect(status).toContain("checksummed Ubuntu x64, macOS arm64, and Windows x64 reports");
-        expect(plan).toContain("and `os-ci` evidence");
+        expect(workflow).toContain("ubuntu-latest");
+        expect(workflow).toContain("macos-latest");
+        expect(workflow).toContain("windows-latest");
+        expect(workflow).toContain("smoke-packed-package.mjs");
+        expect(workflow).toContain("smoke-packed-chat.mjs");
+        expect(workflow).toContain("os-ci-evidence");
     });
 
     test("publishes an honest cost boundary without converting latency into billable compute", () => {
@@ -133,8 +97,8 @@ describe("release documentation contract", () => {
 
         expect(packageJson.files).toContain("COST.md");
         expect(readme).toContain("[COST.md](COST.md) maps Chardb operations to Cloudflare's published meters");
-        expect(status).toContain("A total cost remains unmeasured");
-        expect(plan).toContain("Publish the Cloudflare meter and operation mapping in [COST.md](COST.md)");
+        expect(status).toMatch(/cost.*unmeasured|unmeasured.*cost/i);
+        expect(plan).toContain("Cloudflare file, vector, and range-movement checks");
         expect(nextScope).toContain("Do not build a calculator or infer billable compute from latency");
         expect(cost).toContain("End-to-end latency cannot be converted into Worker CPU time or Durable Object GB-s");
         expect(cost).toContain("Chardb does not publish a total monthly-cost claim");

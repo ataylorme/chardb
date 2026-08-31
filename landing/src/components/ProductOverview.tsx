@@ -1,57 +1,50 @@
-import type { CSSProperties } from "react";
 import { GITHUB_URL } from "../lib/constants";
 
-const files = [
-    {
-        name: "schema.ts",
-        code: `const { cdbTable } = forOrg();
-
-export const messages = cdbTable(
-  "messages",
-  {
-    id: text("id").primaryKey(),
-    organizationId: text("organization_id").notNull(),
-    body: text("body").notNull(),
-    attachment: file("attachment", {
-      maxSize: 5 * 1_024 * 1_024,
-      contentTypes: ["image/jpeg", "image/png"],
-    }),
-  },
-);`,
-    },
-    {
-        name: "auth.ts",
-        code: `export const auth = defineAuth({
-  appName: "my-chardb-app",
-  plugins: [anonymous(), organization(), jwt()],
-});`,
-    },
-    {
-        name: "worker.ts",
-        code: `export const app = chardb({
-  auth,
-  schema: domain,
-  api: { ...api, ...queries },
-  migrations,
-});
-
-export default app;`,
-    },
-    {
-        name: "wrangler.toml",
-        code: `main = "src/worker.ts"
-
-[[durable_objects.bindings]]
-name = "CDB_SHARD"
-class_name = "Cdb"`,
-    },
-] as const;
+function DatabaseSnippet() {
+    return (
+        <code>
+            <span className="syntax-comment">{"// auth.ts"}</span>
+            {"\n"}
+            <span className="syntax-keyword">export const</span> <span className="syntax-variable">auth</span> ={" "}
+            <span className="syntax-function">defineAuth</span>({"{"}
+            {"\n  "}
+            <span className="syntax-property">plugins</span>: [<span className="syntax-function">organization</span>(),{" "}
+            <span className="syntax-function">jwt</span>()],
+            {"\n"}
+            {"});"}
+            {"\n\n"}
+            <span className="syntax-comment">{"// schema.ts"}</span>
+            {"\n"}
+            <span className="syntax-keyword">const</span> {"{ "}
+            <span className="syntax-variable">cdbTable</span>
+            {" }"} = <span className="syntax-function">forOrg</span>();
+            {"\n\n"}
+            <span className="syntax-keyword">export const</span> <span className="syntax-variable">messages</span> ={" "}
+            <span className="syntax-function">cdbTable</span>(<span className="syntax-string">"messages"</span>, {"{"}
+            {"\n  "}
+            <span className="syntax-property">id</span>: <span className="syntax-function">text</span>(
+            <span className="syntax-string">"id"</span>).<span className="syntax-function">primaryKey</span>(),
+            {"\n  "}
+            <span className="syntax-property">organizationId</span>: <span className="syntax-function">text</span>(
+            <span className="syntax-string">"organization_id"</span>){"\n    ."}
+            <span className="syntax-function">notNull</span>()
+            {"\n    ."}
+            <span className="syntax-function">references</span>(() ={">"} <span className="syntax-variable">auth</span>.
+            <span className="syntax-property">organization</span>.<span className="syntax-property">id</span>),
+            {"\n  "}
+            <span className="syntax-property">body</span>: <span className="syntax-function">text</span>(
+            <span className="syntax-string">"body"</span>).<span className="syntax-function">notNull</span>(),
+            {"\n"}
+            {"});"}
+        </code>
+    );
+}
 
 const moments = [
     {
-        label: "SQL + live",
-        title: "The organization is the shard key.",
-        body: "Drizzle queries stay inside the organization that Better Auth already resolved. Writes are transactional. Live handles update from the same shard.",
+        label: "Realtime",
+        title: "Queries update after the transaction commits.",
+        body: "Live handles rerun on the owning shard, so the browser sees committed rows without polling or a second sync service.",
     },
     {
         label: "Files + vectors",
@@ -71,35 +64,27 @@ export function ProductOverview() {
             <section id="files" className="border-y border-line bg-ink-900/50">
                 <div className="mx-auto max-w-page px-5 py-20 sm:px-8 sm:py-28 lg:grid lg:grid-cols-12 lg:items-center lg:gap-16">
                     <div className="lg:col-span-4">
-                        <p className="eyebrow">the stack you already use</p>
+                        <p className="eyebrow">auth + data</p>
                         <h2 className="mt-4 max-w-md text-3xl font-semibold tracking-tight text-fg sm:text-4xl">
-                            Four familiar files. One database.
+                            Your organization is the shard key.
                         </h2>
                         <p className="mt-5 max-w-md text-base leading-7 text-fg-muted">
-                            Better Auth supplies identity. Drizzle supplies the schema. Chardb turns both into a
-                            Wrangler-native Worker backed by Durable Objects, R2, and Vectorize.
+                            Define Better Auth and one Drizzle table. Chardb turns that relationship into an isolated,
+                            transactional database inside your Worker.
                         </p>
                     </div>
 
-                    <div className="file-stack mt-12 lg:col-span-8 lg:mt-0" aria-label="Generated project files">
-                        {files.map((file, index) => (
-                            <article
-                                className="file-card"
-                                key={file.name}
-                                style={{ "--file-index": index } as CSSProperties}
-                            >
-                                <header>
-                                    <span className="file-dot" />
-                                    <span className="file-dot" />
-                                    <span className="file-dot" />
-                                    <code>{file.name}</code>
-                                </header>
-                                <pre>
-                                    <code>{file.code}</code>
-                                </pre>
-                            </article>
-                        ))}
-                    </div>
+                    <article className="code-window mt-12 lg:col-span-8 lg:mt-0" aria-label="Auth and table example">
+                        <header>
+                            <span className="file-dot" />
+                            <span className="file-dot" />
+                            <span className="file-dot" />
+                            <code>auth.ts + schema.ts</code>
+                        </header>
+                        <pre>
+                            <DatabaseSnippet />
+                        </pre>
+                    </article>
                 </div>
             </section>
 

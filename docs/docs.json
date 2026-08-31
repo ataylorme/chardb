@@ -1,28 +1,28 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "chardb",
-  "description": "Organization-owned SQLite, Better Auth tenancy, files, and live Drizzle queries for Cloudflare Workers.",
-  "favicon": "/favicon.png",
-  "colors": {
-    "primary": "#EC5713",
-    "light": "#F0642B",
-    "dark": "#C83D09"
-  },
-  "navigation": {
-    "groups": [
-      {
-        "group": "Core",
-        "pages": ["quickstart", "ownership", "live-queries", "files", "vectors"]
-      },
-      {
-        "group": "Operate",
-        "pages": ["deploy", "schema-migrations"]
-      },
-      {
-        "group": "Cookbook",
-        "pages": ["cookbook/chat-app"]
-      }
-    ]
-  }
+    "$schema": "https://mintlify.com/docs.json",
+    "theme": "mint",
+    "name": "chardb",
+    "description": "Organization-owned SQLite, Better Auth tenancy, files, and live Drizzle queries for Cloudflare Workers.",
+    "favicon": "/favicon.png",
+    "colors": {
+        "primary": "#EC5713",
+        "light": "#F0642B",
+        "dark": "#C83D09"
+    },
+    "navigation": {
+        "groups": [
+            {
+                "group": "Core",
+                "pages": ["quickstart", "ownership", "live-queries", "files", "vectors"]
+            },
+            {
+                "group": "Operate",
+                "pages": ["deploy", "schema-migrations"]
+            },
+            {
+                "group": "Cookbook",
+                "pages": ["cookbook/chat-app"]
+            }
+        ]
+    }
 }

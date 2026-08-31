@@ -5,13 +5,13 @@
 .mdx-content h1,
 .mdx-content h2,
 .mdx-content h3 {
-  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-weight: 500;
-  letter-spacing: -0.035em;
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-weight: 500;
+    letter-spacing: -0.035em;
 }
 
 .nav-logo {
-  font-size: 20px;
-  letter-spacing: -0.025em;
-  text-transform: lowercase;
+    font-size: 20px;
+    letter-spacing: -0.025em;
+    text-transform: lowercase;
 }

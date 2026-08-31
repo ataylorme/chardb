@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  NODE_OPTIONS: --max-old-space-size=4096
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -154,6 +157,11 @@ jobs:
 
       - name: Lint
         run: bun run lint
+
+      - name: Verify docs against the exact candidate
+        env:
+          CHARDB_DOCS_TARBALL: ci-candidate/candidate.tgz
+        run: bun run test:docs
 
       - name: Scan Git history for high-confidence secrets
         run: bun run security:history

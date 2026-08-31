@@ -35,7 +35,7 @@ import {
     authTableName,
     authUpdate,
 } from "../../src/auth/sql.ts";
-import { defineAuth } from "../../src/auth/synthesize.ts";
+import { synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import type { SyncSql } from "../../src/oplog/wrapper.ts";
 import type { RawJson } from "../../src/types.ts";
 
@@ -69,7 +69,7 @@ describe("auth/runtime — epoch scope", () => {
     test("core models identify their canonical principal scope", () => {
         resetAuthRuntime();
         bindAuthRuntime({
-            schema: defineAuth({ plugins: [] }) as never,
+            schema: synthesizeAuthSchema({ plugins: [] }) as never,
             options: {},
         });
         expect(placementFor("user")).toEqual({ kind: "principal", column: "id" });
@@ -81,7 +81,7 @@ describe("auth/runtime — epoch scope", () => {
     test("organization plugin models identify their tenant scope", () => {
         resetAuthRuntime();
         bindAuthRuntime({
-            schema: defineAuth({ plugins: [organization()] }) as never,
+            schema: synthesizeAuthSchema({ plugins: [organization()] }) as never,
             options: {},
         });
         expect(placementFor("organization")).toEqual({ kind: "tenant", column: "id" });
@@ -91,7 +91,7 @@ describe("auth/runtime — epoch scope", () => {
 
     test("tableFor returns the synthesized Drizzle table", () => {
         resetAuthRuntime();
-        bindAuthRuntime({ schema: defineAuth({ plugins: [] }) as never, options: {} });
+        bindAuthRuntime({ schema: synthesizeAuthSchema({ plugins: [] }) as never, options: {} });
         const t = tableFor("user");
         expect(authTableName(t)).toBe("user");
         const cols = authTableColumns(t);
@@ -103,7 +103,7 @@ describe("auth/runtime — epoch scope", () => {
 describe("auth/sql — render path against bun:sqlite", () => {
     test("create then findOne round-trips a row", () => {
         resetAuthRuntime();
-        bindAuthRuntime({ schema: defineAuth({ plugins: [] }) as never, options: {} });
+        bindAuthRuntime({ schema: synthesizeAuthSchema({ plugins: [] }) as never, options: {} });
         const { sql } = bootstrap();
         const t = tableFor("user");
         const cfg = authTableColumns(t);
@@ -117,7 +117,7 @@ describe("auth/sql — render path against bun:sqlite", () => {
 
     test("update mutates and returns the merged row", () => {
         resetAuthRuntime();
-        bindAuthRuntime({ schema: defineAuth({ plugins: [] }) as never, options: {} });
+        bindAuthRuntime({ schema: synthesizeAuthSchema({ plugins: [] }) as never, options: {} });
         const { sql } = bootstrap();
         const t = tableFor("user");
         const cfg = authTableColumns(t);
@@ -130,7 +130,7 @@ describe("auth/sql — render path against bun:sqlite", () => {
 
     test("delete reports affected count", () => {
         resetAuthRuntime();
-        bindAuthRuntime({ schema: defineAuth({ plugins: [] }) as never, options: {} });
+        bindAuthRuntime({ schema: synthesizeAuthSchema({ plugins: [] }) as never, options: {} });
         const { sql } = bootstrap();
         const t = tableFor("user");
         const cfg = authTableColumns(t);
@@ -143,7 +143,7 @@ describe("auth/sql — render path against bun:sqlite", () => {
 
     test("findMany and count agree on row counts", () => {
         resetAuthRuntime();
-        bindAuthRuntime({ schema: defineAuth({ plugins: [] }) as never, options: {} });
+        bindAuthRuntime({ schema: synthesizeAuthSchema({ plugins: [] }) as never, options: {} });
         const { sql } = bootstrap();
         const t = tableFor("user");
         const cfg = authTableColumns(t);
@@ -156,7 +156,7 @@ describe("auth/sql — render path against bun:sqlite", () => {
 
     test("findMany and count bind bounded in filters", () => {
         resetAuthRuntime();
-        bindAuthRuntime({ schema: defineAuth({ plugins: [] }) as never, options: {} });
+        bindAuthRuntime({ schema: synthesizeAuthSchema({ plugins: [] }) as never, options: {} });
         const db = new BunSqlite(":memory:");
         const statements: string[] = [];
         const sql = bunSyncSql(db, statements);
@@ -301,7 +301,7 @@ describe("auth/sql — render path against bun:sqlite", () => {
 
     test("findMany rejects invalid paging and sorting", () => {
         resetAuthRuntime();
-        bindAuthRuntime({ schema: defineAuth({ plugins: [] }) as never, options: {} });
+        bindAuthRuntime({ schema: synthesizeAuthSchema({ plugins: [] }) as never, options: {} });
         const { sql } = bootstrap();
         const t = tableFor("user");
         const cfg = authTableColumns(t);
@@ -479,7 +479,7 @@ describe("auth/sql — render path against bun:sqlite", () => {
 
     test("rejects where keys that are not columns", () => {
         resetAuthRuntime();
-        bindAuthRuntime({ schema: defineAuth({ plugins: [] }) as never, options: {} });
+        bindAuthRuntime({ schema: synthesizeAuthSchema({ plugins: [] }) as never, options: {} });
         const { sql } = bootstrap();
         const t = tableFor("user");
         const cfg = authTableColumns(t);

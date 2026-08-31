@@ -35,6 +35,7 @@
         "smoke:vector:browser": "bun scripts/smoke-packed-public-vector.mjs",
         "test": "bun scripts/test-correctness.mjs",
         "test:correctness": "bun scripts/test-correctness.mjs",
+        "test:docs": "bun scripts/test-docs-contract.mjs",
         "test:watch": "bun scripts/test-correctness.mjs --watch",
         "test:scale": "bun test test/workerd/gateway-live.harness.test.ts --test-name-pattern 'scaled SDK'",
         "bench:planned-query": "bun scripts/run-scale-benchmark.mjs --suite planned-query",

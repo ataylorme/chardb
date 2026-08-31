@@ -1,26 +1,84 @@
 {
-  "protocolV": 3,
-  "up": [
-    { "t": "hello", "protocolV": 3, "clientId": "client-1", "resumeFromCookie": "client-1:4", "jwt": "header.payload.signature" },
-    { "t": "sub", "subId": 1, "ref": "queries.ts#messages", "args": { "organizationId": "org-1" }, "ttlMs": 5000 },
-    { "t": "unsub", "subId": 1 },
-    { "t": "mut", "mutId": "018f-test", "ref": "mutations.ts#post", "args": { "body": "hello" } },
-    { "t": "updateAuth", "jwt": "new.header.signature" },
-    { "t": "ack", "cookie": "client-1:5" },
-    { "t": "presencePub", "key": "room-1", "state": { "typing": true }, "ttlMs": 5000 },
-    { "t": "presenceSub", "key": "room-1" },
-    { "t": "streamReq", "streamReqId": 2, "ref": "exports.ts#rows", "args": {}, "mutId": "018f-stream" },
-    { "t": "ping" }
-  ],
-  "down": [
-    { "t": "welcome", "protocolV": 3, "baseCookie": "client-1:0", "region": "WNAM", "colo": "SJC", "resumedFromCookie": "client-1:4" },
-    { "t": "poke", "cookie": "client-1:5", "patches": [{ "op": "put", "subId": 1, "rowKey": "message-1", "row": { "body": "hello" } }], "mutResults": [{ "mutId": "018f-test", "ok": true, "result": { "id": "message-1" }, "cookie": "client-1:5" }] },
-    { "t": "poke", "cookie": "client-1:6", "patches": [{ "op": "del", "subId": 1, "rowKey": "message-1", "row": { "__key": "conflicting-key", "body": "ignored" } }], "mutResults": [{ "mutId": "018f-failed", "ok": false, "error": { "code": "CDB_RATE_LIMITED", "retryable": true, "docs": "https://chardb.dev/errors/cdb_rate_limited" } }] },
-    { "t": "snapshot", "subId": 1, "cookie": "client-1:4", "rows": [{ "id": "message-1", "body": "hello" }] },
-    { "t": "mustRefetch", "subIds": [1], "reason": "shardsChanged" },
-    { "t": "presence", "key": "room-1", "version": 1, "states": [{ "clientId": "client-2", "state": { "typing": true }, "ts": 1730000000000 }] },
-    { "t": "streamChunk", "streamReqId": 2, "chunk": [1, 2, 3] },
-    { "t": "streamEnd", "streamReqId": 2, "finalMutResult": { "mutId": "018f-stream", "ok": true, "result": { "count": 3 }, "cookie": "client-1:7" } },
-    { "t": "error", "code": "CDB_FORBIDDEN", "subId": 1, "retryable": false, "correlationId": "corr-1", "docs": "https://chardb.dev/errors/cdb_forbidden" }
-  ]
+    "protocolV": 3,
+    "up": [
+        {
+            "t": "hello",
+            "protocolV": 3,
+            "clientId": "client-1",
+            "resumeFromCookie": "client-1:4",
+            "jwt": "header.payload.signature"
+        },
+        { "t": "sub", "subId": 1, "ref": "queries.ts#messages", "args": { "organizationId": "org-1" }, "ttlMs": 5000 },
+        { "t": "unsub", "subId": 1 },
+        { "t": "mut", "mutId": "018f-test", "ref": "mutations.ts#post", "args": { "body": "hello" } },
+        { "t": "updateAuth", "jwt": "new.header.signature" },
+        { "t": "ack", "cookie": "client-1:5" },
+        { "t": "presencePub", "key": "room-1", "state": { "typing": true }, "ttlMs": 5000 },
+        { "t": "presenceSub", "key": "room-1" },
+        { "t": "streamReq", "streamReqId": 2, "ref": "exports.ts#rows", "args": {}, "mutId": "018f-stream" },
+        { "t": "ping" }
+    ],
+    "down": [
+        {
+            "t": "welcome",
+            "protocolV": 3,
+            "baseCookie": "client-1:0",
+            "region": "WNAM",
+            "colo": "SJC",
+            "resumedFromCookie": "client-1:4"
+        },
+        {
+            "t": "poke",
+            "cookie": "client-1:5",
+            "patches": [{ "op": "put", "subId": 1, "rowKey": "message-1", "row": { "body": "hello" } }],
+            "mutResults": [
+                { "mutId": "018f-test", "ok": true, "result": { "id": "message-1" }, "cookie": "client-1:5" }
+            ]
+        },
+        {
+            "t": "poke",
+            "cookie": "client-1:6",
+            "patches": [
+                {
+                    "op": "del",
+                    "subId": 1,
+                    "rowKey": "message-1",
+                    "row": { "__key": "conflicting-key", "body": "ignored" }
+                }
+            ],
+            "mutResults": [
+                {
+                    "mutId": "018f-failed",
+                    "ok": false,
+                    "error": {
+                        "code": "CDB_RATE_LIMITED",
+                        "retryable": true,
+                        "docs": "https://chardb.dev/errors/cdb_rate_limited"
+                    }
+                }
+            ]
+        },
+        { "t": "snapshot", "subId": 1, "cookie": "client-1:4", "rows": [{ "id": "message-1", "body": "hello" }] },
+        { "t": "mustRefetch", "subIds": [1], "reason": "shardsChanged" },
+        {
+            "t": "presence",
+            "key": "room-1",
+            "version": 1,
+            "states": [{ "clientId": "client-2", "state": { "typing": true }, "ts": 1730000000000 }]
+        },
+        { "t": "streamChunk", "streamReqId": 2, "chunk": [1, 2, 3] },
+        {
+            "t": "streamEnd",
+            "streamReqId": 2,
+            "finalMutResult": { "mutId": "018f-stream", "ok": true, "result": { "count": 3 }, "cookie": "client-1:7" }
+        },
+        {
+            "t": "error",
+            "code": "CDB_FORBIDDEN",
+            "subId": 1,
+            "retryable": false,
+            "correlationId": "corr-1",
+            "docs": "https://chardb.dev/errors/cdb_forbidden"
+        }
+    ]
 }
