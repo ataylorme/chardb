@@ -17,8 +17,8 @@ import { fileURLToPath } from "node:url";
 const FINAL_ARTIFACT = Object.freeze({
   name: "@chardb/core",
   version: "0.1.0",
-  size: 455_788,
-  sha256: "51756dc95e3eb9005e381d351761b9d4d8305b18cde41740bba6991f1148df7f",
+  size: 454_339,
+  sha256: "e44112e213ea1e5e908529b3eb59fbd0edd61c361a23ae45f4380b0e4f48ffb6",
 });
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -51,22 +51,32 @@ try {
     fail(`public exports must be ${expectedExports.join(", ")}`);
   }
 
+  const packageReadme = await readFile(join(packageRoot, "README.md"), "utf8");
+  for (const stale of [
+    /\bCandidate\d+\b/i,
+    /\brelease candidate\b/i,
+    /\bfinal candidate\b/i,
+    /bun run (?:preview|proof|release):/i,
+    /github\.com\/zpg6\/chardb\/blob\/main\//i,
+    /Version two deliberately/i,
+    /expanded deployed pass open/i,
+  ]) {
+    if (stale.test(packageReadme)) fail(`packed README contains stale release language: ${stale}`);
+  }
+  for (const current of [
+    "Versions after the initial snapshot deliberately support only SQLite changes",
+    "Every release starts from one packed npm tarball",
+    "These are release-engineering controls, not a durability or production-readiness claim",
+  ]) {
+    requireText(packageReadme, current, `packed README is missing current release language: ${current}`);
+  }
+
   const cli = join(packageRoot, "dist/cli/bin.mjs");
   const help = run(process.execPath, [cli, "--help"]).stdout;
   for (const command of ["init <name>", "doctor [wrangler]", "migrations generate", "vectorize prepare", "migrate --url"]) {
     requireText(help, command, `CLI help is missing ${command}`);
   }
   rejectText(help, "experimental shards", "experimental range movement leaked into primary help");
-  const rangeResult = spawnSync(process.execPath, [cli, "experimental", "shards", "--help"], {
-    cwd: repositoryRoot,
-    encoding: "utf8",
-    env: process.env,
-  });
-  if (rangeResult.status !== 2) fail(`range help exited ${rangeResult.status}; expected 2`);
-  const rangeHelp = `${rangeResult.stdout}${rangeResult.stderr}`;
-  for (const word of ["split", "status|recover|abort", "--max-steps"]) {
-    requireText(rangeHelp, word, `range command help is missing ${word}`);
-  }
 
   const init = run(process.execPath, [cli, "init", "my-chardb-app"], temporaryRoot);
   requireText(init.stdout, 'initialised "my-chardb-app"', "initializer did not report the created directory");
@@ -104,6 +114,16 @@ try {
   }
 
   const combined = [...pageSources.values()].join("\n");
+  for (const stale of [
+    /\bCandidate\d+\b/i,
+    /\brelease candidate\b/i,
+    /bun run (?:preview|proof|release):/i,
+    /github\.com\/zpg6\/chardb\/blob\/main\//i,
+    /Version two deliberately/i,
+    /chardb experimental shards/i,
+  ]) {
+    if (stale.test(combined)) fail(`public docs contain stale or internal release language: ${stale}`);
+  }
   for (const legacy of [/from ["']chardb(?:\/[^"']*)?["']/, /\bbunx chardb\b/, /\bbun add chardb\b/]) {
     if (legacy.test(combined)) fail(`public docs contain a legacy package path: ${legacy}`);
   }
@@ -211,10 +231,10 @@ try {
   for (const phrase of ["does not add a hosted-service charge", "does not publish a total monthly-cost claim"]) {
     requireText(cost, phrase, `packed cost note is missing: ${phrase}`);
   }
-  for (const phrase of ["there is no backup", "point-in-time recovery", "operator path, not automatic resharding"]) {
+  for (const phrase of ["there is no backup", "point-in-time recovery"]) {
     requireText(operations, phrase, `packed operations note is missing: ${phrase}`);
   }
-  for (const claim of ["unmeasured", "no backup", "operator-driven"]) {
+  for (const claim of ["unmeasured", "no backup", "automatic resharding"]) {
     requireText(deploy.toLowerCase(), claim, `deploy page is missing the ${claim} limit`);
   }
 

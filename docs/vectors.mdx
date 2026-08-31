@@ -77,4 +77,4 @@ export const searchMessages = api.query({
 });
 ```
 
-Search returns `{ rowPk, score }`. Chardb rejects stale, cross-organization, and policy-hidden Vectorize candidates against SQLite. Delivery and deletion are eventually consistent. A settled vector change invalidates the matching live search query and causes it to refetch.
+Search returns `{ rowPk, score }`. Chardb rejects stale, cross-organization, and policy-hidden Vectorize results against SQLite. Delivery and deletion are eventually consistent. A settled vector change invalidates the matching live search query and causes it to refetch.

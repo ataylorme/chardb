@@ -3,9 +3,9 @@
 The guide is contracted to this exact final packed artifact:
 
 - package: `@chardb/core@0.1.0`
-- file used for verification: `/private/tmp/chardb-candidate-final.4Rf6cG/chardb-core-0.1.0.tgz`
-- size: `455788` bytes
-- SHA-256: `51756dc95e3eb9005e381d351761b9d4d8305b18cde41740bba6991f1148df7f`
+- file used for verification: `/private/tmp/chardb-candidate-final3.SPYNJY/chardb-core-0.1.0.tgz`
+- size: `454339` bytes
+- SHA-256: `e44112e213ea1e5e908529b3eb59fbd0edd61c361a23ae45f4380b0e4f48ffb6`
 
 `chardb init my-chardb-app` creates the named directory. The docs contract runs that packed command in a clean temporary directory, compares the embedded generated examples byte for byte, and exercises additive migration generation. Set `CHARDB_DOCS_TARBALL` to the packed artifact before running the contract.
 
@@ -20,4 +20,4 @@ The guide documents the shipped API, including its explicit steps:
 
 ## Release limits
 
-The artifact has no supported backup, export, restore, point-in-time recovery, replica promotion, regional failover, or SLA. Range movement is an operator-driven experimental command, not automatic balancing or a recovery mechanism.
+The artifact has no supported backup, export, restore, point-in-time recovery, replica promotion, regional failover, automatic resharding, or SLA.
