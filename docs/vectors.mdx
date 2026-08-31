@@ -1,59 +1,80 @@
 ---
 title: "Vectors"
-description: "Index embeddings without creating a second ownership model."
+description: "Write and search organization vectors through Vectorize."
 ---
 
-Vector columns inherit the table's owner and policy. A search scoped to one organization cannot return a match from another organization, even when both share the same Vectorize index.
+Vector columns are an opt-in organization feature. Chardb stores an opaque logical handle in SQLite and delivers the vector to Cloudflare Vectorize after the transaction commits.
 
-## Choose where the values live
+## Declare the vector
 
-`vector()` stores embeddings in Cloudflare Vectorize. `inlineVector()` keeps them in the owner's SQLite partition.
+The property name supplies the SQL column name, so the string overload is unnecessary here.
 
 ```ts src/schema.ts
-import { inlineVector, vector } from "@chardb/core/server";
+import { vector } from "@chardb/core/server";
 
 export const messages = cdbTable("messages", {
   // ordinary message columns
-  embedding: vector("embedding", { dim: 1_536 }),
-  localEmbedding: inlineVector("local_embedding", { dim: 384 }),
+  embedding: vector({
+    dim: 768,
+    binding: "VECTORS",
+    metric: "cosine",
+  }),
 });
 ```
 
-Use `vector()` for a growing collection and approximate nearest-neighbor search. Index updates are eventually consistent. Use `inlineVector()` for a small partition that needs strict read-after-write behavior.
+Add the matching native binding to `wrangler.toml`, create the index, then prepare Chardb's required metadata index.
 
-## Search inside the owner
+```toml wrangler.toml
+[[vectorize]]
+binding = "VECTORS"
+index_name = "my-app-vectors"
+```
 
-The query still names the organization predicate. Chardb turns it into both the SQL route and the Vectorize metadata filter.
+```bash
+bunx wrangler vectorize create my-app-vectors --dimensions 768 --metric cosine
+bunx @chardb/core vectorize prepare
+```
+
+## Write and delete
+
+Your application computes the embedding values. This release does not call an embedding model for you.
+
+```ts src/api.ts
+export const putMessage = api.mutation({
+  ref: "src/api.ts#putMessage",
+  authority: "organization",
+  partitionKey: "organizationId",
+  args: z.object({
+    organizationId: z.string(),
+    id: z.string(),
+    body: z.string(),
+    values: z.array(z.number()).length(768),
+  }),
+  handler: (ctx, args) => {
+    const embedding = ctx.vector.set(messages.embedding, args.id, args.values);
+    ctx.db.insert(messages).values({ id: args.id, body: args.body, embedding }).run();
+    return { id: args.id };
+  },
+});
+
+ctx.vector.delete(messages.embedding, args.id);
+ctx.db.delete(messages).where(eq(messages.id, args.id)).run();
+```
+
+Keep `ctx.vector.delete()` and the row deletion in the same mutation.
+
+## Search
 
 ```ts src/queries.ts
 export const searchMessages = api.query({
   ref: "src/queries.ts#searchMessages",
   args: z.object({
     organizationId: z.string(),
-    embedding: z.array(z.number()).length(1_536),
+    values: z.array(z.number()).length(768),
+    limit: z.number().int().min(1).max(100),
   }),
-  query: (db, args) => db
-    .select({ id: messages.id, body: messages.body })
-    .from(messages)
-    .where(eq(messages.organizationId, args.organizationId))
-    .nearest(messages.embedding, args.embedding)
-    .limit(8),
+  query: (_db, args) => searchVector(messages.embedding, args),
 });
 ```
 
-The result remains a registered query, so the browser receives a typed handle rather than index names or raw Vectorize calls.
-
-## Keep embedding work explicit
-
-Generate the embedding before the mutation, then write it with the row. This keeps model choice and retry policy in your application.
-
-```ts
-await postMessage({
-  id,
-  organizationId,
-  body,
-  embedding: await embed(body),
-});
-```
-
-Changing the model or dimension requires a new column and a backfill. Do not reinterpret stored values under a new model. Add the column through [Schema migrations](/schema-migrations), fill it, switch reads, then remove the old column in a later release.
+Search returns `{ rowPk, score }`. Chardb rejects stale, cross-organization, and policy-hidden Vectorize candidates against SQLite. Delivery and deletion are eventually consistent. A settled vector change invalidates the matching live search query and causes it to refetch.

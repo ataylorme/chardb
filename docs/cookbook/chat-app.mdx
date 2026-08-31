@@ -1,119 +1,58 @@
 ---
 title: "Chat app"
-description: "Build an organization-owned chat with live messages and attachments."
+description: "Follow the generated organization message app from session to live update."
 ---
 
-This recipe starts from the generated app in [Quickstart](/quickstart). Each organization gets its own channels, messages, live subscriptions, and R2 object keys.
+This recipe uses the app from [Quickstart](/quickstart). Do not rebuild it by hand. The initializer already wires the server, browser, Miniflare test, migration journal, and deploy scripts.
 
-## Add channels and messages
+## Establish the Better Auth session
 
-```ts src/schema.ts
-const { cdbTable } = forOrg();
-
-export const channels = cdbTable("channels", {
-  id: text("id").primaryKey(),
-  organizationId: text("organization_id")
-    .notNull()
-    .references(() => auth.organization.id),
-  name: text("name").notNull(),
+```tsx
+const authClient = createAuthClient({
+  baseURL: window.location.origin,
+  plugins: [anonymousClient(), organizationClient(), jwtClient()],
 });
 
-export const messages = cdbTable(
-  "messages",
-  {
-    id: text("id").primaryKey(),
-    channelId: text("channel_id").notNull().references(() => channels.id),
-    organizationId: text("organization_id")
-      .notNull()
-      .references(() => auth.organization.id),
-    authorId: text("author_id").notNull().references(() => auth.user.id),
-    body: text("body").notNull(),
-    attachment: file("attachment", {
-      maxSize: 5 * 1_024 * 1_024,
-      contentTypes: ["image/jpeg", "image/png"],
-    }),
-    createdAt: integer("created_at").notNull(),
-  },
-  {
-    selfBy: "authorId",
-    roles: {
-      member: { read: "*", create: ["id", "channelId", "body", "attachment", "createdAt"] },
-      self: { update: ["body", "attachment"], delete: true },
-    },
-  },
-);
+<ChardbProvider endpoint={endpoint()} auth={authClient}>
+  <Workspace />
+</ChardbProvider>
 ```
 
-The direct `organizationId` on `messages` is intentional. It makes routing and authorization explicit even though the channel already belongs to the same organization.
+The generated browser signs in anonymously, creates an organization through Better Auth, and calls `organization.setActive`. The provider fetches the signed JWT used by live queries and mutations. File routes use the same-origin session cookie.
 
-## Register one channel query
+## Read the active organization
 
-```ts src/queries.ts
-export const listMessages = api.query({
-  ref: "src/queries.ts#listMessages",
-  args: z.object({ organizationId: z.string(), channelId: z.string() }),
-  query: (db, args) => db
-    .select()
-    .from(messages)
-    .where(and(
-      eq(messages.organizationId, args.organizationId),
-      eq(messages.channelId, args.channelId),
-    ))
-    .orderBy(desc(messages.createdAt), desc(messages.id))
-    .limit(50),
+```tsx
+const { data = [], state } = useQuery(listMessages, {
+  organizationId,
+  limit: 50,
 });
 ```
 
-## Post a message
+The routing value does not grant access. Gateway verifies current membership and the table policy before it registers the query.
 
-```ts src/api.ts
-export const postMessage = api.mutation({
-  ref: "src/api.ts#postMessage",
-  authority: "organization",
-  partitionKey: "organizationId",
-  args: z.object({
-    id: z.string(),
-    organizationId: z.string(),
-    channelId: z.string(),
-    body: z.string().trim().min(1).max(2_000),
-  }),
-  handler: (ctx, args) => {
-    ctx.db.insert(messages).values({
-      id: args.id,
-      channelId: args.channelId,
-      body: args.body,
-      createdAt: Date.now(),
-    }).run();
-    return { id: args.id };
-  },
-});
-```
+## Upload, then write
 
-Chardb fills the owner and author columns after checking the session and membership.
-
-## Render the channel
-
-```tsx src/Channel.tsx
-export function Channel({ organizationId, channelId }: Props) {
-  const { data: messages = [] } = useQuery(listMessages, {
-    organizationId,
-    channelId,
-  });
-  const post = useMutation(postMessage);
-
-  async function send(body: string) {
-    await post({
-      id: crypto.randomUUID(),
+```tsx
+const uploaded = selectedFile
+  ? await attachment.upload({
       organizationId,
-      channelId,
-      body,
-    });
-  }
+      file: selectedFile,
+      idempotencyKey: retryKey,
+    })
+  : null;
 
-  return <MessageList messages={messages} onSend={send} />;
-}
+await mutate({
+  id: uuidv7(),
+  organizationId,
+  body,
+  attachment: uploaded?.fileId ?? null,
+  clientCreatedAt: Date.now(),
+});
 ```
 
-Open the channel in two tabs and send a message. Both subscriptions should receive the same replacement snapshot. Switch one tab to another organization and confirm it cannot read the first organization's channel.
+The message insert and file upload are separate operations. Reuse the same upload idempotency key when retrying the selected file. The row stores only the opaque file ID.
 
-Add uploads with the handle flow in [Files](/files). Add semantic message search with [Vectors](/vectors).
+Open the same organization in two tabs and post a message. Both subscriptions should receive the replacement snapshot. Switch one tab to another organization and confirm it cannot read or download the first organization's data.
+
+The generated Vitest covers the server write and read. The browser path adds live delivery and the authenticated file lifecycle.

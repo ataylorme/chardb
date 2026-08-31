@@ -3,11 +3,13 @@ title: "Live queries"
 description: "Register a typed Drizzle query and keep its React result current."
 ---
 
-A live query is a server-owned Drizzle query with a stable reference. The browser sends the reference and JSON arguments. It never sends SQL.
+A live query is a registered Drizzle query. The browser sends its reference and validated JSON arguments. It never sends SQL.
 
 ## Register the query
 
-{/* contract: ../docs-examples/generated-app/src/queries.ts */}
+This is the complete generated query file.
+
+{/* generated: src/queries.ts */}
 ```ts src/queries.ts
 import { api } from "@chardb/core/server";
 import { desc, eq } from "drizzle-orm";
@@ -55,7 +57,7 @@ export function MessageList({ organizationId }: { organizationId: string }) {
 }
 ```
 
-`pending` means the first snapshot has not arrived. `live` means the subscription is current. `refetching` means Chardb reconnected and is replacing a snapshot it could not resume safely.
+`pending` means the first snapshot has not arrived. `live` means the subscription is current. `refetching` means Chardb could not safely resume an earlier snapshot and is replacing it.
 
 ## Write through a mutation
 
@@ -69,6 +71,6 @@ await post({
 });
 ```
 
-The mutation commits once, even if the response is lost and the client reconnects. Every matching subscription then receives a complete replacement snapshot. There is no local cache merge rule to maintain.
+The client retains one mutation ID while it reconnects, so a retry does not create a second write. Every matching subscription receives a complete replacement snapshot after the commit.
 
 Use [Files](/files) when a row needs an attachment.

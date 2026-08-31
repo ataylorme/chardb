@@ -1,22 +1,21 @@
 ---
 title: "Deploy"
-description: "Create the Cloudflare resources and release the Worker."
+description: "Configure Cloudflare, deploy the Worker, and keep the limits visible."
 ---
 
-Deploy from a clean commit after the local test and build pass.
+Deploy only disposable or independently rebuildable data.
 
 ## Set production secrets
 
-Create `.env.local` from the generated example and fill in the Cloudflare account, Better Auth secret, and Chardb admin token.
+Copy the generated file and replace every placeholder.
 
 ```dotenv .env.local
-CLOUDFLARE_ACCOUNT_ID=your_account_id
-CLOUDFLARE_API_TOKEN=your_api_token
-BETTER_AUTH_SECRET=use_a_long_random_value
-CHARDB_ADMIN_TOKEN=use_a_different_long_random_value
+CHARDB_URL=https://your-worker.example.com
+CHARDB_ADMIN_TOKEN=replace-with-32-to-512-byte-secret
+BETTER_AUTH_SECRET=replace-with-at-least-32-byte-secret
 ```
 
-Do not commit this file. The deploy script sends the runtime secrets to Wrangler and keeps the Cloudflare API token on your machine.
+Do not commit `.env.local`. The bootstrap script sends both secrets through a mode-0600 temporary file, removes it, and never puts a secret in process arguments.
 
 ## First deploy
 
@@ -30,7 +29,7 @@ bun run setup:cloudflare
 bun run deploy:bootstrap
 ```
 
-`setup:cloudflare` creates or verifies the R2 bucket and Vectorize indexes declared by the schema. `deploy:bootstrap` deploys the Worker, installs the packaged schema, and prints the production origin.
+`setup:cloudflare` creates or verifies only the R2 bucket in `wrangler.toml`. Vectorize needs the explicit setup shown in [Vectors](/vectors). `deploy:bootstrap` uploads the first Worker, waits for the packaged schema identity, and applies the migration.
 
 ## Later deploys
 
@@ -43,10 +42,22 @@ bun run build
 bun run deploy
 ```
 
-The deploy command refuses to activate code whose packaged schema is newer than the database. Generate and commit the migration first.
+Routine `deploy` requires an existing Worker and refuses a package or migration mismatch.
 
 <Note>
   Keep `CHARDB_ADMIN_TOKEN` separate from `BETTER_AUTH_SECRET`. The first authorizes maintenance operations. The second signs application sessions.
 </Note>
+
+## Cost boundary
+
+Chardb adds no hosted-service fee. Cloudflare bills Workers, Durable Objects, R2, and Vectorize from the bindings and traffic in your application. One application mutation can cause several Durable Object calls and SQLite row operations.
+
+The total deployed cost is unmeasured. Current evidence does not collect Worker CPU-ms, Durable Object requests or duration, SQLite rows, R2 GB-month, or complete Vectorize billing dimensions. Latency and operation counts are not an invoice estimate.
+
+## Recovery boundary
+
+There is no backup, export, restore, point-in-time recovery, replica promotion, regional failover, or SLA. A successful restart proves reconstruction against storage that still exists. It does not prove recovery after storage loss or corruption.
+
+Range movement is an operator-driven experimental command under `chardb experimental shards`. It is not automatic balancing, automatic resharding, a merge tool, or a recovery system.
 
 Read [Schema migrations](/schema-migrations) before changing a deployed table.

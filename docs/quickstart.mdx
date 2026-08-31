@@ -1,25 +1,24 @@
 ---
 title: "Quickstart"
-description: "Generate the starter and send a live message locally."
+description: "Generate, test, and run the starter."
 ---
 
 You need Bun 1.2.22 or newer. Local development does not need a Cloudflare account.
 
 ## Create the app
 
-`chardb init` writes into the current directory, so start with an empty one.
+Run the initializer from the directory that should contain your new project. It creates `my-chardb-app` for you.
 
 ```bash
-mkdir my-chardb-app
-cd my-chardb-app
 bunx @chardb/core@0.1.0 init my-chardb-app
+cd my-chardb-app
 bun install
 bun run typecheck
 bun run test
 bun run build
 ```
 
-The generated test boots a Worker, applies the first schema migration, creates an organization, and reads back one message. If any command fails, fix it before starting the app.
+`bun run test` reads the generated `wrangler.toml` and runs the Worker through Cloudflare's Vitest integration. It migrates a fresh Miniflare database, checks the four Durable Object bindings and R2 binding, signs in through Better Auth, creates an organization, then writes and reads one message.
 
 ## Run it
 
@@ -29,22 +28,24 @@ Start the Worker and web app together.
 bun run dev
 ```
 
-Open the local URL printed by Vite. The app signs in anonymously, then creates a Better Auth account for that browser.
+`bun run dev` starts Wrangler, migrates the local database, then starts Vite. It prints the browser URL only after both processes are ready.
 
 Try the complete path once.
 
 1. Create an organization.
 2. Open the same organization in a second tab.
-3. Post a message and watch both tabs update.
-4. Restart `bun run dev` and reload the persisted message.
+3. Post a message with a JPEG or PNG attachment and watch both tabs update.
+4. Download the attachment through the same-origin authenticated route.
+5. Restart `bun run dev` and reload the persisted message.
 
-## Know the four files
+## Know the core files
 
 You will make most changes here:
 
-- `src/schema.ts` declares tables and ownership.
-- `src/queries.ts` declares the reads available to clients.
-- `src/api.ts` declares mutations.
-- `src/worker.ts` combines Chardb, Better Auth, and your routes.
+- `src/auth.ts` defines the Better Auth plugins.
+- `src/schema.ts` declares the organization table and policy.
+- `src/queries.ts` and `src/api.ts` declare the live read and mutations.
+- `src/worker.ts` mounts Chardb and application routes.
+- `wrangler.toml` binds Catalog, Cdb, Gateway, Resharder, and R2.
 
-Next, read [Ownership](/ownership). It explains why `organizationId` controls placement and access rather than acting like an ordinary foreign key.
+Next, read [Ownership](/ownership). It explains the two public tenancy builders.

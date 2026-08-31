@@ -19,17 +19,7 @@ For example:
 editedAt: integer("edited_at"),
 ```
 
-The generator writes the next numbered migration and updates the packaged journal. Review the SQL before running it.
-
-```ts src/migrations/0002_add_message_edited_at.ts
-export default {
-  version: 2,
-  name: "add_message_edited_at",
-  statements: [
-    'ALTER TABLE "messages" ADD COLUMN "edited_at" INTEGER',
-  ],
-};
-```
+The generator inspects the schema twice in separate Bun processes and rejects different output. It writes `src/migrations/v2.json`, `src/migrations/v2.ts`, and an updated `src/migrations.ts`, then verifies the complete digest chain. The TypeScript file contains both the immutable schema snapshot and the reviewed additive statements.
 
 Never edit a migration after it has run in any shared environment. Generate a new version instead.
 
@@ -43,16 +33,16 @@ bun run test
 bun run build
 ```
 
-The upgrade test should verify existing rows, the new write path, and a restart after activation. A migration that only passes on a fresh database is incomplete.
+The generated Vitest path covers a fresh Miniflare database. Before changing a shared experiment, also test the exact previous schema, existing rows, the new write path, and a restart after activation.
 
 ## Apply it
 
-`bun run deploy` uploads the Worker and runs the packaged journal in maintenance mode. Reads and writes pause while Chardb upgrades each owned partition and the Better Auth catalog.
+`bun run deploy` uploads the Worker and runs the packaged journal in maintenance mode. Application traffic stays closed while Chardb upgrades each organization shard and the Better Auth catalog.
 
 If the command stops halfway through, rerun it with the same migration ID and target. Chardb resumes from durable progress rather than replaying completed steps.
 
-Schema history moves forward. There is no down migration. To undo an application change, ship another forward migration and deploy compatible code.
+Schema history moves forward. There is no down migration, rollback endpoint, or abort path for statements that already ran. To undo an application change, ship another forward migration and compatible code.
 
 <Warning>
-  A model or dimension change for a vector column needs a new column and a backfill. Renaming the old column in place would reinterpret existing index data.
+  This release accepts new tables, nonunique indexes, and nullable unconstrained columns. It rejects drops, renames, type or constraint changes, new unique indexes, and changes to existing file or vector resources.
 </Warning>
