@@ -39,7 +39,6 @@ import { type ChardbMigrationJournal, defineMigrations, pendingMigrations } from
 import {
     CATALOG_AUTH_INVALIDATION_BATCH_SIZE,
     CatalogAuthInvalidationStore,
-    type CatalogAuthInvalidationTarget,
     initializeCatalogAuthInvalidationStore,
 } from "./catalog-auth-invalidation-store.ts";
 import {

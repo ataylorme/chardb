@@ -613,11 +613,8 @@ export function defineStream<TDb, TArgs extends Record<string, unknown>, TChunk,
 }
 
 /**
- * Eventually-consistent secondary index. A `defineGsi` declaration provisions
- * a fleet of `GsiShard` DOs hash-partitioned on the indexed columns; every
- * base-table write tail-captures into a queue that fans out to the GSI shards.
- * `strict: true` raises `CDB_GSI_STRICT_REQUIRES_2PC` until cross-shard 2PC
- * lights up.
+ * Research-only GSI descriptor retained for conformance tests. No package
+ * entry exports it and the Worker factory does not provision a GSI runtime.
  */
 export function defineGsi<TTable, TCols extends readonly string[]>(
     table: TTable,

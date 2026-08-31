@@ -44,7 +44,7 @@ import {
     routeMutation as resolveMutationRoute,
     routeQuery as resolveQueryRoute,
 } from "../manifest.ts";
-import { assertCdbMutationArgsByteLimit, snapshotCdbMutationArgs, snapshotCdbQueryArgs } from "../result_limits.ts";
+import { assertCdbMutationArgsByteLimit, snapshotCdbQueryArgs } from "../result_limits.ts";
 import type {
     CatalogMutationRpc,
     CatalogOrganizationAuthorityRouteRpc,
@@ -54,8 +54,6 @@ import type {
     CdbErrorWire,
     CdbMutationResponse,
     CdbMutationRpc,
-    CdbQueryResponse,
-    CdbQueryRpc,
     CdbSubscriptionRequest,
     CdbSubscriptionResponse,
     CdbSubscriptionRpc,
@@ -64,11 +62,8 @@ import type {
     GatewayInvalidationResponse,
     LiveSubscriptionId,
     MutationRouteRequest,
-    MutationRouteResolver,
     MutationRouteResponse,
     TrustedMutationAuth,
-    TrustedMutationDispatchRequest,
-    TrustedQueryDispatchRequest,
 } from "../rpc.ts";
 import { GatewayAlarmScheduler, nextGatewayWorkAt } from "./gateway-alarm-store.ts";
 import {
@@ -77,10 +72,8 @@ import {
     type VerifiedGwAttachment,
     dispatchTrustedMutation,
     isCurrentVerifiedAttachment,
-    isTerminalRegisteredQueryFailure,
     isVerifiedAttachment,
     mutationFailure,
-    projectCdbQueryRows,
     resolvePartitionAuthRoute,
     trustedMutationAuthFromAttachment,
     verifyGatewayJwt,
@@ -182,8 +175,6 @@ export interface GatewayEnv {
     readonly CDB_CATALOG: DurableObjectNamespace;
     readonly CDB_SHARD: DurableObjectNamespace;
 }
-
-type CdbRpc = CdbSubscriptionRpc & CdbQueryRpc;
 
 export interface GatewayRuntimeConfig {
     readonly schema: () => Record<string, unknown>;
@@ -2330,11 +2321,6 @@ export class Gateway extends DurableObject<GatewayEnv> {
     private catalog(): CatalogRoutingRpc {
         const id = this.env.CDB_CATALOG.idFromName("global");
         return this.env.CDB_CATALOG.get(id) as unknown as CatalogRoutingRpc;
-    }
-
-    private cdb(shardId: string): CdbRpc {
-        const id = this.env.CDB_SHARD.idFromName(shardId);
-        return this.env.CDB_SHARD.get(id) as unknown as CdbRpc;
     }
 
     emitMustRefetch(subIds: readonly SubId[], reason: MustRefetchReason): void {

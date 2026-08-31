@@ -8,12 +8,12 @@
  *   the closure to route, defeating the manifest design), or when a
  *   `defineQuery` handler reaches for `db.execute(sql\`...\`)` (the static
  *   walker can't lower raw SQL into a `CdbIntent`). Mirrors the runtime
- *   check the `chardb explain --strict` CLI emits, but at editor-time so
+ *   restrictions enforced by the runtime planner, but at editor time so
  *   problem queries never reach a deploy.
  *
- * The plugin is published as a separate package; the source ships here so it
- * stays in lockstep with the helper signatures in `@chardb/core/server`. The shape
- * follows the standard ESLint flat-config plugin contract.
+ * This is not a package entry. The source stays beside the server helper
+ * signatures and its tests so it can be extracted into a standalone plugin.
+ * The shape follows the standard ESLint flat-config plugin contract.
  */
 
 import type { TSESTree } from "@typescript-eslint/utils";

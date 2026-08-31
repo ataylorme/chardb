@@ -3,9 +3,8 @@
  * `SQL` value via a non-enumerable symbol. Our session reads it back when
  * shipping the wire request.
  *
- * This is the only place we touch Drizzle internals; the surface is
- * `defineChardbConfig({ schema })` (writes the `dbCredentials.proxy`) and
- * the internal runtime migration module.
+ * This is the only place we touch Drizzle internals. The server query planner
+ * imports the dialect directly; it has no package entry of its own.
  */
 
 import type { SQL } from "drizzle-orm/sql";

@@ -17,17 +17,10 @@ import { renderSqliteTableDdl } from "../../auth/ddl.ts";
 import { synthesizedAuthTableNames } from "../../auth/synthesize.ts";
 import { CdbError, isCdbError, isCdbErrorCode, throwCdbRpcError } from "../../errors.ts";
 import { intervalSetFromWire } from "../../intervals_wire.ts";
-import {
-    CDB_SPLIT_LOG_MAX_BYTES,
-    CDB_SPLIT_LOG_MAX_ROWS,
-    SHARD_BOOTSTRAP_DDL,
-    SPLIT_LOG_ACCOUNTED_BYTES_SQL,
-    initializeOpLogPlacement,
-    initializeSplitLogAccounting,
-} from "../../oplog/schema.ts";
-import { type JsonText, type SyncSql, parseJsonColumn } from "../../oplog/wrapper.ts";
-import { type RangeFilter, filterRowsInRange, inRange } from "../../reshard/range.ts";
-import { type TableSpec, renderTableTriggers } from "../../reshard/triggers.ts";
+import { SHARD_BOOTSTRAP_DDL, initializeOpLogPlacement, initializeSplitLogAccounting } from "../../oplog/schema.ts";
+import type { SyncSql } from "../../oplog/wrapper.ts";
+import type { RangeFilter } from "../../reshard/range.ts";
+import type { TableSpec } from "../../reshard/triggers.ts";
 import { type ChardbRef, ClientId, type RawJson, SubId } from "../../types.ts";
 import { stableJson } from "../../util/canonical.ts";
 import { vshardOf } from "../../vshard.ts";
@@ -116,7 +109,6 @@ import {
     assertLiveVectorDependencies,
     assertLiveVectorSubscriptionDependency,
     assertSubscriptionTables,
-    enqueueRoutingFenceInvalidations,
     enqueueSchemaMigrationInvalidations,
     enqueueVectorResourceInvalidations,
     finalizeRetiredLiveSubscription,
@@ -181,35 +173,15 @@ export type { TailTransaction } from "./cdb-reshard-runtime.ts";
 import { renderVectorMutationTriggerSet } from "../vector-triggers.ts";
 import {
     CDB_RESHARD_IDENTITY_STORE_DDL,
-    CdbReshardIdentityStore,
     type CdbReshardSplitIdentity,
     assertCdbReshardRangeIdentity,
-    assertCdbSplitHistoryCapacity,
     initializeCdbReshardIdentityStore,
 } from "./cdb-reshard-identity-store.ts";
-import {
-    CDB_RESHARD_MAX_BATCH_BYTES,
-    CDB_RESHARD_MAX_ROW_BYTES,
-    applyReshardRow,
-    applyReshardUpdate,
-    assertNoUnexpectedReshardTriggers,
-    assertReshardBatchBudget,
-    assertReshardDestinationRangeEmpty,
-    assertReshardEnvelopeBudget,
-    assertReshardRowForeignKeysColocated,
-    assertReshardSourceDomainDrained,
-    deleteReshardRow,
-    orderReshardTables,
-    readReshardForeignKeys,
-    readReshardTableLayout,
-    renderReshardForeignKeyGuards,
-    reshardJsonBytes,
-} from "./cdb-reshard-relational.ts";
+import { assertReshardSourceDomainDrained } from "./cdb-reshard-relational.ts";
 import {
     CDB_ROUTING_FENCE_STORE_DDL,
     type CdbRoutingFence,
     type CdbRoutingFenceIdentity,
-    CdbRoutingFenceStore,
 } from "./cdb-routing-fence-store.ts";
 import {
     CDB_SCHEMA_MIGRATION_STORE_DDL,
@@ -226,15 +198,7 @@ import {
     type SplitOpLogAckResult,
     type SplitOpLogApplyResult,
     type SplitOpLogBatch,
-    ackSplitOpLog,
-    applySplitOpLogBatch,
-    beginSplitOpLogDestination,
-    captureSplitOpLogOutcome,
-    finalizeSplitOpLogDestination,
-    finalizeSplitOpLogSource,
     initializeSplitOpLogAccounting,
-    readSplitOpLogBatch,
-    seedSplitOpLogRange,
 } from "./cdb-split-oplog-store.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 

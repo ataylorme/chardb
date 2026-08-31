@@ -109,6 +109,10 @@ Server and SSR builds keep query callbacks and mutation handlers so the manifest
 
 The packed-browser proof checks planned-query erasure from the published tarball, uses dispatch-only stable mutation handles, then runs the React and file hooks in headless Chrome against Wrangler, Miniflare, and native local R2. It covers two-organization isolation, attachment replacement, restart persistence, Better Auth deletion, and the surviving organization's exact bytes. The generated-project proof uses the same tarball to test the native binding, planned live query, migration, auth, persistence, and restart path.
 
+`build.config.ts` defines eight production roots. Five match the package export map. The other three are the CLI binary, its schema-inspector preload, and the private Vectorize proof bundle. Application Workers reach the Worker entrypoint and Durable Object classes through the `chardb()` factory in the server bundle. They do not load separate source roots.
+
+`test/source_reachability.test.ts` traces relative static and dynamic imports from those roots, the test tree, scripts, and examples. It keeps test-only research code separate from shipped code. That group currently contains the auth-profile and colocation experiments, the ESLint and observability prototypes, distributed-transaction, ledger, logpush, and merge helpers, plus the old deploy command test fixture and CLI barrel. Workerd `*.entry.ts` files are test runtime entrypoints loaded by their harnesses. `src/eslint-plugin/peer-deps.d.ts` is compiler input through `tsconfig.json`, not a JavaScript entrypoint.
+
 ## Unsupported systems
 
 The range-movement operator remains private and experimental even though Wrangler provisions `Resharder` and `chardb()` exports the class. Distributed transactions, presence, streams, schedules, PITR, export, and restore are outside the public architecture. Organization files and vectors are public experiments only for the organization-owned descriptors documented in the README. Other implementation and conformance code carries no compatibility promise and cannot be reached through the five public package entries.

@@ -33,8 +33,8 @@ import type { AuthCtx } from "./define.ts";
 import { type PolicyDefinition, chardbPolicy } from "./policy.ts";
 
 /**
- * The four better-auth tables whose writes bump the tenant epoch.
- * Mirrors `TENANT_KEYED_MODELS` in `src/auth/adapter.ts`.
+ * Better Auth tables whose writes bump the tenant epoch.
+ * Keep this list aligned with `TENANT_MODELS` in `src/auth/runtime.ts`.
  */
 export const TENANT_EPOCH_TABLES: readonly string[] = Object.freeze([
     "organization",
@@ -47,7 +47,7 @@ export const TENANT_EPOCH_TABLES: readonly string[] = Object.freeze([
 
 /**
  * Tables whose writes bump the principal epoch (per-user invalidation).
- * Mirrors `PRINCIPAL_KEYED_MODELS` in `src/auth/adapter.ts`.
+ * Keep this list aligned with `PRINCIPAL_MODELS` in `src/auth/runtime.ts`.
  */
 export const PRINCIPAL_EPOCH_TABLES: readonly string[] = Object.freeze([
     "user",

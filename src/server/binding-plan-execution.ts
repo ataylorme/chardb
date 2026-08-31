@@ -16,7 +16,6 @@ import {
     ne,
     or,
 } from "drizzle-orm";
-import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import type { ChardbPlanPredicateV1 } from "../binding-plan.ts";
 import { CdbError } from "../errors.ts";
 import type { RawJson } from "../types.ts";
