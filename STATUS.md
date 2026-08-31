@@ -4,7 +4,7 @@ Chardb is a working experimental database for Cloudflare Workers. Better Auth or
 
 The supported path is deliberately narrow:
 
-- `forOrg()` for organization data and `forOrgUser()` for private rows inside an organization;
+- `forOrg(auth)` for organization data, `forUser(auth)` for user data, and `forOrgUser(auth)` for private rows inside an organization;
 - registered mutations and bounded Drizzle selects through one query executor;
 - resumable, forward-only additive migrations;
 - authenticated file upload and download through R2;

@@ -68,14 +68,11 @@ export const auth = defineAuth({ plugins: [organization()] });
 import { forOrg } from "@chardb/core/server";
 import { auth } from "./auth.ts";
 
-const { cdbTable: orgTable } = forOrg();
+const { cdbTable: orgTable } = forOrg(auth);
 export const projects = orgTable(
     "projects",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id),
         name: text("name").notNull(),
     },
     { roles: { owner: "*", admin: "*", member: { read: "*" } } }
@@ -91,17 +88,11 @@ void projectInsert;
 import { forOrgUser } from "@chardb/core/server";
 import { auth } from "./auth.ts";
 
-const { cdbTable: orgUserTable } = forOrgUser();
+const { cdbTable: orgUserTable } = forOrgUser(auth);
 export const drafts = orgUserTable(
     "drafts",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id),
-        userId: text("user_id")
-            .notNull()
-            .references(() => auth.user.id),
         title: text("title").notNull(),
     },
     {
@@ -114,6 +105,34 @@ export const drafts = orgUserTable(
 
 const draftInsert: typeof drafts.$inferInsert = { id: "draft-1", title: "Launch notes" };
 void draftInsert;
+`
+    );
+    await writeFile(
+        join(consumerDirectory, "user-schema.ts"),
+        `import { text } from "drizzle-orm/sqlite-core";
+import { z } from "zod";
+import { api, forUser } from "@chardb/core/server";
+import { auth } from "./auth.ts";
+
+const { cdbTable } = forUser(auth);
+export const preferences = cdbTable("preferences", {
+    id: text("id").primaryKey(),
+    value: text("value").notNull(),
+});
+
+const preferenceInsert: typeof preferences.$inferInsert = { id: "preference-1", value: "compact" };
+void preferenceInsert;
+
+export const savePreference = api.mutation({
+    ref: "user-schema.ts#savePreference",
+    authority: "user",
+    args: z.object({ userId: z.string(), id: z.string(), value: z.string() }),
+    partitionKey: "userId",
+    handler: (ctx, args: { userId: string; id: string; value: string }) => {
+        ctx.db.insert(preferences).values({ id: args.id, value: args.value }).run();
+        return args.id;
+    },
+});
 `
     );
     await writeFile(
@@ -130,30 +149,21 @@ const auth = defineAuth({
     plugins: [organization(), jwt()],
 });
 
-const { cdbTable: orgTable } = forOrg();
+const { cdbTable: orgTable } = forOrg(auth);
 const projects = orgTable(
     "runtime_projects",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id),
         name: text("name").notNull(),
     },
     { roles: { member: { create: ["id", "name"], read: "*" } } }
 );
 
-const { cdbTable: orgUserTable } = forOrgUser();
+const { cdbTable: orgUserTable } = forOrgUser(auth);
 const drafts = orgUserTable(
     "runtime_drafts",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id),
-        userId: text("user_id")
-            .notNull()
-            .references(() => auth.user.id),
         title: text("title").notNull(),
     },
     {
@@ -294,11 +304,22 @@ export default {
         join(consumerDirectory, "node_modules", "@chardb", "core", "dist", "server", "index.d.mts"),
         "utf8"
     );
-    if (!declaration.includes('declare function forOrgUser(): BoundCdbTable<"orgUser">;')) {
-        throw new Error("packed server declaration lost the forOrgUser scope");
+    if (!["forOrg", "forOrgUser", "forUser"].every(name => declaration.includes(`declare function ${name}(`))) {
+        throw new Error("packed server declaration lost explicit organization-user ownership");
     }
-    if (!/export \{[^}]*\bforOrgUser\b[^}]*\};/.test(declaration)) {
-        throw new Error("packed server declaration does not export forOrgUser");
+    if (declaration.includes("bindOrganizationOwnership") || declaration.includes("bindOrganizationUserOwnership")) {
+        throw new Error("packed server declaration leaked ownership implementation names");
+    }
+    const exportedTypes = declaration.match(/export type \{([^}]*)\};/)?.[1] ?? "";
+    if (
+        /\b(?:OrganizationOwnershipAuth|OrganizationUserOwnershipAuth|UserOwnershipAuth|OwnedCdbTable)\b/.test(
+            exportedTypes
+        )
+    ) {
+        throw new Error("packed server declaration exported ownership implementation types");
+    }
+    if (!/export \{[^}]*\bforOrg\b[^}]*\bforOrgUser\b[^}]*\bforUser\b[^}]*\};/.test(declaration)) {
+        throw new Error("packed server declaration does not export explicit ownership factories");
     }
     const runtime = await readFile(
         join(consumerDirectory, "node_modules", "@chardb", "core", "dist", "server", "index.mjs"),

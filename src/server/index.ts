@@ -1,5 +1,5 @@
 /**
- * Public Worker-side API for the organization-tenancy release.
+ * Public Worker-side API for organization and user tenancy.
  *
  * Runtime internals stay behind `chardb()`: Durable Object classes, RPC
  * contracts, policy compilers, distributed transactions, streams, presence,
@@ -33,21 +33,34 @@ export interface OrganizationMutationConfig<TDb, TArgs extends Record<string, un
     readonly returnUserErrors?: boolean;
 }
 
-export interface OrganizationApi<TSchema extends Record<string, unknown>> {
+export interface UserMutationConfig<TDb, TArgs extends Record<string, unknown>, TResult> {
+    readonly authority: "user";
+    readonly ref: string;
+    readonly args?: StandardSchemaV1<unknown, TArgs>;
+    readonly handler: (ctx: MutationCtx<TDb>, args: TArgs) => TResult;
+    readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
+    readonly singlePartition?: boolean;
+    readonly idempotencyTtl?: "24h";
+    readonly returnUserErrors?: boolean;
+}
+
+export interface PublicApi<TSchema extends Record<string, unknown>> {
     mutation<TArgs extends Record<string, unknown>, TResult>(
-        config: OrganizationMutationConfig<ChardbDb<TSchema>, TArgs, TResult>
+        config:
+            | OrganizationMutationConfig<ChardbDb<TSchema>, TArgs, TResult>
+            | UserMutationConfig<ChardbDb<TSchema>, TArgs, TResult>
     ): MutationFn<ChardbDb<TSchema>, TArgs, TResult>;
     query<TArgs extends Record<string, unknown>, TBuilder extends PlannedQueryBuilder>(
         config: PlannedQueryConfig<ChardbDb<TSchema>, TArgs, TBuilder>
     ): QueryFn<ChardbDb<TSchema>, TArgs, TBuilder["_"]["result"]>;
 }
 
-/** Organization mutations and single-partition planned live queries. */
-export const api: OrganizationApi<Record<string, unknown>> = {
+/** Organization or user mutations and single-partition planned live queries. */
+export const api: PublicApi<Record<string, unknown>> = {
     mutation: config => internalApi.mutation(config),
     query: config => internalApi.query(config),
 };
-export { forOrg, forOrgUser } from "./cdb-tenant.ts";
+export { forOrg, forOrgUser, forUser } from "./schema-ownership.ts";
 export { chardb } from "./chardb.ts";
 export { defineMigrations, defineSchemaBaseline } from "./schema-migrations.ts";
 export {

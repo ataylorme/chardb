@@ -67,7 +67,7 @@ export const postMessage = api.mutation({
 });
 ```
 
-The tenant, row, and column policies live in `schema.ts` on the `forOrg()`-bound `cdbTable` definitions.
+The tenant, row, and column policies live in `schema.ts` on the `forOrg(auth)`-bound `cdbTable` definitions.
 
 Queries live in `queries.ts` so the React bundle can value-import them without dragging the worker module:
 
@@ -160,7 +160,7 @@ The reserved chardb prefixes (`/ws`, `/_chardb/*`) and the optional `/api/auth/*
 
 ### Authorization lives on the table
 
-`forOrg()` binds every `cdbTable` in `schema.ts` to the active organization. Each table's `roles` block declares row verbs and writable or readable columns. `selfBy` binds the `self` role to a user foreign key. Inserts, updates, deletes, and full-row selects require matching grants. Inserts and updates enforce writable columns, and managed authority columns cannot change. Updates, deletes, and selects add tenant and self predicates even without a caller `where`. Select results receive readable-column masks. Projections and joins stay blocked until their result shapes can be masked safely. There are no separate `tenantScope` or `ownerScope` exports to keep in sync.
+`forOrg(auth)` binds every `cdbTable` in `schema.ts` to the active organization. Each table's `roles` block declares row verbs and writable or readable columns. `selfBy` binds the `self` role to a user foreign key. Inserts, updates, deletes, and full-row selects require matching grants. Inserts and updates enforce writable columns, and managed authority columns cannot change. Updates, deletes, and selects add tenant and self predicates even without a caller `where`. Select results receive readable-column masks. Projections and joins stay blocked until their result shapes can be masked safely. There are no separate `tenantScope` or `ownerScope` exports to keep in sync.
 
 `publicRead` removes the matching table-role requirement for selects only. Gateway still requires a verified JWT, Catalog organization membership, and the exact tenant partition. It does not grant writes or cross-organization reads. Better Auth anonymous users count as authenticated principals only after sign-in issues a JWT and the account has organization membership. Subjectless Gateway queries stay closed.
 
@@ -213,7 +213,7 @@ If a domain table shadows a reserved name (`organization`, `user`, `member`, …
 
 ## What this example demonstrates
 
-- Organization-rooted Drizzle tables built with `forOrg()` and `cdbTable`.
+- Organization-rooted Drizzle tables built with `forOrg(auth)` and `cdbTable`.
 - Mutation and query handles using the current exported package subpaths.
 - A public organization mutation declaration with an explicit stable ref.
 - An explicit exact-partition organization query declaration for live replacement snapshots.

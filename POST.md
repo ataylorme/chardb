@@ -28,7 +28,7 @@ Does schema-declared organization tenancy solve a real problem, or just move com
 
 I am publishing chardb, an experimental tenant-sharded SQLite design for Cloudflare Durable Objects.
 
-The idea is to make the organization boundary part of the Drizzle schema. A table declared with `forOrg()` carries the placement and policy boundary. From that declaration, chardb can derive colocation, virtual-shard routing, row and column rules, and the shard-local transaction boundary.
+The idea is to make the organization boundary part of the Drizzle schema. A table declared with `forOrg(auth)` carries the placement and policy boundary. From that declaration, chardb can derive colocation, virtual-shard routing, row and column rules, and the shard-local transaction boundary.
 
 One narrow path now works in a focused workerd harness. A public mutation must declare `authority: "organization"` and an explicit stable ref. Gateway verifies the JWT and retains only its subject. It validates the mutation arguments, extracts the organization key, and asks Catalog for current membership, roles, and auth epochs. Catalog routes the organization to a Cdb Durable Object. Cdb applies the schema policy and commits the SQLite write with its idempotency record in one synchronous transaction.
 

@@ -419,10 +419,9 @@ import { forOrg, vector } from "@chardb/core/server";
 import { text } from "drizzle-orm/sqlite-core";
 import { auth } from "./auth.ts";
 
-const { cdbTable } = forOrg();
+const { cdbTable } = forOrg(auth);
 export const messages = cdbTable("messages", {
   id: text("id").primaryKey(),
-  organizationId: text("organization_id").notNull().references(() => auth.organization.id),
   body: text("body").notNull(),
   embedding: vector("embedding", { dim: 3, binding: "CDB_MESSAGES_VECTOR_INDEX", metric: "cosine" }),
 }, { roles: { member: { create: "*", read: "*", update: "*", delete: true } } });

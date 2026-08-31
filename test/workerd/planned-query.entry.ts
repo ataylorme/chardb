@@ -33,14 +33,11 @@ const auth = defineAuth({
     ],
 });
 
-const { cdbTable } = forOrg();
+const { cdbTable } = forOrg(auth);
 const plannedQueryRows = cdbTable(
     "planned_query_workerd_rows",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id),
         channelId: text("channel_id").notNull(),
         createdAt: integer("created_at").notNull(),
     },

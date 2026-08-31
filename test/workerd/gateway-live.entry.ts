@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import { text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
-import { forUser, globalScope } from "../../src/server/cdb-tenant.ts";
+import { forOrg, forUser, globalScope } from "../../src/server/cdb-tenant.ts";
 import { api } from "../../src/server/define.ts";
 import type {
     CdbAuthInvalidationRequest,
@@ -10,7 +10,6 @@ import type {
 } from "../../src/server/do/cdb-auth-invalidation-store.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { gatewayBucketName } from "../../src/server/gateway-bucket.ts";
-import { forOrg } from "../../src/server/index.ts";
 import { type ChardbManifest, manifestFromExports } from "../../src/server/manifest.ts";
 import { vshardOf } from "../../src/vshard.ts";
 import baseWorker, {

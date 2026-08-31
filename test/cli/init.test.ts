@@ -10,7 +10,7 @@ import { runInit } from "../../src/cli/commands/init.ts";
 import type { CliContext } from "../../src/cli/context.ts";
 import { SCAFFOLD_INITIAL_SNAPSHOT } from "../../src/cli/scaffold-initial-snapshot.ts";
 import { file } from "../../src/files/index.ts";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
+import { forOrg } from "../../src/server/schema-ownership.ts";
 import { inspectInitialSchemaSnapshot } from "../../src/server/schema-snapshot.ts";
 
 function generatedProject(): {
@@ -116,14 +116,11 @@ describe("generated tutorial flow", () => {
 
     test("keeps the embedded scaffold snapshot identical to a fresh inspection", () => {
         const auth = defineAuth({ plugins: [anonymous(), organization(), jwt()] });
-        const { cdbTable } = forOrg();
+        const { cdbTable } = forOrg(auth);
         const messages = cdbTable(
             "messages",
             {
                 id: text("id").primaryKey(),
-                organizationId: text("organization_id")
-                    .notNull()
-                    .references(() => auth.organization.id, { onDelete: "cascade" }),
                 authorId: text("author_id")
                     .notNull()
                     .references(() => auth.user.id, { onDelete: "cascade" }),

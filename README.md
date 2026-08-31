@@ -39,7 +39,7 @@ export const auth = defineAuth({
 });
 ```
 
-Reference those synthesized Better Auth tables from the Drizzle schema:
+Bind each schema module to its Better Auth owner:
 
 ```ts
 // src/schema.ts
@@ -47,15 +47,12 @@ import { text } from "drizzle-orm/sqlite-core";
 import { forOrg } from "@chardb/core/server";
 import { auth } from "./auth.ts";
 
-const { cdbTable } = forOrg();
+const { cdbTable } = forOrg(auth);
 
 export const messages = cdbTable(
     "messages",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id, { onDelete: "cascade" }),
         body: text("body").notNull(),
     },
     {
@@ -68,11 +65,11 @@ export const messages = cdbTable(
 );
 ```
 
-The foreign key identifies organization ownership. The role policy decides which members may read or write each column. Application code does not maintain a second organization or session model.
+`forOrg(auth)` adds a non-null `organizationId` column with a Drizzle reference to `auth.organization.id`. Chardb uses that reference as ownership metadata; shard migrations cannot install a physical foreign key to the Catalog-owned auth table. The role policy decides which members may read or write each column. Chardb fills the column from verified request authority, so inserts omit it.
 
 The `roles` block is Chardb's policy for domain rows. It does not add roles or permissions to Better Auth's organization or admin plugins. Configure those plugins in `defineAuth()` and manage their roles through Better Auth. Chardb reads the current Better Auth organization role at request time, then applies the matching domain-row grant above.
 
-Some organization data belongs to one user. Put those tables behind `forOrgUser()` so Chardb fills and checks both foreign keys. Keep organization-wide tables behind `forOrg()`, in a separate schema module:
+Some organization data belongs to one user. Put those tables behind `forOrgUser(auth)` so Chardb fills and checks both foreign keys. Keep organization-wide tables behind `forOrg(auth)`, in a separate schema module:
 
 ```ts
 // src/project-schema.ts
@@ -80,14 +77,11 @@ import { text } from "drizzle-orm/sqlite-core";
 import { forOrg } from "@chardb/core/server";
 import { auth } from "./auth.ts";
 
-const { cdbTable: orgTable } = forOrg();
+const { cdbTable: orgTable } = forOrg(auth);
 export const projects = orgTable(
     "projects",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id),
         name: text("name").notNull(),
     },
     { roles: { owner: "*", admin: "*", member: { read: "*" } } }
@@ -98,17 +92,11 @@ import { text } from "drizzle-orm/sqlite-core";
 import { forOrgUser } from "@chardb/core/server";
 import { auth } from "./auth.ts";
 
-const { cdbTable: orgUserTable } = forOrgUser();
+const { cdbTable: orgUserTable } = forOrgUser(auth);
 export const drafts = orgUserTable(
     "drafts",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id),
-        userId: text("user_id")
-            .notNull()
-            .references(() => auth.user.id),
         title: text("title").notNull(),
     },
     {
@@ -414,7 +402,7 @@ Local fake-index vector results measure Worker, SQLite, routing, and live-query 
 
 ## Deliberately out of scope
 
-User-tenanted and global-table paths remain inside internal conformance fixtures. They are useful implementation evidence, but they are not supported product modes and no public builder exposes them.
+Global-table paths remain inside internal conformance fixtures. User-owned tables are public through `forUser(auth)`.
 
 User-owned and global files, user-owned and global vectors, vector-search continuation, presence, streams, scheduling, cross-partition transactions, PITR, export, restore, and automatic resharding are unsupported. Organization files and organization vectors are public and experimental within the narrow lifecycles documented above. Lower-level barrier and operator-driven range-movement code remains internal. Scheduled requests no longer create PITR barriers automatically because retention, export, and restore do not exist.
 

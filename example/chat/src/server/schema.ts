@@ -2,15 +2,12 @@ import { forOrg } from "@chardb/core/server";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { auth } from "./auth.ts";
 
-const { cdbTable } = forOrg();
+const { cdbTable } = forOrg(auth);
 
 export const messages = cdbTable(
     "messages",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id, { onDelete: "cascade" }),
         authorId: text("author_id")
             .notNull()
             .references(() => auth.user.id, { onDelete: "cascade" }),

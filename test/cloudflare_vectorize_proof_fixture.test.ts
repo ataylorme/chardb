@@ -71,7 +71,7 @@ describe("candidate-bound Cloudflare Vectorize proof fixture", () => {
         expect(auth).toContain('from "better-auth/plugins/organization"');
         expect(auth).toContain("organization()");
         expect(schema).toContain('import { auth } from "./auth.ts"');
-        expect(schema).toContain("const { cdbTable } = forOrg();");
+        expect(schema).toContain("const { cdbTable } = forOrg(auth);");
         expect(schema.match(/\bvector\(/g)).toHaveLength(1);
         expect(schema).toContain("dim: 32");
         expect(schema).toContain('binding: "CDB_PROOF_VECTORS"');

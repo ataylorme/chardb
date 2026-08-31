@@ -107,7 +107,6 @@ try {
         if (legacy.test(combined)) fail(`public docs contain a legacy package path: ${legacy}`);
     }
     for (const unsupported of [
-        "forUser",
         "globalScope",
         "fileArray",
         "inlineVector",
@@ -172,7 +171,7 @@ try {
     const generatedTest = await readFile(join(appRoot, "test/worker.test.ts"), "utf8");
     const generatedVitest = await readFile(join(appRoot, "vitest.config.ts"), "utf8");
     requireText(generatedAuth, "organization()", "generated auth does not enable Better Auth organizations");
-    requireText(generatedSchema, "forOrg()", "generated schema does not use organization ownership");
+    requireText(generatedSchema, "forOrg(auth)", "generated schema does not bind organization ownership to auth");
     requireText(generatedQueries, "api.query", "generated app has no read path");
     requireText(generatedApi, "api.mutation", "generated app has no write path");
     for (const feature of ["useQuery", "useMutation", "useFile", "upload(", "downloadUrl("]) {
@@ -185,10 +184,10 @@ try {
 
     const serverTypes = await readFile(join(packageRoot, "dist/server/index.d.ts"), "utf8");
     const publicServerExport = [...serverTypes.matchAll(/^export \{([^}]+)\};$/gm)].at(-1)?.[1] ?? "";
-    for (const symbol of ["api", "chardb", "defineAuth", "defineSchemaSnapshot", "forOrg", "forOrgUser"]) {
+    for (const symbol of ["api", "chardb", "defineAuth", "defineSchemaSnapshot", "forOrg", "forOrgUser", "forUser"]) {
         requireText(publicServerExport, symbol, `server export is missing ${symbol}`);
     }
-    for (const privateSymbol of ["forUser", "globalScope"]) {
+    for (const privateSymbol of ["globalScope"]) {
         rejectText(publicServerExport, privateSymbol, `server publicly exports ${privateSymbol}`);
     }
     const sharedTypes = await firstFileContaining(join(packageRoot, "dist/shared"), "declare function searchVector");

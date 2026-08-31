@@ -6,7 +6,7 @@ The files follow the same split an application should use:
 
 ```text
 src/server/auth.ts       Better Auth organization, anonymous, and JWT plugins
-src/server/schema.ts     one forOrg() table
+src/server/schema.ts     one forOrg(auth) table
 src/server/api.ts        postMessage mutation
 src/server/queries.ts    listMessages live query
 src/server/migrations/v1.ts  immutable deployed version-one schema snapshot

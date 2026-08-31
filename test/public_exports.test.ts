@@ -18,7 +18,7 @@ describe("published API boundary", () => {
         ]);
     });
 
-    test("server exports only the organization application API", () => {
+    test("server exports only the supported application API", () => {
         expect(Object.keys(serverApi).sort()).toEqual([
             "api",
             "chardb",
@@ -28,6 +28,7 @@ describe("published API boundary", () => {
             "defineSchemaSnapshot",
             "forOrg",
             "forOrgUser",
+            "forUser",
             "searchVector",
             "vector",
         ]);

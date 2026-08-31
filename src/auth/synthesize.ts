@@ -303,7 +303,8 @@ export function synthesizeAuthSchema<
  * ```ts
  * // src/server/auth.ts
  * import { organization } from "better-auth/plugins/organization";
- * import { defineAuth } from "@chardb/core/server";
+ * import { defineAuth, forOrg } from "@chardb/core/server";
+ * import { text } from "drizzle-orm/sqlite-core";
  *
  * export const auth = defineAuth({ plugins: [organization()] });
  * //     ^ typed as ChardbAuth<"organization" | "member" | "invitation">
@@ -311,9 +312,10 @@ export function synthesizeAuthSchema<
  * // src/server/schema.ts
  * import { auth } from "./auth.ts";
  *
- * export const channels = sqliteTable("channels", {
- *   organizationId: text("organization_id")
- *     .references(() => auth.organization.id, { onDelete: "cascade" }),
+ * const { cdbTable } = forOrg(auth);
+ * export const channels = cdbTable("channels", {
+ *   id: text("id").primaryKey(),
+ *   name: text("name").notNull(),
  * });
  *
  * // src/server/worker.ts

@@ -8,15 +8,12 @@ import { integer, text } from "drizzle-orm/sqlite-core";
 // This is the deployed version-one schema, not the current application schema.
 // Keep it unchanged and append later migrations in worker.ts.
 const authV1 = defineAuth({ plugins: [anonymous(), organization(), jwt()] });
-const { cdbTable } = forOrg();
+const { cdbTable } = forOrg(authV1);
 
 const messagesV1 = cdbTable(
     "messages",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => authV1.organization.id, { onDelete: "cascade" }),
         authorId: text("author_id")
             .notNull()
             .references(() => authV1.user.id, { onDelete: "cascade" }),

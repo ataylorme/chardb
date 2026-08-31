@@ -29,15 +29,12 @@ const DELETE_REF = "test/workerd/public-vector.entry.ts#deleteMessage";
 const SEARCH_REF = "test/workerd/public-vector.entry.ts#searchMessages";
 const FUTURE_CLOCK_OFFSET_MS = 60 * 60 * 1_000;
 
-const { cdbTable } = forOrg();
 const authOrganization = sqliteTable("organization", { id: text("id").primaryKey() });
+const { cdbTable } = forOrg({ organization: authOrganization });
 const messages = cdbTable(
     "public_vector_messages",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => authOrganization.id),
         body: text("body").notNull(),
         embedding: vector("embedding", { dim: 3, binding: VECTOR_BINDING, metric: "cosine" }),
     },

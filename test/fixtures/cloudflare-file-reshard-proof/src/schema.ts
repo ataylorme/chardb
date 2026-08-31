@@ -4,15 +4,12 @@ import { text } from "drizzle-orm/sqlite-core";
 import { auth } from "./auth.ts";
 import { FILE_RESHARD_PROOF_VECTOR } from "./proof-config.ts";
 
-const { cdbTable } = forOrg();
+const { cdbTable } = forOrg(auth);
 
 export const documents = cdbTable(
     "proof_documents",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id, { onDelete: "cascade" }),
         ownerId: text("owner_id")
             .notNull()
             .references(() => auth.user.id, { onDelete: "cascade" }),

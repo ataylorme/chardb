@@ -122,7 +122,7 @@ const explainStrict: Rule.RuleModule = {
  * `chardb/no-raw-sqlite-table` — flag any direct `sqliteTable(...)`
  * call in app schema files. cdbTable's metadata + RLS/CLS surface only
  * fires when the user obtains `cdbTable` via one of the tenancy
- * factories (`forOrg() / forUser() / globalScope()`); a stray
+ * factories (`forOrg(auth) / forUser(auth) / globalScope()`); a stray
  * `sqliteTable(...)` call drops every chardb-specific guarantee
  * silently. The rule fires on the call itself, not the import, so
  * test fixtures and one-off scripts that opt out can do so locally.
@@ -132,14 +132,14 @@ const noRawSqliteTable: Rule.RuleModule = {
         type: "problem",
         docs: {
             description:
-                "Disallow direct `sqliteTable(...)` calls in chardb app schemas; use forOrg() / forUser() / globalScope().cdbTable instead.",
+                "Disallow direct `sqliteTable(...)` calls in chardb app schemas; use forOrg(auth) / forUser(auth) / globalScope().cdbTable instead.",
             recommended: false,
             url: "https://chardb.dev/eslint/no-raw-sqlite-table",
         },
         schema: [],
         messages: {
             rawSqliteTable:
-                "Use `forOrg()` / `forUser()` / `globalScope()` to obtain a tenancy-bound `cdbTable` instead of calling `sqliteTable` directly. cdbTable attaches RLS/CLS metadata; raw sqliteTable rows fall through every chardb policy gate.",
+                "Use `forOrg(auth)` / `forUser(auth)` / `globalScope()` to obtain a tenancy-bound `cdbTable` instead of calling `sqliteTable` directly. cdbTable attaches RLS/CLS metadata; raw sqliteTable rows fall through every chardb policy gate.",
         },
     },
     create(context) {
@@ -164,14 +164,15 @@ const noDirectCdbTableImport: Rule.RuleModule = {
     meta: {
         type: "problem",
         docs: {
-            description: "Disallow importing `cdbTable` directly — obtain via forOrg() / forUser() / globalScope().",
+            description:
+                "Disallow importing `cdbTable` directly — obtain via forOrg(auth) / forUser(auth) / globalScope().",
             recommended: false,
             url: "https://chardb.dev/eslint/no-direct-cdb-table-import",
         },
         schema: [],
         messages: {
             directImport:
-                "`cdbTable` is not exported from @chardb/core/server. Obtain a tenancy-bound builder via `const { cdbTable } = forOrg()` (or forUser/globalScope).",
+                "`cdbTable` is not exported from @chardb/core/server. Obtain a tenancy-bound builder via `const { cdbTable } = forOrg(auth)` (or forUser(auth)/globalScope()).",
         },
     },
     create(context) {

@@ -3,9 +3,8 @@ import { integer, text } from "drizzle-orm/sqlite-core";
 import { forUser, globalScope } from "../../../../../src/server/cdb-tenant.ts";
 import { auth } from "./auth.ts";
 
-// Every cdbTable in this file is org-tenanted. The tenant column is
-// auto-discovered from the `.references(() => auth.organization.id)`
-const { cdbTable } = forOrg();
+// Every cdbTable in this file is bound to the same organization owner.
+const { cdbTable } = forOrg(auth);
 const { cdbTable: userTable } = forUser();
 const { cdbTable: globalTable } = globalScope();
 
@@ -13,9 +12,6 @@ export const channels = cdbTable(
     "channels",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id, { onDelete: "cascade" }),
         name: text("name").notNull(),
         createdAt: integer("created_at").notNull(),
     },
@@ -35,9 +31,6 @@ export const messages = cdbTable(
         channelId: text("channel_id")
             .notNull()
             .references(() => channels.id, { onDelete: "cascade" }),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id, { onDelete: "cascade" }),
         authorId: text("author_id")
             .notNull()
             .references(() => auth.user.id, { onDelete: "cascade" }),

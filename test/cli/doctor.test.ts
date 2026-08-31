@@ -413,7 +413,7 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.get("/tmp/proj/src/worker.ts")).toContain("{ DB, Catalog, Cdb, Gateway, Resharder }");
         expect(files.get("/tmp/proj/src/worker.ts")).not.toContain("ChardbWorker");
         expect(files.get("/tmp/proj/wrangler.toml")).not.toContain("CDB_WORKER");
-        expect(files.get("/tmp/proj/src/schema.ts")).toContain("const { cdbTable } = forOrg()");
+        expect(files.get("/tmp/proj/src/schema.ts")).toContain("const { cdbTable } = forOrg(auth)");
         expect(files.get("/tmp/proj/src/schema.ts")).toContain('from "./auth.ts"');
         expect(files.get("/tmp/proj/src/schema.ts")).not.toContain('from "./worker.ts"');
         expect(files.get("/tmp/proj/src/schema.ts")).toContain('selfBy: "authorId"');

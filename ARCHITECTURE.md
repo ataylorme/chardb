@@ -33,11 +33,11 @@ The CLI is published as the `chardb` binary. Its primary commands are `init`, `d
 
 ## Organization placement
 
-`forOrg()` marks a table with its organization partition column and policy metadata. The placement compiler follows declared colocation and hashes one exact organization key to a virtual shard. Catalog maps that virtual shard to one physical Cdb id.
+`forOrg(auth)` adds the organization partition column and policy metadata. `forUser(auth)` does the same for data owned directly by the signed-in user. The placement compiler follows declared colocation and hashes one exact owner key to a virtual shard. Catalog maps that virtual shard to one physical Cdb id.
 
-Public mutations accept only `authority: "organization"`. Planned queries derive the same boundary from their organization table and exact predicate. Gateway verifies the JWT subject, then Catalog reads current organization membership, role, and auth epochs. Client tenant and role claims never grant access. Cdb reapplies the schema epoch and table policy before SQL runs.
+Public mutations accept `authority: "organization"` or `authority: "user"`. Planned queries derive the same boundary from their owned table and exact predicate. Gateway verifies the JWT subject. Organization routes additionally require fresh Catalog membership, role, and auth epochs; user routes require the partition key to equal that verified subject. Client tenant and role claims never grant access. Cdb reapplies the schema epoch and table policy before SQL runs.
 
-User-tenanted and global-table metadata still exists for internal conformance tests. It is not a public data model.
+Global-table metadata still exists for internal conformance tests. It is not a public data model.
 
 ## Mutation path
 
