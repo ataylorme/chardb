@@ -9,7 +9,7 @@ use std::fmt;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::{Error, ErrorKind, Result};
+use crate::{operation::is_valid_reference, Error, ErrorKind, Result};
 
 pub const PROTOCOL_VERSION: u8 = 3;
 pub const PRESENCE_VERSION: u8 = 1;
@@ -770,7 +770,7 @@ fn validate_remote_error(error: &RemoteError) -> Result<()> {
 }
 
 pub(crate) fn validate_reference(reference: &str) -> Result<()> {
-    if reference.is_empty() || !reference.contains('#') {
+    if !is_valid_reference(reference) {
         return Err(Error::local(
             ErrorKind::Configuration,
             "Chardb reference must be nonempty and contain '#'",

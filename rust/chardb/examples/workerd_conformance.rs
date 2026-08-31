@@ -1,23 +1,20 @@
 use std::{env, time::Duration};
 
-use chardb_client::{Client, ClientConfig, SubscriptionEvent};
+use chardb_client::{Client, ClientConfig, Mutation, Query, SubscriptionEvent};
 use serde::{Deserialize, Serialize};
 
-const QUERY_REF: &str = "test/workerd/gateway-jwt.entry.ts#listOrganizationRows";
-const MUTATION_REF: &str = "test/workerd/gateway-jwt.entry.ts#writeOrganizationRow";
-
 #[derive(Serialize)]
-struct QueryArgs<'a> {
+struct QueryArgs {
     #[serde(rename = "organizationId")]
-    organization_id: &'a str,
+    organization_id: String,
 }
 
 #[derive(Serialize)]
-struct MutationArgs<'a> {
-    id: &'a str,
+struct MutationArgs {
+    id: String,
     #[serde(rename = "organizationId")]
-    organization_id: &'a str,
-    body: &'a str,
+    organization_id: String,
+    body: String,
     #[serde(rename = "createdAt")]
     created_at: u64,
 }
@@ -33,6 +30,11 @@ struct MutationAck {
     roles: Vec<String>,
 }
 
+const LIST_ORGANIZATION_ROWS: Query<QueryArgs, serde_json::Value> =
+    Query::new("test/workerd/gateway-jwt.entry.ts#listOrganizationRows");
+const WRITE_ORGANIZATION_ROW: Mutation<MutationArgs, MutationAck> =
+    Mutation::new("test/workerd/gateway-jwt.entry.ts#writeOrganizationRow");
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(1);
     let endpoint = arguments.next().ok_or("missing endpoint")?;
@@ -47,10 +49,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .connect_timeout(Duration::from_secs(5))
             .welcome_timeout(Duration::from_secs(5)),
     )?;
-    let mut subscription = client.subscribe::<_, serde_json::Value>(
-        QUERY_REF,
+    let mut subscription = client.subscribe(
+        LIST_ORGANIZATION_ROWS,
         &QueryArgs {
-            organization_id: "workerd-org",
+            organization_id: "workerd-org".to_owned(),
         },
     )?;
     match subscription.recv_timeout(Duration::from_secs(5))? {
@@ -60,11 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let result: MutationAck = client.mutate_with_id(
-        MUTATION_REF,
+        WRITE_ORGANIZATION_ROW,
         &MutationArgs {
-            id: &row_id,
-            organization_id: "workerd-org",
-            body: "rust-workerd-conformance",
+            id: row_id.clone(),
+            organization_id: "workerd-org".to_owned(),
+            body: "rust-workerd-conformance".to_owned(),
             created_at: 1,
         },
         format!("rust-{row_id}"),

@@ -28,7 +28,7 @@ use crate::{
         decode_down, encode_up, validate_json, validate_reference, Down, MutationResult,
         RefetchReason, RowPatch, RowPatchOp, SafeId, Up, PROTOCOL_VERSION,
     },
-    Error, ErrorKind, Result,
+    Error, ErrorKind, Mutation, Query, Result,
 };
 
 const MAX_INBOUND_BYTES: usize = 1024 * 1024;
@@ -367,14 +367,14 @@ impl Client {
     /// Returns an error for invalid arguments, capacity exhaustion, or a closed client.
     pub fn subscribe<TArgs, TRow>(
         &self,
-        reference: &str,
+        query: Query<TArgs, TRow>,
         args: &TArgs,
     ) -> Result<Subscription<TRow>>
     where
         TArgs: Serialize + ?Sized,
         TRow: DeserializeOwned,
     {
-        self.0.subscribe(reference, args).map(Subscription)
+        self.0.subscribe(query.reference(), args).map(Subscription)
     }
 
     /// Run a typed mutation with a generated stable mutation ID.
@@ -382,12 +382,16 @@ impl Client {
     /// # Errors
     ///
     /// Returns validation, server, timeout, transport, or result decoding errors.
-    pub fn mutate<TArgs, TResult>(&self, reference: &str, args: &TArgs) -> Result<TResult>
+    pub fn mutate<TArgs, TResult>(
+        &self,
+        mutation: Mutation<TArgs, TResult>,
+        args: &TArgs,
+    ) -> Result<TResult>
     where
         TArgs: Serialize + ?Sized,
         TResult: DeserializeOwned,
     {
-        self.mutate_inner(reference, args, None)
+        self.mutate_inner(mutation.reference(), args, None)
     }
 
     /// Run a typed mutation with an application-supplied stable mutation ID.
@@ -397,7 +401,7 @@ impl Client {
     /// Returns validation, server, timeout, transport, or result decoding errors.
     pub fn mutate_with_id<TArgs, TResult>(
         &self,
-        reference: &str,
+        mutation: Mutation<TArgs, TResult>,
         args: &TArgs,
         mutation_id: impl Into<String>,
     ) -> Result<TResult>
@@ -405,7 +409,7 @@ impl Client {
         TArgs: Serialize + ?Sized,
         TResult: DeserializeOwned,
     {
-        self.mutate_inner(reference, args, Some(mutation_id.into()))
+        self.mutate_inner(mutation.reference(), args, Some(mutation_id.into()))
     }
 
     fn mutate_inner<TArgs, TResult>(
@@ -466,14 +470,16 @@ impl AsyncClient {
     /// Returns an error for invalid arguments, capacity exhaustion, or a closed client.
     pub fn subscribe<TArgs, TRow>(
         &self,
-        reference: &str,
+        query: Query<TArgs, TRow>,
         args: &TArgs,
     ) -> Result<AsyncSubscription<TRow>>
     where
         TArgs: Serialize + ?Sized,
         TRow: DeserializeOwned,
     {
-        self.0.subscribe(reference, args).map(AsyncSubscription)
+        self.0
+            .subscribe(query.reference(), args)
+            .map(AsyncSubscription)
     }
 
     /// Run a typed mutation with a generated stable mutation ID.
@@ -481,12 +487,16 @@ impl AsyncClient {
     /// # Errors
     ///
     /// Returns validation, server, timeout, transport, or result decoding errors.
-    pub async fn mutate<TArgs, TResult>(&self, reference: &str, args: &TArgs) -> Result<TResult>
+    pub async fn mutate<TArgs, TResult>(
+        &self,
+        mutation: Mutation<TArgs, TResult>,
+        args: &TArgs,
+    ) -> Result<TResult>
     where
         TArgs: Serialize + ?Sized,
         TResult: DeserializeOwned,
     {
-        self.mutate_inner(reference, args, None).await
+        self.mutate_inner(mutation.reference(), args, None).await
     }
 
     /// Run a typed mutation with an application-supplied stable mutation ID.
@@ -496,7 +506,7 @@ impl AsyncClient {
     /// Returns validation, server, timeout, transport, or result decoding errors.
     pub async fn mutate_with_id<TArgs, TResult>(
         &self,
-        reference: &str,
+        mutation: Mutation<TArgs, TResult>,
         args: &TArgs,
         mutation_id: impl Into<String>,
     ) -> Result<TResult>
@@ -504,7 +514,7 @@ impl AsyncClient {
         TArgs: Serialize + ?Sized,
         TResult: DeserializeOwned,
     {
-        self.mutate_inner(reference, args, Some(mutation_id.into()))
+        self.mutate_inner(mutation.reference(), args, Some(mutation_id.into()))
             .await
     }
 

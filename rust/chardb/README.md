@@ -6,6 +6,13 @@ subscription state, and mutation replay have the same implementation in both
 APIs. Repository CI is configured to test native builds on Windows, macOS, and
 Linux.
 
+Application calls use typed `Query<Arguments, Row>` and
+`Mutation<Arguments, Output>` handles. The raw TypeScript reference lives in
+one API declaration instead of every call site. Rust then checks the operation
+kind, arguments, and decoded output before the program runs. A handle is one
+`&'static str`, has no allocation, and writes that string unchanged to protocol
+v3's `ref` field.
+
 Chardb and this crate are experimental. This client does not change the
 database's current backup, restore, failover, or regional resilience status.
 
@@ -52,7 +59,7 @@ runtime.
 ```rust
 # #[cfg(feature = "introspection")]
 # fn introspection_example() -> Result<(), Box<dyn std::error::Error>> {
-use chardb_client::introspection::{operation_schema, JsonSchema};
+use chardb_client::{Query, introspection::{operation_schema, JsonSchema}};
 
 #[derive(JsonSchema)]
 struct ListArgs {
@@ -65,7 +72,10 @@ struct Message {
     body: String,
 }
 
-let contract = operation_schema::<ListArgs, Message>("src/queries.rs#list_messages")?;
+const LIST_MESSAGES: Query<ListArgs, Message> =
+    Query::new("src/queries.ts#listMessages");
+
+let contract = operation_schema(LIST_MESSAGES);
 let json = serde_json::to_value(contract)?;
 # let _ = json;
 # Ok(())
@@ -83,13 +93,20 @@ the same ID in `hello`.
 
 ```rust,no_run
 use std::time::Duration;
-use chardb_client::{Client, ClientConfig, SubscriptionEvent};
+use chardb_client::{Client, ClientConfig, Mutation, Query, SubscriptionEvent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
-struct ListArgs<'a> {
+struct ListArgs {
     #[serde(rename = "organizationId")]
-    organization_id: &'a str,
+    organization_id: String,
+}
+
+#[derive(Serialize)]
+struct PostArgs {
+    #[serde(rename = "organizationId")]
+    organization_id: String,
+    body: String,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +120,11 @@ struct Posted {
     id: String,
 }
 
+const LIST_MESSAGES: Query<ListArgs, Message> =
+    Query::new("src/queries.ts#listMessages");
+const POST_MESSAGE: Mutation<PostArgs, Posted> =
+    Mutation::new("src/api.ts#postMessage");
+
 # fn get_jwt() -> Result<String, String> { unimplemented!() }
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let client = Client::connect(
@@ -111,8 +133,8 @@ let client = Client::connect(
         .mutation_timeout(Duration::from_secs(60)),
 )?;
 
-let args = ListArgs { organization_id: "org-1" };
-let mut messages = client.subscribe::<_, Message>("src/queries.ts#listMessages", &args)?;
+let args = ListArgs { organization_id: "org-1".to_owned() };
+let mut messages = client.subscribe(LIST_MESSAGES, &args)?;
 
 match messages.recv()? {
     SubscriptionEvent::Snapshot { rows } => println!("{} rows", rows.len()),
@@ -120,7 +142,10 @@ match messages.recv()? {
     _ => {}
 }
 
-let posted: Posted = client.mutate("src/api.ts#postMessage", &args)?;
+let posted = client.mutate(POST_MESSAGE, &PostArgs {
+    organization_id: "org-1".to_owned(),
+    body: "hello".to_owned(),
+})?;
 println!("posted {}", posted.id);
 client.close();
 # Ok(())
@@ -136,8 +161,13 @@ The async API uses the same methods and event types. Its futures use channel
 wakers and work with any executor.
 
 ```rust,no_run
-use chardb_client::{AsyncClient, ClientConfig, SubscriptionEvent};
+use chardb_client::{AsyncClient, ClientConfig, Mutation, Query, SubscriptionEvent};
 use serde_json::json;
+
+const LIST_MESSAGES: Query<serde_json::Value, serde_json::Value> =
+    Query::new("src/queries.ts#listMessages");
+const POST_MESSAGE: Mutation<serde_json::Value, serde_json::Value> =
+    Mutation::new("src/api.ts#postMessage");
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let client = AsyncClient::connect(ClientConfig::with_token(
@@ -145,8 +175,8 @@ let client = AsyncClient::connect(ClientConfig::with_token(
     "signed-jwt",
 )).await?;
 
-let mut rows = client.subscribe::<_, serde_json::Value>(
-    "src/queries.ts#listMessages",
+let mut rows = client.subscribe(
+    LIST_MESSAGES,
     &json!({ "organizationId": "org-1" }),
 )?;
 
@@ -154,14 +184,76 @@ if let SubscriptionEvent::Snapshot { rows } = rows.recv().await? {
     println!("{} rows", rows.len());
 }
 
-let result: serde_json::Value = client.mutate(
-    "src/api.ts#postMessage",
+let result = client.mutate(
+    POST_MESSAGE,
     &json!({ "organizationId": "org-1", "body": "hello" }),
 ).await?;
 # let _ = result;
 # Ok(())
 # }
 ```
+
+## Operation handles
+
+Keep handles next to the Rust request and response types they bind. A small
+application can use one `api` module:
+
+```rust
+use chardb_client::{Mutation, Query};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize)]
+pub struct ListMessages {
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct Message {
+    pub id: String,
+    pub body: String,
+}
+
+#[derive(Serialize)]
+pub struct PostMessage {
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
+    pub body: String,
+}
+
+#[derive(Deserialize)]
+pub struct Posted {
+    pub id: String,
+}
+
+pub const LIST_MESSAGES: Query<ListMessages, Message> =
+    Query::new("src/queries.ts#listMessages");
+pub const POST_MESSAGE: Mutation<PostMessage, Posted> =
+    Mutation::new("src/api.ts#postMessage");
+```
+
+`Query::new` and `Mutation::new` apply the wire codec's reference check. Since
+handles are normally constants, a missing `#` fails during compilation. The
+client method fixes the result type from the handle, so callers do not need a
+turbofish or a result annotation. A query handle cannot be passed to `mutate`,
+and a mutation handle cannot be passed to `subscribe`.
+
+To migrate from the string API, move each existing reference into one typed
+constant, then replace the string argument at each call site:
+
+```rust,ignore
+// Before
+let rows = client.subscribe::<_, Message>("src/queries.ts#listMessages", &args)?;
+
+// After
+const LIST_MESSAGES: Query<ListArgs, Message> =
+    Query::new("src/queries.ts#listMessages");
+let rows = client.subscribe(LIST_MESSAGES, &args)?;
+```
+
+The protocol types in `chardb_client::wire` still expose `ref` as a string.
+That module represents protocol v3 directly and is the escape hatch for tools
+that build messages from a dynamic registry.
 
 Dropping an async mutation future before the worker sends it prevents the send.
 Dropping it after a send cannot cancel server execution because protocol v3 has

@@ -9,7 +9,8 @@ use std::{
 
 use chardb_client::{
     wire::{decode_up, RefetchReason, Up},
-    AsyncClient, Client, ClientConfig, ConnectionState, ErrorKind, SubscriptionEvent,
+    AsyncClient, Client, ClientConfig, ConnectionState, ErrorKind, Mutation, Query,
+    SubscriptionEvent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -36,6 +37,11 @@ struct Args<'a> {
     #[serde(rename = "organizationId")]
     organization_id: &'a str,
 }
+
+const MESSAGES: Query<Args<'static>, Row> = Query::new("queries.ts#messages");
+const POST: Mutation<Args<'static>, MutationAck> = Mutation::new("mutations.ts#post");
+const JSON_MESSAGES: Query<serde_json::Value, Row> = Query::new("queries.ts#messages");
+const JSON_POST: Mutation<serde_json::Value, MutationAck> = Mutation::new("mutations.ts#post");
 
 fn jwt(subject: &str, expiry: u64) -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -197,8 +203,8 @@ fn blocking_client_matches_reconnect_mutation_and_auth_contract() {
     let client = Client::connect(config(endpoint)).unwrap();
     assert_eq!(client.state(), ConnectionState::Open);
     let mut subscription = client
-        .subscribe::<_, Row>(
-            "queries.ts#messages",
+        .subscribe(
+            MESSAGES,
             &Args {
                 organization_id: "org-1",
             },
@@ -210,7 +216,7 @@ fn blocking_client_matches_reconnect_mutation_and_auth_contract() {
     ));
     let result: MutationAck = client
         .mutate_with_id(
-            "mutations.ts#post",
+            POST,
             &Args {
                 organization_id: "org-1",
             },
@@ -238,8 +244,8 @@ fn async_facade_runs_the_identical_session_contract_without_tokio() {
     futures_lite::future::block_on(async move {
         let client = AsyncClient::connect(config(endpoint)).await.unwrap();
         let mut subscription = client
-            .subscribe::<_, Row>(
-                "queries.ts#messages",
+            .subscribe(
+                MESSAGES,
                 &Args {
                     organization_id: "org-1",
                 },
@@ -251,7 +257,7 @@ fn async_facade_runs_the_identical_session_contract_without_tokio() {
         ));
         let result: MutationAck = client
             .mutate_with_id(
-                "mutations.ts#post",
+                POST,
                 &Args {
                     organization_id: "org-1",
                 },
@@ -325,7 +331,7 @@ fn dispatched_mutation_timeout_reports_unknown_outcome_and_id() {
     let client =
         Client::connect(config(endpoint).mutation_timeout(Duration::from_millis(50))).unwrap();
     let error = client
-        .mutate_with_id::<_, MutationAck>("mutations.ts#post", &json!({}), "timeout-id")
+        .mutate_with_id(JSON_POST, &json!({}), "timeout-id")
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::MutationOutcomeUnknown);
     assert_eq!(error.mutation_id(), Some("timeout-id"));
@@ -397,19 +403,11 @@ fn duplicate_pending_mutation_id_never_replaces_the_first_caller() {
         Client::connect(config(endpoint).mutation_timeout(Duration::from_secs(2))).unwrap();
     let first_client = client.clone();
     let first = thread::spawn(move || {
-        first_client.mutate_with_id::<_, MutationAck>(
-            "mutations.ts#post",
-            &json!({"body":"first"}),
-            "shared-id",
-        )
+        first_client.mutate_with_id(JSON_POST, &json!({"body":"first"}), "shared-id")
     });
     seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     let second = client
-        .mutate_with_id::<_, MutationAck>(
-            "mutations.ts#post",
-            &json!({"body":"second"}),
-            "shared-id",
-        )
+        .mutate_with_id(JSON_POST, &json!({"body":"second"}), "shared-id")
         .unwrap_err();
     assert_eq!(second.kind(), ErrorKind::Configuration);
     assert_eq!(first.join().unwrap().unwrap().id, "first-result");
@@ -498,9 +496,7 @@ fn retryable_subscription_error_resubscribes_and_delete_row_is_accepted() {
         thread::sleep(Duration::from_millis(100));
     });
     let client = Client::connect(config(endpoint)).unwrap();
-    let mut subscription = client
-        .subscribe::<_, Row>("queries.ts#messages", &json!({}))
-        .unwrap();
+    let mut subscription = client.subscribe(JSON_MESSAGES, &json!({})).unwrap();
     assert!(matches!(
         subscription.recv().unwrap(),
         SubscriptionEvent::Snapshot { rows } if rows[0].body == "before"
@@ -586,10 +582,10 @@ fn auth_changed_waits_for_every_named_subscription_snapshot_ack() {
     let client =
         Client::connect(config(endpoint).auth_refresh_timeout(Duration::from_secs(2))).unwrap();
     let mut first = client
-        .subscribe::<_, Row>("queries.ts#messages", &json!({"which":1}))
+        .subscribe(JSON_MESSAGES, &json!({"which":1}))
         .unwrap();
     let mut second = client
-        .subscribe::<_, Row>("queries.ts#messages", &json!({"which":2}))
+        .subscribe(JSON_MESSAGES, &json!({"which":2}))
         .unwrap();
     assert!(matches!(
         first.recv().unwrap(),

@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod operation;
 pub mod wire;
 
 #[cfg(feature = "introspection")]
@@ -11,6 +12,7 @@ pub mod introspection;
 mod client;
 
 pub use error::{Error, ErrorKind, Result};
+pub use operation::{Mutation, Operation, Query};
 
 #[cfg(feature = "client")]
 pub use client::{ClientConfig, ConnectionState, SubscriptionEvent};

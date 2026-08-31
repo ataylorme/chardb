@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use crate::{wire::validate_reference, Result};
+use crate::Operation;
 
 pub use schemars::{JsonSchema, Schema};
 
@@ -25,19 +25,18 @@ pub fn schema_for<T: JsonSchema>() -> Schema {
 /// For subscriptions, use the row type as `R`, not `Vec<R>`. The subscription
 /// event already describes the surrounding collection.
 ///
-/// # Errors
-///
-/// Returns an error if the Chardb reference is malformed.
-pub fn operation_schema<A: JsonSchema, R: JsonSchema>(
-    reference: impl Into<String>,
-) -> Result<OperationSchema> {
-    let reference = reference.into();
-    validate_reference(&reference)?;
-    Ok(OperationSchema {
-        reference,
-        arguments: schema_for::<A>(),
-        result: schema_for::<R>(),
-    })
+#[must_use]
+pub fn operation_schema<O>(operation: O) -> OperationSchema
+where
+    O: Operation,
+    O::Arguments: JsonSchema + Sized,
+    O::Output: JsonSchema,
+{
+    OperationSchema {
+        reference: operation.reference().to_owned(),
+        arguments: schema_for::<O::Arguments>(),
+        result: schema_for::<O::Output>(),
+    }
 }
 
 #[cfg(test)]
@@ -58,7 +57,7 @@ mod tests {
 
     #[test]
     fn operation_schema_keeps_the_wire_reference_and_real_type_shapes() {
-        let schema = operation_schema::<Args, Row>("queries.rs#rows").unwrap();
+        let schema = operation_schema(crate::Query::<Args, Row>::new("queries.rs#rows"));
         let value = serde_json::to_value(schema).unwrap();
         assert_eq!(value["reference"], "queries.rs#rows");
         assert_eq!(
