@@ -1,10 +1,10 @@
 # chardb
 
-Experimental organization-tenanted SQLite for Cloudflare Durable Objects.
+Experimental Better Auth-owned SQLite for Cloudflare Durable Objects.
 
-Chardb derives placement, authorization, and live-query routing from a Drizzle schema. The supported product path is small: one organization boundary, one physical Cdb transaction per operation, registered mutations, planned live queries, bounded direct selects, and opt-in organization files and vectors.
+Chardb derives placement, authorization, and live-query routing from a Drizzle schema. The supported product path is small: one authenticated ownership boundary, one physical Cdb transaction per operation, registered mutations, compiled live queries, bounded direct selects, and opt-in organization files and vectors.
 
-Do not deploy this as a production database yet. Clean-tarball and Workerd tests cover the organization path, but backup, restore, failover, and longer failure runs do not exist.
+Do not deploy this as a production database yet. Clean-tarball and Workerd tests cover the supported ownership paths, but backup, restore, failover, and longer failure runs do not exist.
 
 ## Start here
 
@@ -313,7 +313,7 @@ app.get("/api/messages", async c => {
 });
 ```
 
-The planned live query and direct select compile to the same versioned select plan. Both execute through one policy-wrapped runner. No SQL string crosses RPC.
+The compiled live query and direct select use the same versioned select plan. Both execute through one policy-wrapped runner. No SQL string crosses RPC.
 
 In React, configure Chardb once with the public Worker URL. The client gives that URL to Better Auth, derives `/ws`, and adds the active organization to database operations.
 
@@ -366,19 +366,20 @@ export function App() {
 }
 ```
 
-## Public package entries
+## Public clients and package entries
 
-Chardb publishes these public imports:
+Chardb publishes these clients and imports:
 
 | Import | Purpose |
 | --- | --- |
 | `@chardb/core` | Browser client, native binding client, and shared errors |
-| `@chardb/core/server` | Organization tables, API handles, auth, migrations, vectors, and `chardb()` |
+| `@chardb/core/server` | Ownership-bound tables, API handles, auth, migrations, vectors, and `chardb()` |
 | `@chardb/react` | Configured React client with Better Auth identity and owner-scoped hooks |
 | `@chardb/core/files` | Branded file columns, browser-safe locators, and the same-origin file client |
 | `@chardb/core/vite` | Ref-only browser handles for queries and mutations |
+| `chardb-client` | Native Rust client with blocking and runtime-neutral async APIs |
 
-The preview binary ships `init`, `doctor`, `migrations generate`, `migrate`, and `vectorize prepare`. Range movement is available only under `chardb experimental shards` and is absent from primary help and generated onboarding. Doctor validates Wrangler configuration. Schema and auth doctor targets are not shipped. Durable Object classes, RPC types, policy compilers, presence, streams, distributed transactions, and runtime configuration are not public package exports.
+The CLI ships `init`, `doctor`, `migrations generate`, `migrate`, and `vectorize prepare`. Range movement is available only under `chardb experimental shards` and is absent from primary help and generated onboarding. Doctor validates Wrangler configuration. Durable Object classes, RPC types, policy compilers, presence, streams, distributed transactions, and runtime configuration are not public package exports.
 
 ## Cloudflare runtime
 
@@ -388,7 +389,7 @@ Migration execution is resumable and fail-closed. Generation is deterministic an
 
 ## Release proof
 
-Every release starts from one packed npm tarball. The same bytes must pass package-boundary checks, the generated app, Better Auth organization isolation, live queries, restart recovery, R2 files, Vectorize vectors, combined row/file/vector movement, and the Linux, macOS, and Windows CI matrix. Reports identify the tarball by SHA-256, keep correctness separate from timing, and reject evidence from any other package.
+Every release starts from one paired `@chardb/core` and `@chardb/react` build. The same tarballs must pass package-boundary checks, the generated app, Better Auth organization isolation, live queries, restart recovery, R2 files, Vectorize vectors, combined row/file/vector movement, and the Linux, macOS, and Windows CI matrix. Reports identify both tarballs by SHA-256, keep correctness separate from timing, and reject evidence from any other package.
 
 Cloudflare proofs use disposable Workers, R2 buckets, and Vectorize indexes. They retain no credentials, delete only resources recorded in their ownership ledger, and fail unless independent checks confirm cleanup. These are release-engineering controls, not a durability or production-readiness claim.
 
@@ -404,7 +405,7 @@ Local fake-index vector results measure Worker, SQLite, routing, and live-query 
 
 Global-table paths remain inside internal conformance fixtures. User-owned tables are public through `forUser(auth)`.
 
-User-owned and global files, user-owned and global vectors, vector-search continuation, presence, streams, scheduling, cross-partition transactions, PITR, export, restore, and automatic resharding are unsupported. Organization files and organization vectors are public and experimental within the narrow lifecycles documented above. Lower-level barrier and operator-driven range-movement code remains internal. Scheduled requests no longer create PITR barriers automatically because retention, export, and restore do not exist.
+User-owned and global files, user-owned and global vectors, vector-search continuation, presence, streams, scheduling, cross-partition transactions, PITR, export, restore, and automatic resharding are unsupported. Organization files and organization vectors are public and experimental within the narrow lifecycles documented above. Lower-level barrier and operator-driven range-movement code remains internal.
 
 See [OPERATIONS.md](OPERATIONS.md) for the threat model and recovery limits, [COST.md](COST.md) for the measured-cost boundary, and [ARCHITECTURE.md](ARCHITECTURE.md) for runtime ownership.
 

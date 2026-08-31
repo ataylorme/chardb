@@ -2,7 +2,7 @@
     "$schema": "https://mintlify.com/docs.json",
     "theme": "mint",
     "name": "chardb",
-    "description": "Organization-owned SQLite, Better Auth tenancy, files, and live Drizzle queries for Cloudflare Workers.",
+    "description": "Better Auth-owned SQLite, files, and live Drizzle queries for Cloudflare Workers.",
     "favicon": "/favicon.png",
     "colors": {
         "primary": "#EC5713",
@@ -14,6 +14,10 @@
             {
                 "group": "Core",
                 "pages": ["quickstart", "ownership", "live-queries", "files", "vectors"]
+            },
+            {
+                "group": "Clients",
+                "pages": ["clients"]
             },
             {
                 "group": "Operate",

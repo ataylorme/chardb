@@ -58,7 +58,12 @@ describe("release documentation contract", () => {
         expect(publicDocs).not.toMatch(/Candidate\d+|exact-candidate|construction diary/i);
         expect(publicDocs).not.toContain("github.com/zpg6/chardb/blob/main");
         expect(plan).toContain("Every release is built once and tested as the artifact users install");
-        expect(plan).toContain("same packed `@chardb/core` tarball");
+        expect(plan).toContain("same paired `@chardb/core` and `@chardb/react` tarballs");
+        expect(status).toContain("plus `@chardb/react`");
+        expect(status).not.toContain("`/react`");
+        expect(publicDocs).toContain("| `chardb-client` | Native Rust client");
+        expect(publicDocs).not.toContain("The preview binary ships");
+        expect(publicDocs).not.toContain("Scheduled requests no longer create PITR barriers");
     });
 
     test("keeps the production warning as prose rather than a closable gate", () => {
@@ -93,7 +98,7 @@ describe("release documentation contract", () => {
         expect(readme).not.toContain("<ChardbProvider");
         expect(reactReadme).toContain("const workerUrl = new URL(window.location.origin).origin");
         expect(reactReadme).not.toContain("PUBLIC_CHARD_DB_URL");
-        expect(ownership).toContain("configured React client reads the active organization");
+        expect(ownership).toContain("configured `@chardb/react` client reads the active organization");
         expect(ownership).not.toContain("The caller supplies `organizationId`");
         for (const source of [fileDocs, chatRecipe]) {
             expect(source).not.toMatch(/attachment\.(?:upload|downloadUrl)\(\{\s*organizationId/);
@@ -109,6 +114,18 @@ describe("release documentation contract", () => {
         expect(workflow).toContain("smoke-packed-package.mjs");
         expect(workflow).toContain("smoke-packed-chat.mjs");
         expect(workflow).toContain("os-ci-evidence");
+    });
+
+    test("surfaces the shipped React and Rust clients", () => {
+        const navigation = read("docs/docs.json");
+        const clients = read("docs/clients.mdx");
+
+        expect(navigation).toContain('"group": "Clients"');
+        expect(navigation).toContain('"pages": ["clients"]');
+        expect(clients).toContain("@chardb/react");
+        expect(clients).toContain("chardb-client");
+        expect(clients).toContain("blocking and runtime-neutral async APIs");
+        expect(clients).toContain("does not implement files, vectors, `workers-rs`, or `wasm32` transport");
     });
 
     test("publishes an honest cost boundary without converting latency into billable compute", () => {

@@ -73,6 +73,7 @@ try {
         "live-queries",
         "files",
         "vectors",
+        "clients",
         "deploy",
         "schema-migrations",
         "plan-ahead",
@@ -158,6 +159,13 @@ try {
         "quickstart command order"
     );
     rejectText(quickstart, "mkdir my-chardb-app", "quickstart must let init create the directory");
+
+    const clients = pageSources.get("clients") ?? "";
+    for (const clientPackage of ["@chardb/react", "chardb-client"]) {
+        requireText(clients, clientPackage, `clients page is missing ${clientPackage}`);
+    }
+    requireText(clients, "runtime-neutral async", "clients page is missing the Rust async boundary");
+    requireText(clients, "does not implement files, vectors", "clients page overstates the Rust client surface");
 
     const generatedWrangler = await readFile(join(appRoot, "wrangler.toml"), "utf8");
     for (const binding of ["CDB_SHARD", "CDB_CATALOG", "CDB_GATEWAY", "CDB_RESHARD", "CDB_FILES"]) {

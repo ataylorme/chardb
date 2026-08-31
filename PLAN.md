@@ -5,8 +5,8 @@ The product is the generated application: Better Auth organizations, a Drizzle s
 Every release is built once and tested as the artifact users install:
 
 - Typecheck, lint, unit tests, real Workerd tests, and documentation checks must pass.
-- The generated app, chat example, and browser tests must install the same packed `@chardb/core` tarball.
-- Linux, macOS, and Windows must pass against that package.
+- The generated app, chat example, and browser tests must install the same paired `@chardb/core` and `@chardb/react` tarballs.
+- Linux, macOS, and Windows must pass against that package pair. The Rust client must pass its native platform matrix and packaged-crate check.
 - File, vector, and range-movement proofs must run on disposable Cloudflare resources and prove their cleanup.
 - npm and crates.io contents must be reviewed before publishing.
 - Public landing and example URLs must be tested after deployment.

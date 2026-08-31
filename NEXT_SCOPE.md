@@ -1,8 +1,8 @@
 # Next scope
 
-This is the decision queue after the preview candidate, not a promise that every internal capability will ship. The current release work stays in [PLAN.md](PLAN.md).
+This is the decision queue beyond the experimental release, not a promise that every internal capability will ship. [PLAN.md](PLAN.md) defines the release standard.
 
-## First after preview
+## First priorities
 
 ### Recovery before more scale claims
 
@@ -56,10 +56,6 @@ Choose one:
 - make it public, version the controller contract, add progress and failure UX, prove repeated and larger deployed moves, and document capacity planning.
 
 Automatic balancing comes later. It needs admission policy, load signals, oscillation control, maintenance windows, and recovery that an operator can understand.
-
-### User-only tenancy
-
-`forOrgUser()` supports user-owned rows inside an organization. A separate user-only tenancy mode still needs a real application case, Better Auth subject lifecycle, deletion semantics, migration rules, placement, direct-select behavior, generated code, and a browser proof. Organization tenancy remains the default.
 
 ### Global data
 

@@ -1,6 +1,6 @@
 # Status
 
-Chardb is a working experimental database for Cloudflare Workers. Better Auth organizations own the data, Drizzle defines the schema, SQLite Durable Objects execute transactions, and the browser SDK provides live queries. R2 files and Vectorize search use the same organization boundary.
+Chardb is a working experimental database for Cloudflare Workers. Better Auth users or organizations own the data, Drizzle defines the schema, SQLite Durable Objects execute transactions, and the browser SDK provides live queries. R2 files and Vectorize search use the organization boundary.
 
 The supported path is deliberately narrow:
 
@@ -12,7 +12,7 @@ The supported path is deliberately narrow:
 - local development and tests through Wrangler, Miniflare, and Cloudflare's Vitest integration;
 - `wrangler.toml` by default, with existing JSONC projects accepted by the CLI.
 
-The npm package exports `@chardb/core`, `/server`, `/react`, `/files`, and `/vite`. The Rust workspace contains the separate `chardb-client` protocol client.
+The npm packages are `@chardb/core` with its `/server`, `/files`, and `/vite` entries, plus `@chardb/react`. The Rust workspace contains the separate `chardb-client` protocol client.
 
 ## What is tested
 
