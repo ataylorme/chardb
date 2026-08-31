@@ -17,8 +17,8 @@ import { fileURLToPath } from "node:url";
 const FINAL_ARTIFACT = Object.freeze({
   name: "@chardb/core",
   version: "0.1.0",
-  size: 454_690,
-  sha256: "73dd07bfa9f38a321ea612930563ce88b86266730a38fe114fd1059ecad100d2",
+  size: 455_788,
+  sha256: "51756dc95e3eb9005e381d351761b9d4d8305b18cde41740bba6991f1148df7f",
 });
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");

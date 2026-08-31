@@ -3,9 +3,9 @@
 The guide is contracted to this exact final packed artifact:
 
 - package: `@chardb/core@0.1.0`
-- file used for verification: `/private/tmp/chardb-candidate-sweep.JblNYO/chardb-core-0.1.0.tgz`
-- size: `454690` bytes
-- SHA-256: `73dd07bfa9f38a321ea612930563ce88b86266730a38fe114fd1059ecad100d2`
+- file used for verification: `/private/tmp/chardb-candidate-final.4Rf6cG/chardb-core-0.1.0.tgz`
+- size: `455788` bytes
+- SHA-256: `51756dc95e3eb9005e381d351761b9d4d8305b18cde41740bba6991f1148df7f`
 
 `chardb init my-chardb-app` creates the named directory. The docs contract runs that packed command in a clean temporary directory, compares the embedded generated examples byte for byte, and exercises additive migration generation. Set `CHARDB_DOCS_TARBALL` to the packed artifact before running the contract.
 
