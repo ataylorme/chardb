@@ -5,6 +5,7 @@ import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import { createApi } from "../../src/server/define.ts";
+import type { CdbRoutingFenceIdentity } from "../../src/server/do/cdb-routing-fence-store.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { manifestFromExports, routeValidatedQuery } from "../../src/server/manifest.ts";
 import type {
@@ -23,13 +24,14 @@ interface Cursor<T> extends Iterable<T> {
     raw(): IterableIterator<unknown[]>;
 }
 
-function sqlStorage(db: Database) {
+function sqlStorage(db: Database, afterExec: (query: string) => void = () => undefined) {
     return {
         exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): Cursor<T> {
             const statement = db.prepare(query);
             const rows = statement.all(...(bindings as never[])) as Record<string, unknown>[];
             const columnNames = [...statement.columnNames];
             const rawRows = rows.map(row => columnNames.map(column => row[column]));
+            afterExec(query);
             return {
                 columnNames,
                 raw: () => rawRows.values(),
@@ -44,13 +46,14 @@ function sqlStorage(db: Database) {
 function construct(
     CdbClass: typeof Cdb,
     db: Database,
-    env: Record<string, unknown> = {}
+    env: Record<string, unknown> = {},
+    afterExec: (query: string) => void = () => undefined
 ): { readonly cdb: Cdb; readonly ready: Promise<unknown> } {
     let ready: Promise<unknown> = Promise.resolve();
     const state = {
         id: { toString: () => "routing-fence-shard" },
         storage: {
-            sql: sqlStorage(db),
+            sql: sqlStorage(db, afterExec),
             transactionSync: <T>(callback: () => T): T => db.transaction(callback)(),
             setAlarm: async (): Promise<void> => {},
         },
@@ -85,20 +88,14 @@ describe("Cdb routing fence", () => {
         let queryRuns = 0;
         const listRecords = api.query({
             ref: "routing-fence.ts#listRecords",
-            authority: "global",
-            partitionKey: "ownerId",
-            intent: (args: { ownerId: string }) => ({
-                kind: "select" as const,
-                tables: ["routing_fence_records"],
-                partitionKey: {
-                    table: "routing_fence_records",
-                    column: "owner_id",
-                    values: [args.ownerId],
-                },
-            }),
-            handler: async (ctx, args) => {
+            query: (db, args: { ownerId: string }) => {
                 queryRuns += 1;
-                return ctx.db.select().from(records).where(eq(records.ownerId, args.ownerId)).all();
+                return db
+                    .select()
+                    .from(records)
+                    .where(eq(records.ownerId, args.ownerId))
+                    .orderBy(records.id)
+                    .limit(100);
             },
         });
         const putRecord = api.mutation({
@@ -197,11 +194,9 @@ describe("Cdb routing fence", () => {
         expect(db.query("SELECT COUNT(*) AS count FROM _chardb_op_log").get()).toEqual({ count: 1 });
     });
 
-    test("activation durably wakes an idle source subscription and fences its rerun", async () => {
+    test("activation durably wakes an idle source subscription and fences its planned rerun", async () => {
         const db = new Database(":memory:");
         databases.push(db);
-        let activateDuringQuery: (() => Promise<void>) | undefined;
-        let queryRuns = 0;
         const { cdbTable } = globalScope();
         const records = cdbTable(
             "routing_fence_live_records",
@@ -214,24 +209,8 @@ describe("Cdb routing fence", () => {
         const api = createApi({ records });
         const listRecords = api.query({
             ref: "routing-fence.ts#liveRecords",
-            authority: "global",
-            partitionKey: "ownerId",
-            intent: (args: { ownerId: string }) => ({
-                kind: "select" as const,
-                tables: ["routing_fence_live_records"],
-                partitionKey: {
-                    table: "routing_fence_live_records",
-                    column: "owner_id",
-                    values: [args.ownerId],
-                },
-            }),
-            handler: async (ctx, args) => {
-                queryRuns += 1;
-                const activate = activateDuringQuery;
-                activateDuringQuery = undefined;
-                if (activate) await activate();
-                return ctx.db.select().from(records).where(eq(records.ownerId, args.ownerId)).all();
-            },
+            query: (db, args: { ownerId: string }) =>
+                db.select().from(records).where(eq(records.ownerId, args.ownerId)).orderBy(records.id).limit(100),
         });
         const manifest = manifestFromExports({ listRecords });
         const ConfiguredCdb = configureCdbRuntime({ schema: () => ({ records }), manifest: () => manifest });
@@ -253,7 +232,14 @@ describe("Cdb routing fence", () => {
             idFromString: (id: string) => ({ toString: () => id }),
             get: () => gateway,
         } as unknown as DurableObjectNamespace;
-        const runtime = construct(ConfiguredCdb, db, { CDB_GATEWAY: gatewayNamespace });
+        let fenceToActivate: CdbRoutingFenceIdentity | undefined;
+        let activation: Promise<unknown> | undefined;
+        const runtime = construct(ConfiguredCdb, db, { CDB_GATEWAY: gatewayNamespace }, query => {
+            if (!fenceToActivate || !/from\s+["`]routing_fence_live_records["`]/i.test(query)) return;
+            const fence = fenceToActivate;
+            fenceToActivate = undefined;
+            activation = runtime.cdb.activateRoutingFence(fence);
+        });
         await runtime.ready;
 
         const partitionKey = "idle-routing-user";
@@ -301,14 +287,12 @@ describe("Cdb routing fence", () => {
             vshard,
             domainSchemaEpoch: 1,
         };
-        activateDuringQuery = async () => {
-            await runtime.cdb.activateRoutingFence(fence);
-        };
+        fenceToActivate = fence;
         await expect(runtime.cdb.queryRegistered(rerun)).resolves.toMatchObject({
             ok: false,
             error: { code: "CDB_STALE_EPOCH", retryable: true },
         });
-        expect(queryRuns).toBe(1);
+        await activation;
 
         // Retrying activation after response loss must not create a second invalidation.
         await runtime.cdb.activateRoutingFence(fence);
@@ -324,7 +308,6 @@ describe("Cdb routing fence", () => {
             ok: false,
             error: { code: "CDB_STALE_EPOCH", retryable: true },
         });
-        expect(queryRuns).toBe(1);
         const replacement = {
             ...subscribeRequest,
             subscription: {

@@ -52,22 +52,8 @@ describe("@chardb/core/vite", () => {
         expect(out.code).toContain("src/mutations/post.ts#createPost");
     });
 
-    test("does not expose virtual modules or unfinished Vite hooks", () => {
+    test("does not expose virtual modules or unused Vite hooks", () => {
         const p = makePlugin();
-        const source = `
-          import {
-            defineGsi,
-            defineLedger,
-            definePresenceKey,
-            defineStream,
-          } from "@chardb/core/server";
-          export const changes = defineStream(async function* () {});
-          export const byStatus = defineGsi("orders", ["status"]);
-          export const audit = defineLedger("audit", { id: "text" });
-          export const cursors = definePresenceKey("cursor");
-        `;
-
-        expect(p.transform(source, "/abs/proj/src/unfinished.ts")).toBeNull();
         expect("resolveId" in p).toBe(false);
         expect("load" in p).toBe(false);
         expect("handleHotUpdate" in p).toBe(false);
@@ -95,23 +81,23 @@ describe("@chardb/core/vite", () => {
         expect(p.transform(code, "/abs/proj/src/unrelated.ts")).toBeNull();
     });
 
-    test("stamps distinct module-and-export refs for config-form api mutations and queries", () => {
+    test("stamps mutation refs and preserves planned query refs", () => {
         const p = makePlugin();
         const code = `
       import { createApi } from "@chardb/core/server";
       const api = createApi();
       export const createPost = api.mutation({ handler: () => ({}) });
       export const deletePost = api.mutation({ handler: () => ({}) });
-      export const listPosts = api.query({ handler: async () => [] });
-      export const getPost = api.query({ handler: async () => null });
+      export const listPosts = api.query({ ref: "api/posts#list", query: db => db.select().from(posts) });
+      export const getPost = api.query({ ref: "api/posts#get", query: db => db.select().from(posts).limit(1) });
     `;
         const out = transform(p, code, "/abs/proj/src/routes/posts.ts?worker");
-        const refs = Array.from(out.code.matchAll(/value: "(src\/routes\/posts\.ts#[^"]+)"/g), match => match[1]);
+        const refs = Array.from(out.code.matchAll(/value: "([^"]+)"/g), match => match[1]);
         expect(refs).toEqual([
             "src/routes/posts.ts#createPost",
             "src/routes/posts.ts#deletePost",
-            "src/routes/posts.ts#listPosts",
-            "src/routes/posts.ts#getPost",
+            "api/posts#list",
+            "api/posts#get",
         ]);
         expect(new Set(refs).size).toBe(4);
     });
@@ -491,7 +477,7 @@ export const list = api.query({ ref: "api/items#list", query: db => db.select().
         expect(output?.code).not.toContain("db.select");
     });
 
-    test("browser erasure fails closed for mixed runtime exports and leaves legacy queries intact", () => {
+    test("browser erasure fails closed for mixed runtime exports and rejects callback queries", () => {
         const unknownTarget = makePlugin();
         expect(() =>
             unknownTarget.transform(
@@ -525,20 +511,20 @@ export const browserConstant = 1;
         ).toThrow("may export only planned queries and types");
 
         const legacy = makePlugin();
-        const output = legacy.transform.call(
-            { environment: { name: "client" } },
-            `
+        expect(() =>
+            legacy.transform.call(
+                { environment: { name: "client" } },
+                `
 import { api } from "@chardb/core/server";
 export const listPosts = api.query({
   ref: "api/posts#legacy-list",
   handler: async () => "LEGACY_HANDLER_SENTINEL",
 });
 `,
-            "/abs/proj/src/routes/legacy.ts",
-            { ssr: false }
-        );
-        expect(output?.code).toContain("LEGACY_HANDLER_SENTINEL");
-        expect(output?.code).toContain('value: "api/posts#legacy-list"');
+                "/abs/proj/src/routes/legacy.ts",
+                { ssr: false }
+            )
+        ).toThrow("must use a planned query config");
     });
 
     test("preserves explicit config refs for two mutations and a query", () => {
@@ -547,7 +533,7 @@ export const listPosts = api.query({
       import { api } from "@chardb/core/server";
       export const createPost = api.mutation({ ref: "api/posts#create", handler: () => ({}) });
       export const deletePost = api.mutation({ ref: "api/posts#delete", handler: () => ({}) });
-      export const listPosts = api.query({ ref: "api/posts#list", handler: async () => [] });
+      export const listPosts = api.query({ ref: "api/posts#list", query: db => db.select().from(posts) });
     `;
         const out = transform(p, code, "/abs/proj/src/routes/posts.ts");
         const refs = Array.from(out.code.matchAll(/value: "([^"]+)"/g), match => match[1]);
@@ -603,22 +589,19 @@ export const listPosts = api.query({
         ).toThrow("Organization mutation save requires a literal ref");
     });
 
-    test("rejects an organization query without a literal ref", () => {
+    test("rejects a planned query without a literal ref", () => {
         const p = makePlugin();
         expect(() =>
             p.transform(
                 `
           import { api } from "@chardb/core/server";
           export const list = api.query({
-            authority: "organization",
-            partitionKey: "organizationId",
-            intent: () => ({ kind: "select", tables: [] }),
-            handler: async () => [],
+            query: db => db.select().from(items),
           });
         `,
                 "/abs/proj/src/authority-query.ts"
             )
-        ).toThrow("Organization query list requires a literal ref");
+        ).toThrow("Planned query list requires a literal ref");
     });
 
     test("preserves global query and mutation refs", () => {
@@ -635,10 +618,7 @@ export const listPosts = api.query({
       });
       export const read = api.query({
         ref: "api/settings#read",
-        authority: "global",
-        partitionKey: () => "app",
-        intent: () => ({ kind: "select", tables: ["settings"] }),
-        handler: async () => [],
+        query: db => db.select().from(settings),
       });
     `,
             "/abs/proj/src/global.ts"
@@ -658,14 +638,6 @@ export const listPosts = api.query({
             {
                 source: `export const save = api.mutation({ ref: "api/settings#save", authority: "global", handler: () => null });`,
                 message: "Global mutation save requires an explicit partitionKey extractor",
-            },
-            {
-                source: `export const read = api.query({ ref: "api/settings#read", authority: "global", intent: () => ({ kind: "select", tables: [] }), handler: async () => [] });`,
-                message: "Global query read requires an explicit partitionKey extractor",
-            },
-            {
-                source: `export const read = api.query({ ref: "api/settings#read", authority: "global", partitionKey: () => "app", handler: async () => [] });`,
-                message: "Global query read requires an explicit intent extractor",
             },
         ];
         for (const testCase of cases) {

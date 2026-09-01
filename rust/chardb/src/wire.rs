@@ -12,7 +12,6 @@ use serde_json::Value;
 use crate::{operation::is_valid_reference, Error, ErrorKind, Result};
 
 pub const PROTOCOL_VERSION: u8 = 3;
-pub const PRESENCE_VERSION: u8 = 1;
 pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub const MAX_JSON_DEPTH: usize = 100;
 
@@ -372,24 +371,6 @@ pub enum Up {
     UpdateAuth { jwt: String },
     #[serde(rename = "ack")]
     Ack { cookie: String },
-    #[serde(rename = "presencePub")]
-    PresencePublish {
-        key: String,
-        state: Value,
-        #[serde(rename = "ttlMs", skip_serializing_if = "Option::is_none")]
-        ttl_ms: Option<Value>,
-    },
-    #[serde(rename = "presenceSub")]
-    PresenceSubscribe { key: String },
-    #[serde(rename = "streamReq")]
-    StreamRequest {
-        #[serde(rename = "streamReqId")]
-        stream_request_id: SafeId,
-        r#ref: String,
-        args: Value,
-        #[serde(rename = "mutId")]
-        mutation_id: String,
-    },
     #[serde(rename = "ping")]
     Ping,
 }
@@ -508,15 +489,6 @@ impl Serialize for MutationResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PresenceState {
-    #[serde(rename = "clientId")]
-    pub client_id: String,
-    pub state: Value,
-    pub ts: f64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", deny_unknown_fields)]
 pub enum Down {
     #[serde(rename = "welcome")]
@@ -551,32 +523,11 @@ pub enum Down {
         sub_ids: Vec<SafeId>,
         reason: RefetchReason,
     },
-    #[serde(rename = "presence")]
-    Presence {
-        key: String,
-        version: u8,
-        states: Vec<PresenceState>,
-    },
-    #[serde(rename = "streamChunk")]
-    StreamChunk {
-        #[serde(rename = "streamReqId")]
-        stream_request_id: SafeId,
-        chunk: Value,
-    },
-    #[serde(rename = "streamEnd")]
-    StreamEnd {
-        #[serde(rename = "streamReqId")]
-        stream_request_id: SafeId,
-        #[serde(rename = "finalMutResult")]
-        final_mutation_result: MutationResult,
-    },
     #[serde(rename = "error")]
     Error {
         code: CdbErrorCode,
         #[serde(rename = "subId", skip_serializing_if = "Option::is_none")]
         sub_id: Option<SafeId>,
-        #[serde(rename = "streamReqId", skip_serializing_if = "Option::is_none")]
-        stream_request_id: Option<SafeId>,
         retryable: bool,
         #[serde(rename = "correlationId")]
         correlation_id: String,
@@ -707,19 +658,11 @@ fn validate_up(message: &Up) -> Result<()> {
             validate_json(args, MAX_JSON_DEPTH)?;
             validate_nonnegative_number(ttl_ms.as_ref(), "ttlMs")?;
         }
-        Up::Mutate { r#ref, args, .. } | Up::StreamRequest { r#ref, args, .. } => {
+        Up::Mutate { r#ref, args, .. } => {
             validate_reference(r#ref)?;
             validate_json(args, MAX_JSON_DEPTH)?;
         }
-        Up::PresencePublish { state, ttl_ms, .. } => {
-            validate_json(state, MAX_JSON_DEPTH)?;
-            validate_nonnegative_number(ttl_ms.as_ref(), "ttlMs")?;
-        }
-        Up::Unsubscribe { .. }
-        | Up::UpdateAuth { .. }
-        | Up::Ack { .. }
-        | Up::PresenceSubscribe { .. }
-        | Up::Ping => {}
+        Up::Unsubscribe { .. } | Up::UpdateAuth { .. } | Up::Ack { .. } | Up::Ping => {}
     }
     Ok(())
 }
@@ -729,10 +672,6 @@ fn validate_down(message: &Down) -> Result<()> {
         Down::Welcome { protocol_v, .. } if *protocol_v != PROTOCOL_VERSION => Err(Error::local(
             ErrorKind::Protocol,
             format!("server selected unsupported protocol version {protocol_v}"),
-        )),
-        Down::Presence { version, .. } if *version != PRESENCE_VERSION => Err(Error::local(
-            ErrorKind::Protocol,
-            format!("unsupported presence version {version}"),
         )),
         Down::Poke {
             mutation_results: Some(results),
@@ -745,10 +684,6 @@ fn validate_down(message: &Down) -> Result<()> {
             }
             Ok(())
         }
-        Down::StreamEnd {
-            final_mutation_result: MutationResult::Failure { error, .. },
-            ..
-        } => validate_remote_error(error),
         Down::Error {
             code, retryable, ..
         } if *retryable != code.is_retryable() => Err(Error::local(

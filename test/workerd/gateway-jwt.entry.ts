@@ -1,7 +1,7 @@
 import { admin } from "better-auth/plugins/admin";
 import { jwt } from "better-auth/plugins/jwt";
 import { organization } from "better-auth/plugins/organization";
-import { and, eq } from "drizzle-orm";
+import { and, eq, or } from "drizzle-orm";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { api } from "../../src/server/define.ts";
@@ -19,7 +19,7 @@ const OTHER_ORGANIZATION_ID = "workerd-org-b";
 const WRITE_REF = "test/workerd/gateway-jwt.entry.ts#writeOrganizationRow";
 const CLOSED_REF = "test/workerd/gateway-jwt.entry.ts#closedOrganizationWrite";
 const LIST_REF = "test/workerd/gateway-jwt.entry.ts#listOrganizationRows";
-const CLOSED_QUERY_REF = "test/workerd/gateway-jwt.entry.ts#closedOrganizationRows";
+const UNCONSTRAINED_QUERY_REF = "test/workerd/gateway-jwt.entry.ts#unconstrainedOrganizationRows";
 const INVALID_QUERY_REF = "test/workerd/gateway-jwt.entry.ts#invalidOrganizationRows";
 
 const auth = defineAuth({
@@ -95,18 +95,9 @@ const closedOrganizationWrite = api.mutation({
 const listOrganizationRows = api.query({
     ref: LIST_REF,
     args: z.object({ organizationId: z.string(), body: z.string().optional() }),
-    authority: "organization",
-    partitionKey: "organizationId",
-    intent: args => ({
-        kind: "select",
-        tables: ["gateway_writes"],
-        partitionKey: { table: "gateway_writes", column: "organization_id", values: [args.organizationId] },
-        joinShape: "colocated",
-        intervals: [{ table: "gateway_writes", indexName: "organization_id", intervals: [{ kind: "full" }] }],
-    }),
-    handler: async (ctx, args) => {
+    query: (db, args) => {
         if (args.body === "__throw") throw new Error("forced query failure");
-        const rows = await ctx.db
+        return db
             .select()
             .from(gatewayWrites)
             .where(
@@ -115,52 +106,46 @@ const listOrganizationRows = api.query({
                     : and(eq(gatewayWrites.organizationId, args.organizationId), eq(gatewayWrites.body, args.body))
             )
             .orderBy(gatewayWrites.id)
-            .all();
-        return rows.map(row => ({ ...row, viewerId: ctx.auth.userId }));
+            .limit(100);
     },
 });
 
-const closedOrganizationRows = api.query({
-    ref: CLOSED_QUERY_REF,
+const unconstrainedOrganizationRows = api.query({
+    ref: UNCONSTRAINED_QUERY_REF,
     args: z.object({ organizationId: z.string() }),
-    intent: args => ({
-        kind: "select",
-        tables: ["gateway_writes"],
-        partitionKey: { table: "gateway_writes", column: "organization_id", values: [args.organizationId] },
-    }),
-    handler: async () => [],
+    query: db => db.select().from(gatewayWrites).orderBy(gatewayWrites.id).limit(100),
 });
 
 const invalidOrganizationRows = api.query({
     ref: INVALID_QUERY_REF,
-    args: z.object({ organizationId: z.string(), mode: z.enum(["scatter", "cross", "mismatch"]) }),
-    authority: "organization",
-    partitionKey: "organizationId",
-    intent: args => ({
-        kind: "select",
-        tables: ["gateway_writes"],
-        ...(args.mode === "scatter"
-            ? {}
-            : {
-                  partitionKey: {
-                      table: "gateway_writes",
-                      column: "organization_id",
-                      values: [args.mode === "mismatch" ? OTHER_ORGANIZATION_ID : args.organizationId],
-                  },
-              }),
-        ...(args.mode === "cross" ? { joinShape: "cross-partition" as const } : {}),
-    }),
-    handler: async () => [],
+    args: z.object({ organizationId: z.string(), mode: z.enum(["scatter", "cross", "foreign"]) }),
+    query: (db, args) =>
+        db
+            .select()
+            .from(gatewayWrites)
+            .where(
+                args.mode === "scatter"
+                    ? undefined
+                    : args.mode === "cross"
+                      ? or(
+                            eq(gatewayWrites.organizationId, args.organizationId),
+                            eq(gatewayWrites.organizationId, OTHER_ORGANIZATION_ID)
+                        )
+                      : eq(gatewayWrites.organizationId, OTHER_ORGANIZATION_ID)
+            )
+            .orderBy(gatewayWrites.id)
+            .limit(100),
 });
 
 const app = chardb({
+    ownership: "organization",
     auth,
     schema: { gatewayWrites },
     api: {
         writeOrganizationRow,
         closedOrganizationWrite,
         listOrganizationRows,
-        closedOrganizationRows,
+        unconstrainedOrganizationRows,
         invalidOrganizationRows,
     },
 });
@@ -441,7 +426,7 @@ export default {
                 mutationRef: writeOrganizationRow.__chardbRef,
                 closedMutationRef: closedOrganizationWrite.__chardbRef,
                 queryRef: listOrganizationRows.__chardbRef,
-                closedQueryRef: closedOrganizationRows.__chardbRef,
+                unconstrainedQueryRef: unconstrainedOrganizationRows.__chardbRef,
                 invalidQueryRef: invalidOrganizationRows.__chardbRef,
                 shardA: routeA.shardId,
                 shardB: routeB.shardId,

@@ -1,7 +1,6 @@
 import { CdbError } from "../../errors.ts";
 import { VSHARD_COUNT } from "../../vshard.ts";
 import { type ChardbMigrationJournal, migrationDigestAt, pendingMigrations } from "../schema-migrations.ts";
-import { initializeCatalogBarrierStorage } from "./catalog-barrier-store.ts";
 import type { adaptSqlStorage } from "./sql_adapter.ts";
 
 export type CatalogSql = ReturnType<typeof adaptSqlStorage>;
@@ -158,7 +157,6 @@ export function initializeCatalogStorage(sql: CatalogSql, journal: ChardbMigrati
         .filter(Boolean)) {
         sql.exec(statement);
     }
-    initializeCatalogBarrierStorage(sql);
     assertInternalTable(sql, "catalog_jwks_v2", JWKS_V2_COLUMNS);
     assertInternalTable(sql, "catalog_jwks_refresh", JWKS_REFRESH_COLUMNS);
     sql.exec(

@@ -12,7 +12,7 @@ interface ProofEnv {
     readonly CDB_RELEASE_SHA256: string;
 }
 
-const app = chardb({ auth, authBasePath: "/api/auth", schema, api, migrations });
+const app = chardb({ ownership: "organization", auth, authBasePath: "/api/auth", schema, api, migrations });
 
 function bearer(value: string | undefined): string {
     return value?.replace(/^Bearer\s+/i, "") ?? "";

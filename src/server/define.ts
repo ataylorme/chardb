@@ -15,7 +15,6 @@ import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
 import { CdbError, type CdbErrorCode } from "../errors.ts";
 import type { Brand, RawJson } from "../types.ts";
 import type { VectorMutationApi } from "../vector.ts";
-import type { CdbIntent } from "../wire.ts";
 import { wrapDb } from "./cdb-db-proxy.ts";
 import { type PolicyDefinition, chardbPolicy } from "./policy.ts";
 import { attachRef } from "./refs.ts";
@@ -140,44 +139,10 @@ export type MutationFn<TDb, TArgs, TResult> = ((ctx: MutationCtx<TDb>, args: TAr
 export type QueryFn<TDb, TArgs, TResult> = ((ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>) & {
     readonly __chardbKind: "query";
     readonly __chardbRef: Brand<string, "ChardbRef">;
-    readonly __chardbAuthority?: MutationAuthority;
-    readonly __chardbPartitionKey?: (args: TArgs) => string | number | bigint | undefined;
-    readonly __chardbInvokeValidated?: (ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>;
     /** Server-only validator used before routing intent extraction. */
     readonly __chardbValidateArgs?: (args: unknown) => Promise<TArgs>;
-    /**
-     * Server-owned `CdbIntent` extractor. The configured Gateway reads this
-     * from its local manifest; clients send only the query ref and raw args.
-     */
-    readonly __chardbIntent?: (args: TArgs) => CdbIntent;
     /** Runtime-compiled plan for the single-source Drizzle query form. */
     readonly __chardbCompilePlan?: (args: TArgs) => RegisteredQueryPlan;
-};
-
-export type StreamFn<TDb, TArgs, TChunk, TResult> = ((
-    ctx: MutationCtx<TDb>,
-    args: TArgs
-) => AsyncGenerator<TChunk, TResult, void>) & {
-    readonly __chardbKind: "stream";
-    readonly __chardbRef: Brand<string, "ChardbRef">;
-};
-
-export type GsiHandle<TTable, TCols extends readonly string[]> = {
-    readonly __chardbKind: "gsi";
-    readonly __chardbRef: Brand<string, "ChardbRef">;
-    readonly table: TTable;
-    readonly columns: TCols;
-    readonly strict: boolean;
-};
-
-export type PresenceKey<TState> = ((scope: string) => {
-    readonly __chardbKind: "presenceKey";
-    readonly __chardbRef: Brand<string, "ChardbRef">;
-    readonly key: string;
-    readonly __chardbStateType: TState;
-}) & {
-    readonly __chardbKind: "presenceKey";
-    readonly __chardbRef: Brand<string, "ChardbRef">;
 };
 
 /**
@@ -380,62 +345,12 @@ function runValidatorSync<T>(schema: StandardSchemaV1<unknown, T>, value: unknow
     return valueFromValidationResult(result);
 }
 
-/**
- * Object form of `defineQuery`. Same validator-driven inference as
- * `MutationConfig`.
- */
-interface QueryConfigBase<TDb, TArgs extends Record<string, unknown>, TResult> {
-    /** Stable wire ref shared by browser and Worker builds. Must contain `#`. */
-    readonly ref?: string;
-    readonly args?: StandardSchemaV1<unknown, TArgs>;
-    readonly handler: (ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>;
-    readonly partitionKey?: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
-    /**
-     * Optional server-owned `CdbIntent` extractor. When provided, the
-     * returned `QueryFn` carries `__chardbIntent` for the configured Gateway
-     * to resolve subscription routing from trusted code.
-     *
-     * The intent the user returns must be wire-equivalent to what the
-     * Drizzle expression in `handler` would compile to via the
-     * `StaticIntentExtractor` — partition values, intervals, and table
-     * list. That equivalence is the user's responsibility (no auto-
-     * extraction); the `defineQuery({ intent })` callback is the
-     * one place chardb requires the correspondence to be spelled out.
-     */
-    readonly intent?: (args: TArgs) => CdbIntent;
-}
-
-export type QueryConfig<TDb, TArgs extends Record<string, unknown>, TResult> =
-    | (QueryConfigBase<TDb, TArgs, TResult> & {
-          readonly authority: "organization";
-          readonly ref: string;
-          readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
-          readonly intent: (args: TArgs) => CdbIntent;
-      })
-    | (QueryConfigBase<TDb, TArgs, TResult> & {
-          readonly authority: "user";
-          readonly ref: string;
-          readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
-          readonly intent: (args: TArgs) => CdbIntent;
-      })
-    | (QueryConfigBase<TDb, TArgs, TResult> & {
-          readonly authority: "global";
-          readonly ref: string;
-          readonly partitionKey: PartitionKeyOf<TArgs> | ((args: TArgs) => string | number | bigint | undefined);
-          readonly intent: (args: TArgs) => CdbIntent;
-      })
-    | (QueryConfigBase<TDb, TArgs, TResult> & { readonly authority?: undefined });
-
 export interface PlannedQueryConfig<TDb, TArgs extends Record<string, unknown>, TBuilder extends PlannedQueryBuilder> {
     /** Stable across Wrangler, Vite, browser, Gateway, and Cdb builds. */
     readonly ref: string;
     readonly args?: StandardSchemaV1<unknown, TArgs>;
     /** Pure synchronous builder. Chardb compiles it before Catalog and executes it inside Cdb. */
     readonly query: (db: TDb, args: TArgs) => TBuilder;
-    readonly handler?: never;
-    readonly authority?: never;
-    readonly partitionKey?: never;
-    readonly intent?: never;
 }
 
 export interface PlannedQueryBuilder {
@@ -445,110 +360,41 @@ export interface PlannedQueryBuilder {
 type PlannedQueryResult<TBuilder extends PlannedQueryBuilder> = TBuilder["_"]["result"];
 
 /**
- * Read handler. Body executes against a read-only `Cdb` shard view; live-query
- * fan-in shares the same shape. Accepts either a config object with an
- * `args:` validator (inference) or a bare handler with an inline
- * annotation.
+ * Define a planned read. Chardb compiles the Drizzle builder before routing
+ * and executes the canonical plan inside the target Cdb shard.
  */
-export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>(
-    config: QueryConfig<TDb, TArgs, TResult>
-): QueryFn<TDb, TArgs, TResult>;
 export function defineQuery<TDb, TArgs extends Record<string, unknown>, TBuilder extends PlannedQueryBuilder>(
     config: PlannedQueryConfig<TDb, TArgs, TBuilder>
 ): QueryFn<TDb, TArgs, PlannedQueryResult<TBuilder>>;
 export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>(
-    handler: (ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>
-): QueryFn<TDb, TArgs, TResult>;
-export function defineQuery<TDb, TArgs extends Record<string, unknown>, TResult>(
-    configOrHandler:
-        | QueryConfig<TDb, TArgs, TResult>
-        | PlannedQueryConfig<TDb, TArgs, PlannedQueryBuilder>
-        | ((ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>)
+    config: PlannedQueryConfig<TDb, TArgs, PlannedQueryBuilder>
 ): QueryFn<TDb, TArgs, TResult> {
-    const isConfig = typeof configOrHandler === "object";
-    const isPlanned = isConfig && "query" in configOrHandler;
-    const handler = isPlanned ? undefined : isConfig ? configOrHandler.handler : configOrHandler;
-    const plannedQuery = isPlanned ? configOrHandler.query : undefined;
-    const validator: StandardSchemaV1<unknown, TArgs> | undefined = isConfig ? configOrHandler.args : undefined;
-    const intent = isConfig ? configOrHandler.intent : undefined;
-    const authority = isConfig ? configOrHandler.authority : undefined;
-    const partitionKey = isConfig ? configOrHandler.partitionKey : undefined;
-    const partitionKeyFn: ((args: TArgs) => string | number | bigint | undefined) | undefined =
-        typeof partitionKey === "string"
-            ? (args: TArgs) => {
-                  const value: unknown = args[partitionKey];
-                  return typeof value === "string" || typeof value === "number" || typeof value === "bigint"
-                      ? value
-                      : undefined;
-              }
-            : partitionKey;
-    const explicitRef = isConfig ? configOrHandler.ref : undefined;
-    if (isPlanned) {
-        if (typeof plannedQuery !== "function") {
-            throw new TypeError("chardb: planned query requires a query callback");
-        }
-        const mixed = ["handler", "authority", "partitionKey", "intent"].filter(field => field in configOrHandler);
-        if (mixed.length > 0) {
-            throw new TypeError(`chardb: planned query cannot mix query with ${mixed.join(", ")}`);
-        }
+    const plannedQuery = config.query;
+    const validator = config.args;
+    const explicitRef = config.ref;
+    if (typeof plannedQuery !== "function") {
+        throw new TypeError("chardb: planned query requires a query callback");
     }
-    if (explicitRef !== undefined && (explicitRef.length === 0 || !explicitRef.includes("#"))) {
+    const mixed = ["handler", "authority", "partitionKey", "intent"].filter(field => field in config);
+    if (mixed.length > 0) {
+        throw new TypeError(`chardb: planned query cannot mix query with ${mixed.join(", ")}`);
+    }
+    if (typeof explicitRef !== "string" || explicitRef.length === 0 || !explicitRef.includes("#")) {
         throw new TypeError("chardb: query ref must be a nonempty string containing #");
     }
-    if (authority !== undefined && explicitRef === undefined) {
-        throw new TypeError(`chardb: ${authority} queries require an explicit ref`);
-    }
-    if (authority === "global" && partitionKeyFn === undefined) {
-        throw new TypeError("chardb: global queries require an explicit partitionKey extractor");
-    }
-    if (authority === "global" && intent === undefined) {
-        throw new TypeError("chardb: global queries require an explicit intent extractor");
-    }
-    if (isPlanned && explicitRef === undefined) {
-        throw new TypeError("chardb: planned queries require an explicit ref");
-    }
-    const invokeValidated = async (ctx: QueryCtx<TDb>, args: TArgs): Promise<TResult> => {
-        if (plannedQuery) {
-            throw new CdbError({
-                code: "CDB_UNSUPPORTED_FEATURE",
-                message: "planned query handles are dispatch-only; Cdb executes their compiled select plan",
-            });
-        }
-        const wrappedCtx = wrapCtxDb(ctx) as QueryCtx<TDb>;
-        return (handler as (ctx: QueryCtx<TDb>, args: TArgs) => Promise<TResult>)(wrappedCtx, args);
-    };
-    const fn = (async (ctx: QueryCtx<TDb>, args: TArgs) => {
-        const validated = validator ? await runValidator(validator, args) : args;
-        return invokeValidated(ctx, validated);
-    }) as QueryFn<TDb, TArgs, TResult>;
-    if (handler?.name && handler.name !== "fn") {
-        Object.defineProperty(fn, "name", { value: handler.name, configurable: true });
-    }
-    if (explicitRef) {
-        Object.defineProperty(fn, "__chardbExplicitRef", { value: true, enumerable: false });
-    }
-    if (intent) {
-        Object.defineProperty(fn, "__chardbIntent", {
-            value: intent,
-            enumerable: false,
-            configurable: false,
+    const fn = (async (_ctx: QueryCtx<TDb>, _args: TArgs) => {
+        throw new CdbError({
+            code: "CDB_UNSUPPORTED_FEATURE",
+            message: "planned query handles are dispatch-only; Cdb executes their compiled plan",
         });
-    }
-    if (plannedQuery) {
-        Object.defineProperty(fn, "__chardbCompilePlan", {
-            value: (args: TArgs) =>
-                compileRegisteredQueryPlan(plannedQuery as unknown as (db: unknown, args: TArgs) => unknown, args),
-            enumerable: false,
-            configurable: false,
-        });
-    }
-    if (authority) {
-        Object.defineProperty(fn, "__chardbAuthority", { value: authority, enumerable: false });
-    }
-    if (partitionKeyFn) {
-        Object.defineProperty(fn, "__chardbPartitionKey", { value: partitionKeyFn, enumerable: false });
-    }
-    Object.defineProperty(fn, "__chardbInvokeValidated", { value: invokeValidated, enumerable: false });
+    }) as unknown as QueryFn<TDb, TArgs, TResult>;
+    Object.defineProperty(fn, "__chardbExplicitRef", { value: true, enumerable: false });
+    Object.defineProperty(fn, "__chardbCompilePlan", {
+        value: (args: TArgs) =>
+            compileRegisteredQueryPlan(plannedQuery as unknown as (db: unknown, args: TArgs) => unknown, args),
+        enumerable: false,
+        configurable: false,
+    });
     if (validator) {
         Object.defineProperty(fn, "__chardbValidateArgs", {
             value: (args: unknown) => runValidator(validator, args),
@@ -599,57 +445,6 @@ function valueFromValidationResult<T>(result: StandardSchemaV1.Result<T>): T {
     return result.value;
 }
 
-/**
- * Stream handler. The body runs inside the partition-owning shard; intermediate
- * chunks are best-effort over WebSocket, while the final state is durably
- * written via the wrapping op-log row so retries through the same `mutId`
- * return the cached result without re-streaming.
- */
-export function defineStream<TDb, TArgs extends Record<string, unknown>, TChunk, TResult>(
-    handler: (ctx: MutationCtx<TDb>, args: TArgs) => AsyncGenerator<TChunk, TResult, void>
-): StreamFn<TDb, TArgs, TChunk, TResult> {
-    const fn = ((ctx: MutationCtx<TDb>, args: TArgs) => handler(ctx, args)) as StreamFn<TDb, TArgs, TChunk, TResult>;
-    return attachRef(fn, "stream") as StreamFn<TDb, TArgs, TChunk, TResult>;
-}
-
-/**
- * Research-only GSI descriptor retained for conformance tests. No package
- * entry exports it and the Worker factory does not provision a GSI runtime.
- */
-export function defineGsi<TTable, TCols extends readonly string[]>(
-    table: TTable,
-    columns: TCols,
-    options: { readonly strict?: boolean } = {}
-): GsiHandle<TTable, TCols> {
-    const handle = {
-        table,
-        columns,
-        strict: options.strict ?? false,
-    };
-    return attachRef(handle as object, "gsi") as unknown as GsiHandle<TTable, TCols>;
-}
-
-/**
- * Optionally-typed presence key. Presence rides the same hibernated WebSocket
- * as live queries but bypasses the IntervalMap pipeline; states are
- * best-effort, ephemeral, and capped per key.
- */
-export function definePresenceKey<TState>(prefix: string): PresenceKey<TState> {
-    const factory = ((scope: string) => {
-        const key = `${prefix}:${scope}`;
-        const handle = {
-            key,
-            __chardbStateType: undefined as unknown as TState,
-        };
-        return attachRef(handle, "presenceKey", `presenceKey#${prefix}:${scope}`);
-    }) as PresenceKey<TState>;
-    return attachRef(
-        factory as unknown as object,
-        "presenceKey",
-        `presenceKey#${prefix}`
-    ) as unknown as PresenceKey<TState>;
-}
-
 /** Result kept transient on a mutation outcome. */
 export interface UserError {
     readonly code: CdbErrorCode;
@@ -679,16 +474,9 @@ export interface ChardbApi<TSchema extends Record<string, unknown>> {
         handler: (ctx: MutationCtx<ChardbDb<TSchema>>, args: TArgs) => TResult,
         options?: MutationOptions<TArgs>
     ): MutationFn<ChardbDb<TSchema>, TArgs, TResult>;
-    query<TArgs extends Record<string, unknown>, TResult>(
-        config: QueryConfig<ChardbDb<TSchema>, TArgs, TResult>
-    ): QueryFn<ChardbDb<TSchema>, TArgs, TResult>;
     query<TArgs extends Record<string, unknown>, TBuilder extends PlannedQueryBuilder>(
         config: PlannedQueryConfig<ChardbDb<TSchema>, TArgs, TBuilder>
     ): QueryFn<ChardbDb<TSchema>, TArgs, PlannedQueryResult<TBuilder>>;
-    query<TArgs extends Record<string, unknown>, TResult>(
-        handler: (ctx: QueryCtx<ChardbDb<TSchema>>, args: TArgs) => Promise<TResult>
-    ): QueryFn<ChardbDb<TSchema>, TArgs, TResult>;
-    presence<TState>(prefix: string): PresenceKey<TState>;
     /**
      * Row-level policy with `TRow` inferred from the `TTable` generic's
      * Drizzle `$inferSelect`. Pass the table at the type level only —
@@ -706,7 +494,7 @@ export interface ChardbApi<TSchema extends Record<string, unknown>> {
 type RowFromTable<TTable> = TTable extends { readonly $inferSelect: infer R } ? R : unknown;
 
 /**
- * Build a schema-bound `{ mutation, query, presence }` object. The
+ * Build a schema-bound `{ mutation, query, policy }` object. The
  * user's `api.ts` calls this once with their schema namespace and the
  * synthesized auth tables; every subsequent definition reuses the bound
  * `TDb`, so the inline call sites stay declaration-free.
@@ -733,7 +521,6 @@ export function createApi<const TSchema extends Record<string, unknown>>(_schema
     return {
         mutation: defineMutation as ChardbApi<TSchema>["mutation"],
         query: defineQuery as ChardbApi<TSchema>["query"],
-        presence: definePresenceKey,
         // `policy` is structurally identical to the standalone `chardbPolicy`
         // — the method exists on `api` for symmetry with `api.mutation` /
         // `api.query`, but it's a type-only sugar (TTable is a generic, not
@@ -744,7 +531,7 @@ export function createApi<const TSchema extends Record<string, unknown>>(_schema
 }
 
 /**
- * Ready-to-use `{ mutation, query, presence, policy }` factory bound
+ * Ready-to-use `{ mutation, query, policy }` factory bound
  * to an open schema. Drops the `createApi<typeof auth & typeof
  * domain>()` line every `api.ts` used to start with — the user just
  * does `import { api } from "@chardb/core/server"` and writes `api.mutation

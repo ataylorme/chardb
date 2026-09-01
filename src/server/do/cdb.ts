@@ -31,13 +31,7 @@ import { initializeExternalReshardCapture, withExternalReshardCapture } from "..
 import { renderFileReshardTriggers } from "../file-reshard-triggers.ts";
 import { renderFileAttachmentTriggerSet } from "../file-triggers.ts";
 import { sourceChardbEnv, withChardbLoopbacks } from "../loopback.ts";
-import {
-    type ChardbManifest,
-    type QueryRouteResponse,
-    emptyManifest,
-    resolveQuery,
-    routeValidatedQuery,
-} from "../manifest.ts";
+import { type ChardbManifest, type QueryRouteResponse, emptyManifest, routeValidatedQuery } from "../manifest.ts";
 import {
     type VectorResourceV1,
     assertSchemaResourceJournal,
@@ -127,7 +121,7 @@ import {
 } from "./cdb-live-store.ts";
 import { executeCdbMutation } from "./cdb-mutation-execution.ts";
 import { CdbOpLogRetentionStore } from "./cdb-oplog-retention-store.ts";
-import { executeCdbQueryHandler, executeCdbSelectPlan } from "./cdb-query-execution.ts";
+import { executeCdbSelectPlan } from "./cdb-query-execution.ts";
 import { CdbReshardRuntime, type TailTransaction } from "./cdb-reshard-runtime.ts";
 import { CdbVectorMutationContext, bindCdbVectorMutationContext } from "./cdb-vector-mutation.ts";
 import {
@@ -1859,14 +1853,12 @@ export class Cdb extends DurableObject<CdbEnv> {
             if (request.placement?.authority === "organization") {
                 this.assertOrganizationActive(request.placement.partitionKey, adaptSqlStorage(this.ctx.storage.sql));
             }
-            const descriptor = resolveQuery(this.mutationManifest(), request.ref);
-            const routed =
-                request.placement || descriptor.compilePlan
-                    ? routeValidatedQuery(this.mutationManifest(), { ref: request.ref, args: request.args }, tables =>
-                          cdbPolicyDigest(this.mutationSchema(), tables)
-                      )
-                    : undefined;
-            if (request.placement && routed) {
+            const routed = routeValidatedQuery(
+                this.mutationManifest(),
+                { ref: request.ref, args: request.args },
+                tables => cdbPolicyDigest(this.mutationSchema(), tables)
+            );
+            if (request.placement) {
                 if (
                     routed.authority !== request.placement.authority ||
                     routed.partitionKey !== request.placement.partitionKey
@@ -1874,32 +1866,16 @@ export class Cdb extends DurableObject<CdbEnv> {
                     throw subscriptionInvariant("query placement does not match its server manifest route");
                 }
             }
-            const declaredIntent =
-                routed?.intent ?? (descriptor.extractIntent ? descriptor.extractIntent(request.args) : undefined);
-            let result: RawJson;
-            if (descriptor.compilePlan) {
-                if (!routed || !request.placement || !declaredIntent) {
-                    throw subscriptionInvariant("planned query omitted its canonical plan, placement, or intent");
-                }
-                result = await this.executeRegisteredQueryPlan({
-                    routed,
-                    placement: request.placement,
-                    auth: request.auth,
-                    subject: "query result",
-                    ref: request.ref,
-                });
-            } else {
-                result = await executeCdbQueryHandler({
-                    storage: this.ctx.storage,
-                    schema: this.mutationSchema(),
-                    auth: request.auth,
-                    placement: request.placement,
-                    subject: "query result",
-                    ref: request.ref,
-                    intent: declaredIntent,
-                    invoke: db => descriptor.invokeValidated({ db, auth: request.auth }, request.args),
-                });
+            if (!request.placement) {
+                throw subscriptionInvariant("planned query omitted its placement");
             }
+            const result = await this.executeRegisteredQueryPlan({
+                routed,
+                placement: request.placement,
+                auth: request.auth,
+                subject: "query result",
+                ref: request.ref,
+            });
             if (request.placement) this.assertRoutingEpoch(request.schemaEpoch, request.placement);
             else this.resharding.assertUnplacedRoutingAdmission();
             if (request.placement?.authority === "organization") {
@@ -2024,28 +2000,13 @@ export class Cdb extends DurableObject<CdbEnv> {
             const vectorResourceId = routed.vectorPlan ? cdbVectorResourceId(routed.vectorPlan.resource) : null;
             assertLiveVectorSubscriptionDependency(sql, subscription.subscription, vectorResourceId);
 
-            const descriptor = resolveQuery(this.mutationManifest(), subscription.ref);
-            let result: RawJson;
-            if (descriptor.compilePlan) {
-                result = await this.executeRegisteredQueryPlan({
-                    routed,
-                    placement: { authority: routed.authority, partitionKey: reroutedPartition },
-                    auth: request.auth,
-                    subject: "registered query result",
-                    ref: subscription.ref,
-                });
-            } else {
-                result = await executeCdbQueryHandler({
-                    storage: this.ctx.storage,
-                    schema: this.mutationSchema(),
-                    auth: request.auth,
-                    placement: { authority: routed.authority, partitionKey: reroutedPartition },
-                    subject: "registered query result",
-                    ref: subscription.ref,
-                    intent: routed.intent,
-                    invoke: db => descriptor.invokeValidated({ db, auth: request.auth }, subscription.args),
-                });
-            }
+            const result = await this.executeRegisteredQueryPlan({
+                routed,
+                placement: { authority: routed.authority, partitionKey: reroutedPartition },
+                auth: request.auth,
+                subject: "registered query result",
+                ref: subscription.ref,
+            });
             if (!Array.isArray(result)) {
                 throw subscriptionInvariant("registered query result must be an array");
             }
@@ -3117,12 +3078,6 @@ export class Cdb extends DurableObject<CdbEnv> {
     /** Mark a successful destination split drained and release transfer-only state. */
     async finishReshardDest(args: Omit<CdbReshardSplitIdentity, "role">): Promise<void> {
         return this.resharding.finishReshardDest(args);
-    }
-
-    async barrierBookmark(): Promise<number> {
-        const sql = adaptSqlStorage(this.ctx.storage.sql);
-        const row = sql.one<{ max_id: number | null }>("SELECT MAX(rowid) AS max_id FROM _chardb_op_log");
-        return row?.max_id ?? 0;
     }
 }
 

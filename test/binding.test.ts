@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { CHARDB_BINDING_MAX_IN_FLIGHT, type ChardbBinding, client } from "../src/binding.ts";
 import { CdbError } from "../src/errors.ts";
-import { defineMutation, defineQuery } from "../src/server/define.ts";
+import { defineMutation } from "../src/server/define.ts";
 
-const query = defineQuery<unknown, { organizationId: string }, { count: number }>({
-    ref: "queries.ts#countMessages",
-    handler: async () => ({ count: 3 }),
+const query = Object.assign(async (_ctx: never, _args: { organizationId: string }) => ({ count: 3 }), {
+    __chardbKind: "query" as const,
+    __chardbRef: "queries.ts#countMessages",
 });
 const mutation = defineMutation<unknown, { organizationId: string; body: string }, { id: string }>({
     ref: "api.ts#postMessage",

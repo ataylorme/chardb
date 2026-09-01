@@ -1326,13 +1326,13 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
 
     test("module initialization binds auth before the first Catalog bootstrap", async () => {
         harness.close();
-        chardb({ schema: {}, auth });
+        chardb({ ownership: "user", schema: {}, auth });
         resetAuthRuntime();
 
         // A fresh Worker or DO isolate evaluates the application module
         // again. This second factory call models that evaluation: no fetch,
         // schema getter, or adapter request runs before Catalog construction.
-        chardb({ schema: {}, auth });
+        chardb({ ownership: "user", schema: {}, auth });
         harness = new CatalogHarness();
         await harness.ready();
 

@@ -15,8 +15,8 @@ describe("shared Rust wire corpus", () => {
     test("is accepted byte-for-byte by the authoritative TypeScript codec", async () => {
         const corpus = JSON.parse(await readFile(fixturePath, "utf8")) as Corpus;
         expect(corpus.protocolV).toBe(PROTOCOL_V);
-        expect(corpus.up).toHaveLength(10);
-        expect(corpus.down).toHaveLength(9);
+        expect(corpus.up).toHaveLength(7);
+        expect(corpus.down).toHaveLength(6);
         for (const fixture of [...corpus.up, ...corpus.down]) {
             const raw = JSON.stringify(fixture);
             const decoded = decodeWire(raw);

@@ -94,7 +94,7 @@ export interface DefineChardbInput<TSchema = unknown> {
     /** Override `policy.distributionRoots` etc. */
     readonly policy?: Partial<import("../colocation/types.ts").PolicyInput>;
     /**
-     * Module exports containing mutations, queries, and presence keys.
+     * Module exports containing mutations and queries.
      * `defineChardb` walks the record at first
      * use, picking up every `__chardbRef`-marked value and (combined with
      * any ledgers in `schema`) builds the runtime manifest for you. The
@@ -335,17 +335,7 @@ export function defineChardb<TSchema>(input: DefineChardbInput<TSchema>): typeof
         if (input.manifest) {
             built = input.manifest;
         } else if (input.refs) {
-            // Walk the user's refs (mutations, queries, and presence keys)
-            // plus the merged schema (ledger tables) for any
-            // `__chardbRef`-marked exports.
-            const merged: Record<string, unknown> = { ...input.refs };
-            const schema = getSchema();
-            if (schema && typeof schema === "object") {
-                for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
-                    if (!(k in merged)) merged[k] = v;
-                }
-            }
-            built = manifestFromExports(merged);
+            built = manifestFromExports(input.refs);
         } else {
             built = emptyManifest();
         }

@@ -38,7 +38,7 @@ function assertIntentCoversReads(
     throw new CdbError({
         code: "CDB_INVARIANT",
         message: `query ${ref} read undeclared cdbTable${omitted.length === 1 ? "" : "s"}: ${omitted.join(", ")}`,
-        hint: "add every table read by the handler to intent.tables",
+        hint: "the compiled plan must declare every table it reads",
     });
 }
 
@@ -59,7 +59,7 @@ function assertIntentCoversRanges(
             throw new CdbError({
                 code: "CDB_INVARIANT",
                 message: `query ${ref} read outside declared interval for ${declared.table}.${declared.indexName}`,
-                hint: "widen intent.intervals to cover every range the handler and row policy can read",
+                hint: "the compiled plan intervals must cover every policy-scoped read",
             });
         }
     }
@@ -125,7 +125,7 @@ export interface CdbQueryHandlerExecutionInput extends QueryExecutionInput {
     readonly invoke: (db: object) => Promise<unknown>;
 }
 
-/** Execute a registered handler with read-only access and enforce its declared read intent. */
+/** Run one bounded internal policy read for file and vector resolution. */
 export function executeCdbQueryHandler(input: CdbQueryHandlerExecutionInput): Promise<RawJson> {
     return executeObservedQuery({ ...input, observeReads: true }, input.invoke);
 }

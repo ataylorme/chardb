@@ -7,7 +7,6 @@
  *   - epoch counters: schema_epoch, auth_epoch_global, auth_epoch_tenant, auth_epoch_principal
  *   - JWKS cache (SWR)
  *   - reference tables (replicated)
- *   - unretained internal bookmark barriers used by development fixtures
  *
  * Epoch bumps are CAS-guarded: every bump runs as `UPDATE … SET epoch=epoch+1`
  * inside `transactionSync`; concurrent admin actions serialize at the DO input
@@ -67,7 +66,6 @@ import {
     resolveOrganizationAuthorityFromCatalog,
     resolveUserAuthorityFromCatalog,
 } from "./catalog-authority-store.ts";
-import { acknowledgeCatalogBarrier, listOpenCatalogBarriers, recordCatalogBarrier } from "./catalog-barrier-store.ts";
 import {
     type CatalogOrganizationDeletionBarrier,
     type CatalogOrganizationDeletionBarrierIdentity,
@@ -1659,43 +1657,6 @@ export class Catalog extends DurableObject<CatalogEnv> {
             kid
         );
         return row ? { jwkJson: row.jwk_json, expiresAt: row.expires_at } : null;
-    }
-
-    async recordBarrier(args: {
-        barrierId: string;
-        ts: number;
-        expectedShards: readonly string[];
-        tenantPrefix?: string;
-    }): Promise<void> {
-        recordCatalogBarrier(adaptSqlStorage(this.ctx.storage.sql), args);
-    }
-
-    /**
-     * Record a shard op-log bookmark against an internal barrier. Completion
-     * means every expected shard acknowledged it. Chardb does not retain,
-     * export, or restore these bookmarks.
-     */
-    async ackBarrier(args: {
-        barrierId: string;
-        shardId: string;
-        bookmark: number;
-    }): Promise<{ complete: boolean }> {
-        return this.ctx.storage.transactionSync(() =>
-            acknowledgeCatalogBarrier(adaptSqlStorage(this.ctx.storage.sql), args)
-        );
-    }
-
-    /** Creates one internal barrier record from the current physical shard set. */
-    async openBarrier(now: number): Promise<{ barrierId: string; expectedShards: readonly string[] }> {
-        const expectedShards = this.routingStore.listShardIds().map(shardId => shardId as string);
-        const barrierId = `b-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-        await this.recordBarrier({ barrierId, ts: now, expectedShards });
-        return { barrierId, expectedShards };
-    }
-
-    /** Lists internal barriers that still lack at least one shard acknowledgement. */
-    async openBarriers(): Promise<readonly { barrierId: string; ts: number; missing: readonly string[] }[]> {
-        return listOpenCatalogBarriers(adaptSqlStorage(this.ctx.storage.sql));
     }
 }
 

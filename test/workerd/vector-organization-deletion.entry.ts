@@ -111,7 +111,7 @@ const migrations = defineMigrations([
         authOptions: auth.options,
     }),
 ]);
-const app = chardb({ auth, schema, api: { putDocument }, migrations });
+const app = chardb({ ownership: "organization", auth, schema, api: { putDocument }, migrations });
 
 interface Env extends CdbEnv {
     readonly CDB_ADMIN_TOKEN: string;

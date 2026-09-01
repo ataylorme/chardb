@@ -1,11 +1,10 @@
 # chardb TLA+ specs
 
-Two TLA+ specifications that model safety- and liveness-critical pieces of the
-chardb runtime so they can be exhaustively checked with TLC.
+This TLA+ specification models the online resharding phase machine so it can be
+exhaustively checked with TLC.
 
 | Spec | Models | Source it mirrors |
 | --- | --- | --- |
-| `Barrier.tla` | Distributed PITR barrier protocol | [`src/server/do/catalog.ts`](../src/server/do/catalog.ts), [`src/server/do/cdb.ts`](../src/server/do/cdb.ts) (`barrierBookmark`), [`src/server/entrypoint.ts`](../src/server/entrypoint.ts) (`runBarrierTick`) |
 | `Resharder.tla` | Online resharding phase machine | [`src/server/do/resharder.ts`](../src/server/do/resharder.ts) |
 
 ## Installing TLA+
@@ -27,36 +26,13 @@ The graphical TLA+ Toolbox is also fine if you prefer it; just open the
 From the repo root:
 
 ```bash
-java -jar /path/to/tla2tools.jar -workers auto -config spec/Barrier.cfg   spec/Barrier.tla
 java -jar /path/to/tla2tools.jar -workers auto -config spec/Resharder.cfg spec/Resharder.tla
 ```
 
-Both models are intentionally tiny (2 shards / 2 barriers, and 1 migration
-over 2 vshards / 2 shards) so each finishes in a few seconds on a laptop.
+The model uses one migration over two vshards and two shards, so it finishes in
+a few seconds on a laptop.
 
 ## What the specs prove
-
-### `Barrier.tla`
-
-The PITR barrier is the cluster's distributed snapshot coordinate. The
-Catalog DO opens a barrier with the current expected shard set; each shard
-records its current `_chardb_op_log` `MAX(rowid)` as a per-shard *bookmark*
-when it acks; once every expected shard has acked the barrier is durable
-and may be used as a restore target.
-
-The spec checks:
-
-- **`BarrierMonotone`** — every bookmark in a complete barrier points at a
-  real op-log row (`bookmark <= len(opLog)` always, even after later writes).
-- **`NoMissingAcks`** — a barrier is only ever marked complete once every
-  expected shard has acked. Encodes the contract that the orchestrator's
-  "complete" flag implies a totally-acked snapshot.
-- **`BookmarkSurvivesWrites`** — once a barrier is complete its frozen
-  bookmarks are stable: future shard writes cannot mutate the snapshot
-  coordinate. This is the property that makes PITR restores deterministic.
-- **`EventuallyComplete`** (liveness) — under fair scheduling every opened
-  barrier eventually reaches the complete state. This rules out designs
-  where a barrier could be opened but a shard's ack never makes progress.
 
 ### `Resharder.tla`
 
@@ -88,9 +64,7 @@ The spec checks:
 
 ## Notes on model bounds
 
-- `Barrier.cfg` bounds each shard's op-log to length 3 via the
-  `OpLogBound` state constraint to keep TLC's search finite.
 - `Resharder.cfg` bounds the number of in-flight and completed writes
   via the `WriteBound` constraint, also for finiteness.
-- Both bounds can be raised in the cfg if you want a deeper search at
+- The bounds can be raised in the cfg if you want a deeper search at
   the cost of a longer TLC run.

@@ -93,27 +93,14 @@ const touchChild = api.mutation({
 
 const benchmarkParent = api.query({
     ref: QUERY_REF,
-    authority: "organization",
-    partitionKey: "organizationId",
     args: z.object({ organizationId: z.string(), id: z.string() }),
-    intent: args => ({
-        kind: "select",
-        tables: ["benchmark_parents"],
-        partitionKey: {
-            table: "benchmark_parents",
-            column: "organization_id",
-            values: [args.organizationId],
-        },
-        joinShape: "colocated",
-        intervals: [{ table: "benchmark_parents", indexName: "organization_id", intervals: [{ kind: "full" }] }],
-    }),
-    handler: async (ctx, args) =>
-        ctx.db
+    query: (db, args) =>
+        db
             .select()
             .from(benchmarkParents)
             .where(and(eq(benchmarkParents.organizationId, args.organizationId), eq(benchmarkParents.id, args.id)))
-            .limit(1)
-            .all(),
+            .orderBy(benchmarkParents.id)
+            .limit(1),
 });
 
 const BENCHMARK_MANIFEST = manifestFromExports({ touchParent, touchChild, benchmarkParent });
@@ -128,6 +115,7 @@ const migrations = defineMigrations([
 ]);
 
 const app = chardb({
+    ownership: "organization",
     auth,
     schema: { benchmarkParents, benchmarkChildren },
     api: { touchParent, touchChild, benchmarkParent },

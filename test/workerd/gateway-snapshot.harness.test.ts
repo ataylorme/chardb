@@ -547,7 +547,6 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
                     authorId: "workerd-user",
                     body,
                     createdAt: 24,
-                    viewerId: "workerd-user",
                 },
             ],
         });
@@ -644,8 +643,20 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
             subId,
             cookie: laterStaged?.cookie,
             rows: [
-                expect.objectContaining({ id: "snapshot-after-ack-row", body, viewerId: "workerd-user" }),
-                expect.objectContaining({ id: "snapshot-before-loss-row", body, viewerId: "workerd-user" }),
+                expect.objectContaining({
+                    id: "snapshot-after-ack-row",
+                    organizationId: ORGANIZATION,
+                    authorId: "workerd-user",
+                    body,
+                    createdAt: 22,
+                }),
+                expect.objectContaining({
+                    id: "snapshot-before-loss-row",
+                    organizationId: ORGANIZATION,
+                    authorId: "workerd-user",
+                    body,
+                    createdAt: 24,
+                }),
             ],
         });
 

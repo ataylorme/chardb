@@ -9,6 +9,7 @@ import { CdbFileStore, initializeFileStore } from "../../src/server/do/cdb-file-
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { emptyManifest, manifestFromExports, routeValidatedQuery } from "../../src/server/manifest.ts";
+import { CDB_RESULT_MAX_BYTES } from "../../src/server/result_limits.ts";
 import type { CdbBindingPlanRequest } from "../../src/server/rpc.ts";
 import { ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 import { vshardOf } from "../../src/vshard.ts";
@@ -72,6 +73,15 @@ const privateRows = globalTable(
     { id: text("id").primaryKey(), scope: text("scope").notNull() },
     { partitionBy: "scope", roles: { admin: { read: "*" } } }
 );
+const limitRows = globalTable(
+    "binding_plan_cdb_limit_rows",
+    {
+        id: text("id").primaryKey(),
+        scope: text("scope").notNull(),
+        payload: text("payload").notNull(),
+    },
+    { partitionBy: "scope", roles: { user: { read: "*" } } }
+);
 const { cdbTable: userTable } = forUser();
 const userRows = userTable(
     "binding_plan_cdb_user_rows",
@@ -96,7 +106,7 @@ const fileRows = organizationTable(
         },
     }
 );
-const schema = { rows, privateRows, userRows, fileRows };
+const schema = { rows, privateRows, limitRows, userRows, fileRows };
 const ConfiguredCdb = configureCdbRuntime({ schema: () => schema, manifest: emptyManifest });
 let plannedCompileRuns = 0;
 const plannedRowsQuery = createApi(schema).query({
@@ -111,7 +121,12 @@ const plannedRowsQuery = createApi(schema).query({
             .limit(2);
     },
 });
-const plannedManifest = manifestFromExports({ plannedRowsQuery });
+const plannedLimitRowsQuery = createApi(schema).query({
+    ref: "binding-plan-cdb.ts#plannedLimitRows",
+    query: (db, args: { scope: string }) =>
+        db.select().from(limitRows).where(eq(limitRows.scope, args.scope)).orderBy(limitRows.id).limit(100),
+});
+const plannedManifest = manifestFromExports({ plannedRowsQuery, plannedLimitRowsQuery });
 const PlannedConfiguredCdb = configureCdbRuntime({
     schema: () => schema,
     manifest: () => plannedManifest,
@@ -253,6 +268,122 @@ describe("Cdb native binding select execution", () => {
             ],
         });
         expect(plannedCompileRuns).toBe(1);
+    });
+
+    test("enforces the planned row bound and exact UTF-8 byte result limit", async () => {
+        const { db, cdb } = await setup(undefined, PlannedConfiguredCdb);
+        db.run(
+            `WITH RECURSIVE seq(n) AS (
+                 SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?
+             )
+             INSERT INTO binding_plan_cdb_limit_rows (id, scope, payload)
+             SELECT printf('row-%04d', n), 'limits', '' FROM seq`,
+            [100]
+        );
+        const request = {
+            ref: plannedLimitRowsQuery.__chardbRef,
+            args: { scope: "limits" },
+            placement: { authority: "global" as const, partitionKey: "limits" },
+            auth: AUTH,
+            schemaEpoch: 1,
+            domainSchemaEpoch: 1,
+        };
+        const exactRows = await cdb.query(request);
+        expect(exactRows).toMatchObject({ ok: true });
+        if (!exactRows.ok || !Array.isArray(exactRows.result)) throw new Error("expected planned row result");
+        expect(exactRows.result).toHaveLength(100);
+
+        db.run("DELETE FROM binding_plan_cdb_limit_rows");
+        const emptyResultBytes = new TextEncoder().encode(
+            JSON.stringify([{ id: "byte", scope: "limits", payload: "" }])
+        ).byteLength;
+        const exactPayload = "a".repeat(CDB_RESULT_MAX_BYTES - emptyResultBytes);
+        db.run("INSERT INTO binding_plan_cdb_limit_rows (id, scope, payload) VALUES (?, ?, ?)", [
+            "byte",
+            "limits",
+            exactPayload,
+        ]);
+        await expect(cdb.query(request)).resolves.toMatchObject({ ok: true });
+        db.run("UPDATE binding_plan_cdb_limit_rows SET payload = payload || 'é' WHERE id = 'byte'");
+        await expect(cdb.query(request)).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT", message: expect.stringContaining("byte serialized limit") },
+        });
+
+        const overRows = createApi(schema).query({
+            ref: "binding-plan-cdb.ts#overRows",
+            query: (database, args: { scope: string }) =>
+                database
+                    .select()
+                    .from(limitRows)
+                    .where(eq(limitRows.scope, args.scope))
+                    .orderBy(limitRows.id)
+                    .limit(101),
+        });
+        expect(() => overRows.__chardbCompilePlan?.({ scope: "limits" })).toThrow(/limit/i);
+    });
+
+    test("rejects corrupt persisted planned registrations before compilation", async () => {
+        const { db, cdb } = await setup(undefined, PlannedConfiguredCdb);
+        const args = { scope: "shared", minimumRank: 2 };
+        const routed = routeValidatedQuery(plannedManifest, { ref: plannedRowsQuery.__chardbRef, args }, tables =>
+            cdbPolicyDigest(schema, tables)
+        );
+        const subscription = {
+            gatewayId: "binding-plan-corrupt-gateway",
+            registrationId: "binding-plan-corrupt-registration",
+            connectionId: "binding-plan-corrupt-connection",
+            clientId: ClientId("binding-plan-corrupt-client"),
+            subId: SubId(9),
+        };
+        const placement = { authority: "global" as const, partitionKey: "shared" };
+        await cdb.subscribe({
+            subscription,
+            principalId: PrincipalId("user-1"),
+            organizationId: TenantId("shared"),
+            placement,
+            schemaEpoch: 1,
+            vshard: Number(vshardOf(["shared"])),
+            domainSchemaEpoch: 1,
+            ref: plannedRowsQuery.__chardbRef,
+            args,
+            queryHash: routed.queryHash,
+            tables: routed.intent.tables,
+            intervals: routed.intent.intervals ?? [],
+        });
+        const rerun = {
+            subscription,
+            placement,
+            auth: AUTH,
+            schemaEpoch: 1,
+            vshard: Number(vshardOf(["shared"])),
+            domainSchemaEpoch: 1,
+        };
+        db.run("DELETE FROM _chardb_live_subscription_tables WHERE gateway_id = ? AND registration_id = ?", [
+            subscription.gatewayId,
+            subscription.registrationId,
+        ]);
+        plannedCompileRuns = 0;
+        await expect(cdb.queryRegistered(rerun)).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT" },
+        });
+        expect(plannedCompileRuns).toBe(0);
+
+        db.run(
+            "INSERT INTO _chardb_live_subscription_tables (gateway_id, registration_id, table_name) VALUES (?, ?, ?)",
+            [subscription.gatewayId, subscription.registrationId, "binding_plan_cdb_rows"]
+        );
+        db.run("UPDATE _chardb_live_subscriptions SET args_json = ? WHERE gateway_id = ? AND registration_id = ?", [
+            "{",
+            subscription.gatewayId,
+            subscription.registrationId,
+        ]);
+        await expect(cdb.queryRegistered(rerun)).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_INVARIANT" },
+        });
+        expect(plannedCompileRuns).toBe(0);
     });
 
     test("default-denies rows that fresh policy roles cannot read", async () => {

@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { jwt } from "better-auth/plugins/jwt";
-import { gte } from "drizzle-orm";
-import { integer, text } from "drizzle-orm/sqlite-core";
+import { and, eq, gte } from "drizzle-orm";
+import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { isCdbError } from "../../src/errors.ts";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
@@ -19,17 +19,20 @@ import type {
 } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 import { vshardOf } from "../../src/vshard.ts";
-import { globalScope } from "../helpers/cdb-table.ts";
+import { forUser } from "../helpers/cdb-table.ts";
 
-const { cdbTable } = globalScope();
+const authUser = sqliteTable("user", { id: text("id").primaryKey() });
+const { cdbTable } = forUser();
 const entries = cdbTable(
     "registry_entries",
     {
         id: text("id").primaryKey(),
-        ownerId: text("owner_id").notNull(),
+        ownerId: text("owner_id")
+            .notNull()
+            .references(() => authUser.id),
         value: integer("value").notNull(),
     },
-    { partitionBy: "ownerId", roles: { member: { create: "*", read: "*" } } }
+    { tenantBy: "ownerId", partitionBy: "ownerId", roles: { self: { create: "*", read: "*" } } }
 );
 const schema = { entries };
 const api = createApi(schema);
@@ -53,7 +56,7 @@ const putEntry = api.mutation({
 
 const putRoutedEntry = api.mutation({
     ref: "src/probe.ts#putRoutedEntry",
-    authority: "global",
+    authority: "user",
     partitionKey: "ownerId",
     args: z.object({ id: z.string().min(1), ownerId: z.string().min(1), value: z.number().int() }),
     handler: function putRoutedEntry(ctx, args) {
@@ -83,34 +86,20 @@ const rawAfterTyped = api.mutation({
     },
 });
 
-let registeredQueryRuns = 0;
 const registryEntries = api.query({
     ref: "queries.ts#registryEntries",
     args: z.object({ ownerId: z.string(), minimum: z.number().int() }),
-    authority: "global",
-    partitionKey: "ownerId",
-    intent: (args: { ownerId: string; minimum: number }) => ({
-        kind: "select" as const,
-        tables: ["registry_entries"],
-        partitionKey: {
-            table: "registry_entries",
-            column: "owner_id",
-            values: [args.ownerId],
-        },
-    }),
-    handler: async function registryEntries(ctx, args) {
-        registeredQueryRuns++;
-        const rows = await ctx.db
+    query: (db, args) =>
+        db
             .select()
             .from(entries)
-            .where(gte(entries.value, args.minimum))
+            .where(and(eq(entries.ownerId, args.ownerId), gte(entries.value, args.minimum)))
             .orderBy(entries.id)
-            .all();
-        return rows.map(row => ({ ...row, freshProbe: ctx.auth.claims.probe ?? null }));
-    },
+            .limit(100),
 });
 
 const app = chardb({
+    ownership: "user",
     auth: { plugins: [jwt()] },
     schema,
     api: { putEntry, putRoutedEntry, inspectEntries, rawAfterTyped, registryEntries },
@@ -128,10 +117,6 @@ interface CountRow extends Record<string, SqlStorageValue> {
 }
 
 export class Cdb extends app.Cdb {
-    registeredQueryRunCount(): number {
-        return registeredQueryRuns;
-    }
-
     corruptRegisteredQuery(registrationId: string, kind: "malformed" | "mismatch" | "mapping"): void {
         if (kind === "mapping") {
             this.ctx.storage.sql.exec(
@@ -283,7 +268,7 @@ function registeredSubscriptionRequest(gatewayId: string, registrationId: string
         },
         principalId: PrincipalId(AUTH.userId),
         organizationId: TenantId(AUTH.userId),
-        placement: { authority: "global", partitionKey: AUTH.userId },
+        placement: { authority: "user", partitionKey: AUTH.userId },
         schemaEpoch: 1,
         vshard: Number(vshardOf([AUTH.userId])),
         domainSchemaEpoch: 1,
@@ -308,7 +293,6 @@ export default {
         const stub = env.CDB.get(id) as unknown as {
             mutate(input: CdbMutationRequest): Promise<CdbMutationResponse>;
             inspectAtomicState(): Promise<unknown>;
-            registeredQueryRunCount(): Promise<number>;
             corruptRegisteredQuery(registrationId: string, kind: "malformed" | "mismatch" | "mapping"): Promise<void>;
             subscribeForProof(input: CdbSubscriptionRequest): Promise<Record<string, unknown>>;
             subscribe(input: CdbSubscriptionRequest): Promise<unknown>;
@@ -354,9 +338,6 @@ export default {
                 readonly corruption?: "malformed" | "mismatch" | "mapping";
             };
             const registered = registeredSubscriptionRequest(gatewayId.toString(), body.registrationId);
-            if (url.pathname === "/registered/runs") {
-                return Response.json({ runs: await stub.registeredQueryRunCount() });
-            }
             if (url.pathname === "/registered/subscribe") {
                 return Response.json(await stub.subscribeForProof(registered));
             }
@@ -384,7 +365,7 @@ export default {
                         vshard: Number(vshardOf([AUTH.userId])),
                         domainSchemaEpoch: 1,
                         placement: {
-                            authority: body.forgedAuthority ? "organization" : "global",
+                            authority: body.forgedAuthority ? "organization" : "user",
                             partitionKey: body.forgedPartition ? "forged-partition" : AUTH.userId,
                         },
                     })
@@ -405,15 +386,26 @@ export default {
                       : "src/probe.ts#missing";
         const route = routeMutation(manifest, { ref, args: body.args as CdbMutationRequest["args"] }, () => 0);
         if (!route.ok) return Response.json(route);
+        const routedUserId =
+            body.operation === "routed" &&
+            typeof body.args === "object" &&
+            body.args !== null &&
+            typeof (body.args as { readonly ownerId?: unknown }).ownerId === "string"
+                ? (body.args as { readonly ownerId: string }).ownerId
+                : AUTH.userId;
+        const requestAuth =
+            body.operation === "routed"
+                ? { userId: routedUserId, role: AUTH.role, roles: AUTH.roles, claims: AUTH.claims }
+                : AUTH;
         const mutationRequest: CdbMutationRequest = {
-            principalId: AUTH.userId,
+            principalId: routedUserId,
             mutId: body.mutId,
             ref,
             args: route.args,
             ...(route.authority === null || route.partitionKey === null
                 ? {}
                 : { placement: { authority: route.authority, partitionKey: route.partitionKey } }),
-            auth: AUTH,
+            auth: requestAuth,
             schemaEpoch: body.schemaEpoch ?? 1,
             domainSchemaEpoch: 1,
         };

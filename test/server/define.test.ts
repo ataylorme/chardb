@@ -3,16 +3,7 @@ import { eq } from "drizzle-orm";
 import { text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { isCdbError } from "../../src/errors.ts";
-import {
-    type MutationCtx,
-    createApi,
-    defineGsi,
-    defineMutation,
-    definePresenceKey,
-    defineQuery,
-    defineStream,
-} from "../../src/server/define.ts";
-import { defineLedger } from "../../src/server/ledger.ts";
+import { type MutationCtx, createApi, defineMutation, defineQuery } from "../../src/server/define.ts";
 import { readRef } from "../../src/server/refs.ts";
 import { ChardbRef } from "../../src/types.ts";
 import { globalScope } from "../helpers/cdb-table.ts";
@@ -25,23 +16,6 @@ describe("defineXxx — function-ref identity", () => {
         expect(readRef(fn)).toBeDefined();
         const out = await fn({ db: null, auth: { userId: "u", claims: {} } } as never, { x: 1 });
         expect(out).toBe(2);
-    });
-
-    test("defineQuery / defineStream / defineGsi / definePresenceKey / defineLedger all carry __chardbKind", () => {
-        const q = defineQuery<unknown, { id: string }, number>(async () => 1);
-        const s = defineStream<unknown, { p: string }, string, number>(async function* () {
-            yield "x";
-            return 1;
-        });
-        const g = defineGsi("orders", ["status"]);
-        const p = definePresenceKey<{ x: number; y: number }>("cursor");
-        const l = defineLedger("events", { id: "text" });
-
-        expect(q.__chardbKind).toBe("query");
-        expect(s.__chardbKind).toBe("stream");
-        expect(g.__chardbKind).toBe("gsi");
-        expect(p.__chardbKind).toBe("presenceKey");
-        expect((l as { __chardbKind: string }).__chardbKind).toBe("ledger");
     });
 
     test("planned query carries a runtime compiler, is dispatch-only, and requires a stable ref", async () => {
@@ -64,9 +38,7 @@ describe("defineXxx — function-ref identity", () => {
             planned({ db: {}, auth: { userId: "user-1", claims: {} } } as never, { scope: "shared" })
         ).rejects.toMatchObject({ code: "CDB_UNSUPPORTED_FEATURE" });
         expect(compileRuns).toBe(1);
-        expect(() => defineQuery({ query: (() => null) as never } as never)).toThrow(
-            "planned queries require an explicit ref"
-        );
+        expect(() => defineQuery({ query: (() => null) as never } as never)).toThrow("query ref must be");
         expect(() =>
             defineQuery({
                 ref: "api/define#mixed",
@@ -74,11 +46,6 @@ describe("defineXxx — function-ref identity", () => {
                 intent: (() => null) as never,
             } as never)
         ).toThrow("cannot mix query with intent");
-    });
-
-    test("defineGsi's strict flag defaults false (CDB_GSI_STRICT_REQUIRES_2PC until v1.1)", () => {
-        expect(defineGsi("t", ["a"]).strict).toBe(false);
-        expect(defineGsi("t", ["a"], { strict: true }).strict).toBe(true);
     });
 
     test("singlePartition: true ⇒ chardb defaults `__chardbIdempotencyTtl` to 24h", () => {
@@ -136,7 +103,7 @@ describe("defineXxx — function-ref identity", () => {
         expect(fn.__chardbRef).toBe(ChardbRef("api/messages#post"));
     });
 
-    test("user authority is explicit query and mutation metadata", () => {
+    test("user authority is explicit mutation metadata", () => {
         const mutation = defineMutation({
             ref: "api/preferences#save",
             args: z.object({ userId: z.string() }),
@@ -144,46 +111,17 @@ describe("defineXxx — function-ref identity", () => {
             partitionKey: "userId",
             handler: () => null,
         });
-        const query = defineQuery({
-            ref: "api/preferences#list",
-            authority: "user",
-            partitionKey: "userId",
-            intent: (args: { userId: string }) => ({
-                kind: "select",
-                tables: ["preferences"],
-                partitionKey: { table: "preferences", column: "user_id", values: [args.userId] },
-            }),
-            handler: async () => [],
-        });
-
         expect((mutation as unknown as { __chardbAuthority?: string }).__chardbAuthority).toBe("user");
-        expect(query.__chardbAuthority).toBe("user");
-        expect(query.__chardbPartitionKey?.({ userId: "user-7" })).toBe("user-7");
     });
 
-    test("global authority requires and preserves placement metadata", () => {
+    test("global mutation authority requires and preserves placement metadata", () => {
         const mutation = defineMutation({
             ref: "api/settings#save",
             authority: "global",
             partitionKey: (args: { partition: string }) => args.partition,
             handler: () => null,
         });
-        const query = defineQuery({
-            ref: "api/settings#read",
-            authority: "global",
-            partitionKey: (args: { partition: string }) => args.partition,
-            intent: (args: { partition: string }) => ({
-                kind: "select",
-                tables: ["settings"],
-                partitionKey: { table: "settings", column: "partition", values: [args.partition] },
-            }),
-            handler: async () => [],
-        });
-
         expect((mutation as unknown as { __chardbAuthority?: string }).__chardbAuthority).toBe("global");
-        expect(query.__chardbAuthority).toBe("global");
-        expect(query.__chardbPartitionKey?.({ partition: "app" })).toBe("app");
-        expect(query.__chardbIntent?.({ partition: "app" }).tables).toEqual(["settings"]);
     });
 
     test("global declarations reject missing placement metadata at runtime", () => {
@@ -194,31 +132,12 @@ describe("defineXxx — function-ref identity", () => {
                 handler: () => null,
             } as never)
         ).toThrow("global mutations require an explicit partitionKey extractor");
-        expect(() =>
-            defineQuery({
-                ref: "api/settings#missingQueryPartition",
-                authority: "global",
-                intent: () => ({ kind: "select", tables: [] }),
-                handler: async () => [],
-            } as never)
-        ).toThrow("global queries require an explicit partitionKey extractor");
-        expect(() =>
-            defineQuery({
-                ref: "api/settings#missingIntent",
-                authority: "global",
-                partitionKey: () => "app",
-                handler: async () => [],
-            } as never)
-        ).toThrow("global queries require an explicit intent extractor");
     });
 
-    test("config mutation and query refs are stable and validated", () => {
+    test("config mutation refs are stable and validated", () => {
         const mutation = defineMutation({ ref: "api/items#create", handler: () => null });
-        const query = defineQuery({ ref: "api/items#list", handler: async () => [] });
         expect(mutation.__chardbRef).toBe(ChardbRef("api/items#create"));
-        expect(query.__chardbRef).toBe(ChardbRef("api/items#list"));
         expect(() => defineMutation({ ref: "missing-separator", handler: () => null })).toThrow(/containing #/);
-        expect(() => defineQuery({ ref: "", handler: async () => [] })).toThrow(/containing #/);
         expect(() =>
             defineMutation({
                 authority: "organization",
@@ -226,33 +145,6 @@ describe("defineXxx — function-ref identity", () => {
                 handler: () => null,
             } as never)
         ).toThrow(/require an explicit ref/);
-        expect(() =>
-            defineQuery({
-                authority: "organization",
-                partitionKey: (_args: { organizationId: string }) => "org-1",
-                intent: () => ({ kind: "select", tables: [] }),
-                handler: async () => [],
-            } as never)
-        ).toThrow(/require an explicit ref/);
-    });
-
-    test("organization query authority and partition extraction are explicit metadata", () => {
-        const query = defineQuery({
-            ref: "api/items#organizationList",
-            args: z.object({ organizationId: z.string() }),
-            authority: "organization",
-            partitionKey: "organizationId",
-            intent: args => ({
-                kind: "select",
-                tables: ["items"],
-                partitionKey: { table: "items", column: "organization_id", values: [args.organizationId] },
-            }),
-            handler: async () => [],
-        });
-
-        expect(query.__chardbAuthority).toBe("organization");
-        expect(query.__chardbPartitionKey?.({ organizationId: "org-4" })).toBe("org-4");
-        expect(query.__chardbRef).toBe(ChardbRef("api/items#organizationList"));
     });
 
     test("explicit singlePartition: false beats the partitionKey-implied default", () => {

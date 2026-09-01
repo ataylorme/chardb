@@ -300,6 +300,9 @@ function collectExports(code: string, id: string): FoundExport[] {
         // build transform.
         const namedProperty = (name: string) => exactNamedProperty(name) ?? computedProperty;
         const plannedQuery = kind === "defineQuery" && exactNamedProperty("query") !== undefined;
+        if (kind === "defineQuery" && !plannedQuery) {
+            throw new Error(`[@chardb/core/vite] Query ${exportName} must use a planned query config`);
+        }
         if (plannedQuery) {
             if (computedProperty) {
                 throw new Error(
@@ -361,13 +364,10 @@ function collectExports(code: string, id: string): FoundExport[] {
             throw new Error(`[@chardb/core/vite] Explicit ref for ${exportName} must be a string literal`);
         }
         const explicitRef = validExplicitRef(property.initializer.text, exportName);
-        if (stableAuthority === "global" && !namedProperty("partitionKey")) {
+        if (stableAuthority === "global" && kind === "defineMutation" && !namedProperty("partitionKey")) {
             throw new Error(
-                `[@chardb/core/vite] Global ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires an explicit partitionKey extractor`
+                `[@chardb/core/vite] Global mutation ${exportName} requires an explicit partitionKey extractor`
             );
-        }
-        if (stableAuthority === "global" && kind === "defineQuery" && !namedProperty("intent")) {
-            throw new Error(`[@chardb/core/vite] Global query ${exportName} requires an explicit intent extractor`);
         }
         return explicitRef;
     };
@@ -445,7 +445,7 @@ function eraseBrowserHandleModule(code: string, id: string, found: readonly Foun
     if (found.some(entry => !entry.plannedQuery && !entry.browserErasableMutation)) {
         const message = hasMutation
             ? `[@chardb/core/vite] Browser handle module ${JSON.stringify(id)} cannot mix erased and runtime exports`
-            : `[@chardb/core/vite] Browser planned-query module ${JSON.stringify(id)} cannot mix planned and legacy runtime exports`;
+            : `[@chardb/core/vite] Browser planned-query module ${JSON.stringify(id)} cannot mix planned queries with runtime exports`;
         throw new Error(message);
     }
 

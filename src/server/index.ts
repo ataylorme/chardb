@@ -2,8 +2,8 @@
  * Public Worker-side API for organization and user tenancy.
  *
  * Runtime internals stay behind `chardb()`: Durable Object classes, RPC
- * contracts, policy compilers, distributed transactions, streams, presence,
- * indexes, resharding, and runtime configuration are not package exports.
+ * contracts, policy compilers, resharding, and runtime configuration are not
+ * package exports.
  */
 
 import type { StandardSchemaV1 } from "@standard-schema/spec";

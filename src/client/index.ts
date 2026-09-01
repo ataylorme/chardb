@@ -708,7 +708,7 @@ export function createDeferredChardbClientController(
                 }
                 return;
             case "error":
-                if (pendingAuthRefresh !== null && msg.subId === undefined && msg.streamReqId === undefined) {
+                if (pendingAuthRefresh !== null && msg.subId === undefined) {
                     pendingAuthRefresh = null;
                     clearAuthRefreshDeadline();
                     failSession(msg.code, `authentication refresh failed: ${msg.code}`, "auth-refresh-rejection");
@@ -718,16 +718,11 @@ export function createDeferredChardbClientController(
                     applySubscriptionError(msg.code, msg.retryable, msg.subId, msg.correlationId);
                     return;
                 }
-                if (msg.streamReqId !== undefined) return;
                 if (msg.retryable) {
                     disconnectSocket(attempt, socket);
                     return;
                 }
                 failSession(msg.code, `Chardb session failed: ${msg.code}`, "session-rejection");
-                return;
-            case "presence":
-            case "streamChunk":
-            case "streamEnd":
                 return;
         }
         msg satisfies never;

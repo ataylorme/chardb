@@ -174,21 +174,21 @@ function keyedRowsAtBytes(bytes: number, rowKey: string): RawJson[] {
     return [{ __key: rowKey, value: "x".repeat(bytes - overhead) }];
 }
 
-function streamChunkRawAtBytes(bytes: number, multibyte = false): string {
-    const envelope: { t: "streamChunk"; streamReqId: number; chunk: string } = {
-        t: "streamChunk",
-        streamReqId: 1,
-        chunk: "",
+function pokeRawAtBytes(bytes: number, multibyte = false): string {
+    const envelope: { t: "poke"; cookie: string; patches: [] } = {
+        t: "poke",
+        cookie: "",
+        patches: [],
     };
     const overhead = new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
-    if (bytes < overhead) throw new RangeError("stream chunk envelope is larger than the requested byte length");
+    if (bytes < overhead) throw new RangeError("poke envelope is larger than the requested byte length");
     const remaining = bytes - overhead;
-    envelope.chunk = multibyte
+    envelope.cookie = multibyte
         ? `${"é".repeat(Math.floor(remaining / 2))}${remaining % 2 === 0 ? "" : "x"}`
         : "x".repeat(remaining);
     const raw = JSON.stringify(envelope);
     if (new TextEncoder().encode(raw).byteLength !== bytes) {
-        throw new Error("stream chunk helper produced the wrong UTF-8 byte length");
+        throw new Error("poke helper produced the wrong UTF-8 byte length");
     }
     return raw;
 }
@@ -677,50 +677,6 @@ describe("createChardbClient — wire round-trip", () => {
         }
     });
 
-    test("a stream-scoped error cannot reject an auth refresh awaiting verification", async () => {
-        const timers = installManualTimers();
-        const nowMs = 2_000_000_000_000;
-        setSystemTime(nowMs);
-        let getJwtCalls = 0;
-        const c = client({
-            getJwt: async () => {
-                getJwtCalls += 1;
-                return jwtWithClaims("user-1", Math.floor(nowMs / 1_000) + (getJwtCalls === 1 ? 61 : 180));
-            },
-        });
-        try {
-            await flush();
-            const ws = fakeWebSocket();
-            await welcome(ws);
-            timers.runDelay(1_000);
-            await flush();
-            expect(ws.sent.map(raw => (JSON.parse(raw) as Up).t)).toEqual(["hello", "updateAuth"]);
-
-            ws.emit({
-                t: "error",
-                code: "CDB_UNSUPPORTED_FEATURE",
-                streamReqId: 7,
-                retryable: false,
-                correlationId: "corr-stream" as never,
-                docs: "https://chardb.dev/errors/cdb_unsupported_feature",
-            });
-            await flush();
-
-            expect(c.state).toBe("open");
-            expect(ws.readyState).toBe(FakeWS.OPEN);
-            expect(timers.scheduledDelays()).toEqual([61_000]);
-
-            ws.emit({ t: "mustRefetch", subIds: [], reason: "authChanged" });
-            await flush();
-            expect(c.state).toBe("open");
-            expect(timers.scheduledDelays()).toEqual([120_000]);
-        } finally {
-            c.close();
-            timers.restore();
-            setSystemTime();
-        }
-    });
-
     test("reconnects when the socket closes while an auth refresh is awaiting verification", async () => {
         const timers = installManualTimers();
         const nowMs = 2_000_000_000_000;
@@ -1029,13 +985,13 @@ describe("createChardbClient — wire round-trip", () => {
         }
     });
 
-    test("accepts an ignored inbound text envelope at the exact 1 MiB transport limit", async () => {
+    test("accepts an inbound text envelope at the exact 1 MiB transport limit", async () => {
         const c = client();
         await flush();
         const ws = fakeWebSocket();
         await welcome(ws);
 
-        ws.emitRaw(streamChunkRawAtBytes(1_024 * 1_024));
+        ws.emitRaw(pokeRawAtBytes(1_024 * 1_024));
         await flush();
 
         expect(c.state).toBe("open");
@@ -1045,8 +1001,8 @@ describe("createChardbClient — wire round-trip", () => {
 
     test("rejects ASCII, multibyte, and binary inbound messages outside the text transport limit", async () => {
         const cases: readonly unknown[] = [
-            streamChunkRawAtBytes(1_024 * 1_024 + 1),
-            streamChunkRawAtBytes(1_024 * 1_024 + 1, true),
+            pokeRawAtBytes(1_024 * 1_024 + 1),
+            pokeRawAtBytes(1_024 * 1_024 + 1, true),
             new ArrayBuffer(8),
         ];
 
@@ -1082,7 +1038,7 @@ describe("createChardbClient — wire round-trip", () => {
             const mutationError = c.mutate("mutations.ts#pending", {}).catch(error => error);
             expect(timers.scheduledDelays()).toEqual([60_000]);
 
-            ws.emitRaw(streamChunkRawAtBytes(1_024 * 1_024 + 1));
+            ws.emitRaw(pokeRawAtBytes(1_024 * 1_024 + 1));
             await flush();
 
             expect(c.state).toBe("closed");

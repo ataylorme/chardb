@@ -14,7 +14,7 @@ import { ChardbRef } from "../types.ts";
 
 const REF_KEY = "__chardbRef" as const;
 
-export type ChardbFunctionKind = "mutation" | "query" | "ledger" | "stream" | "gsi" | "presenceKey";
+export type ChardbFunctionKind = "mutation" | "query";
 
 /** Marker carried on every helper-produced value. */
 export interface ChardbRefMarker {

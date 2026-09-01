@@ -1,4 +1,4 @@
-import { ChardbProvider, useMutation, useQuery } from "@chardb/react";
+import { createChardbReactClient } from "@chardb/react";
 import { type Organization, anonymousClient, jwtClient, organizationClient } from "better-auth/client/plugins";
 import { createAuthClient } from "better-auth/react";
 import { type FormEvent, useEffect, useState } from "react";
@@ -6,27 +6,27 @@ import { uuidv7 } from "uuidv7";
 import { postMessage } from "../server/api.ts";
 import { listMessages } from "../server/queries.ts";
 
-const authClient = createAuthClient({
-    baseURL: window.location.origin,
-    plugins: [anonymousClient(), organizationClient(), jwtClient()],
+const db = createChardbReactClient({
+    url: window.location.origin,
+    ownership: "organization",
+    auth: ({ baseURL }) =>
+        createAuthClient({
+            baseURL,
+            plugins: [anonymousClient(), organizationClient(), jwtClient()],
+        }),
 });
 
-let anonymousSignInRequest: ReturnType<typeof authClient.signIn.anonymous> | undefined;
+let anonymousSignInRequest: ReturnType<typeof db.auth.signIn.anonymous> | undefined;
 
 function signInAnonymously() {
-    anonymousSignInRequest ??= authClient.signIn.anonymous().finally(() => {
+    anonymousSignInRequest ??= db.auth.signIn.anonymous().finally(() => {
         anonymousSignInRequest = undefined;
     });
     return anonymousSignInRequest;
 }
 
-function endpoint(): string {
-    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    return `${protocol}://${window.location.host}/ws`;
-}
-
 export function App() {
-    const session = authClient.useSession();
+    const session = db.auth.useSession();
     const [authError, setAuthError] = useState<string | null>(null);
 
     useEffect(() => {
@@ -50,20 +50,17 @@ export function App() {
     }
 
     return (
-        <ChardbProvider ownership="organization" endpoint={endpoint()} auth={authClient}>
-            <Workspace activeOrganizationId={session.data.session.activeOrganizationId} userId={session.data.user.id} />
-        </ChardbProvider>
+        <db.Provider>
+            <Workspace />
+        </db.Provider>
     );
 }
 
-function Workspace({
-    activeOrganizationId,
-    userId,
-}: {
-    readonly activeOrganizationId: string | null | undefined;
-    readonly userId: string;
-}) {
-    const organizations = authClient.useListOrganizations();
+function Workspace() {
+    const identity = db.useIdentity();
+    const organizations = db.auth.useListOrganizations();
+    const activeOrganizationId = identity.organizationId;
+    const userId = identity.user?.id;
     const [name, setName] = useState("");
     const [slug, setSlug] = useState("");
     const [savingOrganization, setSavingOrganization] = useState(false);
@@ -73,7 +70,7 @@ function Workspace({
         setSavingOrganization(true);
         setError(null);
         try {
-            const result = await authClient.organization.setActive({ organizationId });
+            const result = await db.auth.organization.setActive({ organizationId });
             if (result.error) throw new Error(result.error.message);
         } catch (cause) {
             setError(cause instanceof Error ? cause.message : String(cause));
@@ -90,7 +87,7 @@ function Workspace({
         setSavingOrganization(true);
         setError(null);
         try {
-            const created = await authClient.organization.create({
+            const created = await db.auth.organization.create({
                 name: organizationName,
                 slug: organizationSlug,
                 keepCurrentActiveOrganization: true,
@@ -98,7 +95,7 @@ function Workspace({
             if (created.error || !created.data) {
                 throw new Error(created.error?.message ?? "Better Auth did not return the new organization");
             }
-            const active = await authClient.organization.setActive({ organizationId: created.data.id });
+            const active = await db.auth.organization.setActive({ organizationId: created.data.id });
             if (active.error) throw new Error(active.error.message);
             setName("");
             setSlug("");
@@ -165,7 +162,7 @@ function Workspace({
                 </form>
             </section>
 
-            {activeOrganizationId ? (
+            {activeOrganizationId && userId ? (
                 <Messages organizationId={activeOrganizationId} userId={userId} />
             ) : (
                 <section className="messages" data-testid="message-list">
@@ -178,8 +175,8 @@ function Workspace({
 }
 
 function Messages({ organizationId, userId }: { readonly organizationId: string; readonly userId: string }) {
-    const { data = [], state } = useQuery(listMessages, { organizationId, limit: 50 });
-    const mutate = useMutation<Parameters<typeof postMessage>[1], { readonly id: string }>(postMessage);
+    const { data = [], state } = db.useQuery(listMessages, { limit: 50 });
+    const mutate = db.useMutation(postMessage);
     const [body, setBody] = useState("");
     const [sending, setSending] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -193,7 +190,6 @@ function Messages({ organizationId, userId }: { readonly organizationId: string;
         try {
             await mutate({
                 id: uuidv7(),
-                organizationId,
                 body: message,
                 clientCreatedAt: Date.now(),
             });

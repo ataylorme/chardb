@@ -1,10 +1,9 @@
 import { CdbError } from "../errors.ts";
 import type { MutationAuthority } from "../server/define.ts";
-import type { ChardbManifest, LedgerDescriptor, MutationDescriptor, QueryDescriptor } from "../server/manifest.ts";
+import type { ChardbManifest, MutationDescriptor, QueryDescriptor } from "../server/manifest.ts";
 import type { ChardbFunctionKind } from "../server/refs.ts";
 import type { RegisteredQueryPlan } from "../server/registered-query-plan.ts";
 import type { Brand, ChardbRef, RawJson } from "../types.ts";
-import type { CdbIntent } from "../wire.ts";
 
 interface RefMarked {
     readonly __chardbRef: Brand<string, "ChardbRef">;
@@ -22,11 +21,7 @@ interface MutationMarked extends RefMarked {
 
 interface QueryMarked extends RefMarked {
     readonly __chardbKind: "query";
-    readonly __chardbIntent?: (args: RawJson) => CdbIntent;
     readonly __chardbValidateArgs?: (args: unknown) => Promise<RawJson>;
-    readonly __chardbAuthority?: MutationAuthority;
-    readonly __chardbPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
-    readonly __chardbInvokeValidated?: (ctx: unknown, args: RawJson) => Promise<unknown>;
     readonly __chardbCompilePlan?: (args: RawJson) => RegisteredQueryPlan;
 }
 
@@ -41,7 +36,6 @@ function isRefMarked(value: unknown): value is RefMarked {
 export function manifestFromExports(exports: Record<string, unknown>): ChardbManifest {
     const mutations = new Map<ChardbRef, MutationDescriptor>();
     const queries = new Map<ChardbRef, QueryDescriptor>();
-    const ledgers = new Map<ChardbRef, LedgerDescriptor>();
     const seenRefs = new Map<ChardbRef, { readonly kind: string; readonly value: unknown }>();
 
     for (const value of Object.values(exports)) {
@@ -75,31 +69,27 @@ export function manifestFromExports(exports: Record<string, unknown>): ChardbMan
                 break;
             }
             case "query": {
-                const query = value as QueryMarked & ((ctx: unknown, args: RawJson) => Promise<unknown>);
+                const query = value as QueryMarked;
+                if (!query.__chardbCompilePlan) {
+                    throw new CdbError({
+                        code: "CDB_INVARIANT",
+                        message: `query ref has no compiled plan: ${ref}`,
+                    });
+                }
                 const duplicate = queries.get(ref);
-                if (duplicate && duplicate.invoke !== query) {
+                if (duplicate) {
                     throw new CdbError({ code: "CDB_INVARIANT", message: `duplicate query ref: ${ref}` });
                 }
                 queries.set(ref, {
                     ref,
-                    invoke: query,
-                    invokeValidated: query.__chardbInvokeValidated ?? query,
                     ...(query.__chardbValidateArgs ? { validateArgs: query.__chardbValidateArgs } : {}),
-                    ...(query.__chardbIntent ? { extractIntent: query.__chardbIntent } : {}),
-                    ...(query.__chardbAuthority ? { authority: query.__chardbAuthority } : {}),
-                    ...(query.__chardbPartitionKey ? { extractPartitionKey: query.__chardbPartitionKey } : {}),
-                    ...(query.__chardbCompilePlan ? { compilePlan: query.__chardbCompilePlan } : {}),
+                    compilePlan: query.__chardbCompilePlan,
                 });
-                break;
-            }
-            case "ledger": {
-                const ledger = value as RefMarked & { readonly tableName?: string };
-                ledgers.set(ref, { ref, tableName: ledger.tableName ?? ref });
                 break;
             }
             default:
                 break;
         }
     }
-    return { mutations, queries, ledgers };
+    return { mutations, queries };
 }

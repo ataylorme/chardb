@@ -1,11 +1,4 @@
-/**
- * Workerd-level integration test for the internal Catalog barrier records.
- *
- * Boots `miniflare@4` with a bundled test worker that exposes `Catalog`
- * and drives the `openBarrier` -> `ackBarrier` -> `openBarriers` flow
- * against real Durable Object `SqlStorage`. The supported Worker does not
- * schedule these methods and has no backup or restore path.
- */
+/** Workerd-level Catalog persistence and authority integration tests. */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import { Miniflare } from "miniflare";
@@ -78,16 +71,6 @@ async function callFailure(op: string, body?: unknown): Promise<string> {
     return payload.error;
 }
 
-interface OpenBarrierResult {
-    readonly barrierId: string;
-    readonly expectedShards: readonly string[];
-}
-
-interface OpenBarriersEntry {
-    readonly barrierId: string;
-    readonly missing: readonly string[];
-}
-
 interface AuthRow {
     readonly [key: string]: unknown;
 }
@@ -105,86 +88,7 @@ interface OrganizationAuthority {
     };
 }
 
-describe("workerd Catalog barrier flow", () => {
-    test("openBarrier seeds expected shards from the range table; ackBarrier completes once every expected shard acks", async () => {
-        const opened = (await call("openBarrier", { now: 1_700_000_000_000 })) as OpenBarrierResult;
-        expect(opened.expectedShards).toEqual(["ShardDO_0"]);
-        expect(opened.barrierId).toMatch(/^b-/);
-
-        // First ack covers the only expected shard → complete.
-        const acked = (await call("ackBarrier", {
-            barrierId: opened.barrierId,
-            shardId: "ShardDO_0",
-            bookmark: 42,
-        })) as { complete: boolean };
-        expect(acked.complete).toBe(true);
-
-        const open = (await call("openBarriers", {})) as readonly OpenBarriersEntry[];
-        expect(open.find(b => b.barrierId === opened.barrierId)).toBeUndefined();
-    });
-
-    test("ackBarrier is idempotent (same shard re-acks → still complete, no error)", async () => {
-        const opened = (await call("openBarrier", { now: 1_700_000_001_000 })) as OpenBarrierResult;
-        await call("ackBarrier", { barrierId: opened.barrierId, shardId: "ShardDO_0", bookmark: 50 });
-        const second = (await call("ackBarrier", {
-            barrierId: opened.barrierId,
-            shardId: "ShardDO_0",
-            bookmark: 50,
-        })) as { complete: boolean };
-        expect(second.complete).toBe(true);
-    });
-
-    test("openBarriers reports any barrier with at least one missing shard", async () => {
-        // An exact topology lease and cutover synthesize a second shard so we
-        // can have a barrier with multiple expected acknowledgements.
-        const before = (await call("route", { vshard: 0 })) as { readonly schemaEpoch: number };
-        await call("beginTopologyOperation", {
-            migId: "mig_pitr_1",
-            sourceShard: "ShardDO_0",
-            destinationShard: "ShardDO_1",
-            rangeLo: 0,
-            rangeHi: 8191,
-            startEpoch: before.schemaEpoch,
-        });
-        await call("cutover", {
-            migId: "mig_pitr_1",
-            lo: 0,
-            hi: 8191,
-            fromShard: "ShardDO_0",
-            toShard: "ShardDO_1",
-            startEpoch: before.schemaEpoch,
-        });
-        const opened = (await call("openBarrier", { now: 1_700_000_002_000 })) as OpenBarrierResult;
-        expect(new Set(opened.expectedShards)).toEqual(new Set(["ShardDO_0", "ShardDO_1"]));
-        // Ack only one — barrier remains incomplete.
-        const partial = (await call("ackBarrier", {
-            barrierId: opened.barrierId,
-            shardId: "ShardDO_0",
-            bookmark: 100,
-        })) as { complete: boolean };
-        expect(partial.complete).toBe(false);
-        const open = (await call("openBarriers", {})) as readonly OpenBarriersEntry[];
-        const ours = open.find(b => b.barrierId === opened.barrierId);
-        expect(ours).toBeDefined();
-        expect(ours?.missing).toEqual(["ShardDO_1"]);
-        // Final ack from ShardDO_1 closes it.
-        const closed = (await call("ackBarrier", {
-            barrierId: opened.barrierId,
-            shardId: "ShardDO_1",
-            bookmark: 200,
-        })) as { complete: boolean };
-        expect(closed.complete).toBe(true);
-    });
-
-    test("ackBarrier on an unknown barrierId is a silent no-op (never complete) — defends against a stale shard", async () => {
-        const result = (await call("ackBarrier", {
-            barrierId: "b-doesntexist",
-            shardId: "ShardDO_0",
-            bookmark: 0,
-        })) as { complete: boolean };
-        expect(result.complete).toBe(false);
-    });
-
+describe("workerd Catalog persistence", () => {
     test("Catalog reconstruction keeps auth tables and stored authority rows", async () => {
         if (!mf) throw new Error("miniflare not initialized");
         const now = Date.parse("2026-08-23T00:00:00Z");

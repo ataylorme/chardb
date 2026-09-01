@@ -539,6 +539,9 @@ export type ChardbReactClient<M extends ChardbOwnership, A extends AuthClientLik
 export function createChardbReactClient<const M extends ChardbOwnership, const A extends AuthClientLike>(
     options: CreateChardbReactClientOptions<M, A>
 ): ChardbReactClient<M, A> {
+    if (options.ownership !== "organization" && options.ownership !== "user") {
+        throw new Error('chardb: ownership must be exactly "organization" or "user"');
+    }
     const publicUrl = normalizePublicWorkerUrl(options.url);
     const endpoint = publicWorkerWebSocketUrl(publicUrl);
     const auth = options.auth({ baseURL: publicUrl });

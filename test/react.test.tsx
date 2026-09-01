@@ -303,6 +303,26 @@ describe("@chardb/react — hook lifecycle", () => {
         expect(sdk.auth.pluginAction()).toBe("typed-plugin");
     });
 
+    test("rejects missing and unknown ownership modes before client setup", () => {
+        const createFromJavaScript = ChardbReact.createChardbReactClient as unknown as (
+            options: Record<string, unknown>
+        ) => unknown;
+        let authFactoryCalls = 0;
+        for (const ownership of [undefined, "global", null]) {
+            expect(() =>
+                createFromJavaScript({
+                    url: "https://db.example.com",
+                    ownership,
+                    auth: () => {
+                        authFactoryCalls++;
+                        return mutableSessionAuth().auth;
+                    },
+                })
+            ).toThrow('chardb: ownership must be exactly "organization" or "user"');
+        }
+        expect(authFactoryCalls).toBe(0);
+    });
+
     test("configures a real Better Auth React client without losing its inferred actions", () => {
         let authBaseURL: string | undefined;
         const sdk = ChardbReact.createChardbReactClient({

@@ -33,7 +33,7 @@ let rotatedPublicJwk: JWK | undefined;
 let mutationRef: ChardbRef | undefined;
 let closedMutationRef: ChardbRef | undefined;
 let queryRef: ChardbRef | undefined;
-let closedQueryRef: ChardbRef | undefined;
+let unconstrainedQueryRef: ChardbRef | undefined;
 let invalidQueryRef: ChardbRef | undefined;
 
 interface TokenOverrides {
@@ -247,12 +247,12 @@ beforeAll(async () => {
         mutationRef: ChardbRef;
         closedMutationRef: ChardbRef;
         queryRef: ChardbRef;
-        closedQueryRef: ChardbRef;
+        unconstrainedQueryRef: ChardbRef;
         invalidQueryRef: ChardbRef;
         shardA: string;
         shardB: string;
     };
-    ({ closedQueryRef, invalidQueryRef } = seedResult);
+    ({ unconstrainedQueryRef, invalidQueryRef } = seedResult);
     expect(seedResult).toMatchObject({ mutationRef, closedMutationRef, queryRef });
     expect(seedResult.shardA).toBe(seedResult.shardB);
 });
@@ -633,24 +633,19 @@ describe("configured Gateway JWT handshake in real workerd", () => {
             mutResults: [{ mutId: "workerd-closed", ok: false, error: { code: "CDB_AUTH_NOT_BOUND" } }],
         });
 
-        if (!closedQueryRef) throw new Error("closed query ref was not seeded");
+        if (!unconstrainedQueryRef) throw new Error("unconstrained query ref was not seeded");
         const subscription = await sendAndReceive(socket, {
             t: "sub",
             subId: SubId(7),
-            ref: closedQueryRef,
+            ref: unconstrainedQueryRef,
             args: { organizationId: "workerd-org" },
         });
         expect(subscription).toMatchObject({
             t: "error",
-            code: "CDB_AUTH_NOT_BOUND",
+            code: "CDB_CROSS_PARTITION",
             subId: 7,
         });
 
-        const presence = await sendAndReceive(socket, { t: "presenceSub", key: "org:workerd-org" });
-        expect(presence).toMatchObject({
-            t: "error",
-            code: "CDB_AUTH_NOT_BOUND",
-        });
         socket.close();
         await closed;
 
@@ -756,8 +751,9 @@ describe("configured Gateway JWT handshake in real workerd", () => {
                 {
                     id: "query-seed-row-b",
                     organizationId: "workerd-org-b",
+                    authorId: "workerd-user-b",
                     body: "query-visible",
-                    viewerId: "workerd-user-b",
+                    createdAt: 9,
                 },
             ],
         });
@@ -794,8 +790,9 @@ describe("configured Gateway JWT handshake in real workerd", () => {
                 {
                     id: "query-seed-row",
                     organizationId: "workerd-org",
+                    authorId: "workerd-user",
                     body: "query-visible",
-                    viewerId: "workerd-user",
+                    createdAt: 10,
                 },
             ],
         });
@@ -820,23 +817,23 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         socket.close();
     });
 
-    test("organization queries reject undeclared, scatter, cross-partition, and mismatched intents", async () => {
-        if (!closedQueryRef || !invalidQueryRef || !queryRef) throw new Error("query refs were not seeded");
+    test("organization queries reject unconstrained, cross-partition, and foreign-tenant plans", async () => {
+        if (!unconstrainedQueryRef || !invalidQueryRef || !queryRef) throw new Error("query refs were not seeded");
         const { socket, first } = await openSocket(await signed());
         await first;
 
-        const undeclared = await sendAndReceive(socket, {
+        const unconstrained = await sendAndReceive(socket, {
             t: "sub",
             subId: SubId(20),
-            ref: closedQueryRef,
+            ref: unconstrainedQueryRef,
             args: { organizationId: "workerd-org" },
         });
-        expect(undeclared).toMatchObject({ t: "error", subId: 20, code: "CDB_AUTH_NOT_BOUND" });
+        expect(unconstrained).toMatchObject({ t: "error", subId: 20, code: "CDB_CROSS_PARTITION" });
 
-        for (const [subId, mode] of [
-            [21, "scatter"],
-            [22, "cross"],
-            [23, "mismatch"],
+        for (const [subId, mode, code] of [
+            [21, "scatter", "CDB_CROSS_PARTITION"],
+            [22, "cross", "CDB_CROSS_PARTITION"],
+            [23, "foreign", "CDB_FORBIDDEN"],
         ] as const) {
             const rejected = await sendAndReceive(socket, {
                 t: "sub",
@@ -844,7 +841,7 @@ describe("configured Gateway JWT handshake in real workerd", () => {
                 ref: invalidQueryRef,
                 args: { organizationId: "workerd-org", mode },
             });
-            expect(rejected).toMatchObject({ t: "error", subId, code: "CDB_CROSS_PARTITION" });
+            expect(rejected).toMatchObject({ t: "error", subId, code });
         }
         for (const [subId, fault] of [
             [24, "route-malformed"],
@@ -1098,13 +1095,29 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         expect(before).toMatchObject({
             t: "snapshot",
             subId: 40,
-            rows: [{ id: "query-refresh-row", viewerId: "workerd-user" }],
+            rows: [
+                {
+                    id: "query-refresh-row",
+                    organizationId: "workerd-org",
+                    authorId: "workerd-user",
+                    body: "query-refresh",
+                    createdAt: 11,
+                },
+            ],
         });
         expect(refresh).toMatchObject({ t: "mustRefetch", subIds: [], reason: "authChanged" });
         expect(after).toMatchObject({
             t: "snapshot",
             subId: 41,
-            rows: [{ id: "query-refresh-row", viewerId: "workerd-user" }],
+            rows: [
+                {
+                    id: "query-refresh-row",
+                    organizationId: "workerd-org",
+                    authorId: "workerd-user",
+                    body: "query-refresh",
+                    createdAt: 11,
+                },
+            ],
         });
         await expectNoDown(socket);
         socket.close();

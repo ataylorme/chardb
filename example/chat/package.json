@@ -4,7 +4,6 @@
     "type": "module",
     "scripts": {
         "test": "bun test ./test/server/worker.test.ts",
-        "test:e2e": "bun test conformance/test/e2e/",
         "test:conformance": "bun test conformance/test/",
         "typecheck": "tsc --noEmit",
         "dev": "bun scripts/dev-worker.mjs",

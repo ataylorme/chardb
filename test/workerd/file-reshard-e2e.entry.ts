@@ -78,7 +78,13 @@ const attachDocument = api.mutation({
     },
 });
 
-const app = chardb({ auth, schema: { documents }, api: { attachDocument }, migrations });
+const app = chardb({
+    ownership: "organization",
+    auth,
+    schema: { documents },
+    api: { attachDocument },
+    migrations,
+});
 
 const TABLES = Object.freeze([
     {

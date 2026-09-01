@@ -85,7 +85,7 @@ export function assertCdbSplitHistoryCapacity(sql: SyncSql, migId: string): void
     }
 }
 
-/** Add fields introduced after the first internal split-identity prototype. */
+/** Fill fields omitted by the earliest stored split-identity format. */
 export function initializeCdbReshardIdentityStore(sql: SyncSql): void {
     const columns = sql.all<{ name: string }>("PRAGMA table_info(_chardb_split_identity)");
     if (!columns.some(column => column.name === "schema_epoch")) {

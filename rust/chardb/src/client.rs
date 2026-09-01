@@ -1182,7 +1182,6 @@ impl Session {
             Down::Error {
                 code,
                 sub_id,
-                stream_request_id,
                 retryable,
                 correlation_id,
                 docs,
@@ -1195,9 +1194,7 @@ impl Session {
                     "Chardb rejected an operation",
                 ),
                 sub_id,
-                stream_request_id,
             ),
-            Down::Presence { .. } | Down::StreamChunk { .. } | Down::StreamEnd { .. } => Ok(()),
         }
     }
 
@@ -1252,27 +1249,10 @@ impl Session {
         Ok(())
     }
 
-    fn handle_remote_error(
-        &mut self,
-        error: Error,
-        sub_id: Option<SafeId>,
-        stream_request_id: Option<SafeId>,
-    ) -> Result<()> {
-        if sub_id.is_some() && stream_request_id.is_some() {
-            return Err(Error::local(
-                ErrorKind::Protocol,
-                "error envelope has both subscription and stream scopes",
-            ));
-        }
+    fn handle_remote_error(&mut self, error: Error, sub_id: Option<SafeId>) -> Result<()> {
         if let Some(id) = sub_id {
             self.handle_subscription_error(id, error);
             return Ok(());
-        }
-        if stream_request_id.is_some() {
-            return Err(Error::local(
-                ErrorKind::Protocol,
-                "received an error for an unsupported stream request",
-            ));
         }
         self.fail_pending_refresh(error.clone());
         Err(error)

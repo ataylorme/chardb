@@ -11,10 +11,11 @@
  * The shape:
  *
  *   const app = chardb({
+ *     ownership: "organization",
  *     appName: "chat",
  *     plugins: [organization()],
  *     schema: domain,
- *     refs: api,
+ *     api,
  *   });
  *   app.get("/health", (c) => c.text("ok"));
  *   app.get("/me", async (c) => c.json(
@@ -75,9 +76,7 @@ import { type ChardbMigrationJournal, defineMigrations } from "./schema-migratio
  *
  * `api?` lets the user pass the handler-module namespace (`import * as
  * api from "./api.ts"`) so chardb can walk it for `__chardbRef`
- * markers and build the manifest lazily — equivalent to the old
- * `refs:` field, just named for what it actually contains. `refs:`
- * remains accepted as a deprecated alias.
+ * markers and build the manifest lazily.
  *
  * `routes?: (app) => void` lets the user wire Hono routes inline; if
  * omitted, they can chain `app.get/post/…` on the returned object.
@@ -88,6 +87,8 @@ export interface ChardbFactoryInput<
     TPlugins extends readonly BetterAuthPlugin[],
     TSchema extends Record<string, unknown>,
 > extends Omit<DefineChardbInput<TSchema>, "auth" | "refs" | "policy" | "manifest"> {
+    /** The single ownership model accepted by this Worker's domain schema. */
+    readonly ownership: "organization" | "user";
     /**
      * Either a pre-built bundle from `defineAuth({ plugins })` or
      * inline better-auth options (`{ plugins, appName, … }`). Omit to
@@ -96,8 +97,6 @@ export interface ChardbFactoryInput<
     readonly auth?: ChardbAuth<TPlugins> | AuthOptionsInput<TPlugins>;
     /** Handler-module namespace (`import * as api from "./api.ts"`). */
     readonly api?: DefineChardbInput<TSchema>["refs"];
-    /** Deprecated alias for `api` — supported for one minor cycle. */
-    readonly refs?: DefineChardbInput<TSchema>["refs"];
     /** Inline-route hook so the whole config can read top-to-bottom. */
     readonly routes?: (app: Hono<ChardbHonoEnv<TPlugins>>) => void;
     readonly authBasePath?: MountChardbOptions["authBasePath"];
@@ -137,6 +136,7 @@ export type ChardbApp<TPlugins extends readonly BetterAuthPlugin[], TSchema exte
 > & {
     readonly fetch: (request: Request, env: ChardbEnv, ctx: ExecutionContext) => Promise<Response>;
     readonly auth: ChardbAuth<TPlugins>;
+    readonly ownership: "organization" | "user";
     readonly schema: TSchema & SynthesizedAuthSchema<TPlugins>;
     readonly DB: typeof DB;
     readonly Cdb: typeof Cdb;
@@ -167,6 +167,13 @@ export function chardb<
     const TPlugins extends readonly BetterAuthPlugin[] = [],
     const TSchema extends Record<string, unknown> = Record<string, unknown>,
 >(input: ChardbFactoryInput<TPlugins, TSchema>): ChardbApp<TPlugins, TSchema> {
+    if (input.ownership !== "organization" && input.ownership !== "user") {
+        throw new CdbError({
+            code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+            message: 'chardb: ownership must be exactly "organization" or "user"',
+            hint: 'Pass ownership: "organization" or ownership: "user" to chardb().',
+        });
+    }
     // Resolve the auth profile. The `auth` slot accepts either a
     // pre-built `ChardbAuth` (from `defineAuth(...)`) or raw better-auth
     // options (`{ plugins, appName, … }`). We discriminate by the
@@ -178,15 +185,14 @@ export function chardb<
         return defineAuth((input.auth ?? {}) as unknown as AuthOptionsInput<TPlugins>);
     })();
 
-    // `api` is the new field name; `refs` is the deprecated alias.
-    const refsValue = input.api ?? input.refs;
+    const refsValue = input.api;
     const authBasePath = input.authBasePath ?? auth.options.basePath ?? "/api/auth";
     const jwtConfig = gatewayJwtConfigFromAuthOptions(auth.options, authBasePath);
     if (refsValue !== undefined && jwtConfig === null) {
         throw new CdbError({
             code: "CDB_AUTH_NOT_BOUND",
             message: "chardb: authenticated DB transport requires Better Auth's jwt() plugin",
-            hint: "Add jwt() to defineAuth({ plugins: [...] }) before passing api/refs to chardb().",
+            hint: "Add jwt() to defineAuth({ plugins: [...] }) before passing api to chardb().",
         });
     }
 
@@ -204,6 +210,7 @@ export function chardb<
     const getValidatedSchema = (): Record<string, unknown> => {
         if (validatedSchema) return validatedSchema;
         const schema = runtimeEntrypoint.schema;
+        assertOwnershipMode(schema, input.ownership);
         assertConfiguredAuthTargets(schema, auth.options);
         assertSchemaResourceJournal(schema, migrationJournal.migrations);
         validatedSchema = schema;
@@ -298,6 +305,7 @@ export function chardb<
     const merged = Object.assign(hono, {
         fetch: mounted.fetch,
         auth,
+        ownership: input.ownership,
         DB: ConfiguredDB,
         Cdb: ConfiguredCdb,
         Catalog: ConfiguredCatalog,
@@ -305,6 +313,23 @@ export function chardb<
         Resharder: ConfiguredResharder,
     });
     return merged as ChardbApp<TPlugins, TSchema>;
+}
+
+function assertOwnershipMode(schema: Record<string, unknown>, ownership: "organization" | "user"): void {
+    for (const { meta } of collectCdbTables(schema)) {
+        const declared = meta.tenantKind === "user" ? "user" : meta.tenantKind === "org" ? "organization" : "none";
+        if (declared === ownership) continue;
+        const factory =
+            meta.tenantKind === "user" ? "forUser()" : meta.selfTarget === "user" ? "forOrgUser()" : "forOrg()";
+        throw new CdbError({
+            code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+            message: `chardb: ownership "${ownership}" cannot include cdbTable "${meta.name}" from ${factory}`,
+            hint:
+                ownership === "organization"
+                    ? "Use forOrg() or forOrgUser() for every domain table in this Worker."
+                    : "Use forUser() for every domain table in this Worker.",
+        });
+    }
 }
 
 function assertConfiguredAuthTargets(schema: Record<string, unknown>, authOptions: BetterAuthOptions): void {

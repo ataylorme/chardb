@@ -68,30 +68,6 @@ const CASES = {
         valid: { t: "ack", cookie: Cookie("cookie-1") },
         malformed: [{ t: "ack" }, { t: "ack", cookie: 4 }],
     },
-    presencePub: {
-        valid: { t: "presencePub", key: "room-1", state: { typing: true }, ttlMs: 5_000 },
-        malformed: [
-            { t: "presencePub", key: "room-1" },
-            { t: "presencePub", key: "room-1", state: null, ttlMs: -1 },
-        ],
-    },
-    presenceSub: {
-        valid: { t: "presenceSub", key: "room-1" },
-        malformed: [{ t: "presenceSub" }, { t: "presenceSub", key: [] }],
-    },
-    streamReq: {
-        valid: {
-            t: "streamReq",
-            streamReqId: 1,
-            ref: ChardbRef("api.ts#exportRows"),
-            args: { limit: 10 },
-            mutId: MutId("mut-2"),
-        },
-        malformed: [
-            { t: "streamReq", streamReqId: -1, ref: "api.ts#exportRows", args: {}, mutId: "mut-2" },
-            { t: "streamReq", streamReqId: 1, ref: "bad", args: {}, mutId: "mut-2" },
-        ],
-    },
     ping: {
         valid: { t: "ping" },
         malformed: [
@@ -165,55 +141,11 @@ const CASES = {
             { t: "mustRefetch", subIds: [], reason: 7 },
         ],
     },
-    presence: {
-        valid: {
-            t: "presence",
-            key: "room-1",
-            version: 1,
-            states: [{ clientId: ClientId("client-1"), state: { typing: true }, ts: 1_700_000_000_000 }],
-        },
-        malformed: [
-            { t: "presence", key: "room-1", version: 2, states: [] },
-            { t: "presence", key: "room-1", version: 1, states: [{ clientId: "client-1", state: null }] },
-        ],
-    },
-    streamChunk: {
-        valid: { t: "streamChunk", streamReqId: 1, chunk: [1, 2, 3] },
-        malformed: [
-            { t: "streamChunk", streamReqId: -1, chunk: null },
-            { t: "streamChunk", streamReqId: 1 },
-        ],
-    },
-    streamEnd: {
-        valid: {
-            t: "streamEnd",
-            streamReqId: 1,
-            finalMutResult: {
-                mutId: MutId("mut-1"),
-                ok: false,
-                error: { code: "CDB_SHARD_UNAVAILABLE", retryable: true, docs: "https://chardb.dev/errors/x" },
-            },
-        },
-        malformed: [
-            { t: "streamEnd", streamReqId: 1.5, finalMutResult: {} },
-            { t: "streamEnd", streamReqId: 1, finalMutResult: [] },
-            {
-                t: "streamEnd",
-                streamReqId: 1,
-                finalMutResult: {
-                    mutId: "mut-1",
-                    ok: false,
-                    error: { code: 7, retryable: false, docs: "docs" },
-                },
-            },
-        ],
-    },
     error: {
         valid: {
             t: "error",
             code: "CDB_CATALOG_UNAVAILABLE",
             subId: SubId(1),
-            streamReqId: 2,
             retryable: true,
             correlationId: CorrelationId("corr-1"),
             docs: "https://chardb.dev/errors/cdb_catalog_unavailable",

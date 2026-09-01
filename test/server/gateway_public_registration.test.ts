@@ -615,7 +615,6 @@ describe("Gateway public durable registration", () => {
             jwtExp: socket.attachment.jwtExp + 1_000,
             jwtNbf: 50,
             lastCookie: Cookie("cookie-newer"),
-            presenceKeys: ["presence-newer"],
             snapshotSubIds: [SubId(1), SubId(2)],
         } satisfies VerifiedGwAttachment;
         socket.attachment = newerAttachment;

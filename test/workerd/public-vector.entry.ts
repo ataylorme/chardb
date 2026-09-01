@@ -106,7 +106,6 @@ function withVectorApi(base: ChardbManifest): ChardbManifest {
     return {
         mutations: new Map([...base.mutations, ...vectorManifest.mutations]),
         queries: new Map([...base.queries, ...vectorManifest.queries]),
-        ledgers: base.ledgers,
     };
 }
 

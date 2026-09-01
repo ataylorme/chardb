@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import type { CliContext, CliFetch } from "../../src/cli/context.ts";
-import * as cliSurface from "../../src/cli/index.ts";
 import { runCli } from "../../src/cli/run.ts";
 
 function fakeCtx(overrides: Partial<CliContext> = {}): { ctx: CliContext; out: string[]; err: string[] } {
@@ -41,7 +40,6 @@ describe("chardb command availability", () => {
         }
         expect(out.join("")).not.toContain("not implemented");
         expect(out.join("")).not.toContain("__migrations-inspect");
-        expect("runMigrationsInspect" in cliSurface).toBe(false);
     });
 
     test("parses initial migration generation strictly", async () => {

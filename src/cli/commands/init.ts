@@ -1409,7 +1409,13 @@ import * as domain from "./schema.ts";
 // manifest from \`api\`'s exports, Hono router for non-reserved routes,
 // and the Durable Object classes wired by the generated Wrangler config.
 // The returned \`app\` is the wrangler-ready module. Chain routes on it.
-export const app = chardb({ auth, schema: domain, api: { ...api, ...queries }, migrations });
+export const app = chardb({
+  ownership: "organization",
+  auth,
+  schema: domain,
+  api: { ...api, ...queries },
+  migrations,
+});
 
 app.get("/health", (c) => c.json({
   ok: true,

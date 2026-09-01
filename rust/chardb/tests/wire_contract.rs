@@ -18,8 +18,8 @@ fn corpus() -> Corpus {
 fn shared_typescript_corpus_round_trips_in_rust() {
     let corpus = corpus();
     assert_eq!(corpus.protocol_v, 3);
-    assert_eq!(corpus.up.len(), 10);
-    assert_eq!(corpus.down.len(), 9);
+    assert_eq!(corpus.up.len(), 7);
+    assert_eq!(corpus.down.len(), 6);
     for expected in corpus.up {
         let raw = serde_json::to_string(&expected).unwrap();
         let message = decode_up(&raw).unwrap();

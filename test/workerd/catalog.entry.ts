@@ -26,9 +26,6 @@ interface Env {
 }
 
 type Op =
-    | "openBarrier"
-    | "ackBarrier"
-    | "openBarriers"
     | "beginTopologyOperation"
     | "cutover"
     | "route"
@@ -51,9 +48,7 @@ export default {
         }
         try {
             let result: unknown;
-            if (op === "openBarrier") {
-                result = await stubAny.openBarrier((body ?? { now: Date.now() }).now as number);
-            } else if (op === "route") {
+            if (op === "route") {
                 result = await stubAny.route(body?.vshard);
             } else if (op === "fixtureInstanceId") {
                 result = await stubAny.fixtureInstanceId();

@@ -33,8 +33,6 @@ export default defineBuildConfig({
         "vite",
         "@cloudflare/vite-plugin",
         "miniflare",
-        "eslint",
-        "@typescript-eslint/utils",
     ],
     failOnWarn: true,
 });

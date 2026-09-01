@@ -19,6 +19,7 @@ import { describe, expect, test } from "bun:test";
 import { admin } from "better-auth/plugins/admin";
 import { jwt } from "better-auth/plugins/jwt";
 import { organization } from "better-auth/plugins/organization";
+import { eq } from "drizzle-orm";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { defineAuth } from "../../src/auth/synthesize.ts";
@@ -26,14 +27,13 @@ import type { ChardbBinding } from "../../src/binding.ts";
 import { CdbError } from "../../src/errors.ts";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import { chardb } from "../../src/server/chardb.ts";
-import { defineMutation, defineQuery } from "../../src/server/define.ts";
+import { createApi, defineMutation } from "../../src/server/define.ts";
 import { Cdb } from "../../src/server/do/cdb.ts";
 import { Gateway } from "../../src/server/do/gateway.ts";
 import { defineMigrations } from "../../src/server/schema-migrations.ts";
 import type { RawJson } from "../../src/types.ts";
-import { stableJson } from "../../src/util/canonical.ts";
 import { vshardOf } from "../../src/vshard.ts";
-import { forOrg, forOrgUser } from "../helpers/cdb-table.ts";
+import { forOrg, forOrgUser, forUser } from "../helpers/cdb-table.ts";
 
 const organizationTable = sqliteTable("organization", { id: text("id").primaryKey() });
 const userTable = sqliteTable("user", { id: text("id").primaryKey() });
@@ -47,7 +47,7 @@ const items = cdbTable(
             .references(() => organizationTable.id),
         name: text("name").notNull(),
     },
-    { roles: { member: { read: "*" } } }
+    { partitionBy: "organizationId", roles: { member: { read: "*" } } }
 );
 const { cdbTable: orgUserTable } = forOrgUser();
 const drafts = orgUserTable(
@@ -57,6 +57,17 @@ const drafts = orgUserTable(
         organizationId: text("organization_id")
             .notNull()
             .references(() => organizationTable.id),
+        userId: text("user_id")
+            .notNull()
+            .references(() => userTable.id),
+    },
+    { roles: { self: { read: "*" } } }
+);
+const { cdbTable: userOwnedTable } = forUser();
+const userNotes = userOwnedTable(
+    "user_notes",
+    {
+        id: text("id").primaryKey(),
         userId: text("user_id")
             .notNull()
             .references(() => userTable.id),
@@ -78,36 +89,45 @@ const routedMutation = defineMutation<unknown, RoutedArgs, null>(() => null, {
     singlePartition: true,
     partitionKey: args => args.organizationId,
 });
-const routedQuery = defineQuery<unknown, RoutedQueryArgs, readonly []>({
+const itemApi = createApi({ items });
+const routedQuery = itemApi.query({
     ref: "api/items#list",
     args: z.object({ organizationId: z.string(), limit: z.number().int().default(25) }),
-    authority: "organization",
-    partitionKey: "organizationId",
-    handler: async () => [],
-    intent: args => ({
-        kind: "select",
-        tables: ["items"],
-        partitionKey: { table: "items", column: "organization_id", values: [args.organizationId] },
-        joinShape: "colocated",
-    }),
+    query: (db, args: RoutedQueryArgs) =>
+        db
+            .select()
+            .from(items)
+            .where(eq(items.organizationId, args.organizationId))
+            .orderBy(items.id)
+            .limit(args.limit),
 });
-const queryWithoutIntent = defineQuery<unknown, RoutedArgs, readonly []>(async (): Promise<readonly []> => []);
-const queryWithNonJsonTransform = defineQuery({
+const queryWithNonJsonTransform = itemApi.query({
+    ref: "api/items#nonJsonTransform",
     args: z.object({ organizationId: z.string(), at: z.string().transform(() => new Date(0)) }),
-    handler: async () => [],
-    intent: args => ({
-        kind: "select",
-        tables: ["items"],
-        partitionKey: { table: "items", column: "organization_id", values: [args.organizationId] },
-    }),
+    query: (db, args) => db.select().from(items).where(eq(items.organizationId, args.organizationId)),
 });
 
 describe("chardb({…})", () => {
+    test("rejects missing and unknown ownership modes at construction", () => {
+        const callFromJavaScript = chardb as unknown as (input: Record<string, unknown>) => unknown;
+        for (const ownership of [undefined, "global", null]) {
+            expect(() => callFromJavaScript({ ownership, schema: {} })).toThrow(CdbError);
+            try {
+                callFromJavaScript({ ownership, schema: {} });
+            } catch (error) {
+                expect(error).toMatchObject({
+                    code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                    message: 'chardb: ownership must be exactly "organization" or "user"',
+                });
+            }
+        }
+    });
+
     test("fails at construction when api transport is configured without jwt()", () => {
         const authWithoutJwt = defineAuth({ plugins: [organization()] });
         let caught: unknown;
         try {
-            chardb({ auth: authWithoutJwt, schema: { items }, api: { routedMutation } });
+            chardb({ ownership: "organization", auth: authWithoutJwt, schema: { items }, api: { routedMutation } });
         } catch (error) {
             caught = error;
         }
@@ -120,14 +140,14 @@ describe("chardb({…})", () => {
 
     test("allows a core-only route setup when authenticated DB transport is not configured", () => {
         const coreAuth = defineAuth({});
-        const app = chardb({ auth: coreAuth, schema: {} });
+        const app = chardb({ ownership: "user", auth: coreAuth, schema: {} });
         expect(app.auth).toBe(coreAuth);
         expect(app.schema.user).toBeDefined();
     });
 
     test("fails clearly when forOrg() is used without organization()", () => {
         const authWithoutOrganization = defineAuth({ plugins: [jwt()] });
-        const app = chardb({ auth: authWithoutOrganization, schema: { items } });
+        const app = chardb({ ownership: "organization", auth: authWithoutOrganization, schema: { items } });
         let caught: unknown;
         try {
             void app.schema;
@@ -144,7 +164,7 @@ describe("chardb({…})", () => {
 
     test("rejects forOrgUser() when Better Auth omits organization()", () => {
         const authWithoutOrganization = defineAuth({ plugins: [jwt()] });
-        const app = chardb({ auth: authWithoutOrganization, schema: { drafts } });
+        const app = chardb({ ownership: "organization", auth: authWithoutOrganization, schema: { drafts } });
 
         expect(() => void app.schema).toThrow(CdbError);
         try {
@@ -157,8 +177,51 @@ describe("chardb({…})", () => {
         }
     });
 
+    test("rejects a user-owned table in organization mode", () => {
+        const app = chardb({ ownership: "organization", auth, schema: { items, userNotes } });
+
+        expect(() => void app.schema).toThrow(CdbError);
+        try {
+            void app.schema;
+        } catch (error) {
+            expect(error).toMatchObject({
+                code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                message: 'chardb: ownership "organization" cannot include cdbTable "user_notes" from forUser()',
+            });
+        }
+    });
+
+    test("rejects organization-owned tables in user mode", () => {
+        const app = chardb({ ownership: "user", auth, schema: { userNotes, items } });
+
+        expect(() => void app.schema).toThrow(CdbError);
+        try {
+            void app.schema;
+        } catch (error) {
+            expect(error).toMatchObject({
+                code: "CDB_AUTH_PROFILE_INCOMPATIBLE",
+                message: 'chardb: ownership "user" cannot include cdbTable "items" from forOrg()',
+            });
+        }
+    });
+
+    test("accepts forOrg() and forOrgUser() together in organization mode", () => {
+        const app = chardb({ ownership: "organization", auth, schema: { items, drafts } });
+
+        expect(app.ownership).toBe("organization");
+        expect(app.schema.items).toBe(items);
+        expect(app.schema.drafts).toBe(drafts);
+    });
+
+    test("accepts only forUser() tables in user mode", () => {
+        const app = chardb({ ownership: "user", auth: defineAuth({}), schema: { userNotes } });
+
+        expect(app.ownership).toBe("user");
+        expect(app.schema.userNotes).toBe(userNotes);
+    });
+
     test("returns a Hono instance the user can chain routes on", async () => {
-        const app = chardb({ auth, schema: { items } });
+        const app = chardb({ ownership: "organization", auth, schema: { items } });
         app.get("/hello", c => c.text("world"));
         const res = await app.fetch(
             new Request("https://example.com/hello"),
@@ -173,7 +236,7 @@ describe("chardb({…})", () => {
     });
 
     test("maps typed route failures through the shared HTTP boundary", async () => {
-        const app = chardb({ auth, schema: { items } });
+        const app = chardb({ ownership: "organization", auth, schema: { items } });
         app.get("/forbidden", () => {
             throw new CdbError({ code: "CDB_FORBIDDEN", message: "membership revoked" });
         });
@@ -190,6 +253,7 @@ describe("chardb({…})", () => {
 
     test("rejects Better Auth at the HTTP boundary while its Catalog schema is fenced", async () => {
         const app = chardb({
+            ownership: "organization",
             auth: defineAuth({}),
             schema: {},
             migrations: defineMigrations([{ version: 1, name: "initial", statements: ["SELECT 1"] }]),
@@ -222,7 +286,7 @@ describe("chardb({…})", () => {
     });
 
     test("pins unconfigured Better Auth instances to each canonical request origin", async () => {
-        const app = chardb({ auth: defineAuth({}), schema: {} });
+        const app = chardb({ ownership: "user", auth: defineAuth({}), schema: {} });
         app.get("/auth-origin", c => c.json({ baseURL: c.var.auth.options.baseURL }));
         const env = {} as Parameters<typeof app.fetch>[1];
         const ctx = {
@@ -238,7 +302,7 @@ describe("chardb({…})", () => {
     });
 
     test("binds the typed Better Auth runtime to Hono routes and caches it per env", async () => {
-        const app = chardb({ auth, schema: { items } });
+        const app = chardb({ ownership: "organization", auth, schema: { items } });
         let firstRuntime: unknown;
         app.get("/auth-runtime", c => {
             const getSession: typeof c.var.auth.api.getSession = c.var.auth.api.getSession;
@@ -289,6 +353,7 @@ describe("chardb({…})", () => {
 
     test("binds Better Auth before inline routes run", async () => {
         const app = chardb({
+            ownership: "organization",
             auth,
             schema: { items },
             routes: router => {
@@ -308,7 +373,7 @@ describe("chardb({…})", () => {
         const adminPlugin = admin();
         const plugins = [organizationPlugin, adminPlugin] as const;
         const exactAuth = defineAuth({ baseURL: "https://example.com", plugins });
-        const app = chardb({ auth: exactAuth, schema: { items } });
+        const app = chardb({ ownership: "organization", auth: exactAuth, schema: { items } });
         app.get("/auth-profile", c => {
             const runtimePlugins = c.var.auth.options.plugins;
             return c.json({
@@ -331,7 +396,7 @@ describe("chardb({…})", () => {
     });
 
     test("exposes the native DB loopback as typed Hono environment state", async () => {
-        const app = chardb({ auth, schema: { items } });
+        const app = chardb({ ownership: "organization", auth, schema: { items } });
         const db = {
             async executeQuery() {
                 return { ok: true as const, result: null };
@@ -355,7 +420,7 @@ describe("chardb({…})", () => {
     });
 
     test("the DB entrypoint and four Durable Object classes are direct configured fields", () => {
-        const app = chardb({ auth, schema: { items } });
+        const app = chardb({ ownership: "organization", auth, schema: { items } });
         // Existence + identity — these are the named exports wrangler binds.
         expect(typeof app.DB).toBe("function");
         expect(typeof app.Cdb).toBe("function");
@@ -369,7 +434,7 @@ describe("chardb({…})", () => {
     });
 
     test("the configured Gateway resolves mutation refs from the factory api manifest", () => {
-        const app = chardb({ auth, schema: { items }, api: { routedMutation } });
+        const app = chardb({ ownership: "organization", auth, schema: { items }, api: { routedMutation } });
         const gateway = Object.create(app.Gateway.prototype) as InstanceType<typeof app.Gateway>;
         expect(
             gateway.routeMutation({
@@ -388,8 +453,13 @@ describe("chardb({…})", () => {
         if (!missing.ok) expect(missing.error.code).toBe("CDB_REF_NOT_FOUND");
     });
 
-    test("the configured Gateway validates args, derives query intent, and fails closed without an extractor", async () => {
-        const app = chardb({ auth, schema: { items }, api: { routedQuery, queryWithoutIntent } });
+    test("the configured Gateway validates args and derives a planned query route", async () => {
+        const app = chardb({
+            ownership: "organization",
+            auth,
+            schema: { items },
+            api: { routedQuery },
+        });
         const gateway = Object.create(app.Gateway.prototype) as InstanceType<typeof app.Gateway>;
         const routed = await gateway.routeQuery({ ref: routedQuery.__chardbRef, args: { organizationId: "org-7" } });
         expect(routed.ok).toBe(true);
@@ -399,30 +469,27 @@ describe("chardb({…})", () => {
             tables: ["items"],
             partitionKey: { table: "items", column: "organization_id", values: ["org-7"] },
             joinShape: "colocated",
+            intervals: expect.any(Array),
         });
         expect(routed.args).toEqual({ organizationId: "org-7", limit: 25 });
         expect(routed.authority).toBe("organization");
         expect(routed.partitionKey).toBe("org-7");
         const policyDigest = cdbPolicyDigest({ items }, routed.intent.tables);
         expect(routed.policyDigest).toBe(policyDigest);
-        expect(routed.queryHash).toBe(
-            stableJson({ ref: routedQuery.__chardbRef, args: routed.args, intent: routed.intent, policyDigest })
-        );
+        expect(routed.queryHash).toContain("planHash");
 
         const invalid = await gateway.routeQuery({ ref: routedQuery.__chardbRef, args: { organizationId: 7 } });
         expect(invalid.ok).toBe(false);
         if (!invalid.ok) expect(invalid.error.code).toBe("CDB_INVALID_ARGS");
-
-        const closed = await gateway.routeQuery({
-            ref: queryWithoutIntent.__chardbRef,
-            args: { organizationId: "org-7" },
-        });
-        expect(closed.ok).toBe(false);
-        if (!closed.ok) expect(closed.error.code).toBe("CDB_NO_INTENT_FOR_RAW_SQL");
     });
 
     test("query routing rejects non-JSON validator transforms", async () => {
-        const app = chardb({ auth, schema: { items }, api: { queryWithNonJsonTransform } });
+        const app = chardb({
+            ownership: "organization",
+            auth,
+            schema: { items },
+            api: { queryWithNonJsonTransform },
+        });
         const gateway = Object.create(app.Gateway.prototype) as InstanceType<typeof app.Gateway>;
         const result = await gateway.routeQuery({
             ref: queryWithNonJsonTransform.__chardbRef,
@@ -431,56 +498,37 @@ describe("chardb({…})", () => {
         expect(result).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS" } });
     });
 
-    test("query routing caps raw and transformed arguments before downstream callbacks", async () => {
+    test("query routing caps raw and transformed arguments before compiling plans", async () => {
         let rawValidatorRuns = 0;
-        let rawIntentRuns = 0;
-        const rawGuarded = defineQuery({
+        let rawCompilerRuns = 0;
+        const rawGuarded = itemApi.query({
             ref: "api/items#rawArgumentLimit",
             args: z.unknown().transform(value => {
                 rawValidatorRuns++;
                 return value as { organizationId: string };
             }),
-            handler: async () => [],
-            intent: args => {
-                rawIntentRuns++;
-                return {
-                    kind: "select" as const,
-                    tables: ["items"],
-                    partitionKey: { table: "items", column: "organization_id", values: [args.organizationId] },
-                };
+            query: (db, args) => {
+                rawCompilerRuns++;
+                return db.select().from(items).where(eq(items.organizationId, args.organizationId));
             },
         });
-        let transformedIntentRuns = 0;
-        const transformedGuarded = defineQuery({
+        let transformedCompilerRuns = 0;
+        const transformedGuarded = itemApi.query({
             ref: "api/items#transformedArgumentLimit",
             args: z.object({ organizationId: z.string() }).transform(args => ({
                 ...args,
                 padding: "é".repeat(262_139),
             })),
-            handler: async () => [],
-            intent: args => {
-                transformedIntentRuns++;
-                return {
-                    kind: "select" as const,
-                    tables: ["items"],
-                    partitionKey: { table: "items", column: "organization_id", values: [args.organizationId] },
-                };
-            },
-        });
-        let callbackIntent: { kind: "select"; tables: string[] } | undefined;
-        const callbackGuarded = defineQuery<unknown, { value: string } & Record<string, RawJson>, readonly []>({
-            ref: "api/items#callbackArgumentOwnership",
-            handler: async () => [],
-            intent: args => {
-                args.value = "callback-mutated";
-                callbackIntent = { kind: "select", tables: ["items"] };
-                return callbackIntent;
+            query: (db, args) => {
+                transformedCompilerRuns++;
+                return db.select().from(items).where(eq(items.organizationId, args.organizationId));
             },
         });
         const app = chardb({
+            ownership: "organization",
             auth,
             schema: { items },
-            api: { rawGuarded, transformedGuarded, callbackGuarded },
+            api: { rawGuarded, transformedGuarded },
         });
         const gateway = Object.create(app.Gateway.prototype) as InstanceType<typeof app.Gateway>;
 
@@ -491,7 +539,7 @@ describe("chardb({…})", () => {
             })
         ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } });
         expect(rawValidatorRuns).toBe(0);
-        expect(rawIntentRuns).toBe(0);
+        expect(rawCompilerRuns).toBe(0);
 
         await expect(
             gateway.routeQuery({
@@ -499,22 +547,11 @@ describe("chardb({…})", () => {
                 args: { organizationId: "org-7" },
             })
         ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } });
-        expect(transformedIntentRuns).toBe(0);
-
-        const callerArgs = { value: "caller-owned" };
-        const callbackRouted = await gateway.routeQuery({ ref: callbackGuarded.__chardbRef, args: callerArgs });
-        expect(callbackRouted).toMatchObject({
-            ok: true,
-            args: { value: "callback-mutated" },
-            intent: { kind: "select", tables: ["items"] },
-        });
-        expect(callerArgs).toEqual({ value: "caller-owned" });
-        callbackIntent?.tables.splice(0, 1, "hostile-after-return");
-        expect(callbackRouted).toMatchObject({ intent: { tables: ["items"] } });
+        expect(transformedCompilerRuns).toBe(0);
     });
 
     test("`auth` is the pre-built bundle when supplied", () => {
-        const app = chardb({ auth, schema: { items } });
+        const app = chardb({ ownership: "organization", auth, schema: { items } });
         expect(app.auth).toBe(auth);
         expect(app.auth.user).toBeDefined();
         expect(app.auth.organization).toBeDefined();
@@ -522,6 +559,7 @@ describe("chardb({…})", () => {
 
     test("inline `auth: { plugins, appName }` builds the bundle without a separate defineAuth call", () => {
         const app = chardb({
+            ownership: "organization",
             auth: { appName: "inline-app", plugins: [organization()] },
             schema: { items },
         });
@@ -550,7 +588,7 @@ describe("chardb({…})", () => {
                 },
             }
         );
-        const app = chardb({ auth, schema });
+        const app = chardb({ ownership: "organization", auth, schema });
         // Constructing the factory must NOT iterate the schema namespace —
         // the merge with auth tables is deferred to first `.schema` read.
         expect(accessCount).toBe(0);
@@ -559,7 +597,7 @@ describe("chardb({…})", () => {
     });
 
     test(".schema merges synthesized auth tables with the domain namespace", () => {
-        const app = chardb({ auth, schema: { items } });
+        const app = chardb({ ownership: "organization", auth, schema: { items } });
         const organizationIdColumn: typeof app.auth.organization.id = app.schema.organization.id;
         expect(app.schema.items).toBe(items);
         expect(app.schema.user).toBeDefined();

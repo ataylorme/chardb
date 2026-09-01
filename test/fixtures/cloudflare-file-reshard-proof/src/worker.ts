@@ -153,7 +153,7 @@ interface ReshardState {
     readonly rangeHi: number;
 }
 
-const app = chardb({ auth, authBasePath: "/api/auth", schema, api, migrations });
+const app = chardb({ ownership: "organization", auth, authBasePath: "/api/auth", schema, api, migrations });
 interface ProofExecutionContext {
     waitUntil(promise: Promise<unknown>): void;
     passThroughOnException(): void;

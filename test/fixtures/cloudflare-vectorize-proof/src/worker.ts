@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS _chardb_vector_proof_search_audit (
   created_at                   INTEGER NOT NULL CHECK (created_at >= 0)
 );`;
 
-const app = chardb({ auth, authBasePath: "/api/auth", schema, api, migrations });
+const app = chardb({ ownership: "organization", auth, authBasePath: "/api/auth", schema, api, migrations });
 const vectorResources = collectSchemaResourceDescriptors(schema).filter(isChardbVectorResourceDescriptor);
 
 function bearer(value: string | undefined): string {

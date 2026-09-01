@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { jwt } from "better-auth/plugins/jwt";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { renderSqliteTableDdl } from "../../src/auth/ddl.ts";
@@ -9,27 +9,40 @@ import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
 import { api } from "../../src/server/define.ts";
 import { cdbSubscriptionRequest } from "../../src/server/do/gateway.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
-import { chardb, defineAuth, defineMigrations } from "../../src/server/index.ts";
+import { chardb, defineAuth, defineMigrations, forUser } from "../../src/server/index.ts";
 import { routeValidatedQuery } from "../../src/server/manifest.ts";
 import type { GatewayInvalidationRequest, GatewayInvalidationResponse } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 import { VSHARD_COUNT, vshardOf } from "../../src/vshard.ts";
-import { globalScope } from "../helpers/cdb-table.ts";
 
 declare const CHARDB_MIGRATION_RELEASE: "v1" | "v2" | "v3" | "fresh" | "fresh3" | "legacy";
 
 const MUTATION_REF = "test/workerd/migration.entry.ts#createMigrationRow";
 const LIVE_QUERY_REF = "test/workerd/migration.entry.ts#listMigrationRows";
-const { cdbTable } = globalScope();
+const authV1 = defineAuth({ plugins: [jwt()] });
+const authV2 = defineAuth({
+    plugins: [jwt()],
+    user: { additionalFields: { nickname: { type: "string", required: false } } },
+});
+const authV3 = defineAuth({
+    plugins: [jwt()],
+    user: {
+        additionalFields: {
+            nickname: { type: "string", required: false },
+            timezone: { type: "string", required: false },
+        },
+    },
+});
+const { cdbTable } = forUser(authV1);
 const rowsV1 = cdbTable(
     "migration_rows",
     { id: text("id").primaryKey(), value: text("value").notNull() },
-    { partitionBy: "id", roles: { member: { create: "*", read: "*" } } }
+    { roles: { self: { create: "*", read: "*" } } }
 );
 const rowsV2 = cdbTable(
     "migration_rows",
     { id: text("id").primaryKey(), value: text("value").notNull(), note: text("note") },
-    { partitionBy: "id", roles: { member: { create: "*", read: "*" } } }
+    { roles: { self: { create: "*", read: "*" } } }
 );
 const rowsV3 = cdbTable(
     "migration_rows",
@@ -39,7 +52,7 @@ const rowsV3 = cdbTable(
         note: text("note"),
         label: text("label"),
     },
-    { partitionBy: "id", roles: { member: { create: "*", read: "*" } } }
+    { roles: { self: { create: "*", read: "*" } } }
 );
 
 const createV1 = api.mutation({
@@ -83,59 +96,35 @@ const createV3 = api.mutation({
 const listV1 = api.query({
     ref: LIVE_QUERY_REF,
     args: z.object({ id: z.string() }),
-    authority: "global",
-    partitionKey: "id",
-    intent: args => ({
-        kind: "select",
-        tables: ["migration_rows"],
-        partitionKey: { table: "migration_rows", column: "id", values: [args.id] },
-        joinShape: "colocated",
-        intervals: [{ table: "migration_rows", indexName: "id", intervals: [{ kind: "full" }] }],
-    }),
-    handler: async (ctx, args) => ctx.db.select().from(rowsV1).where(eq(rowsV1.id, args.id)).all(),
+    query: (db, args) =>
+        db
+            .select()
+            .from(rowsV1)
+            .where(and(eq(rowsV1.userId, "migration-user"), eq(rowsV1.id, args.id)))
+            .orderBy(rowsV1.id)
+            .limit(100),
 });
 const listV2 = api.query({
     ref: LIVE_QUERY_REF,
     args: z.object({ id: z.string() }),
-    authority: "global",
-    partitionKey: "id",
-    intent: args => ({
-        kind: "select",
-        tables: ["migration_rows"],
-        partitionKey: { table: "migration_rows", column: "id", values: [args.id] },
-        joinShape: "colocated",
-        intervals: [{ table: "migration_rows", indexName: "id", intervals: [{ kind: "full" }] }],
-    }),
-    handler: async (ctx, args) => ctx.db.select().from(rowsV2).where(eq(rowsV2.id, args.id)).all(),
+    query: (db, args) =>
+        db
+            .select()
+            .from(rowsV2)
+            .where(and(eq(rowsV2.userId, "migration-user"), eq(rowsV2.id, args.id)))
+            .orderBy(rowsV2.id)
+            .limit(100),
 });
 const listV3 = api.query({
     ref: LIVE_QUERY_REF,
     args: z.object({ id: z.string() }),
-    authority: "global",
-    partitionKey: "id",
-    intent: args => ({
-        kind: "select",
-        tables: ["migration_rows"],
-        partitionKey: { table: "migration_rows", column: "id", values: [args.id] },
-        joinShape: "colocated",
-        intervals: [{ table: "migration_rows", indexName: "id", intervals: [{ kind: "full" }] }],
-    }),
-    handler: async (ctx, args) => ctx.db.select().from(rowsV3).where(eq(rowsV3.id, args.id)).all(),
-});
-
-const authV1 = defineAuth({ plugins: [jwt()] });
-const authV2 = defineAuth({
-    plugins: [jwt()],
-    user: { additionalFields: { nickname: { type: "string", required: false } } },
-});
-const authV3 = defineAuth({
-    plugins: [jwt()],
-    user: {
-        additionalFields: {
-            nickname: { type: "string", required: false },
-            timezone: { type: "string", required: false },
-        },
-    },
+    query: (db, args) =>
+        db
+            .select()
+            .from(rowsV3)
+            .where(and(eq(rowsV3.userId, "migration-user"), eq(rowsV3.id, args.id)))
+            .orderBy(rowsV3.id)
+            .limit(100),
 });
 const addNoteMigration = {
     version: 1,
@@ -156,7 +145,9 @@ const addLabelMigration = {
     catalogStatements: ['ALTER TABLE "user" ADD COLUMN "timezone" text'],
 } as const;
 const migrationJournal = defineMigrations([addNoteMigration]);
-const rowsV1Ddl = renderSqliteTableDdl(rowsV1);
+const rowsV1Ddl = renderSqliteTableDdl(rowsV1, {
+    includeForeignKey: reference => reference.foreignTableName !== "user",
+});
 const authV1Ddl = Object.values(synthesizeAuthSchema(authV1.options as never) as Record<string, unknown>).flatMap(
     table => {
         const ddl = renderSqliteTableDdl(table as never);
@@ -193,6 +184,7 @@ const usesV3Schema = CHARDB_MIGRATION_RELEASE === "v3" || CHARDB_MIGRATION_RELEA
 const app =
     CHARDB_MIGRATION_RELEASE === "v3"
         ? chardb({
+              ownership: "user",
               auth: authV3,
               schema: { rows: rowsV3 },
               api: { createMigrationRow: createV3, listMigrationRows: listV3 },
@@ -200,6 +192,7 @@ const app =
           })
         : CHARDB_MIGRATION_RELEASE === "fresh3"
           ? chardb({
+                ownership: "user",
                 auth: authV3,
                 schema: { rows: rowsV3 },
                 api: { createMigrationRow: createV3, listMigrationRows: listV3 },
@@ -207,6 +200,7 @@ const app =
             })
           : CHARDB_MIGRATION_RELEASE === "v2"
             ? chardb({
+                  ownership: "user",
                   auth: authV2,
                   schema: { rows: rowsV2 },
                   api: { createMigrationRow: createV2, listMigrationRows: listV2 },
@@ -214,6 +208,7 @@ const app =
               })
             : CHARDB_MIGRATION_RELEASE === "fresh"
               ? chardb({
+                    ownership: "user",
                     auth: authV2,
                     schema: { rows: rowsV2 },
                     api: { createMigrationRow: createV2, listMigrationRows: listV2 },
@@ -221,11 +216,13 @@ const app =
                 })
               : CHARDB_MIGRATION_RELEASE === "legacy"
                 ? chardb({
+                      ownership: "user",
                       auth: authV2,
                       schema: { rows: rowsV2 },
                       api: { createMigrationRow: createV2, listMigrationRows: listV2 },
                   })
                 : chardb({
+                      ownership: "user",
                       auth: authV1,
                       schema: { rows: rowsV1 },
                       api: { createMigrationRow: createV1, listMigrationRows: listV1 },
@@ -253,8 +250,10 @@ export class Cdb extends app.Cdb {
         const routed = routeValidatedQuery(this.mutationManifest(), { ref: LIVE_QUERY_REF, args }, tables =>
             cdbPolicyDigest(this.mutationSchema(), tables)
         );
-        if (routed.authority === null) throw new Error("migration live query fixture omitted authority");
-        const organizationId = TenantId(args.id);
+        if (routed.authority === null || routed.partitionKey === null) {
+            throw new Error("migration live query fixture omitted placement");
+        }
+        const organizationId = TenantId(routed.partitionKey);
         return await this.subscribe(
             cdbSubscriptionRequest({
                 gatewayId,

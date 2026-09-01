@@ -55,15 +55,23 @@ describe("tutorial Better Auth integration", () => {
         ]);
 
         expect(app).toContain('from "better-auth/react"');
+        expect(app).toContain('from "@chardb/react"');
+        expect(app).toContain("const db = createChardbReactClient({");
+        expect(app).toContain('ownership: "organization"');
+        expect(app).toContain("auth: ({ baseURL }) =>");
         expect(app).toContain("plugins: [anonymousClient(), organizationClient(), jwtClient()]");
-        expect(app).toContain("const session = authClient.useSession()");
+        expect(app).toContain("const session = db.auth.useSession()");
         expect(app).toContain("anonymousSignInRequest ??=");
         expect(app).toContain("Sign-in failed:");
-        expect(app).toContain("const organizations = authClient.useListOrganizations()");
-        expect(app).toContain("authClient.organization.create({");
-        expect(app).toContain("authClient.organization.setActive({ organizationId");
+        expect(app).toContain("const identity = db.useIdentity()");
+        expect(app).toContain("const organizations = db.auth.useListOrganizations()");
+        expect(app).toContain("db.auth.organization.create({");
+        expect(app).toContain("db.auth.organization.setActive({ organizationId");
         expect(app).not.toContain("session.refetch");
-        expect(app).toContain("useQuery(listMessages, { organizationId, limit: 50 })");
+        expect(app).toContain("db.useQuery(listMessages, { limit: 50 })");
+        expect(app).toContain("const mutate = db.useMutation(postMessage)");
+        expect(app).not.toContain("<ChardbProvider");
+        expect(app).not.toContain("organizationId,\n                body");
         expect(app).not.toContain("DEMO_ORG_ID");
         expect(app).not.toContain("useSession.get()");
         expect(app).not.toContain("useSession.subscribe(");

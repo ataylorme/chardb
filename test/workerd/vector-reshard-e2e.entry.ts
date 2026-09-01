@@ -143,7 +143,13 @@ const migrations = defineMigrations([
         authOptions: auth.options,
     }),
 ]);
-const app = chardb({ auth, schema, api: { putMessage, replaceMessage, deleteMessage, searchMessages }, migrations });
+const app = chardb({
+    ownership: "organization",
+    auth,
+    schema,
+    api: { putMessage, replaceMessage, deleteMessage, searchMessages },
+    migrations,
+});
 
 const TABLES = Object.freeze([
     Object.freeze({

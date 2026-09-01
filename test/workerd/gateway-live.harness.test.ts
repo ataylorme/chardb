@@ -554,9 +554,9 @@ async function signed(subject: string): Promise<string> {
 interface ScaleRow {
     readonly id: string;
     readonly organizationId: string;
+    readonly authorId: string;
     readonly body: string;
     readonly createdAt: number;
-    readonly viewerId: string;
 }
 
 interface QueryObservation {
@@ -1692,12 +1692,28 @@ describe("public durable live queries in real workerd", () => {
         expect(snapshotA1).toMatchObject({
             t: "snapshot",
             subId: 1,
-            rows: [{ id: "live-proof-row", organizationId: ORGANIZATION_A, viewerId: "workerd-user" }],
+            rows: [
+                {
+                    id: "live-proof-row",
+                    organizationId: ORGANIZATION_A,
+                    authorId: "workerd-user",
+                    body: "live-proof",
+                    createdAt: 42,
+                },
+            ],
         });
         expect(snapshotA2).toMatchObject({
             t: "snapshot",
             subId: 1,
-            rows: [{ id: "live-proof-row", organizationId: ORGANIZATION_A, viewerId: "workerd-user" }],
+            rows: [
+                {
+                    id: "live-proof-row",
+                    organizationId: ORGANIZATION_A,
+                    authorId: "workerd-user",
+                    body: "live-proof",
+                    createdAt: 42,
+                },
+            ],
         });
         expect(snapshotB).toMatchObject({ t: "snapshot", subId: 1, rows: [] });
         if (snapshotA1.t !== "snapshot" || snapshotA2.t !== "snapshot" || snapshotB.t !== "snapshot") {
@@ -1863,8 +1879,9 @@ describe("public durable live queries in real workerd", () => {
                 {
                     id: "live-restart-row",
                     organizationId: ORGANIZATION_A,
+                    authorId: "workerd-user",
                     body: "restart-proof",
-                    viewerId: "workerd-user",
+                    createdAt: 43,
                 },
             ],
         });
@@ -1944,11 +1961,13 @@ describe("public durable live queries in real workerd", () => {
         await write("live-authority-seed", "live-authority-row-1");
         const initial = await subscribe(opened, clientId, 12, ORGANIZATION_A, "authority-proof");
         expect(initial.rows).toEqual([
-            expect.objectContaining({
+            {
                 id: "live-authority-row-1",
                 organizationId: ORGANIZATION_A,
-                viewerId: "workerd-user",
-            }),
+                authorId: "workerd-writer",
+                body: "authority-proof",
+                createdAt: 44,
+            },
         ]);
         acknowledge(opened.socket, initial);
 
@@ -1973,9 +1992,27 @@ describe("public durable live queries in real workerd", () => {
             t: "snapshot",
             subId: 12,
             rows: [
-                { id: "live-authority-row-1", organizationId: ORGANIZATION_A, viewerId: "workerd-user" },
-                { id: "live-authority-row-2", organizationId: ORGANIZATION_A, viewerId: "workerd-user" },
-                { id: "live-authority-row-3", organizationId: ORGANIZATION_A, viewerId: "workerd-user" },
+                {
+                    id: "live-authority-row-1",
+                    organizationId: ORGANIZATION_A,
+                    authorId: "workerd-writer",
+                    body: "authority-proof",
+                    createdAt: 44,
+                },
+                {
+                    id: "live-authority-row-2",
+                    organizationId: ORGANIZATION_A,
+                    authorId: "workerd-writer",
+                    body: "authority-proof",
+                    createdAt: 44,
+                },
+                {
+                    id: "live-authority-row-3",
+                    organizationId: ORGANIZATION_A,
+                    authorId: "workerd-writer",
+                    body: "authority-proof",
+                    createdAt: 44,
+                },
             ],
         });
         if (restored.t !== "snapshot") throw new Error("expected restored-role replacement snapshot");
@@ -2059,8 +2096,20 @@ describe("public durable live queries in real workerd", () => {
             expect(fresh.rows).toHaveLength(4);
             expect(fresh.rows).toEqual(
                 expect.arrayContaining([
-                    expect.objectContaining({ id: "live-authority-row-1", viewerId: "workerd-user" }),
-                    expect.objectContaining({ id: "live-authority-row-4", viewerId: "workerd-user" }),
+                    expect.objectContaining({
+                        id: "live-authority-row-1",
+                        organizationId: ORGANIZATION_A,
+                        authorId: "workerd-writer",
+                        body: "authority-proof",
+                        createdAt: 44,
+                    }),
+                    expect.objectContaining({
+                        id: "live-authority-row-4",
+                        organizationId: ORGANIZATION_A,
+                        authorId: "workerd-writer",
+                        body: "authority-proof",
+                        createdAt: 44,
+                    }),
                 ])
             );
             acknowledge(opened.socket, fresh);
@@ -2502,12 +2551,15 @@ describe("public durable live queries in real workerd", () => {
                     if (!tenantIds) throw new Error(`missing expected ids for ${entry.organizationId}`);
                     expect(ids).toEqual(tenantIds);
                     expect(new Set(ids).size).toBe(SCALE_MUTATIONS_PER_TENANT);
+                    expect(observation.rows.map(row => row.createdAt)).toEqual(
+                        Array.from({ length: SCALE_MUTATIONS_PER_TENANT }, (_, rowIndex) => 10_000 + rowIndex)
+                    );
                     expect(
                         observation.rows.every(
                             row =>
                                 row.organizationId === entry.organizationId &&
                                 row.body === body &&
-                                row.viewerId === entry.subject
+                                row.authorId === entry.subject
                         )
                     ).toBe(true);
                     const registration = settledStates[index]?.registrations.find(
@@ -2596,12 +2648,15 @@ describe("public durable live queries in real workerd", () => {
                 );
                 expect(responseLossObservation.rows.map(row => row.id)).toEqual(responseLossIds);
                 expect(new Set(responseLossObservation.rows.map(row => row.id)).size).toBe(responseLossCount);
+                expect(responseLossObservation.rows.map(row => row.createdAt)).toEqual(
+                    Array.from({ length: responseLossCount }, (_, index) => 30_000 + index)
+                );
                 expect(
                     responseLossObservation.rows.every(
                         row =>
                             row.organizationId === ORGANIZATION_A &&
                             row.body === responseLossBody &&
-                            row.viewerId === "workerd-user"
+                            row.authorId === "workerd-user"
                     )
                 ).toBe(true);
 
@@ -2824,12 +2879,18 @@ describe("public durable live queries in real workerd", () => {
                                         .padStart(3, "0")}`
                             )
                         );
+                        expect(observation.rows.map(row => row.createdAt)).toEqual(
+                            Array.from(
+                                { length: round + 1 },
+                                (_, priorRound) => 20_000 + priorRound * SCALE_SUBSCRIPTIONS + index
+                            )
+                        );
                         expect(
                             observation.rows.every(
                                 row =>
                                     row.organizationId === ORGANIZATION_A &&
                                     row.body === bodies[index] &&
-                                    row.viewerId === "workerd-user"
+                                    row.authorId === "workerd-user"
                             )
                         ).toBe(true);
                     }

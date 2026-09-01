@@ -1,191 +1,105 @@
 import { describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { text } from "drizzle-orm/sqlite-core";
+import { z } from "zod";
 import { isCdbError } from "../../src/errors.ts";
-import { createApi, defineMutation, defineQuery } from "../../src/server/define.ts";
+import { createApi, defineMutation } from "../../src/server/define.ts";
 import {
     manifestFromExports,
     resolveMutation,
     resolveQuery,
     routeMutation,
+    routeQuery,
     routeValidatedQuery,
 } from "../../src/server/manifest.ts";
 import type { ChardbRef } from "../../src/types.ts";
 import { globalScope } from "../helpers/cdb-table.ts";
 
-const createPost = defineMutation<unknown, { authorId: string; body: string }, { id: string }>(
-    (_ctx, args) => ({ id: `post-${args.authorId}` }),
-    { ref: "api/posts#create", authority: "organization", singlePartition: true, partitionKey: a => a.authorId }
+const { cdbTable } = globalScope();
+const rows = cdbTable(
+    "manifest_rows",
+    { id: text("id").primaryKey(), scope: text("scope").notNull() },
+    { partitionBy: "scope", roles: { user: { read: "*" } } }
+);
+const api = createApi({ rows });
+const listRows = api.query({
+    ref: "api/manifest#list",
+    query: (db, args: { scope: string }) =>
+        db.select().from(rows).where(eq(rows.scope, args.scope)).orderBy(rows.id).limit(10),
+});
+const validatedRows = api.query({
+    ref: "api/manifest#validated",
+    args: z.object({ scope: z.string() }),
+    query: (db, args) => db.select().from(rows).where(eq(rows.scope, args.scope)).orderBy(rows.id).limit(10),
+});
+const createRow = defineMutation<unknown, { scope: string }, { id: string }>(
+    (_ctx, args) => ({ id: `row-${args.scope}` }),
+    { ref: "api/manifest#create", authority: "global", singlePartition: true, partitionKey: args => args.scope }
 );
 
-const listPosts = defineQuery<unknown, { authorId: string }, readonly { id: string }[]>(async () => []);
-const listOrganizationPosts = defineQuery({
-    ref: "api/posts#organizationList",
-    authority: "organization",
-    partitionKey: "organizationId",
-    intent: (args: { organizationId: string }) => ({
-        kind: "select" as const,
-        tables: ["posts"],
-        partitionKey: { table: "posts", column: "organization_id", values: [args.organizationId] },
-    }),
-    handler: async () => [],
-});
-
 describe("manifestFromExports", () => {
-    test("collects mutations and queries by ref", () => {
-        const m = manifestFromExports({ createPost, listPosts, junk: 42, schema: {} });
-        expect(m.mutations.size).toBe(1);
-        expect(m.queries.size).toBe(1);
-        const ref = createPost.__chardbRef as ChardbRef;
-        const desc = resolveMutation(m, ref);
-        expect(desc.singlePartition).toBe(true);
-        expect(desc.authority).toBe("organization");
-        expect(desc.extractPartitionKey?.({ authorId: "u1", body: "hi" })).toBe("u1");
-        expect(desc.invoke({ db: {}, auth: { userId: "u1", claims: {} } }, { authorId: "u1", body: "hi" })).toEqual({
-            id: "post-u1",
-        });
+    test("collects mutations and planned queries", () => {
+        const manifest = manifestFromExports({ createRow, listRows, junk: 42 });
+        expect(manifest.mutations.size).toBe(1);
+        expect(manifest.queries.size).toBe(1);
+        expect(resolveMutation(manifest, createRow.__chardbRef).singlePartition).toBe(true);
+        expect(resolveQuery(manifest, listRows.__chardbRef).compilePlan).toBeDefined();
     });
 
-    test("resolveMutation throws CDB_REF_NOT_FOUND for unknown ref", () => {
-        const m = manifestFromExports({});
-        try {
-            resolveMutation(m, "mutation#missing" as ChardbRef);
-            throw new Error("expected throw");
-        } catch (e) {
-            expect(isCdbError(e)).toBe(true);
-            if (isCdbError(e)) expect(e.code).toBe("CDB_REF_NOT_FOUND");
-        }
-    });
-
-    test("rejects distinct functions with the same explicit ref", () => {
-        const first = defineMutation({ ref: "api/posts#save", handler: () => null });
-        const second = defineMutation({ ref: "api/posts#save", handler: () => null });
-        expect(() => manifestFromExports({ first, second })).toThrow("duplicate ref across mutation and mutation");
-    });
-
-    test("rejects the same explicit ref across client-addressable kinds", () => {
-        const mutation = defineMutation({ ref: "api/posts#shared", handler: () => null });
-        const query = defineQuery({ ref: "api/posts#shared", handler: async () => null });
-        expect(() => manifestFromExports({ mutation, query })).toThrow("duplicate ref across mutation and query");
-    });
-
-    test("preserves organization query authority and partition extraction", () => {
-        const manifest = manifestFromExports({ listOrganizationPosts });
-        const descriptor = resolveQuery(manifest, listOrganizationPosts.__chardbRef);
-        expect(descriptor.authority).toBe("organization");
-        expect(descriptor.extractPartitionKey?.({ organizationId: "org-1" })).toBe("org-1");
-    });
-
-    test("preserves and routes a runtime-compiled query plan", () => {
-        const { cdbTable } = globalScope();
-        const rows = cdbTable(
-            "manifest_planned_rows",
-            { id: text("id").primaryKey(), scope: text("scope").notNull() },
-            { partitionBy: "scope", roles: { user: { read: "*" } } }
-        );
-        const query = createApi({ rows }).query({
-            ref: "api/manifest#planned",
-            query: (db, args: { scope: string }) =>
-                db.select().from(rows).where(eq(rows.scope, args.scope)).orderBy(rows.id).limit(10),
-        });
-        const manifest = manifestFromExports({ query });
-        expect(resolveQuery(manifest, query.__chardbRef).compilePlan).toBeDefined();
+    test("routes a compiled plan and includes its plan hash", () => {
+        const manifest = manifestFromExports({ listRows });
         const route = routeValidatedQuery(
             manifest,
-            { ref: query.__chardbRef, args: { scope: "shared" } },
+            { ref: listRows.__chardbRef, args: { scope: "shared" } },
             () => "policy"
         );
         expect(route).toMatchObject({ authority: "global", partitionKey: "shared" });
-        expect(route.selectPlan).toEqual(query.__chardbCompilePlan?.({ scope: "shared" }).plan);
+        expect(route.selectPlan).toEqual(listRows.__chardbCompilePlan?.({ scope: "shared" }).plan);
         expect(route.queryHash).toContain("planHash");
-
-        const legacyRoute = routeValidatedQuery(
-            manifestFromExports({ listOrganizationPosts }),
-            { ref: listOrganizationPosts.__chardbRef, args: { organizationId: "org-1" } },
-            () => "policy"
-        );
-        expect(legacyRoute.selectPlan).toBeUndefined();
-
-        const descriptor = resolveQuery(manifest, query.__chardbRef);
-        const compilePlan = descriptor.compilePlan;
-        if (!compilePlan) throw new Error("planned descriptor omitted its compiler");
-        (manifest.queries as Map<ChardbRef, typeof descriptor>).set(query.__chardbRef, {
-            ...descriptor,
-            compilePlan: args => {
-                const compiled = compilePlan(args);
-                if (compiled.kind !== "select") throw new Error("select fixture compiled a vector plan");
-                return { ...compiled, plan: { ...compiled.plan, limit: compiled.limit - 1 } };
-            },
-        });
-        expect(() =>
-            routeValidatedQuery(manifest, { ref: query.__chardbRef, args: { scope: "shared" } }, () => "policy")
-        ).toThrow("canonical select plan disagrees with its legacy compiler metadata");
     });
 
-    test("preserves and routes global mutation and query placement", () => {
-        const mutation = defineMutation({
-            ref: "api/settings#save",
-            authority: "global",
-            partitionKey: (args: { partition: string }) => args.partition,
-            handler: () => null,
+    test("rejects a query marker without a compiled plan", () => {
+        const legacy = Object.assign(async () => [], {
+            __chardbKind: "query" as const,
+            __chardbRef: "api/manifest#legacy" as never,
         });
-        const query = defineQuery({
-            ref: "api/settings#read",
-            authority: "global",
-            partitionKey: (args: { partition: string }) => args.partition,
-            intent: (args: { partition: string }) => ({
-                kind: "select",
-                tables: ["settings"],
-                partitionKey: { table: "settings", column: "partition", values: [args.partition] },
-            }),
-            handler: async () => [],
-        });
-        const manifest = manifestFromExports({ mutation, query });
-
-        const mutationRoute = routeMutation(
-            manifest,
-            { ref: mutation.__chardbRef, args: { partition: "app" } },
-            parts => (parts[0] === "app" ? 7 : 0)
-        );
-        expect(mutationRoute).toMatchObject({
-            ok: true,
-            authority: "global",
-            partitionKey: "app",
-            vshard: 7,
-        });
-        const queryRoute = routeValidatedQuery(
-            manifest,
-            { ref: query.__chardbRef, args: { partition: "app" } },
-            tables => tables.join(",")
-        );
-        expect(queryRoute.authority).toBe("global");
-        expect(queryRoute.partitionKey).toBe("app");
-        expect(queryRoute.policyDigest).toBe("settings");
+        expect(() => manifestFromExports({ legacy })).toThrow("query ref has no compiled plan");
     });
 
-    test("rejects empty and non-string global partition results", () => {
-        const mutation = defineMutation({
-            ref: "api/settings#invalidSave",
-            authority: "global",
-            partitionKey: (args: { partition: string | number }) => args.partition,
-            handler: () => null,
+    test("rejects distinct handles with the same ref", () => {
+        const duplicate = Object.assign(async () => [], {
+            __chardbKind: "query" as const,
+            __chardbRef: listRows.__chardbRef,
+            __chardbCompilePlan: listRows.__chardbCompilePlan,
         });
-        const query = defineQuery({
-            ref: "api/settings#invalidRead",
-            authority: "global",
-            partitionKey: (args: { partition: string | number }) => args.partition,
-            intent: () => ({ kind: "select", tables: ["settings"] }),
-            handler: async () => [],
-        });
-        const manifest = manifestFromExports({ mutation, query });
+        expect(() => manifestFromExports({ listRows, duplicate })).toThrow("duplicate ref across query and query");
+    });
 
-        const emptyMutation = routeMutation(manifest, { ref: mutation.__chardbRef, args: { partition: "" } }, () => 0);
-        expect(emptyMutation).toMatchObject({
-            ok: false,
-            error: { code: "CDB_INVALID_ARGS", message: expect.stringContaining("nonempty string partition key") },
-        });
-        expect(() =>
-            routeValidatedQuery(manifest, { ref: query.__chardbRef, args: { partition: 1 } }, () => "policy")
-        ).toThrow("global query api/settings#invalidRead requires a nonempty string partition key");
+    test("routes mutations and reports unknown refs", () => {
+        const manifest = manifestFromExports({ createRow });
+        expect(
+            routeMutation(manifest, { ref: createRow.__chardbRef, args: { scope: "shared" } }, () => 7)
+        ).toMatchObject({ ok: true, authority: "global", partitionKey: "shared", vshard: 7 });
+        try {
+            resolveMutation(manifest, "api/manifest#missing" as ChardbRef);
+            throw new Error("expected throw");
+        } catch (error) {
+            expect(isCdbError(error)).toBe(true);
+        }
+    });
+
+    test("isolates malformed and deeply nested args from a valid planned sibling", async () => {
+        const manifest = manifestFromExports({ listRows, validatedRows });
+        await expect(
+            routeQuery(manifest, { ref: validatedRows.__chardbRef, args: { scope: 7 } }, () => "policy")
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS" } });
+        let deep: Record<string, unknown> = {};
+        for (let index = 0; index < 40; index++) deep = { child: deep };
+        await expect(
+            routeQuery(manifest, { ref: validatedRows.__chardbRef, args: deep as never }, () => "policy")
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS" } });
+        await expect(
+            routeQuery(manifest, { ref: listRows.__chardbRef, args: { scope: "shared" } }, () => "policy")
+        ).resolves.toMatchObject({ ok: true, partitionKey: "shared" });
     });
 });

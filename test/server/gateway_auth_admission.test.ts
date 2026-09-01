@@ -195,51 +195,6 @@ describe("Gateway authentication single-flight admission", () => {
         ]);
     });
 
-    test("keeps an unsupported stream error scoped to its request", async () => {
-        const socket = new FakeSocket(verifiedAttachment());
-
-        await gateway.webSocketMessage(
-            socket as unknown as WebSocket,
-            JSON.stringify({
-                t: "streamReq",
-                streamReqId: 7,
-                ref: "api.ts#exportRows",
-                args: {},
-                mutId: "stream-mut-1",
-            })
-        );
-
-        expect(socket.sent.map(message => JSON.parse(message))).toEqual([
-            expect.objectContaining({
-                t: "error",
-                code: "CDB_UNSUPPORTED_FEATURE",
-                streamReqId: 7,
-            }),
-        ]);
-        expect(socket.closed).toEqual([]);
-    });
-
-    test("distinguishes unauthenticated presence from an authenticated but unbound feature", async () => {
-        const pending = new FakeSocket(pendingAttachment());
-        await gateway.webSocketMessage(
-            pending as unknown as WebSocket,
-            JSON.stringify({ t: "presenceSub", key: "room-1" })
-        );
-
-        const verified = new FakeSocket(verifiedAttachment());
-        await gateway.webSocketMessage(
-            verified as unknown as WebSocket,
-            JSON.stringify({ t: "presenceSub", key: "room-1" })
-        );
-
-        expect(pending.sent.map(message => JSON.parse(message))).toEqual([
-            expect.objectContaining({ t: "error", code: "CDB_FORBIDDEN" }),
-        ]);
-        expect(verified.sent.map(message => JSON.parse(message))).toEqual([
-            expect.objectContaining({ t: "error", code: "CDB_AUTH_NOT_BOUND" }),
-        ]);
-    });
-
     test("admits one held hello, rate-limits duplicates, and commits only the owner", async () => {
         const socket = new FakeSocket(pendingAttachment());
         const internals = gateway as unknown as GatewayInternals;

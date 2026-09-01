@@ -88,17 +88,8 @@ const writeUserRow = api.mutation({
 const listUserRows = api.query({
     ref: USER_QUERY_REF,
     args: z.object({ userId: z.string() }),
-    authority: "user",
-    partitionKey: "userId",
-    intent: args => ({
-        kind: "select",
-        tables: ["gateway_user_rows"],
-        partitionKey: { table: "gateway_user_rows", column: "user_id", values: [args.userId] },
-        joinShape: "colocated",
-        intervals: [{ table: "gateway_user_rows", indexName: "user_id", intervals: [{ kind: "full" }] }],
-    }),
-    handler: async (ctx, args) =>
-        ctx.db.select().from(userRows).where(eq(userRows.userId, args.userId)).orderBy(userRows.id).all(),
+    query: (db, args) =>
+        db.select().from(userRows).where(eq(userRows.userId, args.userId)).orderBy(userRows.id).limit(100),
 });
 
 const writeGlobalRow = api.mutation({
@@ -115,57 +106,20 @@ const writeGlobalRow = api.mutation({
 const listGlobalRows = api.query({
     ref: GLOBAL_QUERY_REF,
     args: z.object({ namespace: z.string() }),
-    authority: "global",
-    partitionKey: "namespace",
-    intent: args => ({
-        kind: "select",
-        tables: ["gateway_global_rows"],
-        partitionKey: { table: "gateway_global_rows", column: "namespace", values: [args.namespace] },
-        joinShape: "colocated",
-        intervals: [
-            {
-                table: "gateway_global_rows",
-                indexName: "namespace",
-                intervals: [
-                    {
-                        kind: "range",
-                        lo: { kind: "value", value: [args.namespace], inclusive: true },
-                        hi: { kind: "value", value: [args.namespace], inclusive: true },
-                    },
-                ],
-            },
-        ],
-    }),
-    // Deliberately omit a caller predicate. The request-scoped global
-    // placement floor must keep neighboring partitions out of the result.
-    handler: async ctx => ctx.db.select().from(globalRows).orderBy(globalRows.id).all(),
+    query: (db, args) =>
+        db.select().from(globalRows).where(eq(globalRows.namespace, args.namespace)).orderBy(globalRows.id).limit(100),
 });
 
 const listPublicOrganizationRows = api.query({
     ref: PUBLIC_QUERY_REF,
     args: z.object({ organizationId: z.string() }),
-    authority: "organization",
-    partitionKey: "organizationId",
-    intent: args => ({
-        kind: "select",
-        tables: ["gateway_public_rows"],
-        partitionKey: {
-            table: "gateway_public_rows",
-            column: "organization_id",
-            values: [args.organizationId],
-        },
-        joinShape: "colocated",
-        intervals: [
-            {
-                table: "gateway_public_rows",
-                indexName: "organization_id",
-                intervals: [{ kind: "full" }],
-            },
-        ],
-    }),
-    // Deliberately omit a caller predicate. The authenticated organization
-    // floor must remain in force even though publicRead supplies the grant.
-    handler: async ctx => ctx.db.select().from(publicOrganizationRows).orderBy(publicOrganizationRows.id).all(),
+    query: (db, args) =>
+        db
+            .select()
+            .from(publicOrganizationRows)
+            .where(eq(publicOrganizationRows.organizationId, args.organizationId))
+            .orderBy(publicOrganizationRows.id)
+            .limit(100),
 });
 
 const publicManifest = manifestFromExports({
@@ -180,7 +134,6 @@ function withPublicQuery(base: ChardbManifest): ChardbManifest {
     return {
         mutations: new Map([...base.mutations, ...publicManifest.mutations]),
         queries: new Map([...base.queries, ...publicManifest.queries]),
-        ledgers: base.ledgers,
     };
 }
 

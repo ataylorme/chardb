@@ -19,9 +19,6 @@ export type { RawJson } from "./types.ts";
 export const PROTOCOL_V = 3 as const;
 export type ProtocolV = typeof PROTOCOL_V;
 
-export const PRESENCE_V = 1 as const;
-export type PresenceV = typeof PRESENCE_V;
-
 export interface Envelope {
     readonly protocolV: ProtocolV;
     readonly serverVersion: string;
@@ -114,20 +111,6 @@ export type Up =
     | { readonly t: "mut"; readonly mutId: MutId; readonly ref: ChardbRef; readonly args: RawJson }
     | { readonly t: "updateAuth"; readonly jwt: string }
     | { readonly t: "ack"; readonly cookie: Cookie }
-    | {
-          readonly t: "presencePub";
-          readonly key: string;
-          readonly state: RawJson;
-          readonly ttlMs?: number;
-      }
-    | { readonly t: "presenceSub"; readonly key: string }
-    | {
-          readonly t: "streamReq";
-          readonly streamReqId: number;
-          readonly ref: ChardbRef;
-          readonly args: RawJson;
-          readonly mutId: MutId;
-      }
     | { readonly t: "ping" };
 
 export type Down =
@@ -157,22 +140,9 @@ export type Down =
           readonly reason: MustRefetchReason;
       }
     | {
-          readonly t: "presence";
-          readonly key: string;
-          readonly version: PresenceV;
-          readonly states: readonly {
-              readonly clientId: ClientId;
-              readonly state: RawJson;
-              readonly ts: number;
-          }[];
-      }
-    | { readonly t: "streamChunk"; readonly streamReqId: number; readonly chunk: RawJson }
-    | { readonly t: "streamEnd"; readonly streamReqId: number; readonly finalMutResult: MutResult }
-    | {
           readonly t: "error";
           readonly code: CdbErrorCode;
           readonly subId?: SubId | undefined;
-          readonly streamReqId?: number | undefined;
           readonly retryable: boolean;
           readonly correlationId: CorrelationId;
           readonly docs: string;
@@ -197,9 +167,6 @@ const UP_TAG_RECORD = {
     mut: true,
     updateAuth: true,
     ack: true,
-    presencePub: true,
-    presenceSub: true,
-    streamReq: true,
     ping: true,
 } as const satisfies Record<Up["t"], true>;
 
@@ -208,9 +175,6 @@ const DOWN_TAG_RECORD = {
     poke: true,
     snapshot: true,
     mustRefetch: true,
-    presence: true,
-    streamChunk: true,
-    streamEnd: true,
     error: true,
 } as const satisfies Record<Down["t"], true>;
 
@@ -401,25 +365,6 @@ function validateMessage(message: WireObject, tag: string): void {
             onlyKeys(message, path, ["t", "cookie"]);
             stringValue(required(message, "cookie", path), `${path}.cookie`);
             return;
-        case "presencePub": {
-            onlyKeys(message, path, ["t", "key", "state", "ttlMs"]);
-            stringValue(required(message, "key", path), `${path}.key`);
-            rawJson(required(message, "state", path), `${path}.state`);
-            const ttlMs = optional(message, "ttlMs");
-            if (ttlMs !== undefined) nonnegativeNumber(ttlMs, `${path}.ttlMs`);
-            return;
-        }
-        case "presenceSub":
-            onlyKeys(message, path, ["t", "key"]);
-            stringValue(required(message, "key", path), `${path}.key`);
-            return;
-        case "streamReq":
-            onlyKeys(message, path, ["t", "streamReqId", "ref", "args", "mutId"]);
-            integerId(required(message, "streamReqId", path), `${path}.streamReqId`);
-            validateRef(required(message, "ref", path), `${path}.ref`);
-            rawJson(required(message, "args", path), `${path}.args`);
-            stringValue(required(message, "mutId", path), `${path}.mutId`);
-            return;
         case "ping":
             onlyKeys(message, path, ["t"]);
             return;
@@ -466,38 +411,10 @@ function validateMessage(message: WireObject, tag: string): void {
             if (!REFETCH_REASONS.has(reason as MustRefetchReason)) message.reason = "lagged";
             return;
         }
-        case "presence": {
-            onlyKeys(message, path, ["t", "key", "version", "states"]);
-            stringValue(required(message, "key", path), `${path}.key`);
-            const version = required(message, "version", path);
-            if (version !== PRESENCE_V) malformed(`${path}.version`, `equal ${PRESENCE_V}`);
-            const states = arrayValue(required(message, "states", path), `${path}.states`);
-            for (let index = 0; index < states.length; index++) {
-                const statePath = `${path}.states[${index}]`;
-                const state = objectValue(states[index], statePath);
-                onlyKeys(state, statePath, ["clientId", "state", "ts"]);
-                stringValue(required(state, "clientId", statePath), `${statePath}.clientId`);
-                rawJson(required(state, "state", statePath), `${statePath}.state`);
-                finiteNumber(required(state, "ts", statePath), `${statePath}.ts`);
-            }
-            return;
-        }
-        case "streamChunk":
-            onlyKeys(message, path, ["t", "streamReqId", "chunk"]);
-            integerId(required(message, "streamReqId", path), `${path}.streamReqId`);
-            rawJson(required(message, "chunk", path), `${path}.chunk`);
-            return;
-        case "streamEnd":
-            onlyKeys(message, path, ["t", "streamReqId", "finalMutResult"]);
-            integerId(required(message, "streamReqId", path), `${path}.streamReqId`);
-            validateMutResult(required(message, "finalMutResult", path), `${path}.finalMutResult`);
-            return;
         case "error": {
-            onlyKeys(message, path, ["t", "code", "subId", "streamReqId", "retryable", "correlationId", "docs"]);
+            onlyKeys(message, path, ["t", "code", "subId", "retryable", "correlationId", "docs"]);
             const subId = optional(message, "subId");
             if (subId !== undefined) integerId(subId, `${path}.subId`);
-            const streamReqId = optional(message, "streamReqId");
-            if (streamReqId !== undefined) integerId(streamReqId, `${path}.streamReqId`);
             stringValue(required(message, "correlationId", path), `${path}.correlationId`);
             validateErrorFields(message, path);
             return;

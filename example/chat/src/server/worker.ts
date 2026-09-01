@@ -8,6 +8,7 @@ import * as queries from "./queries.ts";
 import * as schema from "./schema.ts";
 
 export const app = chardb({
+    ownership: "organization",
     auth,
     authBasePath: "/api/auth",
     schema,

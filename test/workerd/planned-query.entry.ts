@@ -88,6 +88,7 @@ const driftedPlannedQueryRows = api.query({
 
 const driftedManifest = manifestFromExports({ driftedPlannedQueryRows });
 const app = chardb({
+    ownership: "organization",
     auth,
     schema: { plannedQueryRows },
     api: { listPlannedQueryRows },

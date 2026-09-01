@@ -41,7 +41,6 @@ export interface VerifiedGwAttachment {
     readonly authOrigin: string;
     readonly clientId: ClientId;
     readonly lastCookie?: Cookie;
-    readonly presenceKeys?: readonly string[];
     readonly snapshotSubIds?: readonly SubId[];
     /** Resumed subscriptions told to discard retained state and awaiting their replacement frame. */
     readonly resumeRefetchPendingSubIds?: readonly SubId[];
@@ -76,7 +75,6 @@ export interface GatewayJwtVerificationRequest {
     readonly connectionId: string;
     readonly clientId: ClientId;
     readonly lastCookie?: Cookie;
-    readonly presenceKeys?: readonly string[];
 }
 
 export interface TrustedMutationDispatchDeps {
@@ -473,7 +471,6 @@ export async function verifyGatewayJwt(request: GatewayJwtVerificationRequest): 
         authOrigin: request.authOrigin,
         clientId: request.clientId,
         ...(request.lastCookie !== undefined ? { lastCookie: request.lastCookie } : {}),
-        ...(request.presenceKeys !== undefined ? { presenceKeys: request.presenceKeys } : {}),
         principalId: PrincipalId(claims.sub),
         jwtExp: claims.exp,
         ...(typeof claims.nbf === "number" ? { jwtNbf: claims.nbf } : {}),

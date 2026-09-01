@@ -15,7 +15,13 @@ export const migrations = defineMigrations([
     }),
 ]);
 
-export const app = chardb({ auth, schema: domain, api: { ...api, ...queries }, migrations });
+export const app = chardb({
+    ownership: "organization",
+    auth,
+    schema: domain,
+    api: { ...api, ...queries },
+    migrations,
+});
 
 app.get("/health", c => c.text("ok"));
 app.get("/api/version", c => c.json({ name: "chardb-chat-example", version: "0.1.0" }));
@@ -82,44 +88,5 @@ app.post("/api/db/messages", async c => {
     });
     return c.json(result);
 });
-app.get("/api/db/preferences", async c => {
-    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
-    const url = new URL(c.req.url);
-    const rows = await client(c.env.DB, { jwt, authOrigin: url.origin }).query(queries.listUserPreferences, {
-        userId: url.searchParams.get("userId") ?? "",
-    });
-    return c.json(rows);
-});
-app.post("/api/db/preferences", async c => {
-    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
-    const url = new URL(c.req.url);
-    const body = await c.req.json<{ id: string; userId: string; theme: string; mutId?: string }>();
-    const result = await client(c.env.DB, { jwt, authOrigin: url.origin }).mutate(api.createUserPreference, body, {
-        ...(body.mutId ? { mutId: body.mutId } : {}),
-    });
-    return c.json(result);
-});
-app.get("/api/db/notices", async c => {
-    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
-    const url = new URL(c.req.url);
-    const rows = await client(c.env.DB, { jwt, authOrigin: url.origin }).query(queries.listGlobalNotices, {
-        namespace: url.searchParams.get("namespace") ?? "",
-    });
-    return c.json(rows);
-});
-app.post("/api/db/notices", async c => {
-    const jwt = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-    if (!jwt) return c.json({ error: "missing bearer token" }, 401);
-    const url = new URL(c.req.url);
-    const body = await c.req.json<{ id: string; namespace: string; body: string; mutId?: string }>();
-    const result = await client(c.env.DB, { jwt, authOrigin: url.origin }).mutate(api.createGlobalNotice, body, {
-        ...(body.mutId ? { mutId: body.mutId } : {}),
-    });
-    return c.json(result);
-});
-
 export default app;
 export const { DB, Catalog, Cdb, Gateway, Resharder } = app;

@@ -65,13 +65,8 @@ export interface MutationDescriptor {
 
 export interface QueryDescriptor {
     readonly ref: ChardbRef;
-    readonly invoke: (ctx: unknown, args: RawJson) => Promise<unknown>;
-    readonly invokeValidated: (ctx: unknown, args: RawJson) => Promise<unknown>;
     readonly validateArgs?: (args: unknown) => Promise<RawJson>;
-    readonly extractIntent?: (args: RawJson) => CdbIntent;
-    readonly authority?: MutationAuthority;
-    readonly extractPartitionKey?: (args: RawJson) => string | number | bigint | undefined;
-    readonly compilePlan?: (args: RawJson) => RegisteredQueryPlan;
+    readonly compilePlan: (args: RawJson) => RegisteredQueryPlan;
 }
 
 export type QueryRouteResponse =
@@ -90,21 +85,14 @@ export type QueryRouteResponse =
       }
     | { readonly ok: false; readonly error: ReturnType<CdbError["toJSON"]> };
 
-export interface LedgerDescriptor {
-    readonly ref: ChardbRef;
-    readonly tableName: string;
-}
-
 export interface ChardbManifest {
     readonly mutations: ReadonlyMap<ChardbRef, MutationDescriptor>;
     readonly queries: ReadonlyMap<ChardbRef, QueryDescriptor>;
-    readonly ledgers: ReadonlyMap<ChardbRef, LedgerDescriptor>;
 }
 
 const EMPTY: ChardbManifest = {
     mutations: new Map(),
     queries: new Map(),
-    ledgers: new Map(),
 };
 
 export function emptyManifest(): ChardbManifest {
@@ -164,7 +152,7 @@ function registeredSelectPlan(compiled: RegisteredQueryPlan | undefined, ref: st
     if (!metadataMatches) {
         throw new CdbError({
             code: "CDB_INVARIANT",
-            message: `query ${ref} canonical select plan disagrees with its legacy compiler metadata`,
+            message: `query ${ref} canonical select plan disagrees with its compiler metadata`,
         });
     }
     return plan;
@@ -233,24 +221,12 @@ export function routeValidatedQuery(
 ): Extract<QueryRouteResponse, { readonly ok: true }> {
     const callbackArgs = snapshotCdbQueryArgs(input.args);
     const descriptor = resolveQuery(manifest, input.ref as ChardbRef);
-    if (!descriptor.extractIntent && !descriptor.compilePlan) {
-        throw new CdbError({
-            code: "CDB_NO_INTENT_FOR_RAW_SQL",
-            message: `query ${input.ref} has no server intent extractor`,
-        });
-    }
-    const plan = descriptor.compilePlan?.(callbackArgs);
+    const plan = descriptor.compilePlan(callbackArgs);
     const selectPlan = registeredSelectPlan(plan, input.ref);
     const vectorPlan = registeredVectorPlan(plan, input.ref);
-    const intentCandidate = plan?.intent ?? descriptor.extractIntent?.(callbackArgs);
-    if (!intentCandidate) {
-        throw new CdbError({
-            code: "CDB_NO_INTENT_FOR_RAW_SQL",
-            message: `query ${input.ref} has no server intent extractor`,
-        });
-    }
-    const authority = plan?.authority ?? descriptor.authority;
-    const key = plan?.partitionKey ?? descriptor.extractPartitionKey?.(callbackArgs);
+    const intentCandidate = plan.intent;
+    const authority = plan.authority;
+    const key = plan.partitionKey;
     const args = snapshotCdbQueryArgs(callbackArgs);
     const intent = snapshotCdbJsonByteLimit(
         intentCandidate as unknown as RawJson,
@@ -274,7 +250,7 @@ export function routeValidatedQuery(
             args,
             intent,
             policyDigest,
-            ...(plan ? { planHash: plan.planHash } : {}),
+            planHash: plan.planHash,
         }),
         authority: authority ?? null,
         partitionKey: key === undefined ? null : String(key),
@@ -292,12 +268,6 @@ export async function routeQuery(
     try {
         const rawArgs = snapshotCdbQueryArgs(input.args);
         const descriptor = resolveQuery(manifest, input.ref as ChardbRef);
-        if (!descriptor.extractIntent && !descriptor.compilePlan) {
-            throw new CdbError({
-                code: "CDB_NO_INTENT_FOR_RAW_SQL",
-                message: `query ${input.ref} has no server intent extractor`,
-            });
-        }
         const validatedArgs = snapshotCdbQueryArgs(
             (descriptor.validateArgs ? await descriptor.validateArgs(rawArgs) : rawArgs) as RawJson
         );

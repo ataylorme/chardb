@@ -1,7 +1,7 @@
 /**
  * `Gateway` DO — Hibernatable WebSockets
  * (https://developers.cloudflare.com/durable-objects/api/hibernatable-websockets-api/),
- * sub registry, presence broadcast.
+ * subscription registry.
  *
  * Sharded by the full `clientId` through 4,096 pinned-hash Gateway buckets.
  * The per-conn 2 KiB `serializeAttachment` payload carries verified subject,
@@ -1190,15 +1190,6 @@ export class Gateway extends DurableObject<GatewayEnv> {
             case "ack":
                 this.onAck(ws, msg);
                 break;
-            case "presencePub":
-                this.onPresencePub(ws, msg);
-                break;
-            case "presenceSub":
-                this.onPresenceSub(ws, msg);
-                break;
-            case "streamReq":
-                this.sendStreamError(ws, "CDB_UNSUPPORTED_FEATURE", msg.streamReqId);
-                break;
             case "ping":
                 // Hibernation auto-replies; nothing to do.
                 break;
@@ -1394,7 +1385,6 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 clientId: current.clientId,
                 jwt: msg.jwt,
                 ...(current.lastCookie !== undefined ? { lastCookie: current.lastCookie } : {}),
-                ...(current.presenceKeys !== undefined ? { presenceKeys: current.presenceKeys } : {}),
             },
             isCurrent
         );
@@ -1435,7 +1425,6 @@ export class Gateway extends DurableObject<GatewayEnv> {
         ws.serializeAttachment({
             ...attachment,
             ...(latest.lastCookie !== undefined ? { lastCookie: latest.lastCookie } : {}),
-            ...(latest.presenceKeys !== undefined ? { presenceKeys: latest.presenceKeys } : {}),
             ...(latest.snapshotSubIds !== undefined ? { snapshotSubIds: latest.snapshotSubIds } : {}),
             ...(latest.resumeRefetchPendingSubIds !== undefined
                 ? { resumeRefetchPendingSubIds: latest.resumeRefetchPendingSubIds }
@@ -2300,24 +2289,6 @@ export class Gateway extends DurableObject<GatewayEnv> {
         }
     }
 
-    private onPresencePub(ws: WebSocket, msg: Extract<Up, { t: "presencePub" }>): void {
-        const sender = ws.deserializeAttachment() as GwAttachment | null;
-        void msg;
-        this.sendError(
-            ws,
-            isVerifiedAttachment(sender) && isCurrentVerifiedAttachment(sender) ? "CDB_AUTH_NOT_BOUND" : "CDB_FORBIDDEN"
-        );
-    }
-
-    private onPresenceSub(ws: WebSocket, msg: Extract<Up, { t: "presenceSub" }>): void {
-        const att = ws.deserializeAttachment() as GwAttachment | null;
-        void msg;
-        this.sendError(
-            ws,
-            isVerifiedAttachment(att) && isCurrentVerifiedAttachment(att) ? "CDB_AUTH_NOT_BOUND" : "CDB_FORBIDDEN"
-        );
-    }
-
     private catalog(): CatalogRoutingRpc {
         const id = this.env.CDB_CATALOG.idFromName("global");
         return this.env.CDB_CATALOG.get(id) as unknown as CatalogRoutingRpc;
@@ -2336,11 +2307,6 @@ export class Gateway extends DurableObject<GatewayEnv> {
     private sendError(ws: WebSocket, code: import("../../errors.ts").CdbErrorCode, subId?: SubId): void {
         const corr = CorrelationId(crypto.randomUUID());
         this.send(ws, gatewayErrorEnvelope(code, corr, subId));
-    }
-
-    private sendStreamError(ws: WebSocket, code: import("../../errors.ts").CdbErrorCode, streamReqId: number): void {
-        const corr = CorrelationId(crypto.randomUUID());
-        this.send(ws, { ...gatewayErrorEnvelope(code, corr), streamReqId });
     }
 
     private sendMutFailure(ws: WebSocket, mutId: MutId, error: CdbErrorWire, cookie: Cookie): void {

@@ -511,14 +511,6 @@ describe("configured Cdb domain schema", () => {
         );
 
         const schemaV2 = migrationSchemaV2();
-        const apiV2 = createApi(schemaV2);
-        let queryRuns = 0;
-        const listProjects = apiV2.query({
-            handler: async ctx => {
-                queryRuns += 1;
-                return ctx.db.select().from(schemaV2.projects).all();
-            },
-        });
         const ddlV2 = renderSqliteTableDdl(schemaV2.projects);
         const journalV2 = defineMigrations([
             {
@@ -536,20 +528,11 @@ describe("configured Cdb domain schema", () => {
         ]);
         const CdbV2 = configureCdbRuntime({
             schema: () => schemaV2,
-            manifest: () => manifestFromExports({ listProjects }),
+            manifest: () => manifestFromExports({}),
             migrations: () => journalV2,
         });
         const upgrading = construct(CdbV2, db);
         await upgrading.ready;
-        await expect(
-            upgrading.cdb.query({
-                domainSchemaEpoch: 1,
-                ref: listProjects.__chardbRef,
-                args: {},
-                auth: { userId: "user-1", role: "member", roles: ["member"], claims: {} },
-            })
-        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_STALE_EPOCH" } });
-        expect(queryRuns).toBe(0);
 
         upgrading.cdb.prepareSchemaMigration({
             migrationId: "rebuild-projects-v2",
@@ -575,26 +558,9 @@ describe("configured Cdb domain schema", () => {
         });
         const activeAgain = construct(CdbV2, db);
         await activeAgain.ready;
-        await expect(
-            activeAgain.cdb.query({
-                domainSchemaEpoch: 1,
-                ref: listProjects.__chardbRef,
-                args: {},
-                auth: { userId: "user-1", role: "member", roles: ["member"], claims: {} },
-            })
-        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_STALE_EPOCH" } });
-        await expect(
-            activeAgain.cdb.query({
-                domainSchemaEpoch: 2,
-                ref: listProjects.__chardbRef,
-                args: {},
-                auth: { userId: "user-1", role: "member", roles: ["member"], claims: {} },
-            })
-        ).resolves.toMatchObject({
-            ok: true,
-            result: [{ id: "project-1", slug: "retained", description: "migrated" }],
-        });
-        expect(queryRuns).toBe(1);
+        expect(db.query('SELECT id, slug, description FROM "domain_migration_projects"').all()).toEqual([
+            { id: "project-1", slug: "retained", description: "migrated" },
+        ]);
     });
 
     test("starts a fresh journal at version zero and applies every schema step before serving", async () => {

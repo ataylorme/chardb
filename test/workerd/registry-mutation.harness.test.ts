@@ -134,7 +134,7 @@ async function inspectGateway(): Promise<readonly Record<string, unknown>[]> {
 }
 
 async function registeredProof(
-    operation: "subscribe" | "unsubscribe" | "query" | "corrupt" | "runs",
+    operation: "subscribe" | "unsubscribe" | "query" | "corrupt",
     body: {
         readonly registrationId: string;
         readonly forgedIdentity?: boolean;
@@ -305,7 +305,7 @@ describe("configured Cdb local mutation registry", () => {
         expect(await inspectAtomicState()).toEqual(before);
     });
 
-    test("runs only active, intact registered query generations under fresh auth", async () => {
+    test("executes only active, intact registered query generations under fresh auth", async () => {
         const inserted = await mutate({
             operation: "put",
             mutId: "registered-query-row",
@@ -325,12 +325,9 @@ describe("configured Cdb local mutation registry", () => {
                     id: "registered-query-entry",
                     ownerId: "registry-user",
                     value: 64,
-                    freshProbe: "fresh-query-auth",
                 },
             ],
         });
-        expect(await registeredProof("runs", { registrationId: active })).toEqual({ runs: 1 });
-
         for (const forged of [
             { registrationId: active, forgedIdentity: true },
             { registrationId: active, forgedPrincipal: true },
@@ -358,7 +355,6 @@ describe("configured Cdb local mutation registry", () => {
                 error: { code: "CDB_INVARIANT" },
             });
         }
-        expect(await registeredProof("runs", { registrationId: active })).toEqual({ runs: 1 });
     });
 
     test("an unsubscribe-before-subscribe tombstone cannot reactivate", async () => {
@@ -418,7 +414,7 @@ describe("configured Cdb local mutation registry", () => {
         expect(await routingFence("cleanup", fence)).toMatchObject({ status: "cleaned" });
 
         const after = await inspectAtomicState();
-        expect(after.entries.filter(row => row.owner_id === ownerId)).toEqual([
+        expect(after.entries.filter(row => row.id.startsWith("native-fence-"))).toEqual([
             { id: "native-fence-source", owner_id: ownerId, value: 2 },
         ]);
         expect(after.opLogRows).toBe(before.opLogRows + 1);
