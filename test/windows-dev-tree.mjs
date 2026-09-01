@@ -8,6 +8,12 @@ import { isOccupiedPortFailure } from "./helpers/windows-port-collision.ts";
 
 if (process.platform !== "win32") throw new Error("windows-dev-tree.mjs must run on Windows");
 
+const CHILD_PROCESS_TIMEOUT_MS = 5 * 60_000;
+const FILESYSTEM_CLEANUP_TIMEOUT_MS = 30_000;
+const HTTP_REQUEST_TIMEOUT_MS = 10_000;
+const PROCESS_OUTPUT_TIMEOUT_MS = 5_000;
+const WINDOWS_UTILITY_TIMEOUT_MS = 10_000;
+
 const tarballArgument = process.argv.indexOf("--tarball");
 if (tarballArgument === -1 || !process.argv[tarballArgument + 1]) {
     throw new Error("usage: bun test/windows-dev-tree.mjs --tarball <package.tgz> [--report <report.json>]");
@@ -36,15 +42,19 @@ let identity;
 try {
     await mkdir(bootstrap, { recursive: true });
     await writeFile(join(bootstrap, "package.json"), '{"name":"chardb-windows-bootstrap","private":true}\n');
-    await mustRun(process.execPath, ["add", "--no-save", tarball], bootstrap);
+    await runPhase("install packed core candidate", () =>
+        mustRun(process.execPath, ["add", "--no-save", tarball], bootstrap)
+    );
     const chardb = join(bootstrap, "node_modules", "@chardb", "core", "dist", "cli", "bin.mjs");
     const candidatePackage = JSON.parse(
         await readFile(join(bootstrap, "node_modules", "@chardb", "core", "package.json"), "utf8")
     );
-    await mustRun(
-        process.execPath,
-        [chardb, "init", "generated-app", "--core-package", corePackage, "--react-package", reactPackage],
-        bootstrap
+    await runPhase("scaffold generated app", () =>
+        mustRun(
+            process.execPath,
+            [chardb, "init", "generated-app", "--core-package", corePackage, "--react-package", reactPackage],
+            bootstrap
+        )
     );
 
     const packageJson = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
@@ -58,7 +68,7 @@ try {
             `generated @chardb/react specifier ${String(packageJson.dependencies?.["@chardb/react"])} does not match ${reactPackage}`
         );
     }
-    await mustRun(process.execPath, ["install"], project);
+    await runPhase("install generated app", () => mustRun(process.execPath, ["install"], project));
     const installedPackage = JSON.parse(
         await readFile(join(project, "node_modules", "@chardb", "core", "package.json"), "utf8")
     );
@@ -78,64 +88,83 @@ try {
     if (!candidateCliBytes.equals(installedCliBytes)) {
         throw new Error("generated app did not install the CLI bytes used to create it");
     }
-    await mustRun(process.execPath, ["run", "typecheck"], project);
-    await mustRun(process.execPath, ["run", "test"], project);
-    await mustRun(process.execPath, ["run", "build"], project);
-    await mustRun(process.execPath, [installedChardb, "doctor", "wrangler"], project);
+    await runPhase("typecheck generated app", () => mustRun(process.execPath, ["run", "typecheck"], project));
+    await runPhase("test generated app", () => mustRun(process.execPath, ["run", "test"], project));
+    await runPhase("build generated app", () => mustRun(process.execPath, ["run", "build"], project));
+    await runPhase("run generated Wrangler doctor", () =>
+        mustRun(process.execPath, [installedChardb, "doctor", "wrangler"], project)
+    );
 
     const blockedWorker = await listen(0);
     const blockedAddress = blockedWorker.address();
     if (!blockedAddress || typeof blockedAddress === "string") throw new Error("blocked worker port is unavailable");
     const failedWebPort = await reservePort();
-    await proveOccupiedPortFailure({
-        blockedServer: blockedWorker,
-        blockedPort: blockedAddress.port,
-        workerPort: blockedAddress.port,
-        webPort: failedWebPort,
-        service: "Worker",
-        timeoutMs: 10_000,
-    });
+    await runPhase("prove occupied Worker port cleanup", () =>
+        proveOccupiedPortFailure({
+            blockedServer: blockedWorker,
+            blockedPort: blockedAddress.port,
+            workerPort: blockedAddress.port,
+            webPort: failedWebPort,
+            service: "Worker",
+            timeoutMs: 10_000,
+        })
+    );
 
     const failedWorkerPort = await reservePort();
     const blockedWeb = await listen(0);
     const blockedWebAddress = blockedWeb.address();
     if (!blockedWebAddress || typeof blockedWebAddress === "string") throw new Error("blocked web port is unavailable");
-    await proveOccupiedPortFailure({
-        blockedServer: blockedWeb,
-        blockedPort: blockedWebAddress.port,
-        workerPort: failedWorkerPort,
-        webPort: blockedWebAddress.port,
-        service: "Web",
-        timeoutMs: 30_000,
-    });
+    await runPhase("prove occupied Web port cleanup", () =>
+        proveOccupiedPortFailure({
+            blockedServer: blockedWeb,
+            blockedPort: blockedWebAddress.port,
+            workerPort: failedWorkerPort,
+            webPort: blockedWebAddress.port,
+            service: "Web",
+            timeoutMs: 30_000,
+        })
+    );
 
     for (let iteration = 0; iteration < 3; iteration++) {
+        const cycle = iteration + 1;
         const workerPort = await reservePort();
         const webPort = await reservePort();
         const workerOrigin = new URL(`http://127.0.0.1:${workerPort}`);
         const child = spawnGeneratedDev(workerPort, webPort);
         try {
-            await Promise.all([
-                waitForUrl(new URL("/health", workerOrigin), child),
-                waitForUrl(`http://127.0.0.1:${webPort}`, child),
-            ]);
+            await runPhase(`restart cycle ${cycle}: wait for Worker and Web`, () =>
+                Promise.all([
+                    waitForUrl(new URL("/health", workerOrigin), child),
+                    waitForUrl(`http://127.0.0.1:${webPort}`, child),
+                ])
+            );
             if (iteration === 0) {
-                identity = await provisionOrganization(workerOrigin);
-                await writeMessage(workerOrigin, identity.token, identity.organizationId, messageId);
+                identity = await runPhase(`restart cycle ${cycle}: provision organization`, () =>
+                    provisionOrganization(workerOrigin)
+                );
+                await runPhase(`restart cycle ${cycle}: write organization data`, () =>
+                    writeMessage(workerOrigin, identity.token, identity.organizationId, messageId)
+                );
             } else {
                 if (!identity) throw new Error("persistence identity was not provisioned");
-                identity.token = await issueToken(workerOrigin, identity.cookie);
+                identity.token = await runPhase(`restart cycle ${cycle}: refresh auth token`, () =>
+                    issueToken(workerOrigin, identity.cookie)
+                );
             }
             if (!identity) throw new Error("persistence identity is unavailable");
-            await assertMessage(workerOrigin, identity.token, identity.organizationId, messageId);
+            await runPhase(`restart cycle ${cycle}: read persisted organization data`, () =>
+                assertMessage(workerOrigin, identity.token, identity.organizationId, messageId)
+            );
 
-            const before = await processSnapshot();
+            const before = await runPhase(`restart cycle ${cycle}: snapshot descendants`, processSnapshot);
             const descendants = descendantProcesses(before, child.pid);
             if (descendants.length < 3) {
                 throw new Error(`iteration ${iteration + 1} observed only ${descendants.length} dev descendants`);
             }
 
-            const stopped = await runUtility(["taskkill.exe", "/PID", String(child.pid), "/F"]);
+            const stopped = await runPhase(`restart cycle ${cycle}: force-stop dev parent`, () =>
+                runUtility(["taskkill.exe", "/PID", String(child.pid), "/F"])
+            );
             if (stopped.exitCode !== 0) {
                 throw new Error(
                     `iteration ${iteration + 1} could not force-stop the dev parent: ${stopped.stderr.trim()}`
@@ -143,10 +172,15 @@ try {
             }
             const exited = await Promise.race([child.exited.then(() => true), Bun.sleep(5_000).then(() => false)]);
             if (!exited) throw new Error(`iteration ${iteration + 1} dev parent survived forced termination`);
-            await waitForProcessesToExit(descendants, 5_000);
-            await waitForNoProjectProcesses(project, 5_000);
-            await assertPortReusable(workerPort);
-            await assertPortReusable(webPort);
+            await runPhase(`restart cycle ${cycle}: verify descendant cleanup`, () =>
+                waitForProcessesToExit(descendants, 5_000)
+            );
+            await runPhase(`restart cycle ${cycle}: verify project cleanup`, () =>
+                waitForNoProjectProcesses(project, 5_000)
+            );
+            await runPhase(`restart cycle ${cycle}: verify port reuse`, () =>
+                Promise.all([assertPortReusable(workerPort), assertPortReusable(webPort)])
+            );
         } finally {
             if (child.exitCode === null) {
                 await runUtility(["taskkill.exe", "/PID", String(child.pid), "/T", "/F"]).catch(() => undefined);
@@ -163,54 +197,56 @@ try {
                 JSON.parse(await readFile(join(project, "node_modules", name, "package.json"), "utf8"))
             )
         );
-        await writeJsonAtomically(
-            reportPath,
-            buildWindowsOsCiReport({
-                package: {
-                    name: installedPackage.name,
-                    version: installedPackage.version,
-                    tarball: await fingerprintFile(tarball),
-                },
-                reactPackage: {
-                    name: installedReactPackage.name,
-                    version: installedReactPackage.version,
-                    tarball: await fingerprintFile(reactTarball),
-                },
-                platform: {
-                    name: "windows-latest",
-                    operatingSystem: process.platform,
-                    release: release(),
-                    architecture: arch(),
-                },
-                runtime: {
-                    bun: Bun.version,
-                    nodeCompatibility: process.versions.node,
-                    wrangler: wranglerPackage.version,
-                    miniflare: miniflarePackage.version,
-                    betterAuth: betterAuthPackage.version,
-                },
-                run: {
-                    id: `${Date.now().toString(36)}-${process.pid}`,
-                    startedAt,
-                    durationMs: performance.now() - startedAtMs,
-                    ci,
-                },
-                forcedParentTerminationCycles: 3,
-                checks: {
-                    packedCandidateInstalled: true,
-                    packedReactCandidateInstalled: true,
-                    generatedTypecheckPassed: true,
-                    cloudflareVitestPassed: true,
-                    generatedBuildPassed: true,
-                    wranglerDoctorPassed: true,
-                    workerPortCollisionCleanup: true,
-                    webPortCollisionCleanup: true,
-                    descendantCleanup: true,
-                    portReuse: true,
-                    betterAuthPersistence: true,
-                    organizationDataPersistence: true,
-                },
-            })
+        await runPhase("write Windows CI evidence", async () =>
+            writeJsonAtomically(
+                reportPath,
+                buildWindowsOsCiReport({
+                    package: {
+                        name: installedPackage.name,
+                        version: installedPackage.version,
+                        tarball: await fingerprintFile(tarball),
+                    },
+                    reactPackage: {
+                        name: installedReactPackage.name,
+                        version: installedReactPackage.version,
+                        tarball: await fingerprintFile(reactTarball),
+                    },
+                    platform: {
+                        name: "windows-latest",
+                        operatingSystem: process.platform,
+                        release: release(),
+                        architecture: arch(),
+                    },
+                    runtime: {
+                        bun: Bun.version,
+                        nodeCompatibility: process.versions.node,
+                        wrangler: wranglerPackage.version,
+                        miniflare: miniflarePackage.version,
+                        betterAuth: betterAuthPackage.version,
+                    },
+                    run: {
+                        id: `${Date.now().toString(36)}-${process.pid}`,
+                        startedAt,
+                        durationMs: performance.now() - startedAtMs,
+                        ci,
+                    },
+                    forcedParentTerminationCycles: 3,
+                    checks: {
+                        packedCandidateInstalled: true,
+                        packedReactCandidateInstalled: true,
+                        generatedTypecheckPassed: true,
+                        cloudflareVitestPassed: true,
+                        generatedBuildPassed: true,
+                        wranglerDoctorPassed: true,
+                        workerPortCollisionCleanup: true,
+                        webPortCollisionCleanup: true,
+                        descendantCleanup: true,
+                        portReuse: true,
+                        betterAuthPersistence: true,
+                        organizationDataPersistence: true,
+                    },
+                })
+            )
         );
     }
 
@@ -235,8 +271,8 @@ try {
 
     async function proveOccupiedPortFailure({ blockedServer, blockedPort, workerPort, webPort, service, timeoutMs }) {
         const failedStartup = spawnGeneratedDev(workerPort, webPort, "pipe");
-        const failedStdout = new Response(failedStartup.stdout).text();
-        const failedStderr = new Response(failedStartup.stderr).text();
+        const failedStdout = drainStream(failedStartup.stdout);
+        const failedStderr = drainStream(failedStartup.stderr);
         try {
             const exited = await Promise.race([
                 failedStartup.exited.then(() => true),
@@ -244,7 +280,12 @@ try {
             ]);
             if (!exited) throw new Error(`generated dev did not exit after ${service} startup failure`);
             if (failedStartup.exitCode === 0) throw new Error(`generated dev accepted an occupied ${service} port`);
-            const output = `${await failedStdout}\n${await failedStderr}`;
+            const [stdout, stderr] = await withTimeout(
+                Promise.all([failedStdout.promise, failedStderr.promise]),
+                PROCESS_OUTPUT_TIMEOUT_MS,
+                `${service} collision output`
+            );
+            const output = `${stdout}\n${stderr}`;
             if (!isOccupiedPortFailure(output, blockedPort)) {
                 throw new Error(
                     `generated dev failed for an unrelated reason instead of occupied ${service} port ${blockedPort}: ${output}`
@@ -258,27 +299,112 @@ try {
                 );
                 await Promise.race([failedStartup.exited, Bun.sleep(2_000)]);
             }
+            await Promise.all([failedStdout.cancel(), failedStderr.cancel()]);
         }
         await waitForNoProjectProcesses(project, 5_000);
         await assertPortReusable(workerPort);
         await assertPortReusable(webPort);
     }
 } finally {
-    await rm(root, { recursive: true, force: true });
+    await runPhase("remove temporary generated app", () =>
+        withTimeout(
+            rm(root, { recursive: true, force: true }),
+            FILESYSTEM_CLEANUP_TIMEOUT_MS,
+            "temporary generated app cleanup"
+        )
+    );
 }
 
 async function mustRun(command, args, cwd) {
     const child = Bun.spawn([command, ...args], { cwd, stdin: "ignore", stdout: "inherit", stderr: "inherit" });
-    const exitCode = await child.exited;
+    let exitCode;
+    try {
+        exitCode = await withTimeout(child.exited, CHILD_PROCESS_TIMEOUT_MS, `${command} ${args.join(" ")}`);
+    } catch (error) {
+        await runUtility(["taskkill.exe", "/PID", String(child.pid), "/T", "/F"]).catch(() => undefined);
+        if (child.exitCode === null) child.kill("SIGKILL");
+        await withTimeout(child.exited, 2_000, `${command} termination`).catch(() => undefined);
+        throw error;
+    }
     if (exitCode !== 0) throw new Error(`${command} exited with status ${exitCode}`);
 }
 
 async function runUtility(command) {
     const child = Bun.spawn(command, { stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true });
-    const stdout = new Response(child.stdout).text();
-    const stderr = new Response(child.stderr).text();
-    const exitCode = await child.exited;
-    return { exitCode, stdout: await stdout, stderr: await stderr };
+    const stdout = drainStream(child.stdout);
+    const stderr = drainStream(child.stderr);
+    const label = command.join(" ");
+    try {
+        const exitCode = await withTimeout(child.exited, WINDOWS_UTILITY_TIMEOUT_MS, label);
+        const output = await withTimeout(
+            Promise.all([stdout.promise, stderr.promise]),
+            PROCESS_OUTPUT_TIMEOUT_MS,
+            `${label} output`
+        );
+        return { exitCode, stdout: output[0], stderr: output[1] };
+    } catch (error) {
+        if (child.exitCode === null) child.kill("SIGKILL");
+        await withTimeout(child.exited, 2_000, `${label} termination`).catch(() => undefined);
+        throw error;
+    } finally {
+        await Promise.all([stdout.cancel(), stderr.cancel()]);
+    }
+}
+
+function drainStream(stream) {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    const promise = (async () => {
+        let output = "";
+        while (true) {
+            const chunk = await reader.read();
+            if (chunk.done) return output + decoder.decode();
+            output += decoder.decode(chunk.value, { stream: true });
+        }
+    })();
+    void promise.catch(() => undefined);
+    return {
+        promise,
+        cancel: async () => {
+            await withTimeout(
+                reader.cancel().catch(() => undefined),
+                PROCESS_OUTPUT_TIMEOUT_MS,
+                "process output cancellation"
+            ).catch(() => undefined);
+            try {
+                reader.releaseLock();
+            } catch {
+                // A timed-out read can retain its lock without blocking harness cleanup.
+            }
+        },
+    };
+}
+
+async function runPhase(label, operation) {
+    const started = performance.now();
+    console.log(`[windows-dev-tree] ${label}: start`);
+    try {
+        const result = await operation();
+        console.log(`[windows-dev-tree] ${label}: passed (${Math.round(performance.now() - started)}ms)`);
+        return result;
+    } catch (error) {
+        console.error(`[windows-dev-tree] ${label}: failed (${Math.round(performance.now() - started)}ms)`);
+        throw error;
+    }
+}
+
+async function withTimeout(promise, timeoutMs, label) {
+    let timer;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 async function processSnapshot() {
@@ -370,12 +496,12 @@ async function provisionOrganization(origin) {
 }
 
 async function signIn(origin) {
-    const response = await fetch(new URL("/api/auth/sign-in/anonymous", origin), {
+    const response = await fetchWithTimeout(new URL("/api/auth/sign-in/anonymous", origin), {
         method: "POST",
         headers: { "content-type": "application/json", origin: origin.origin },
         body: "{}",
     });
-    const text = await response.text();
+    const text = await readResponseText(response);
     if (!response.ok) throw new Error(`anonymous sign-in failed (${response.status}): ${text}`);
     const cookie = sessionCookies(response.headers);
     if (!cookie) throw new Error("anonymous sign-in returned no session cookie");
@@ -383,12 +509,12 @@ async function signIn(origin) {
 }
 
 async function postAuthJson(origin, path, cookie, body) {
-    const response = await fetch(new URL(`/api/auth/${path}`, origin), {
+    const response = await fetchWithTimeout(new URL(`/api/auth/${path}`, origin), {
         method: "POST",
         headers: { "content-type": "application/json", cookie, origin: origin.origin },
         body: JSON.stringify(body),
     });
-    const text = await response.text();
+    const text = await readResponseText(response);
     let parsed;
     try {
         parsed = JSON.parse(text);
@@ -431,8 +557,8 @@ async function assertMessage(origin, token, organizationId, expectedId) {
 }
 
 async function fetchJson(url, init) {
-    const response = await fetch(url, init);
-    const text = await response.text();
+    const response = await fetchWithTimeout(url, init);
+    const text = await readResponseText(response);
     let body;
     try {
         body = JSON.parse(text);
@@ -440,6 +566,14 @@ async function fetchJson(url, init) {
         throw new Error(`${url.pathname} returned invalid JSON (${response.status}): ${text}`);
     }
     return { response, body };
+}
+
+function fetchWithTimeout(url, init = {}) {
+    return fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(HTTP_REQUEST_TIMEOUT_MS) });
+}
+
+function readResponseText(response) {
+    return withTimeout(response.text(), HTTP_REQUEST_TIMEOUT_MS, `${response.url} response body`);
 }
 
 function sessionCookies(headers) {
@@ -469,7 +603,7 @@ async function waitForUrl(url, child) {
     while (Date.now() < deadline) {
         if (child.exitCode !== null) throw new Error(`generated dev exited before ${url} became ready`);
         try {
-            const response = await fetch(url);
+            const response = await fetchWithTimeout(url);
             if (response.ok) return;
         } catch {
             // The generated server has not opened its listener yet.

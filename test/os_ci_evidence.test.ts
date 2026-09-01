@@ -213,6 +213,20 @@ describe("cross-OS CI evidence", () => {
         expect(workflow).toContain("name: os-ci-${{ github.sha }}-${{ github.run_attempt }}");
     });
 
+    test("bounds Windows command, HTTP, output, and temp-cleanup waits", async () => {
+        const harness = await readFile(path.resolve(import.meta.dir, "windows-dev-tree.mjs"), "utf8");
+
+        expect(harness).toContain("CHILD_PROCESS_TIMEOUT_MS");
+        expect(harness).toContain("WINDOWS_UTILITY_TIMEOUT_MS");
+        expect(harness).toContain("AbortSignal.timeout(HTTP_REQUEST_TIMEOUT_MS)");
+        expect(harness).toContain("readResponseText(response)");
+        expect(harness).toContain("FILESYSTEM_CLEANUP_TIMEOUT_MS");
+        expect(harness).toContain("[windows-dev-tree] ${label}: start");
+        expect(harness).toContain("restart cycle ${cycle}: force-stop dev parent");
+        expect(harness).not.toContain("const response = await fetch(url);");
+        expect(harness).not.toContain("const exitCode = await child.exited;");
+    });
+
     test("builds one candidate and hands the exact artifact to all three OS jobs", async () => {
         const workflow = await readFile(path.resolve(import.meta.dir, "../.github/workflows/ci.yml"), "utf8");
         const occurrences = (needle: string): number => workflow.split(needle).length - 1;
