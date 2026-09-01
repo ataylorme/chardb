@@ -1,14 +1,4 @@
-/**
- * The locked `defineXxx` surface.
- *
- * Each helper takes a typed handler and returns a typed function reference.
- * The reference IS the wire identifier; there is no hidden runtime managing a
- * separate string registry. On the server, the helper's return value is a
- * function `(ctx, args) => result`. On the client, the same value is passed
- * to `useMutation(postMessage)` and the SDK reads `__chardbRef` to fill the
- * wire `ref` field. Renaming an export bumps the wire id; deleting it
- * removes it. Users never type a wire identifier.
- */
+/** Internal builders behind the public `api.query` and `api.mutation` object. */
 
 import type { StandardSchemaV1 } from "@standard-schema/spec";
 import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
@@ -16,7 +6,6 @@ import { CdbError, type CdbErrorCode } from "../errors.ts";
 import type { Brand, RawJson } from "../types.ts";
 import type { VectorMutationApi } from "../vector.ts";
 import { wrapDb } from "./cdb-db-proxy.ts";
-import { type PolicyDefinition, chardbPolicy } from "./policy.ts";
 import { attachRef } from "./refs.ts";
 import { type RegisteredQueryPlan, compileRegisteredQueryPlan } from "./registered-query-plan.ts";
 
@@ -451,21 +440,10 @@ export interface UserError {
     readonly message: string;
 }
 
-/**
- * The `db` instance handed to mutation / query closures. Parameterised
- * over the merged schema record (auth tables + the user's domain tables);
- * `createApi<typeof schema>()` binds this for you so call sites never
- * have to spell out a `BaseSQLiteDatabase<...>` alias.
- */
+/** Drizzle database passed to query and mutation handlers. */
 export type ChardbDb<TSchema extends Record<string, unknown>> = BaseSQLiteDatabase<"sync", unknown, TSchema>;
 
-/**
- * Typed `mutation` / `query` factories bound to a concrete schema. The
- * args type for each handler is inferred from the inline annotation
- * (`(ctx, args: { … }) => { … }`) and the result from the return
- * value — no `defineMutation<Db, Args, Result>` explicit-generic
- * triplet, no `& { [k: string]: RawJson }` intersection.
- */
+/** Schema-bound handle builders used inside the runtime and its tests. */
 export interface ChardbApi<TSchema extends Record<string, unknown>> {
     mutation<TArgs extends Record<string, unknown>, TResult>(
         config: MutationConfig<ChardbDb<TSchema>, TArgs, TResult>
@@ -477,70 +455,15 @@ export interface ChardbApi<TSchema extends Record<string, unknown>> {
     query<TArgs extends Record<string, unknown>, TBuilder extends PlannedQueryBuilder>(
         config: PlannedQueryConfig<ChardbDb<TSchema>, TArgs, TBuilder>
     ): QueryFn<ChardbDb<TSchema>, TArgs, PlannedQueryResult<TBuilder>>;
-    /**
-     * Row-level policy with `TRow` inferred from the `TTable` generic's
-     * Drizzle `$inferSelect`. Pass the table at the type level only —
-     * `api.policy<typeof messages>("name", { using, usingSql, … })` —
-     * so the call site doesn't have to read a table value at module init
-     * (which would force ESM cycle evaluation between `worker.ts` and
-     * `schema.ts`).
-     */
-    policy<TTable>(
-        name: string,
-        def: Omit<PolicyDefinition<TTable, RowFromTable<TTable>>, "name">
-    ): PolicyDefinition<TTable, RowFromTable<TTable>>;
 }
 
-type RowFromTable<TTable> = TTable extends { readonly $inferSelect: infer R } ? R : unknown;
-
-/**
- * Build a schema-bound `{ mutation, query, policy }` object. The
- * user's `api.ts` calls this once with their schema namespace and the
- * synthesized auth tables; every subsequent definition reuses the bound
- * `TDb`, so the inline call sites stay declaration-free.
- *
- * ```ts
- * import { auth } from "./worker.ts";
- * import * as schema from "./schema.ts";
- * import { createApi } from "@chardb/core/server";
- *
- * const api = createApi({ ...auth, ...schema });
- *
- * export const postMessage = api.mutation(
- *   async (ctx, args: { organizationId: string; body: string; … }) => { … },
- *   { singlePartition: true, partitionKey: (a) => a.organizationId },
- * );
- * ```
- *
- * The `@chardb/react` hooks derive their `TArgs` / `TResult` types from
- * the returned function via `Parameters<typeof postMessage>[1]` and
- * `Awaited<ReturnType<typeof postMessage>>`, so the user never exports a
- * separate `*Args` type alias for the wire shape.
- */
+/** Build internal schema-bound query and mutation helpers. */
 export function createApi<const TSchema extends Record<string, unknown>>(_schema?: TSchema): ChardbApi<TSchema> {
     return {
         mutation: defineMutation as ChardbApi<TSchema>["mutation"],
         query: defineQuery as ChardbApi<TSchema>["query"],
-        // `policy` is structurally identical to the standalone `chardbPolicy`
-        // — the method exists on `api` for symmetry with `api.mutation` /
-        // `api.query`, but it's a type-only sugar (TTable is a generic, not
-        // a value arg) so the call site never reads a table value at module
-        // init and the ESM cycle stays benign.
-        policy: chardbPolicy as ChardbApi<TSchema>["policy"],
     };
 }
 
-/**
- * Ready-to-use `{ mutation, query, policy }` factory bound
- * to an open schema. Drops the `createApi<typeof auth & typeof
- * domain>()` line every `api.ts` used to start with — the user just
- * does `import { api } from "@chardb/core/server"` and writes `api.mutation
- * ({...})` directly. Calls like `ctx.db.select().from(messages)`
- * still typecheck because Drizzle's `.from(table)` reads the table's
- * own row type rather than the bound schema generic.
- *
- * For full Drizzle "relational queries" typing (`ctx.db.query
- * .messages.findMany()`), users can still write `const api =
- * createApi<typeof schema>()` — the local-binding path stays public.
- */
+/** Internal open-schema helper wrapped by the public server entrypoint. */
 export const api: ChardbApi<Record<string, unknown>> = createApi();
