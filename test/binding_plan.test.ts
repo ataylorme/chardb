@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
     and,
-    asc,
     between,
     desc,
     eq,

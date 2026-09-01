@@ -19,7 +19,7 @@ import {
     queryCdbVectorizeCandidates,
 } from "../../src/server/do/cdb-vectorize-adapter.ts";
 import { cdbVectorizePhysicalIdFromCanonical } from "../../src/server/do/cdb-vectorize-wire.ts";
-import { type Cdb, type CdbEnv, configureCdbRuntime } from "../../src/server/do/cdb.ts";
+import { type CdbEnv, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { manifestFromExports } from "../../src/server/manifest.ts";
 import {

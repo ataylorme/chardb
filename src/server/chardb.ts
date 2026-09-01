@@ -1,38 +1,10 @@
 /**
- * `chardb({ … })` — the single Worker-entry factory.
+ * Build the Worker entrypoint from one ownership mode, Better Auth setup,
+ * domain schema, API handles, and migration journal.
  *
- * Returns the wrangler-ready module: a Hono app you can mount your own
- * routes on, with `.fetch`, the native `DB` entrypoint, the four chardb Durable Object
- * classes, the synthesized better-auth schema, and the chardb-managed
- * `auth` value all hanging off the same object. One call replaces
- * `defineAuth` + `defineChardb` + `new Hono()` + `mountChardb` + the DO
- * re-exports. Runtime internals remain behind the factory.
- *
- * The shape:
- *
- *   const app = chardb({
- *     ownership: "organization",
- *     appName: "chat",
- *     plugins: [organization()],
- *     schema: domain,
- *     api,
- *   });
- *   app.get("/health", (c) => c.text("ok"));
- *   app.get("/me", async (c) => c.json(
- *     await c.var.auth.api.getSession({ headers: c.req.raw.headers })
- *   ));
- *   export default app;
- *   export const { DB, Cdb, Catalog, Gateway, Resharder } = app;
- *
- * Schema authors reach the synthesized auth tables via the live ESM
- * binding (`import { app } from "./worker.ts"`) — Drizzle's
- * `.references(() => app.auth.organization.id)` thunk defers past the
- * cycle so the import order is safe.
- *
- * API authors keep using `createApi<typeof app.schema>()` — the schema
- * type is published on the factory output, so the user types exactly
- * one schema reference per file (no separate `typeof auth & typeof
- * domain` intersection).
+ * The returned Hono app owns the mounted auth and database routes. It also
+ * exposes the native DB entrypoint and Durable Object classes required by
+ * Wrangler, so the Worker module can export them with one destructuring line.
  */
 
 import { type Auth, type BetterAuthOptions, type BetterAuthPlugin, betterAuth } from "better-auth";
@@ -61,41 +33,16 @@ import { type OrganizationFileHttpAuth, handleOrganizationFileRequest } from "./
 import { assertSchemaResourceJournal, collectSchemaFileResourceDescriptors } from "./resource-descriptors.ts";
 import { type ChardbMigrationJournal, defineMigrations } from "./schema-migrations.ts";
 
-/**
- * Input shape. Two equivalent ways to provide the auth profile:
- *
- *   - `auth: defineAuth({ … })` — pre-built `ChardbAuth` value (the
- *     recommended path; the user's `schema.ts` can `import { auth }
- *     from "./worker.ts"` to FK-reference `auth.organization.id` etc.
- *     without dragging the chardb factory's schema-dependent type
- *     into the cycle).
- *   - `auth: { plugins, appName, … }` — inline better-auth options
- *     when the user doesn't need `auth` as a separate named export
- *     (chardb runs `defineAuth(...)` internally and exposes the
- *     synthesized bundle as `app.auth`).
- *
- * `api?` lets the user pass the handler-module namespace (`import * as
- * api from "./api.ts"`) so chardb can walk it for `__chardbRef`
- * markers and build the manifest lazily.
- *
- * `routes?: (app) => void` lets the user wire Hono routes inline; if
- * omitted, they can chain `app.get/post/…` on the returned object.
- * Every route receives the same per-env Better Auth instance that owns
- * `/api/auth/*` as `c.var.auth`.
- */
+/** Configure the Worker runtime and the one ownership mode its schema accepts. */
 export interface ChardbFactoryInput<
     TPlugins extends readonly BetterAuthPlugin[],
     TSchema extends Record<string, unknown>,
 > extends Omit<DefineChardbInput<TSchema>, "auth" | "refs" | "policy" | "manifest"> {
     /** The single ownership model accepted by this Worker's domain schema. */
     readonly ownership: "organization" | "user";
-    /**
-     * Either a pre-built bundle from `defineAuth({ plugins })` or
-     * inline better-auth options (`{ plugins, appName, … }`). Omit to
-     * get the core four better-auth tables with no plugins.
-     */
+    /** A `defineAuth()` bundle or inline Better Auth options. */
     readonly auth?: ChardbAuth<TPlugins> | AuthOptionsInput<TPlugins>;
-    /** Handler-module namespace (`import * as api from "./api.ts"`). */
+    /** Handler module namespace, usually `{ ...queries, ...mutations }`. */
     readonly api?: DefineChardbInput<TSchema>["refs"];
     /** Inline-route hook so the whole config can read top-to-bottom. */
     readonly routes?: (app: Hono<ChardbHonoEnv<TPlugins>>) => void;
@@ -104,24 +51,12 @@ export interface ChardbFactoryInput<
     readonly migrations?: ChardbMigrationJournal;
 }
 
-/**
- * The factory return — a single object that satisfies wrangler's
- * worker module contract, the Hono routing surface, AND chardb's
- * typed-handle requirements.
- *
- * Notable fields:
- *   - `fetch` (replaces Hono's) is the chardb-mounted handler.
- *   - `auth` is the `ChardbAuth` value (synthesized tables + options).
- *   - `schema` is the merged auth + domain schema typed for downstream
- *     `createApi<typeof app.schema>()` calls.
- *   - DO classes are direct fields so `export const { Cdb, … } = app`
- *     drops the DO re-export ceremony to a single destructure line.
- */
+/** Hono app plus the bindings and classes required by the Worker module. */
 export type ChardbAppEnv = ChardbEnv & { readonly DB: ChardbBinding };
 
 type MutablePluginTuple<TPlugins extends readonly BetterAuthPlugin[]> = [...TPlugins];
 
-/** The Better Auth server instance available to Hono routes as `c.var.auth`. */
+/** Better Auth server instance available to Hono routes as `c.var.auth`. */
 export type ChardbAuthRuntime<TPlugins extends readonly BetterAuthPlugin[]> = Auth<
     Omit<BetterAuthOptions, "plugins"> & { plugins: MutablePluginTuple<TPlugins> }
 >;
@@ -145,12 +80,7 @@ export type ChardbApp<TPlugins extends readonly BetterAuthPlugin[], TSchema exte
     readonly Resharder: typeof Resharder;
 };
 
-/**
- * Type guard: `ChardbAuth` carries an `.options` field (the original
- * better-auth options) and a `user` synthesized table. A raw options
- * object passed inline has neither, so the presence of `.options` is
- * the discriminator.
- */
+/** Distinguish a `defineAuth()` bundle from inline Better Auth options. */
 function isChardbAuth<TPlugins extends readonly BetterAuthPlugin[]>(
     value: ChardbAuth<TPlugins> | AuthOptionsInput<TPlugins>
 ): value is ChardbAuth<TPlugins> {
@@ -174,16 +104,10 @@ export function chardb<
             hint: 'Pass ownership: "organization" or ownership: "user" to chardb().',
         });
     }
-    // Resolve the auth profile. The `auth` slot accepts either a
-    // pre-built `ChardbAuth` (from `defineAuth(...)`) or raw better-auth
-    // options (`{ plugins, appName, … }`). We discriminate by the
-    // presence of `.options` — `ChardbAuth` carries the original options
-    // under `auth.options`, while a freshly-passed options object IS
-    // those options. Omit entirely → no plugins, core four tables only.
-    const auth: ChardbAuth<TPlugins> = (() => {
-        if (input.auth && isChardbAuth(input.auth)) return input.auth;
-        return defineAuth((input.auth ?? {}) as unknown as AuthOptionsInput<TPlugins>);
-    })();
+    const auth: ChardbAuth<TPlugins> =
+        input.auth && isChardbAuth(input.auth)
+            ? input.auth
+            : defineAuth((input.auth ?? {}) as unknown as AuthOptionsInput<TPlugins>);
 
     const refsValue = input.api;
     const authBasePath = input.authBasePath ?? auth.options.basePath ?? "/api/auth";

@@ -6,7 +6,6 @@ import { FileId, file } from "../../src/files/index.ts";
 import {
     CDB_SPLIT_LOG_MAX_BYTES,
     CDB_SPLIT_LOG_MAX_ROWS,
-    CDB_SPLIT_TX_MAX_BYTES,
     CDB_SPLIT_TX_MAX_ROWS,
     CDB_SPLIT_TX_MAX_ROW_BYTES,
 } from "../../src/oplog/schema.ts";

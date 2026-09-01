@@ -12,7 +12,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { CdbError, type CdbErrorCode } from "../../src/errors.ts";
 import { applyColumnMask, assertColumnsWritable } from "../../src/server/cdb-cls.ts";
 import { cdbPolicyDigest, compileCdbPolicies } from "../../src/server/cdb-policy.ts";

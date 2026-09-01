@@ -11,7 +11,6 @@ import {
     CDB_VECTOR_MAX_DIMENSIONS,
     CDB_VECTOR_MAX_ERROR_BYTES,
     CDB_VECTOR_MAX_METADATA_BYTES,
-    type CdbVectorDeleteClaim,
     CdbVectorOutboxStore,
     type CdbVectorUpsertClaim,
     cdbVectorPhysicalId,
