@@ -969,7 +969,8 @@ button:disabled { cursor: default; opacity: 0.55; }
 @media (max-width: 640px) { .organization-form { grid-template-columns: 1fr; } }
 `;
 
-const DEV_SCRIPT_TEMPLATE = `import { dirname, join } from "node:path";
+const DEV_SCRIPT_TEMPLATE = `import { realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const WINDOWS_WATCHDOG_ARGUMENT = "--chardb-windows-watchdog";
@@ -1089,14 +1090,17 @@ const origin = new URL(process.env.CHARDB_URL ?? "http://127.0.0.1:8787");
 const webOrigin = new URL(process.env.CHARDB_WEB_URL ?? "http://127.0.0.1:5173");
 const adminToken = process.env.CHARDB_ADMIN_TOKEN ?? "local-chardb-admin";
 const authSecret = process.env.BETTER_AUTH_SECRET ?? "local-chardb-auth-secret-that-is-at-least-32-characters";
-const persistTo = process.env.CHARDB_PERSIST_TO ?? join(process.cwd(), ".wrangler", "state");
+const projectRoot = realpathSync.native(fileURLToPath(new URL("..", import.meta.url)));
+const persistTo = process.env.CHARDB_PERSIST_TO ?? join(projectRoot, ".wrangler", "state");
 const wranglerModule = join(
   dirname(fileURLToPath(import.meta.resolve("wrangler/package.json"))),
   "bin",
   "wrangler.js",
 );
-const viteModule = join(dirname(fileURLToPath(import.meta.resolve("vite/package.json"))), "bin", "vite.js");
-const chardbBin = join(process.cwd(), "node_modules", "@chardb", "core", "dist", "cli", "bin.mjs");
+const viteModule = realpathSync.native(
+  join(dirname(fileURLToPath(import.meta.resolve("vite/package.json"))), "bin", "vite.js"),
+);
+const chardbBin = join(projectRoot, "node_modules", "@chardb", "core", "dist", "cli", "bin.mjs");
 const nodeRuntime = Bun.which("node");
 
 for (const path of [wranglerModule, viteModule, chardbBin]) {
@@ -1282,7 +1286,13 @@ try {
   await applyMigrations(targetVersion);
   web = Bun.spawn(
     [nodeRuntime, viteModule, "--host", webOrigin.hostname, "--port", webOrigin.port || "5173", "--strictPort"],
-    { stdin: "inherit", stdout: "inherit", stderr: "inherit", detached: process.platform !== "win32" },
+    {
+      cwd: projectRoot,
+      stdin: "inherit",
+      stdout: "inherit",
+      stderr: "inherit",
+      detached: process.platform !== "win32",
+    },
   );
   await waitForWeb();
   console.log("chardb app ready at " + webOrigin.origin + " with schema version " + targetVersion);

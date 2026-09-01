@@ -224,6 +224,9 @@ describe("generated tutorial flow", () => {
 
         expect(generatedDev).toContain('import.meta.resolve("wrangler/package.json")');
         expect(generatedDev).toContain('import.meta.resolve("vite/package.json")');
+        expect(generatedDev).toContain('realpathSync.native(fileURLToPath(new URL("..", import.meta.url)))');
+        expect(generatedDev).toContain("const viteModule = realpathSync.native(");
+        expect(generatedDev).toContain("cwd: projectRoot");
         expect(generatedDev).toContain("[nodeRuntime, viteModule");
         expect(generatedDev).toContain("nodeRuntime,\n    wranglerModule");
         expect(generatedDev).toContain('["taskkill.exe", "/PID", String(pid), "/T", "/F"]');
