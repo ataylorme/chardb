@@ -60,6 +60,22 @@ function reportInput() {
 }
 
 describe("packed-chat evidence", () => {
+    test("keeps the chat npm lock aligned with its consumer manifest", async () => {
+        const chat = join(import.meta.dir, "..", "example", "chat");
+        const [packageJson, packageLock] = await Promise.all(
+            ["package.json", "package-lock.json"].map(async file =>
+                JSON.parse(await readFile(join(chat, file), "utf8"))
+            )
+        );
+
+        expect(packageLock.packages[""].dependencies).toEqual(packageJson.dependencies);
+        expect(packageLock.packages[""].devDependencies).toEqual(packageJson.devDependencies);
+        expect(packageLock.packages["node_modules/@chardb/react"]).toMatchObject({
+            version: "0.1.0",
+            resolved: "file:../../packages/react",
+        });
+    });
+
     test("parses one tarball and an optional report path", () => {
         expect(parsePackedChatArgs(["package.tgz", "--react", "react.tgz"])).toEqual({
             tarball: "package.tgz",
