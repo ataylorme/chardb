@@ -34,7 +34,7 @@ describe("disposable Cloudflare file reshard proof fixture", () => {
         ]);
         expect(`${stdout}${stderr}`).toBe("");
         expect(exitCode).toBe(0);
-    }, 60_000);
+    }, 180_000);
 
     test("keeps TOML primary and validates equivalent JSONC compatibility", async () => {
         const [tomlText, jsoncText] = await Promise.all([

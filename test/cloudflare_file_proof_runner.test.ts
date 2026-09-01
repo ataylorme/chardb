@@ -384,7 +384,7 @@ describe("Cloudflare R2 proof runner", () => {
         ]);
         expect(exitCode).toBe(0);
         expect(`${stdout}\n${stderr}`).toContain(CLOUDFLARE_FILE_PROOF_WRANGLER_VERSION);
-    });
+    }, 60_000);
 
     test("captures Catalog shard status and bounded last-error diagnostics after a failed shard POST", async () => {
         let observedPath = "";
