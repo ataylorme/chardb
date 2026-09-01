@@ -975,6 +975,7 @@ import { fileURLToPath } from "node:url";
 
 const WINDOWS_WATCHDOG_ARGUMENT = "--chardb-windows-watchdog";
 const WINDOWS_UTILITY_TIMEOUT_MS = 5_000;
+const WINDOWS_STDIN_CANCEL_TIMEOUT_MS = 1_000;
 const READINESS_PROBE_TIMEOUT_MS = 1_000;
 
 async function runWindowsUtility(command) {
@@ -1038,6 +1039,12 @@ function descendantProcesses(snapshot, rootPid) {
   return descendants;
 }
 
+function descendantsOfProcessIdentity(snapshot, rootPid, rootCreatedAt) {
+  const root = snapshot.find(row => row.pid === rootPid);
+  if (root && root.createdAt !== rootCreatedAt) return [];
+  return descendantProcesses(snapshot, rootPid);
+}
+
 async function forceWindowsProcessTree(pid) {
   const result = await runWindowsUtility(["taskkill.exe", "/PID", String(pid), "/T", "/F"]);
   if (result.exitCode !== 0) {
@@ -1050,24 +1057,47 @@ async function forceWindowsProcessTree(pid) {
 
 async function runWindowsWatchdog(rootPid) {
   const tracked = new Map();
+  const initialSnapshot = await windowsProcessSnapshot();
+  const root = initialSnapshot.find(row => row.pid === rootPid);
+  if (!root) return;
+  const rootCreatedAt = root.createdAt;
+  const stdinReader = Bun.stdin.stream().getReader();
   let inputClosed = false;
-  const close = (async () => {
-    for await (const _chunk of Bun.stdin.stream()) {
-      // The parent holds the pipe open for its lifetime.
+  const observeInput = (async () => {
+    try {
+      while (!(await stdinReader.read()).done) {
+        // The parent writes nothing. EOF means it closed the watchdog pipe.
+      }
+    } finally {
+      inputClosed = true;
     }
-    inputClosed = true;
-  })();
-  while (!inputClosed) {
-    const snapshot = await windowsProcessSnapshot();
-    for (const child of descendantProcesses(snapshot, rootPid)) {
-      if (child.pid !== process.pid) tracked.set(child.pid, child.createdAt);
+  })().catch(() => undefined);
+  try {
+    while (!inputClosed) {
+      const snapshot = await windowsProcessSnapshot();
+      const currentRoot = snapshot.find(row => row.pid === rootPid);
+      if (!currentRoot) {
+        for (const child of descendantsOfProcessIdentity(snapshot, rootPid, rootCreatedAt)) {
+          if (child.pid !== process.pid) tracked.set(child.pid, child.createdAt);
+        }
+        break;
+      }
+      if (currentRoot.createdAt !== rootCreatedAt) break;
+      for (const child of descendantsOfProcessIdentity(snapshot, rootPid, rootCreatedAt)) {
+        if (child.pid !== process.pid) tracked.set(child.pid, child.createdAt);
+      }
+      await Bun.sleep(50);
     }
-    await Bun.sleep(50);
+  } finally {
+    await Promise.race([
+      stdinReader.cancel().catch(() => undefined),
+      Bun.sleep(WINDOWS_STDIN_CANCEL_TIMEOUT_MS),
+    ]);
+    void observeInput;
   }
-  await close;
   for (let pass = 0; pass < 3; pass++) {
     const snapshot = await windowsProcessSnapshot();
-    for (const child of descendantProcesses(snapshot, rootPid)) {
+    for (const child of descendantsOfProcessIdentity(snapshot, rootPid, rootCreatedAt)) {
       if (child.pid !== process.pid) tracked.set(child.pid, child.createdAt);
     }
     const live = new Map(snapshot.map(row => [row.pid, row.createdAt]));

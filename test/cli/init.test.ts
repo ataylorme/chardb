@@ -232,6 +232,13 @@ describe("generated tutorial flow", () => {
         expect(generatedDev).toContain('["taskkill.exe", "/PID", String(pid), "/T", "/F"]');
         expect(generatedDev).toContain("runWindowsWatchdog(rootPid)");
         expect(generatedDev).toContain("Select-Object ProcessId, ParentProcessId, CreationDate");
+        expect(generatedDev).toContain("const rootCreatedAt = root.createdAt");
+        expect(generatedDev).toContain("currentRoot.createdAt !== rootCreatedAt");
+        expect(generatedDev).toContain("const WINDOWS_STDIN_CANCEL_TIMEOUT_MS = 1_000");
+        expect(generatedDev).toContain("stdinReader.cancel().catch(() => undefined)");
+        expect(generatedDev).toContain("Bun.sleep(WINDOWS_STDIN_CANCEL_TIMEOUT_MS)");
+        expect(generatedDev).toContain("function descendantsOfProcessIdentity(snapshot, rootPid, rootCreatedAt)");
+        expect(generatedDev).toContain("if (root && root.createdAt !== rootCreatedAt) return []");
         expect(generatedDev).toContain("tracked.set(child.pid, child.createdAt)");
         expect(generatedDev).toContain("live.get(pid) === createdAt");
         expect(generatedDev.match(/AbortSignal\.timeout\(READINESS_PROBE_TIMEOUT_MS\)/g)).toHaveLength(2);

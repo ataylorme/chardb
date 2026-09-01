@@ -475,6 +475,17 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain(
             "Select-Object ProcessId, ParentProcessId, CreationDate"
         );
+        expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("const rootCreatedAt = root.createdAt");
+        expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("currentRoot.createdAt !== rootCreatedAt");
+        expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("const WINDOWS_STDIN_CANCEL_TIMEOUT_MS = 1_000");
+        expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("stdinReader.cancel().catch(() => undefined)");
+        expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("Bun.sleep(WINDOWS_STDIN_CANCEL_TIMEOUT_MS)");
+        expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain(
+            "function descendantsOfProcessIdentity(snapshot, rootPid, rootCreatedAt)"
+        );
+        expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain(
+            "if (root && root.createdAt !== rootCreatedAt) return []"
+        );
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("live.get(pid) === createdAt");
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain(
             "signal: AbortSignal.timeout(READINESS_PROBE_TIMEOUT_MS)"
