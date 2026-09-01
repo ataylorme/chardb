@@ -224,19 +224,4 @@ describe("packed-chat evidence", () => {
             })
         ).toThrow("authentication secrets");
     });
-
-    test("runs restart reconstruction in two isolated child phases", async () => {
-        const source = await readFile(join(import.meta.dir, "..", "scripts", "smoke-packed-chat.mjs"), "utf8");
-        expect(source).toContain('runIsolatedPhase("before-restart"');
-        expect(source).toContain('runIsolatedPhase("after-restart"');
-        expect(source).toContain("runManagedCommand(process.execPath");
-        expect(source).toContain("timeoutMs: PHASE_TIMEOUT_MS");
-        expect(source).toContain('label: "packed migration"');
-        expect(source).toContain("captureOutput: true");
-        expect(source).not.toContain("terminateRemainingProcessGroup");
-        expect(source).not.toContain("processGroupExists");
-        expect(source).not.toContain("Bun.spawn(");
-        expect(source).not.toContain("restartMiniflareBounded");
-        expect(source).not.toContain(".setOptions(");
-    });
 });

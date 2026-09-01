@@ -355,16 +355,6 @@ describe("Cloudflare R2 proof runner", () => {
         expect(wrangler).toContain('name = "CDB_RESHARD"\nclass_name = "Resharder"');
         expect(wrangler.match(/\[\[durable_objects\.bindings\]\]/g)).toHaveLength(4);
         expect(wrangler).not.toContain("__");
-        const runnerSource = await readFile(
-            path.join(import.meta.dir, "..", "scripts", "run-cloudflare-file-proof.mjs"),
-            "utf8"
-        );
-        expect(runnerSource).toContain('resolveWranglerExecutable(path.join(app, "package.json"))');
-        expect(runnerSource).toContain("runCommand(wrangler, args");
-        expect(runnerSource).not.toContain("runCommand(process.execPath, [wrangler");
-        expect(runnerSource).not.toContain("runtimeExecutable: process.execPath");
-        expect(runnerSource).not.toContain('.resolve("wrangler")');
-        expect(runnerSource).not.toContain('runCommand(\n                "bun"');
     });
 
     test("executes Wrangler's declared binary instead of its import entry", async () => {

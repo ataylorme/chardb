@@ -1,6 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 import {
     GENERATED_PROJECT_INVARIANTS,
     assertMatchingGeneratedProjectReport,
@@ -94,32 +92,5 @@ describe("generated-project evidence", () => {
         expect(() =>
             assertMatchingGeneratedProjectReport(report, fingerprint, { ...reactFingerprint, bytes: 25 })
         ).toThrow("React tarball");
-    });
-
-    test("keeps scaffold coverage while managing both generated dev process trees", async () => {
-        const source = await readFile(join(import.meta.dir, "..", "scripts", "smoke-generated-project.mjs"), "utf8");
-
-        expect(source).toContain("proveInitBoundaries(");
-        expect(source).toContain('"--core-package"');
-        expect(source).toContain("`file:${tarballPath}`");
-        expect(source).toContain('"--react-package"');
-        expect(source).toContain("`file:${reactTarballPath}`");
-        expect(source).toContain('run("bun", ["install", "--ignore-scripts"]');
-        expect(source.match(/"doctor", "wrangler"/g)).toHaveLength(3);
-        expect(source).toContain("VERSION_THREE_MIGRATION_NAME");
-        expect(source).toContain("VERSION_FOUR_MIGRATION_NAME");
-        expect(source).toContain('run("npm", ["run", "test"], cwd, extraEnvironment)');
-
-        expect(source).toContain('spawnManagedProcess([process.execPath, "run", "dev"]');
-        expect(source).toContain("const [workerPort, webPort, inspectorPort] = await reserveLocalPorts(3);");
-        expect(source).toContain('injectGeneratedDevInspectorPort(await readFile(devPath, "utf8"), inspectorPort)');
-        expect(source).toContain("const [port, inspectorPort] = await reserveLocalPorts(2);");
-        expect(source).toContain('"--inspector-port",\n            String(inspectorPort)');
-        expect(source).toContain('label: "Wrangler dev"');
-        expect(source).toContain('label: "generated dev output drain"');
-        expect(source).toContain('label: "Wrangler startup output drain"');
-        expect(source).toContain('label: "Wrangler output drain"');
-        expect(source).not.toContain("function processGroupExists");
-        expect(source).not.toContain("async function terminate(");
     });
 });

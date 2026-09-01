@@ -15,8 +15,10 @@ describe("Cloudflare promotion runner", () => {
     test("parses a bounded secret-safe promotion target", () => {
         expect(
             parseCloudflarePromotionArgs([
-                "--gate",
-                "/proof",
+                "--tarball",
+                "/candidate/core.tgz",
+                "--react-tarball",
+                "/candidate/react.tgz",
                 "--worker",
                 "chardb-preview-k",
                 "--url",
@@ -30,7 +32,8 @@ describe("Cloudflare promotion runner", () => {
             ])
         ).toEqual({
             help: false,
-            gate: "/proof",
+            tarball: "/candidate/core.tgz",
+            reactTarball: "/candidate/react.tgz",
             worker: "chardb-preview-k",
             url: "https://chardb-preview-k.example.workers.dev",
             output: "/evidence",
@@ -42,8 +45,10 @@ describe("Cloudflare promotion runner", () => {
         });
         expect(() =>
             parseCloudflarePromotionArgs([
-                "--gate",
-                "/proof",
+                "--tarball",
+                "/candidate/core.tgz",
+                "--react-tarball",
+                "/candidate/react.tgz",
                 "--worker",
                 "Bad Worker",
                 "--url",
@@ -58,8 +63,10 @@ describe("Cloudflare promotion runner", () => {
         ).toThrow("Cloudflare Worker name");
         expect(() =>
             parseCloudflarePromotionArgs([
-                "--gate",
-                "/proof",
+                "--tarball",
+                "/candidate/core.tgz",
+                "--react-tarball",
+                "/candidate/react.tgz",
                 "--worker",
                 "valid-worker",
                 "--url",
@@ -88,8 +95,10 @@ describe("Cloudflare promotion runner", () => {
         ).toThrow("does not match");
         expect(() =>
             parseCloudflarePromotionArgs([
-                "--gate",
-                "/proof",
+                "--tarball",
+                "/candidate/core.tgz",
+                "--react-tarball",
+                "/candidate/react.tgz",
                 "--worker",
                 "valid-worker",
                 "--url",

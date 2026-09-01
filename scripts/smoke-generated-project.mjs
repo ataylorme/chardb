@@ -6,7 +6,6 @@ import { pathToFileURL } from "node:url";
 import { fingerprintFile, writeJsonAtomically } from "./browser-benchmark-report.mjs";
 import { injectGeneratedDevInspectorPort, injectGeneratedLoopbackProbe } from "./generated-loopback-probe.mjs";
 import { buildGeneratedProjectReport, parseGeneratedProjectArgs } from "./generated-project-report.mjs";
-import { githubActionsRunFromEnvironment } from "./os-ci-evidence.mjs";
 import { preserveFailure, settleBounded, spawnManagedProcess } from "./process-lifecycle.mjs";
 
 const ADMIN_TOKEN = "generated-project-migration-secret";
@@ -120,13 +119,11 @@ try {
     const miniflarePackage = JSON.parse(
         await readFile(join(projectDirectory, "node_modules", "miniflare", "package.json"), "utf8")
     );
-    const ciRun = githubActionsRunFromEnvironment();
     const report = buildGeneratedProjectReport({
         run: {
             id: `${Date.now().toString(36)}-${process.pid}`,
             startedAt,
             durationMs: performance.now() - startedAtMs,
-            ...(ciRun ? { ci: ciRun } : {}),
         },
         packageEvidence: {
             name: installedChardb.name,

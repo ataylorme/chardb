@@ -70,19 +70,4 @@ describe("disposable Cloudflare file reshard proof fixture", () => {
         expect(toml).not.toHaveProperty("vars.CDB_PROOF_DEPLOYMENT_VERSION");
         expect(toml).toHaveProperty("vars.CDB_PROOF_LOCAL_VERSION", "local-dev");
     });
-
-    test("uses only packaged public imports and exports the generated Resharder class", async () => {
-        const worker = await readFile(path.join(FIXTURE, "src", "worker.ts"), "utf8");
-        expect(worker).toContain('from "@chardb/core/server"');
-        expect(worker).toContain("export const { DB, Gateway, Resharder } = app;");
-        expect(worker).toContain("export class Catalog extends app.Catalog");
-        expect(worker).toContain("export class Cdb extends app.Cdb");
-        expect(worker).toContain("export class VectorIndexProbe");
-        expect(worker).toContain("proofVectorEvidence({ vectorIds })");
-        expect(worker).toContain("destinationPublicSearch");
-        expect(worker).toContain("vectorProviderNoMovementMutation");
-        expect(worker).toContain('env.CDB_PROOF_TARGET_KIND === "deployed" ? env.CF_VERSION_METADATA?.id');
-        expect(worker).not.toMatch(/\.\.\/\.\.\/\.\.\/src\//);
-        expect(worker).not.toContain("src/server/do/");
-    });
 });

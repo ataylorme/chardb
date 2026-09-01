@@ -3,7 +3,6 @@ import { chmod, cp, lstat, mkdir, readFile, readdir, rename, symlink, writeFile 
 import { createServer } from "node:net";
 import path from "node:path";
 import { assertChatBenchmarkReport, compareChatBenchmarkReports } from "./chat-benchmark-report.mjs";
-import { CHARDB_PACKAGE_NAME, npmPackFilename } from "./package-identity.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const REPORT_SCHEMA = "chardb.cloudflare-promotion.report.v1";
@@ -39,7 +38,8 @@ function value(argv, flag) {
 
 export function parseCloudflarePromotionArgs(argv) {
     const allowed = new Set([
-        "--gate",
+        "--tarball",
+        "--react-tarball",
         "--worker",
         "--url",
         "--output",
@@ -57,7 +57,8 @@ export function parseCloudflarePromotionArgs(argv) {
         if (argument !== "--help" && argument !== "-h") index++;
     }
     const help = argv.includes("--help") || argv.includes("-h");
-    const gate = value(argv, "--gate");
+    const tarball = value(argv, "--tarball");
+    const reactTarball = value(argv, "--react-tarball");
     const worker = value(argv, "--worker");
     const url = value(argv, "--url");
     const output = value(argv, "--output");
@@ -69,7 +70,8 @@ export function parseCloudflarePromotionArgs(argv) {
     const benchmarkSamples = Number(rawSamples);
     if (!help) {
         for (const [flag, item] of [
-            ["--gate", gate],
+            ["--tarball", tarball],
+            ["--react-tarball", reactTarball],
             ["--worker", worker],
             ["--url", url],
             ["--output", output],
@@ -102,7 +104,8 @@ export function parseCloudflarePromotionArgs(argv) {
     }
     return {
         help,
-        gate,
+        tarball,
+        reactTarball,
         worker,
         url,
         output,
@@ -196,7 +199,8 @@ function usage() {
     return [
         "Usage: bun scripts/run-cloudflare-promotion.mjs [options]",
         "",
-        "  --gate <directory>          passing preview-gate output",
+        "  --tarball <core.tgz>         exact @chardb/core candidate",
+        "  --react-tarball <react.tgz>  exact @chardb/react candidate",
         "  --worker <name>             exact Cloudflare Worker name",
         "  --url <https-origin>        deployed Worker origin",
         "  --output <directory>        absent or resumable evidence directory",
@@ -265,7 +269,7 @@ async function fingerprintTree(root, included) {
     };
 }
 
-async function fingerprintDeployment(app, tarball) {
+async function fingerprintDeployment(app, tarballs) {
     const fingerprint = await fingerprintTree(app, [
         "package.json",
         "package-lock.json",
@@ -274,12 +278,14 @@ async function fingerprintDeployment(app, tarball) {
         "src",
         "dist",
     ]);
-    const bytes = await readFile(tarball);
-    fingerprint.files.push({
-        path: `../${path.basename(tarball)}`,
-        bytes: bytes.byteLength,
-        sha256: sha256(bytes),
-    });
+    for (const tarball of tarballs) {
+        const bytes = await readFile(tarball);
+        fingerprint.files.push({
+            path: `../${path.basename(tarball)}`,
+            bytes: bytes.byteLength,
+            sha256: sha256(bytes),
+        });
+    }
     fingerprint.files.sort((left, right) => left.path.localeCompare(right.path));
     fingerprint.digest = sha256(fingerprint.files.map(record => `${record.sha256}  ${record.path}\n`).join(""));
     return fingerprint;
@@ -613,7 +619,8 @@ async function main() {
         console.log(usage());
         return;
     }
-    const gate = path.resolve(options.gate);
+    const sourceTarball = path.resolve(options.tarball);
+    const sourceReactTarball = path.resolve(options.reactTarball);
     const output = path.resolve(options.output);
     const privateDir = path.resolve(options.privateDir);
     const origin = new URL(options.url);
@@ -625,8 +632,16 @@ async function main() {
     const work = path.join(privateDir, "work");
     const v1 = path.join(work, "v1");
     const v2 = path.join(work, "v2");
-    const tarballName = npmPackFilename(CHARDB_PACKAGE_NAME, "0.1.0");
-    const tarball = path.join(work, tarballName);
+    const tarball = path.join(work, "core.tgz");
+    const reactTarball = path.join(work, "react.tgz");
+    const candidateBytes = await readFile(sourceTarball);
+    const reactCandidateBytes = await readFile(sourceReactTarball);
+    const candidate = { algorithm: "sha256", digest: sha256(candidateBytes), bytes: candidateBytes.byteLength };
+    const reactCandidate = {
+        algorithm: "sha256",
+        digest: sha256(reactCandidateBytes),
+        bytes: reactCandidateBytes.byteLength,
+    };
     const v1MigrationId = `${options.migrationPrefix}-v1`;
     const v2MigrationId = `${options.migrationPrefix}-v2`;
 
@@ -645,6 +660,15 @@ async function main() {
             report.migrations?.v1 === v1MigrationId && report.migrations?.v2 === v2MigrationId,
             "migration identity drifted"
         );
+        assert(
+            report.candidate?.digest === candidate.digest && report.candidate?.bytes === candidate.bytes,
+            "core candidate drifted"
+        );
+        assert(
+            report.reactCandidate?.digest === reactCandidate.digest &&
+                report.reactCandidate?.bytes === reactCandidate.bytes,
+            "React candidate drifted"
+        );
     } else {
         if ((await readdir(output)).length > 0) throw new Error("promotion output must be absent, empty, or resumable");
         report = {
@@ -655,6 +679,7 @@ async function main() {
             target: { worker: options.worker, origin: origin.origin },
             migrations: { v1: v1MigrationId, v2: v2MigrationId },
             candidate: null,
+            reactCandidate: null,
             stages: [],
             results: {},
         };
@@ -738,7 +763,7 @@ async function main() {
         return JSON.parse(result.stdout);
     };
     const deploy = async (app, label, expectedHash) => {
-        const actualHash = await fingerprintDeployment(app, tarball);
+        const actualHash = await fingerprintDeployment(app, [tarball, reactTarball]);
         if (expectedHash && actualHash.digest !== expectedHash.digest)
             throw new Error(`${label} deployment input drifted`);
         let before = null;
@@ -814,31 +839,37 @@ async function main() {
     const saveSession = async value => atomicJson(sessionPath, value, 0o600);
 
     await stage("prepare", async () => {
-        const gateReport = JSON.parse(await readFile(path.join(gate, "preview-gate.json"), "utf8"));
-        assert(
-            gateReport?.schema === "chardb.preview-gate.report.v1" && gateReport?.summary?.passed === true,
-            "promotion requires a passing preview gate"
-        );
-        const candidate = gateReport.package?.tarball;
-        assert(
-            /^[a-f0-9]{64}$/.test(candidate?.digest ?? "") && Number.isSafeInteger(candidate?.bytes),
-            "gate tarball fingerprint is invalid"
-        );
-        const sourceTarball = path.join(gate, tarballName);
-        const tarballBytes = await readFile(sourceTarball);
-        assert(
-            sha256(tarballBytes) === candidate.digest && tarballBytes.byteLength === candidate.bytes,
-            "gate tarball bytes drifted"
-        );
-        const completeWork = (await pathExists(tarball)) && (await pathExists(v1)) && (await pathExists(v2));
-        const reusableWork = completeWork && sha256(await readFile(tarball)) === candidate.digest;
+        const completeWork =
+            (await pathExists(tarball)) &&
+            (await pathExists(reactTarball)) &&
+            (await pathExists(v1)) &&
+            (await pathExists(v2));
+        const reusableWork =
+            completeWork &&
+            sha256(await readFile(tarball)) === candidate.digest &&
+            sha256(await readFile(reactTarball)) === reactCandidate.digest;
         if (!reusableWork) {
             if (await pathExists(work)) {
                 await rename(work, `${work}.incomplete-${Date.now()}-${randomUUID().slice(0, 8)}`);
             }
             await mkdir(work, { recursive: true });
             await cp(sourceTarball, tarball);
-            await cp(path.join(gate, "staging-app"), v1, { recursive: true });
+            await cp(sourceReactTarball, reactTarball);
+            await runCommand(
+                "bun",
+                [
+                    path.join(ROOT, "scripts", "prepare-preview-chat.mjs"),
+                    "--tarball",
+                    tarball,
+                    "--react-tarball",
+                    reactTarball,
+                    "--output",
+                    v1,
+                    "--name",
+                    options.worker,
+                ],
+                { cwd: ROOT, label: "prepare version-one app", secrets }
+            );
             await runCommand(
                 "bun",
                 [path.join(ROOT, "scripts", "prepare-preview-upgrade.mjs"), "--input", v1, "--output", v2],
@@ -850,20 +881,17 @@ async function main() {
             );
         }
         report.candidate = { algorithm: "sha256", digest: candidate.digest, bytes: candidate.bytes };
-        for (const file of [
-            "preview-gate.json",
-            "generated-project.json",
-            "packed-chat.json",
-            "browser-proof.json",
-            tarballName,
-        ]) {
-            const source = path.join(gate, file);
-            if (await pathExists(source)) {
-                await mkdir(path.join(output, "candidate"), { recursive: true });
-                await cp(source, path.join(output, "candidate", file));
-            }
-        }
-        return { candidate: report.candidate, v1: "prepared", v2: "prepared" };
+        report.reactCandidate = {
+            algorithm: "sha256",
+            digest: reactCandidate.digest,
+            bytes: reactCandidate.bytes,
+        };
+        return {
+            candidate: report.candidate,
+            reactCandidate: report.reactCandidate,
+            v1: "prepared",
+            v2: "prepared",
+        };
     });
 
     await stage("validate", async () => {
@@ -895,8 +923,8 @@ async function main() {
             }
         }
         return {
-            v1: await fingerprintDeployment(v1, tarball),
-            v2: await fingerprintDeployment(v2, tarball),
+            v1: await fingerprintDeployment(v1, [tarball, reactTarball]),
+            v2: await fingerprintDeployment(v2, [tarball, reactTarball]),
         };
     });
 

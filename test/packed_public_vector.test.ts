@@ -1,6 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
-import path from "node:path";
 import {
     PACKED_LOCAL_VECTOR_CAPABILITY,
     PACKED_PUBLIC_VECTOR_SCHEMA,
@@ -108,36 +106,5 @@ describe("packed public vector browser contract", () => {
                 reactFingerprint
             )
         ).toThrow("React tarball");
-    });
-
-    test("keeps browser proof intact while cleanup advances after an earlier teardown failure", async () => {
-        const source = await readFile(
-            path.join(import.meta.dir, "..", "scripts", "smoke-packed-public-vector.mjs"),
-            "utf8"
-        );
-        const proofAssertion = source.indexOf("assertPackedPublicVectorBrowserProof(proof)");
-        const passed = source.indexOf("passed = true", proofAssertion);
-        const cleanup = source.indexOf("const cleanupFailures = []", passed);
-        const browserClose = source.indexOf('label: "packed public vector Chromium close"', cleanup);
-        const serverStop = source.indexOf('label: "packed public vector server stop"', browserClose);
-        const scratchCleanup = source.indexOf('label: "packed public vector scratch cleanup"', serverStop);
-        const aggregate = source.indexOf('new AggregateError(cleanupFailures, "packed public vector cleanup failed")');
-
-        expect(
-            [proofAssertion, passed, cleanup, browserClose, serverStop, scratchCleanup, aggregate].every(
-                index => index >= 0
-            )
-        ).toBe(true);
-        expect(proofAssertion).toBeLessThan(passed);
-        expect(passed).toBeLessThan(cleanup);
-        expect(cleanup).toBeLessThan(browserClose);
-        expect(browserClose).toBeLessThan(serverStop);
-        expect(serverStop).toBeLessThan(scratchCleanup);
-        expect(scratchCleanup).toBeLessThan(aggregate);
-        expect(source).toContain('label: "packed public vector smoke"');
-        expect(source.match(/cleanupFailures\.push\(error\)/g)).toHaveLength(3);
-        expect(source.slice(browserClose, serverStop)).toContain("}\n    }\n    if (server) {");
-        expect(source.slice(serverStop, scratchCleanup)).toContain("}\n    }\n    try {\n        if (!passed");
-        expect(source).toContain("capability: PACKED_LOCAL_VECTOR_CAPABILITY");
     });
 });

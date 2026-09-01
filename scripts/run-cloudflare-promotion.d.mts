@@ -1,6 +1,7 @@
 export interface CloudflarePromotionOptions {
     readonly help: boolean;
-    readonly gate: string | undefined;
+    readonly tarball: string | undefined;
+    readonly reactTarball: string | undefined;
     readonly worker: string | undefined;
     readonly url: string | undefined;
     readonly output: string | undefined;

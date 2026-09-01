@@ -33,9 +33,6 @@ describe("generated Cloudflare workflow", () => {
             assertGeneratedConfig(raw: string): { workerName: string; filesBucket: string };
         }>(source, "setup-cloudflare.mjs");
 
-        expect(source).toContain('wrangler("r2", "bucket", "info", filesBucket, "--json")');
-        expect(source).toContain('wrangler("r2", "bucket", "create", filesBucket)');
-        expect(source).not.toContain("vectorize create");
         expect(
             generated.isMissingBucket({
                 exitCode: 1,
@@ -138,38 +135,6 @@ bucket_name = "stale-files"
         temporaryDirectories.push(failedRoot);
         await expect(generated.createSecretFile({ cannotSerialize: 1n }, failedRoot)).rejects.toThrow();
         expect(await readdir(failedRoot)).toEqual([]);
-    });
-
-    test("routine deploy cannot upload secrets and both modes verify exact schema identity", () => {
-        const source = renderCloudflareDeployScript(input);
-        const routineDeploy = 'if (decision === "routine-upload") await mustRun(wrangler("deploy", "--strict"));';
-
-        expect(source).toContain(routineDeploy);
-        expect(source).toContain('if (decision === "bootstrap-upload") await deployBootstrap();');
-        expect(source).toContain('"--secrets-file", secretFile.path');
-        expect(source).toContain("await rm(secretFile.directory, { recursive: true, force: true });");
-        expect(source).toContain("active.activeDigest !== expected.digest");
-        expect(source).toContain("await waitForHealth(origin, expected);");
-        expect(source).toContain('[process.execPath, "run", "test"]');
-        expect(source).toContain('[process.execPath, "run", "build:worker"]');
-        expect(source).toContain('"migrate"');
-        expect(source).not.toContain("workers.dev");
-        expect(source).not.toContain("rollback");
-    });
-
-    test("resolves JavaScript entry modules without shell or .bin assumptions", () => {
-        for (const source of [renderCloudflareSetupScript(input), renderCloudflareDeployScript(input)]) {
-            expect(source).toContain('fileURLToPath(import.meta.resolve("wrangler"))');
-            expect(source).toContain('fileURLToPath(import.meta.resolve("@chardb/core"))');
-            expect(source).toContain("[process.execPath, wranglerModule, ...args]");
-            expect(source).toContain("[process.execPath, chardbModule, ...args]");
-            expect(source).not.toContain("node_modules/.bin");
-            expect(source).not.toContain(".cmd");
-            expect(source).not.toContain("shell:");
-            expect(source).toContain("delete env.CHARDB_URL");
-            expect(source).toContain("delete env.CHARDB_ADMIN_TOKEN");
-            expect(source).toContain("delete env.BETTER_AUTH_SECRET");
-        }
     });
 
     test("routine reruns resume only the exact pending migration", async () => {

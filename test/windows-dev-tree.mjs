@@ -1,9 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { arch, release, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { fingerprintFile, writeJsonAtomically } from "../scripts/browser-proof-report.mjs";
-import { buildWindowsOsCiReport, githubActionsRunFromEnvironment } from "../scripts/os-ci-evidence.mjs";
 import { isOccupiedPortFailure } from "./helpers/windows-port-collision.ts";
 
 if (process.platform !== "win32") throw new Error("windows-dev-tree.mjs must run on Windows");
@@ -16,18 +14,14 @@ const WINDOWS_UTILITY_TIMEOUT_MS = 10_000;
 
 const tarballArgument = process.argv.indexOf("--tarball");
 if (tarballArgument === -1 || !process.argv[tarballArgument + 1]) {
-    throw new Error("usage: bun test/windows-dev-tree.mjs --tarball <package.tgz> [--report <report.json>]");
+    throw new Error("usage: bun test/windows-dev-tree.mjs --tarball <package.tgz> --react-tarball <react.tgz>");
 }
 const reactTarballArgument = process.argv.indexOf("--react-tarball");
 if (reactTarballArgument === -1 || !process.argv[reactTarballArgument + 1]) {
     throw new Error("--react-tarball <package.tgz> is required");
 }
-const reportArgument = process.argv.indexOf("--report");
-if (reportArgument !== -1 && !process.argv[reportArgument + 1]) throw new Error("--report requires a path");
-
 const tarball = resolve(process.argv[tarballArgument + 1]);
 const reactTarball = resolve(process.argv[reactTarballArgument + 1]);
-const reportPath = reportArgument === -1 ? undefined : resolve(process.argv[reportArgument + 1]);
 const root = await mkdtemp(join(tmpdir(), "chardb-windows-dev-tree-"));
 const bootstrap = join(root, "bootstrap");
 const project = join(bootstrap, "generated-app");
@@ -35,8 +29,6 @@ const corePackage = `file:${relative(project, tarball).replaceAll("\\", "/")}`;
 const reactPackage = `file:${relative(project, reactTarball).replaceAll("\\", "/")}`;
 const persistTo = join(project, ".wrangler", "state");
 const messageId = `windows-persistence-${Date.now().toString(36)}`;
-const startedAt = new Date().toISOString();
-const startedAtMs = performance.now();
 let identity;
 
 try {
@@ -187,67 +179,6 @@ try {
                 await Promise.race([child.exited, Bun.sleep(2_000)]);
             }
         }
-    }
-
-    if (reportPath) {
-        const ci = githubActionsRunFromEnvironment();
-        if (!ci) throw new Error("--report requires a GitHub Actions environment");
-        const [wranglerPackage, miniflarePackage, betterAuthPackage] = await Promise.all(
-            ["wrangler", "miniflare", "better-auth"].map(async name =>
-                JSON.parse(await readFile(join(project, "node_modules", name, "package.json"), "utf8"))
-            )
-        );
-        await runPhase("write Windows CI evidence", async () =>
-            writeJsonAtomically(
-                reportPath,
-                buildWindowsOsCiReport({
-                    package: {
-                        name: installedPackage.name,
-                        version: installedPackage.version,
-                        tarball: await fingerprintFile(tarball),
-                    },
-                    reactPackage: {
-                        name: installedReactPackage.name,
-                        version: installedReactPackage.version,
-                        tarball: await fingerprintFile(reactTarball),
-                    },
-                    platform: {
-                        name: "windows-latest",
-                        operatingSystem: process.platform,
-                        release: release(),
-                        architecture: arch(),
-                    },
-                    runtime: {
-                        bun: Bun.version,
-                        nodeCompatibility: process.versions.node,
-                        wrangler: wranglerPackage.version,
-                        miniflare: miniflarePackage.version,
-                        betterAuth: betterAuthPackage.version,
-                    },
-                    run: {
-                        id: `${Date.now().toString(36)}-${process.pid}`,
-                        startedAt,
-                        durationMs: performance.now() - startedAtMs,
-                        ci,
-                    },
-                    forcedParentTerminationCycles: 3,
-                    checks: {
-                        packedCandidateInstalled: true,
-                        packedReactCandidateInstalled: true,
-                        generatedTypecheckPassed: true,
-                        cloudflareVitestPassed: true,
-                        generatedBuildPassed: true,
-                        wranglerDoctorPassed: true,
-                        workerPortCollisionCleanup: true,
-                        webPortCollisionCleanup: true,
-                        descendantCleanup: true,
-                        portReuse: true,
-                        betterAuthPersistence: true,
-                        organizationDataPersistence: true,
-                    },
-                })
-            )
-        );
     }
 
     function spawnGeneratedDev(workerPort, webPort, output = "inherit") {

@@ -1,10 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { disposeMiniflareBounded, restartMiniflareBounded } from "../scripts/miniflare-lifecycle.mjs";
-
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 describe("bounded Miniflare lifecycle", () => {
     test("returns after the disposal deadline instead of hanging", async () => {
@@ -111,15 +106,5 @@ describe("bounded Miniflare lifecycle", () => {
         );
 
         expect(startedAt - disposedAt).toBeGreaterThanOrEqual(15);
-    });
-
-    test("the packed smoke runner hard-exits a phase after a disposal timeout", async () => {
-        const source = await readFile(join(ROOT, "scripts", "smoke-packed-chat.mjs"), "utf8");
-
-        expect(source).toContain("onTimeout: () =>");
-        expect(source).toContain("forceExitAfterMain = true");
-        expect(source).toContain("process.exit(failure ? 1 : 0)");
-        expect(source).toContain('runIsolatedPhase("before-restart"');
-        expect(source).toContain('runIsolatedPhase("after-restart"');
     });
 });

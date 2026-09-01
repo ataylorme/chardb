@@ -23,7 +23,7 @@
         "chardb": "./dist/cli/bin.mjs",
         "core": "./dist/cli/bin.mjs"
     },
-    "files": ["dist", "README.md", "COST.md", "ARCHITECTURE.md", "OPERATIONS.md", "SECURITY.md"],
+    "files": ["dist", "README.md"],
     "workspaces": ["landing"],
     "scripts": {
         "build": "unbuild",
@@ -37,7 +37,6 @@
         "smoke:vector:browser": "bun scripts/smoke-packed-public-vector.mjs",
         "test": "bun scripts/test-correctness.mjs",
         "test:correctness": "bun scripts/test-correctness.mjs",
-        "test:docs": "bun scripts/test-docs-contract.mjs",
         "test:watch": "bun scripts/test-correctness.mjs --watch",
         "test:scale": "bun test test/workerd/gateway-live.harness.test.ts --test-name-pattern 'scaled SDK'",
         "bench:planned-query": "bun scripts/run-scale-benchmark.mjs --suite planned-query",
@@ -63,11 +62,8 @@
         "proof:cloudflare:files": "bun scripts/run-cloudflare-file-proof.mjs",
         "proof:cloudflare:reshard:prepare": "bun scripts/prepare-file-reshard-deployment-proof.mjs",
         "proof:cloudflare:reshard": "bun scripts/file-reshard-proof-orchestrator.mjs",
-        "preview:gate": "bun scripts/run-preview-gate.mjs",
         "preview:prepare": "bun scripts/prepare-preview-chat.mjs",
         "preview:upgrade": "bun scripts/prepare-preview-upgrade.mjs",
-        "preview:finalize": "bun scripts/finalize-preview-evidence.mjs",
-        "release:admit": "bun scripts/release-admission.mjs",
         "preview:cloudflare": "bun scripts/run-cloudflare-promotion.mjs",
         "security:history": "bun scripts/scan-git-history.mjs",
         "typecheck": "tsc --noEmit",

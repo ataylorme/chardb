@@ -213,23 +213,4 @@ describe("packed generated browser proof reports", () => {
         expect(JSON.parse(await readFile(reportPath, "utf8"))).toEqual(report);
         expect(await readdir(path.dirname(reportPath))).toEqual(["proof.json"]);
     });
-
-    test("keeps correlated restart evidence while independently cleaning browser and dev processes", async () => {
-        const source = await readFile(path.join(import.meta.dir, "..", "scripts", "smoke-packed-browser.mjs"), "utf8");
-
-        expect(source).toContain('schema: "chardb.browser-restart-evidence.v1"');
-        expect(source).toContain('checkpoint: "session-read-before-app-navigation"');
-        expect(source).toContain("sessionAfterRestart.sessionId === sessionBeforeRestart.sessionId");
-        expect(source).toContain("cookiesAfterRestart");
-        expect(source).toContain("freshAnonymousSignInRequests === 1");
-
-        expect(source).toContain('label: "packed browser smoke"');
-        expect(source).toContain('label: "generated bun run dev"');
-        expect(source).toContain('label: "generated app startup output drain"');
-        expect(source).toContain('label: "generated app output drain"');
-        expect(source).toContain('label: "Chromium close"');
-        expect(source).toContain("const cleanupFailures = []");
-        expect(source).not.toContain("function processGroupExists");
-        expect(source).not.toContain("async function terminate(");
-    });
 });

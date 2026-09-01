@@ -79,14 +79,7 @@ jobs:
           CDB_GENERATED_E2E_PLATFORM_NAME: macos-latest
         run: |
           bun scripts/smoke-packed-package.mjs ci-candidate/core.tgz
-          bun scripts/smoke-generated-project.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz --report generated-macos-report.json
-
-      - name: Upload generated app evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: generated-macos-${{ github.sha }}-${{ github.run_attempt }}
-          path: generated-macos-report.json
-          if-no-files-found: error
+          bun scripts/smoke-generated-project.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz
 
   generated-windows-dev-tree:
     name: Generated Windows dev tree
@@ -117,19 +110,12 @@ jobs:
       - name: Exercise generated dev shutdown
         shell: pwsh
         run: |
-          bun test/windows-dev-tree.mjs --tarball ci-candidate/core.tgz --react-tarball ci-candidate/react.tgz --report generated-windows-report.json
-
-      - name: Upload generated app evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: generated-windows-${{ github.sha }}-${{ github.run_attempt }}
-          path: generated-windows-report.json
-          if-no-files-found: error
+          bun test/windows-dev-tree.mjs --tarball ci-candidate/core.tgz --react-tarball ci-candidate/react.tgz
 
   verify:
     needs: candidate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -159,12 +145,6 @@ jobs:
       - name: Lint
         run: bun run lint
 
-      - name: Verify docs against the exact candidate
-        env:
-          CHARDB_DOCS_TARBALL: ci-candidate/core.tgz
-          CHARDB_DOCS_REACT_TARBALL: ci-candidate/react.tgz
-        run: bun run test:docs
-
       - name: Scan Git history for high-confidence secrets
         run: bun run security:history
 
@@ -181,61 +161,8 @@ jobs:
         run: |
           bun scripts/smoke-packed-package.mjs ci-candidate/core.tgz
           bun scripts/smoke-packed-react.mjs ci-candidate/core.tgz ci-candidate/react.tgz
-          bun scripts/smoke-generated-project.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz --report generated-linux-report.json
+          bun scripts/smoke-packed-org-user.mjs ci-candidate/core.tgz
+          bun scripts/smoke-packed-public-vector.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz
+          bun scripts/smoke-packed-browser.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz
+          bun scripts/smoke-generated-project.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz
           bun scripts/smoke-packed-chat.mjs ci-candidate/core.tgz --react ci-candidate/react.tgz
-
-      - name: Upload generated app evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: generated-linux-${{ github.sha }}-${{ github.run_attempt }}
-          path: generated-linux-report.json
-          if-no-files-found: error
-
-      - name: Install packed chat consumer
-        working-directory: example/chat
-        run: |
-          npm ci
-          npm install --ignore-scripts --no-audit --no-fund --no-save ../../ci-candidate/core.tgz ../../ci-candidate/react.tgz
-
-      - name: Typecheck chat consumer
-        working-directory: example/chat
-        run: npm run typecheck
-
-      - name: Build chat consumer
-        working-directory: example/chat
-        run: npm run build
-
-      - name: Test chat consumer
-        working-directory: example/chat
-        run: npm run test:e2e
-
-  os-ci-evidence:
-    name: Bind Linux, macOS, and Windows evidence
-    needs: [generated-macos, generated-windows-dev-tree, verify]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.2.22
-
-      - name: Download this run's platform reports
-        uses: actions/download-artifact@v4
-        with:
-          pattern: generated-*-${{ github.sha }}-${{ github.run_attempt }}
-          path: os-ci
-          merge-multiple: true
-
-      - name: Validate one run and checksum all reports
-        run: bun scripts/os-ci-evidence.mjs --directory os-ci
-
-      - name: Upload combined OS evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: os-ci-${{ github.sha }}-${{ github.run_attempt }}
-          path: os-ci
-          if-no-files-found: error

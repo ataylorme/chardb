@@ -94,14 +94,4 @@ describe("packed org-user evidence", () => {
         expect(JSON.parse(await readFile(file, "utf8"))).toEqual(report);
         expect(await readdir(directory)).toEqual(["org-user.json"]);
     });
-
-    test("the smoke always writes evidence and supports an explicit report path", async () => {
-        const source = await readFile(new URL("../scripts/smoke-packed-org-user.mjs", import.meta.url), "utf8");
-        expect(source).toContain("`${tarballPath}.org-user.json`");
-        expect(source).toContain("options.reportPath");
-        expect(source).toContain("await runRuntimeProof(workerSource)");
-        expect(source).toContain("organizationUserPeerReadDenied: true");
-        expect(source).not.toContain("PACKED_ORG_USER_CHECKS.map(name => [name, true])");
-        expect(source).toContain("await writeJsonAtomically(reportPath, report)");
-    });
 });

@@ -213,6 +213,7 @@ const listDrafts = api.mutation({
 });
 
 const app = chardb({
+    ownership: "organization",
     auth,
     schema: { projects, drafts },
     api: { createProject, listProjects, createDraft, listDrafts },

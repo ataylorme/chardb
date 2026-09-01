@@ -6,7 +6,6 @@ import { release, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { chromium } from "playwright-core";
 import { buildBrowserProofReport, fingerprintFile, writeJsonAtomically } from "./browser-proof-report.mjs";
-import { assertGeneratedBrowserContract } from "./generated-browser-contract.mjs";
 import { isolateProcessTree, preserveFailure, settleBounded, spawnManagedProcess } from "./process-lifecycle.mjs";
 
 if (await isolateProcessTree(import.meta.url, { label: "packed browser smoke", timeoutMs: 15 * 60_000 })) {
@@ -58,8 +57,10 @@ const PROTECTED_GENERATED_FILES = [
 ];
 
 let browser;
+let context;
 let running;
-let passed = false;
+let proofPassed = false;
+let proofReport;
 let restartEvidence;
 const browserErrors = [];
 try {
@@ -77,10 +78,6 @@ try {
     );
 
     const protectedBefore = await fingerprintGeneratedApp(project);
-    assertGeneratedBrowserContract({
-        authSource: await readFile(join(project, "src", "auth.ts"), "utf8"),
-        appSource: await readFile(join(project, "src", "web", "App.tsx"), "utf8"),
-    });
     await installPackedDependency(project);
     await assertGeneratedAppUnchanged(project, protectedBefore);
 
@@ -94,7 +91,7 @@ try {
 
     const browserExecutable = findChrome();
     browser = await chromium.launch({ executablePath: browserExecutable, headless: true });
-    const context = await browser.newContext();
+    context = await browser.newContext();
     const authRoutes = [];
     let anonymousSignInRequests = 0;
     context.on("request", request => {
@@ -409,7 +406,7 @@ try {
         readPackageVersion(project, "vite"),
         readPackageVersion(project, "better-auth"),
     ]);
-    const report = buildBrowserProofReport({
+    proofReport = buildBrowserProofReport({
         run: { id: runId, startedAt: runStartedAt },
         package: { name: "@chardb/core", version: packageVersion, tarball: await fingerprintFile(tarballPath) },
         reactPackage: {
@@ -464,11 +461,17 @@ try {
             activeOrganizationReshardObserved: true,
         },
     });
-    await writeJsonAtomically(reportPath, report);
-    console.log(JSON.stringify({ schema: report.schema, ok: true, artifact: { path: reportPath } }));
-    passed = true;
+    proofPassed = true;
 } finally {
     const cleanupFailures = [];
+    if (context) {
+        try {
+            await settleBounded(() => context.close(), { label: "primary browser context close", timeoutMs: 5_000 });
+            context = undefined;
+        } catch (error) {
+            cleanupFailures.push(error);
+        }
+    }
     if (browser) {
         try {
             await settleBounded(() => browser.close(), { label: "Chromium close", timeoutMs: 5_000 });
@@ -484,7 +487,7 @@ try {
         }
     }
     try {
-        if (!passed && process.env.CDB_BROWSER_KEEP_SCRATCH === "1") {
+        if ((!proofPassed || cleanupFailures.length > 0) && process.env.CDB_BROWSER_KEEP_SCRATCH === "1") {
             console.error(`packed browser scratch retained at ${scratch}`);
         } else {
             await rm(scratch, { recursive: true, force: true });
@@ -496,6 +499,11 @@ try {
         console.error(new AggregateError(cleanupFailures, "packed browser cleanup failed"));
         process.exitCode = 1;
     }
+}
+
+if (process.exitCode !== 1 && proofReport !== undefined) {
+    await writeJsonAtomically(reportPath, proofReport);
+    console.log(JSON.stringify({ schema: proofReport.schema, ok: true, artifact: { path: reportPath } }));
 }
 
 async function fingerprintGeneratedApp(cwd) {

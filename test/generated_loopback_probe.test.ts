@@ -3,7 +3,7 @@ import { injectGeneratedDevInspectorPort, injectGeneratedLoopbackProbe } from ".
 
 describe("generated Worker loopback probe", () => {
     test("inserts before the default export without depending on health-route formatting", () => {
-        const source = `export const app = chardb({});
+        const source = `export const app = chardb({ ownership: "user" });
 app.get(
   "/health",
   (c) => c.json({ ok: true, schemaVersion: migrations.version, schemaDigest: migrations.digest }),

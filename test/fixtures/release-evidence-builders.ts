@@ -20,13 +20,6 @@ import {
     FILE_RESHARD_LOCAL_BINDINGS,
     compareFileReshardDeploymentSamples,
 } from "../../scripts/file-reshard-deployment-proof.mjs";
-import { GENERATED_PROJECT_INVARIANTS, buildGeneratedProjectReport } from "../../scripts/generated-project-report.mjs";
-import { PACKED_CHAT_INVARIANTS, buildPackedChatReport } from "../../scripts/packed-chat-report.mjs";
-import {
-    PACKED_LOCAL_VECTOR_CAPABILITY,
-    PACKED_PUBLIC_VECTOR_SCHEMA,
-    PUBLIC_VECTOR_QUERY_REF,
-} from "../../scripts/packed-public-vector-contract.mjs";
 import { alternatingTargetOrder } from "../../scripts/run-file-benchmark.mjs";
 
 export interface ExactCandidate {
@@ -44,111 +37,6 @@ function reactCandidateFor(candidate: ExactCandidate): ExactCandidate {
         algorithm: "sha256",
         digest: fixtureSha256(`react:${candidate.digest}:${candidate.bytes}`),
         bytes: candidate.bytes + 17,
-    };
-}
-
-export function buildGeneratedProjectEvidence(
-    candidate: ExactCandidate,
-    reactCandidate = reactCandidateFor(candidate)
-) {
-    return buildGeneratedProjectReport({
-        run: { id: "release-admission-generated" },
-        packageEvidence: { name: "@chardb/core", version: "0.1.0", tarball: candidate },
-        reactPackageEvidence: {
-            name: "@chardb/react",
-            version: "0.1.0",
-            tarball: reactCandidate,
-        },
-        platform: { name: "test-linux-x64" },
-        runtime: { bun: "1.2.22", wrangler: "4.125.0" },
-        migrations: {
-            initial: { id: "generated-initial-schema", targetVersion: 1, activatedShards: ["ShardDO_0"] },
-            upgrade: {
-                id: "generated-upgrade-v2",
-                fromVersion: 1,
-                targetVersion: 2,
-                activatedShards: ["ShardDO_0"],
-            },
-        },
-        invariants: Object.fromEntries(GENERATED_PROJECT_INVARIANTS.map(name => [name, true])),
-    });
-}
-
-export function buildPackedChatEvidence(candidate: ExactCandidate, reactCandidate = reactCandidateFor(candidate)) {
-    const route = (path: string) => ({ method: "POST", path, status: 200 });
-    return buildPackedChatReport({
-        run: { id: "release-admission-chat" },
-        packageEvidence: { name: "@chardb/core", version: "0.1.0", tarball: candidate },
-        reactPackageEvidence: {
-            name: "@chardb/react",
-            version: "0.1.0",
-            tarball: reactCandidate,
-        },
-        platform: { operatingSystem: "linux", release: "6.11.0", architecture: "x64" },
-        runtime: {
-            name: "packed-chat-miniflare-process-restart",
-            bun: "1.2.22",
-            nodeCompatibility: "22.14.0",
-            wrangler: "4.125.0",
-            miniflare: "4.20260828.0",
-            betterAuth: "1.6.30",
-        },
-        identity: { ownerUserId: "user-owner", memberUserId: "user-member" },
-        organizations: { shared: { id: "org-shared" }, isolated: { id: "org-isolated" } },
-        betterAuthRoutes: [
-            route("/api/auth/sign-in/anonymous"),
-            route("/api/auth/sign-in/anonymous"),
-            route("/api/auth/organization/create"),
-            route("/api/auth/organization/create"),
-            route("/api/auth/organization/set-active"),
-            route("/api/auth/organization/set-active"),
-            route("/api/auth/organization/set-active"),
-            route("/api/auth/organization/invite-member"),
-            route("/api/auth/organization/accept-invitation"),
-            route("/api/auth/organization/leave"),
-        ],
-        benchmark: {
-            profile: "ci-smoke",
-            direct: { type: "chardb-direct-select-benchmark", profile: "ci-smoke", queries: 32, concurrency: 8 },
-            live: { type: "chardb-binding-benchmark", profile: "ci-smoke", queries: 4, concurrency: 8 },
-        },
-        invariants: Object.fromEntries(PACKED_CHAT_INVARIANTS.map(name => [name, true])),
-    });
-}
-
-export function buildPackedPublicVectorEvidence(
-    candidate: ExactCandidate,
-    reactCandidate = reactCandidateFor(candidate)
-) {
-    const queryArgs = { organizationId: "org-browser-proof", values: [1, 0, 0], limit: 5 };
-    return {
-        schema: PACKED_PUBLIC_VECTOR_SCHEMA,
-        ok: true,
-        capability: PACKED_LOCAL_VECTOR_CAPABILITY,
-        package: { name: "@chardb/core", version: "0.1.0", tarball: candidate },
-        reactPackage: {
-            name: "@chardb/react",
-            version: "0.1.0",
-            tarball: reactCandidate,
-        },
-        proof: {
-            schema: PACKED_PUBLIC_VECTOR_SCHEMA,
-            queryRef: PUBLIC_VECTOR_QUERY_REF,
-            queryArgs,
-            observations: [
-                { state: "pending", rows: [] },
-                { state: "live", rows: [{ rowPk: "message-a", score: 0.98 }] },
-                { state: "refetching", rows: [] },
-                { state: "live", rows: [{ rowPk: "message-b", score: 0.91 }] },
-            ],
-            sent: [
-                { t: "hello", protocolV: 3, clientId: "browser-proof", jwt: "proof.jwt.value" },
-                { t: "sub", subId: 1, ref: PUBLIC_VECTOR_QUERY_REF, args: queryArgs },
-                { t: "ack", cookie: "browser-proof:1" },
-                { t: "sub", subId: 1, ref: PUBLIC_VECTOR_QUERY_REF, args: queryArgs },
-                { t: "ack", cookie: "browser-proof:2" },
-            ],
-        },
     };
 }
 
