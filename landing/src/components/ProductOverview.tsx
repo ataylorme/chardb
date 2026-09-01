@@ -10,8 +10,8 @@ function DatabaseSnippet() {
             <span className="syntax-function">defineAuth</span>
             <span className="syntax-punctuation">({"{"}</span>
             {"\n  "}
-            <span className="syntax-property">plugins</span>: [<span className="syntax-function">organization</span>(),{" "}
-            <span className="syntax-function">jwt</span>()],
+            <span className="syntax-property">plugins</span>: [<span className="syntax-function">anonymous</span>(),{" "}
+            <span className="syntax-function">organization</span>(), <span className="syntax-function">jwt</span>()],
             {"\n"}
             <span className="syntax-punctuation">{"});"}</span>
             {"\n\n"}
@@ -21,7 +21,7 @@ function DatabaseSnippet() {
             <span className="syntax-variable">cdbTable</span>
             {" } = "}
             <span className="syntax-function">forOrg</span>
-            <span className="syntax-punctuation">();</span>
+            <span className="syntax-punctuation">(auth);</span>
             {"\n\n"}
             <span className="syntax-keyword">export const</span> <span className="syntax-variable">messages</span>{" "}
             {"= "}
@@ -33,13 +33,6 @@ function DatabaseSnippet() {
             <span className="syntax-property">id</span>: <span className="syntax-function">text</span>(
             <span className="syntax-string">"id"</span>).<span className="syntax-function">primaryKey</span>(),
             {"\n  "}
-            <span className="syntax-property">organizationId</span>: <span className="syntax-function">text</span>(
-            <span className="syntax-string">"organization_id"</span>){"\n    ."}
-            <span className="syntax-function">notNull</span>()
-            {"\n    ."}
-            <span className="syntax-function">references</span>(() ={">"} <span className="syntax-variable">auth</span>.
-            <span className="syntax-property">organization</span>.<span className="syntax-property">id</span>),
-            {"\n  "}
             <span className="syntax-property">body</span>: <span className="syntax-function">text</span>(
             <span className="syntax-string">"body"</span>).<span className="syntax-function">notNull</span>(),
             {"\n"}
@@ -47,8 +40,6 @@ function DatabaseSnippet() {
             {"\n\n"}
             <span className="syntax-keyword">export default</span> <span className="syntax-function">chardb</span>
             <span className="syntax-punctuation">({"{"}</span>
-            {"\n  "}
-            <span className="syntax-property">ownership</span>: <span className="syntax-string">"organization"</span>,
             {"\n  "}
             <span className="syntax-property">auth</span>, <span className="syntax-property">schema</span>: {"{ "}
             <span className="syntax-variable">messages</span>
@@ -70,7 +61,10 @@ function ReactClientSnippet() {
             {"\n\n"}
             <span className="syntax-keyword">const</span> <span className="syntax-variable">url</span> {"= "}
             <span className="syntax-variable">import</span>.<span className="syntax-property">meta</span>.
-            <span className="syntax-property">env</span>.<span className="syntax-property">PUBLIC_CHARD_DB_URL</span>
+            <span className="syntax-property">env</span>.<span className="syntax-property">VITE_CHARD_DB_URL</span>
+            {" ?? "}
+            <span className="syntax-variable">window</span>.<span className="syntax-property">location</span>.
+            <span className="syntax-property">origin</span>
             <span className="syntax-punctuation">;</span>
             {"\n\n"}
             <span className="syntax-keyword">export const</span> <span className="syntax-variable">db</span> {"= "}
@@ -85,6 +79,7 @@ function ReactClientSnippet() {
             <span className="syntax-function">createAuthClient</span>({"{"}
             {"\n    "}
             <span className="syntax-property">baseURL</span>, <span className="syntax-property">plugins</span>: [
+            <span className="syntax-function">anonymousClient</span>(),{" "}
             <span className="syntax-function">organizationClient</span>(),{" "}
             <span className="syntax-function">jwtClient</span>()],
             {"\n  "}
@@ -93,9 +88,7 @@ function ReactClientSnippet() {
             {"\n\n"}
             <span className="syntax-keyword">const</span> <span className="syntax-variable">signIn</span> {"= () => "}
             <span className="syntax-variable">db</span>.<span className="syntax-property">auth</span>.
-            <span className="syntax-property">signIn</span>.<span className="syntax-function">social</span>({"{"}{" "}
-            <span className="syntax-property">provider</span>: {""}
-            <span className="syntax-string">"github"</span> {"}"});
+            <span className="syntax-property">signIn</span>.<span className="syntax-function">anonymous</span>();
             {"\n\n"}
             <span className="syntax-keyword">export function</span> <span className="syntax-function">App</span>() {"{"}
             {"\n  "}
@@ -144,10 +137,14 @@ function RustClientSnippet() {
             <span className="syntax-variable">operations</span>::{"{"}
             <span className="syntax-type">ListMessagesArgs</span>,{" "}
             <span className="syntax-variable">LIST_MESSAGES</span>
+            {"};\n"}
+            <span className="syntax-keyword">use</span> <span className="syntax-variable">chardb_client</span>::{"{"}
+            <span className="syntax-type">AsyncClient</span>, <span className="syntax-type">ClientConfig</span>,{" "}
+            <span className="syntax-type">SubscriptionEvent</span>
             {"};\n\n"}
             <span className="syntax-keyword">let</span> <span className="syntax-variable">client</span> {"= "}
             <span className="syntax-type">AsyncClient</span>::<span className="syntax-function">connect</span>(
-            <span className="syntax-type">ClientConfig</span>::<span className="syntax-function">new</span>(
+            <span className="syntax-type">ClientConfig</span>::<span className="syntax-function">with_token</span>(
             <span className="syntax-variable">endpoint</span>, <span className="syntax-variable">jwt</span>))
             {"\n  ."}
             <span className="syntax-keyword">await</span>?;
@@ -158,14 +155,19 @@ function RustClientSnippet() {
             <span className="syntax-type">ListMessagesArgs</span> {"{"}
             <span className="syntax-property"> organization_id</span>, <span className="syntax-property">limit</span>:{" "}
             <span className="syntax-number">50</span> {"}"},{"\n"}
-            ).<span className="syntax-keyword">await</span>?;
+            )?;
             {"\n\n"}
-            <span className="syntax-keyword">while let</span> <span className="syntax-type">Some</span>(
-            <span className="syntax-variable">event</span>) {"= "}
-            <span className="syntax-variable">messages</span>.<span className="syntax-function">next</span>().
-            <span className="syntax-keyword">await</span> {"{"}
+            <span className="syntax-keyword">loop</span> {"{"}
             {"\n  "}
-            <span className="syntax-function">render</span>(<span className="syntax-variable">event</span>?);
+            <span className="syntax-keyword">let</span> <span className="syntax-variable">event</span> {"= "}
+            <span className="syntax-variable">messages</span>.<span className="syntax-function">recv</span>().
+            <span className="syntax-keyword">await</span>?;
+            {"\n  "}
+            <span className="syntax-keyword">if</span> <span className="syntax-function">matches!</span>(
+            <span className="syntax-variable">event</span>, <span className="syntax-type">SubscriptionEvent</span>::
+            <span className="syntax-property">Closed</span>) {"{ break; }"}
+            {"\n  "}
+            <span className="syntax-function">render</span>(<span className="syntax-variable">event</span>);
             {"\n"}
             {"}"}
         </code>
@@ -215,7 +217,7 @@ export function ProductOverview() {
                         </h2>
                         <p className="mt-5 text-base leading-7 text-fg-muted">
                             Pick organization or user ownership once. Chardb carries the successful Better Auth identity
-                            through routing, policy, generated types, and every client query.
+                            through routing, policy, typed handles, and every client query.
                         </p>
                     </div>
 
@@ -316,9 +318,9 @@ export function ProductOverview() {
                         <a href={GITHUB_URL} rel="noopener" className="text-fg hover:text-accent transition-colors">
                             GitHub
                         </a>
-                        <span className="text-fg-dim" aria-label="Documentation coming soon">
-                            Docs soon
-                        </span>
+                        <a href="/docs" className="text-fg-dim hover:text-fg transition-colors">
+                            Docs
+                        </a>
                     </div>
                 </div>
             </section>

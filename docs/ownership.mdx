@@ -3,7 +3,7 @@ title: "Ownership"
 description: "Bind tables to organization, user, or organization-and-user ownership."
 ---
 
-The schema factory makes ownership explicit. `forOrg(auth)` stores rows for an organization. `forUser(auth)` stores rows for the signed-in user. `forOrgUser(auth)` stores rows for one user inside an organization.
+Every Worker chooses one ownership mode in `chardb()`. Organization mode accepts tables from `forOrg(auth)` and `forOrgUser(auth)`. User mode accepts only `forUser(auth)`. Chardb rejects a schema that mixes the two modes.
 
 ## Own rows with an organization
 
@@ -49,7 +49,7 @@ Chardb fills `organizationId` and `authorId` from verified authority during inse
 
 ## Own rows with a user
 
-Use a separate schema module for rows that follow the signed-in user rather than an active organization.
+Choose `ownership: "user"` for a Worker whose rows follow the signed-in user rather than an active organization.
 
 ```ts src/preference-schema.ts
 import { text } from "drizzle-orm/sqlite-core";
@@ -68,7 +68,7 @@ export const preferences = cdbTable("preferences", {
 
 ## Own a row with an organization and user
 
-Put private rows in a separate schema module with `forOrgUser(auth)`.
+In an organization-owned Worker, use `forOrgUser(auth)` for rows owned by one member inside the organization.
 
 ```ts src/draft-schema.ts
 import { text } from "drizzle-orm/sqlite-core";

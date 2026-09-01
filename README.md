@@ -276,6 +276,7 @@ import { migrations } from "./migrations.ts";
 import * as schema from "./schema.ts";
 
 export const app = chardb({
+    ownership: "organization",
     auth,
     schema,
     api: { ...api, ...queries },
@@ -383,7 +384,7 @@ The CLI ships `init`, `doctor`, `migrations generate`, `migrate`, and `vectorize
 
 ## Cloudflare runtime
 
-Generated projects run through Wrangler and Miniflare with native Durable Objects, SQLite, and four explicit same-Worker namespace bindings. The scaffold includes a native R2-backed file example. Vector columns use a native Vectorize binding after the application configures one. The generated default is `wrangler.toml`; `chardb doctor` and resource preparation also accept `wrangler.json` and `wrangler.jsonc`. Application code uses the exported `DB` entrypoint. Runtime-provided `ctx.exports` remains a fallback, but internal Durable Object calls in generated deployments do not depend on it. [ARCHITECTURE.md](ARCHITECTURE.md) documents the internal ownership and routing model.
+Generated projects run through Wrangler and Miniflare with native Durable Objects, SQLite, and four explicit same-Worker namespace bindings. The scaffold includes a native R2-backed file example. Vector columns use a native Vectorize binding after the application configures one. The generated default is `wrangler.toml`; `chardb doctor` and resource preparation also accept `wrangler.json` and `wrangler.jsonc`. Application code uses the exported `DB` entrypoint. Runtime-provided `ctx.exports` remains a fallback, but internal Durable Object calls in generated deployments do not depend on it.
 
 Migration execution is resumable and fail-closed. Generation is deterministic and writes static, digest-chained JSON and TypeScript snapshots, so deployed history does not import mutable schema or auth modules. Versions after the initial snapshot deliberately support only SQLite changes that do not require a table rewrite or data cleanup.
 
@@ -399,15 +400,11 @@ Benchmarks use named, versioned workloads. Warmups are excluded from latency sum
 
 Local fake-index vector results measure Worker, SQLite, routing, and live-query work. They do not measure Vectorize or Cloudflare network cost. A local and deployed comparison is valid only when both tracks use the same packed candidate and workload.
 
-[COST.md](COST.md) maps Chardb operations to Cloudflare's published meters. Timings are not CPU, Durable Object duration, or an invoice estimate.
-
 ## Deliberately out of scope
 
 Global-table paths remain inside internal conformance fixtures. User-owned tables are public through `forUser(auth)`.
 
 User-owned and global files, user-owned and global vectors, vector-search continuation, presence, streams, scheduling, cross-partition transactions, PITR, export, restore, and automatic resharding are unsupported. Organization files and organization vectors are public and experimental within the narrow lifecycles documented above. Lower-level barrier and operator-driven range-movement code remains internal.
-
-See [OPERATIONS.md](OPERATIONS.md) for the threat model and recovery limits, [COST.md](COST.md) for the measured-cost boundary, and [ARCHITECTURE.md](ARCHITECTURE.md) for runtime ownership.
 
 ## License
 

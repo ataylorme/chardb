@@ -29,9 +29,9 @@ export function TopNav({ homeHref = "#top", storyActive = false }: TopNavProps) 
                             </a>
                         </li>
                         <li>
-                            <span className="text-fg-dim" aria-label="Documentation coming soon">
-                                docs soon
-                            </span>
+                            <a href="/docs" className="nav-link text-fg-dim hover:text-fg transition-colors">
+                                docs
+                            </a>
                         </li>
                     </ul>
                     <a
