@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { text } from "drizzle-orm/sqlite-core";
 import { isCdbError } from "../../src/errors.ts";
-import { globalScope } from "../../src/server/cdb-tenant.ts";
 import { createApi, defineMutation, defineQuery } from "../../src/server/define.ts";
 import {
     manifestFromExports,
@@ -12,6 +11,7 @@ import {
     routeValidatedQuery,
 } from "../../src/server/manifest.ts";
 import type { ChardbRef } from "../../src/types.ts";
+import { globalScope } from "../helpers/cdb-table.ts";
 
 const createPost = defineMutation<unknown, { authorId: string; body: string }, { id: string }>(
     (_ctx, args) => ({ id: `post-${args.authorId}` }),

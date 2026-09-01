@@ -5,7 +5,6 @@ import { text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { isCdbError, rehydrateCdbRpcError } from "../../src/errors.ts";
 import { FileId, file } from "../../src/files/index.ts";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { api } from "../../src/server/define.ts";
 import { CatalogOrganizationDeletionStore } from "../../src/server/do/catalog-organization-deletion-store.ts";
 import { cdbVectorLogicalId, stageCdbVector } from "../../src/server/do/cdb-vector-mutation.ts";
@@ -18,6 +17,7 @@ import { cdbVectorResourceId } from "../../src/server/resource-descriptors.ts";
 import { PrincipalId, TenantId } from "../../src/types.ts";
 import { vector } from "../../src/vector.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { forOrg } from "../helpers/cdb-table.ts";
 
 const USER_ID = "vector-delete-user";
 const OWNER_SHARD = "ShardDO_vector_owner";

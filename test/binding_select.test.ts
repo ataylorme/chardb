@@ -8,7 +8,7 @@ import {
     client,
 } from "../src/binding.ts";
 import { CdbError } from "../src/errors.ts";
-import { globalScope } from "../src/server/cdb-tenant.ts";
+import { globalScope } from "./helpers/cdb-table.ts";
 
 const { cdbTable } = globalScope();
 const messages = cdbTable(

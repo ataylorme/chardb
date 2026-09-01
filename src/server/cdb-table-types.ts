@@ -1,7 +1,7 @@
 /**
  * Type vocabulary shared across the cdbTable subsystem.
  *
- * The factory layer (`cdb-tenant.ts`) and the table builder
+ * The ownership factory layer (`schema-ownership.ts`) and the table builder
  * (`cdb-table.ts`) both consume these types; the registry
  * (`cdb-table-registry.ts`) stores them at runtime. Splitting them
  * into a leaf module avoids the import cycle every other arrangement
@@ -12,8 +12,8 @@
  *     constrain what the schema author can write inside a `cdbTable
  *     (...)` call. Discriminated on factory scope so `forOrgUser()` can
  *     require both organization and user ownership, `forUser()` rejects
- *     `selfBy:` (self is implicit there), and `global()` requires
- *     `partitionBy:`.
+ *     `selfBy:` (self is implicit there), and internal non-tenant tables
+ *     require `partitionBy:`.
  *   - **Resolved metadata** (`CdbTableMeta`) is the compile-once boot-
  *     time record stored in the WeakMap. It carries the auto-discovered
  *     tenant column, materialized roles, partition spec, and audit
@@ -43,7 +43,7 @@ export type CdbScopeKind = TenantKind | "orgUser";
  * The subset of role names with framework meaning. `self` is reserved
  * (binds to the row's user-FK column via `selfBy`); other names match
  * the active tenancy lattice (`member.role` for `forOrg`,
- * `user.role` for `forUser`/`global`). A `user:`-prefixed name always
+ * `user.role` for `forUser` and internal tables). A `user:`-prefixed name always
  * matches `user.role` regardless of file lattice.
  */
 export type ReservedRoleName = "owner" | "admin" | "member" | "self";
@@ -99,7 +99,7 @@ interface BaseConfigCommon<TCols> {
     readonly publicRead?: boolean;
 }
 
-/** When `self` MAY appear (forOrg + global): selfBy required iff self is used. */
+/** When `self` may appear, selfBy is required if a policy uses it. */
 type WithOptionalSelf<TCols> =
     | (BaseConfigCommon<TCols> & {
           readonly selfBy?: never;
@@ -131,7 +131,7 @@ type OrgUserConfig<TCols> = BaseConfigCommon<TCols> & {
     readonly columns?: { readonly [C in keyof TCols & string]?: ColumnSpec<TCols, RoleName> };
 };
 
-/** Global tables MUST set `partitionBy` (no implicit tenant column to default to). */
+/** Internal non-tenant tables must set `partitionBy`. */
 type GlobalConfig<TCols> =
     | (BaseConfigCommon<TCols> & {
           readonly partitionBy: (keyof TCols & string) | readonly (keyof TCols & string)[] | "replicated";
@@ -157,7 +157,7 @@ export type CdbTableConfig<TCols, K extends CdbScopeKind> = K extends "org"
 
 /**
  * The four canonical auth target tables we care about for tenancy
- * binding. `null` covers `global()`. Stored on the meta record so the
+ * binding. `null` covers internal non-tenant tables. Stored on the meta record so the
  * boot-time validator can match a column's `.references()` target
  * without re-resolving the auth synthesizer.
  */
@@ -185,13 +185,13 @@ export interface CdbTableMeta {
     readonly name: string;
     /** Tenancy axis declared by the file's factory. */
     readonly tenantKind: TenantKind;
-    /** Auth target the tenant column FKs into; null for `global()`. */
+    /** Auth target the tenant column FKs into; null for internal non-tenant tables. */
     readonly authTarget: AuthTargetKind;
     /** Auth target used to auto-discover user ownership under `forOrgUser()`. */
     readonly selfTarget: "user" | undefined;
     /**
      * Auto-discovered tenant column name (or the explicit `tenantBy`
-     * override). Undefined under `global()`. Resolved lazily — the
+     * override). Undefined for internal non-tenant tables. Resolved lazily — the
      * registry call site triggers FK walk.
      */
     readonly tenantBy: string | undefined;

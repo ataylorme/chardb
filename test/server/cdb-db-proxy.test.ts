@@ -24,9 +24,9 @@ import type { BaseSQLiteDatabase, SQLiteTable } from "drizzle-orm/sqlite-core";
 import { CdbError } from "../../src/errors.ts";
 import { type QueryReadRangeObservation, wrapDb, wrapMutationDb, wrapQueryDb } from "../../src/server/cdb-db-proxy.ts";
 import type { RoleValue } from "../../src/server/cdb-table-types.ts";
-import { forOrg, forOrgUser, forUser, globalScope } from "../../src/server/cdb-tenant.ts";
 import type { AuthCtx } from "../../src/server/define.ts";
 import type { VectorMutationApi } from "../../src/vector.ts";
+import { forOrg, forOrgUser, forUser, globalScope } from "../helpers/cdb-table.ts";
 
 /**
  * The stub satisfies the surface chardb's proxy actually inspects

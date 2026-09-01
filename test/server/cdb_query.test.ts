@@ -3,7 +3,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { and, between, eq, exists, gt, gte, sql } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
-import { forOrg, globalScope } from "../../src/server/cdb-tenant.ts";
 import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { manifestFromExports, resolveQuery, routeValidatedQuery } from "../../src/server/manifest.ts";
@@ -18,6 +17,7 @@ import { ChardbRef, ClientId, PrincipalId, type RawJson, SubId, TenantId } from 
 import { stableHashHex, stableJson } from "../../src/util/canonical.ts";
 import { vshardOf } from "../../src/vshard.ts";
 import type { WireEndpoint, WireInterval } from "../../src/wire.ts";
+import { forOrg, globalScope } from "../helpers/cdb-table.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];

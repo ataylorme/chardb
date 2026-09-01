@@ -2,7 +2,6 @@ import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import type { TableSpec } from "../../src/reshard/triggers.ts";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { CdbVectorOutboxStore } from "../../src/server/do/cdb-vector-outbox-store.ts";
 import { decodeCdbVectorReshardPage } from "../../src/server/do/cdb-vector-reshard-records.ts";
 import { Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
@@ -12,6 +11,7 @@ import { defineMigrations } from "../../src/server/schema-migrations.ts";
 import { renderVectorReshardTriggers } from "../../src/server/vector-reshard-triggers.ts";
 import { stableJson } from "../../src/util/canonical.ts";
 import { vector } from "../../src/vector.ts";
+import { forOrg } from "../helpers/cdb-table.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];

@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { text } from "drizzle-orm/sqlite-core";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { CdbVectorOutboxStore } from "../../src/server/do/cdb-vector-outbox-store.ts";
 import {
     executeRegisteredVectorQueryPlan,
@@ -16,6 +15,7 @@ import { cdbVectorResourceId, collectSchemaResourceDescriptors } from "../../src
 import { renderVectorMutationTriggerSet } from "../../src/server/vector-triggers.ts";
 import { ShardId } from "../../src/types.ts";
 import { searchVector, vector } from "../../src/vector.ts";
+import { forOrg } from "../helpers/cdb-table.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];

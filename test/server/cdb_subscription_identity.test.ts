@@ -1,13 +1,13 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { emptyManifest } from "../../src/server/manifest.ts";
 import type { CdbSubscriptionRequest, LiveSubscriptionId } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 import { stableHashHex } from "../../src/util/canonical.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { forOrg } from "../helpers/cdb-table.ts";
 
 const organization = sqliteTable("organization", { id: text("id").primaryKey() });
 const { cdbTable } = forOrg();

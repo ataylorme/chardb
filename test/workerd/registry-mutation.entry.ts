@@ -5,7 +5,6 @@ import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { isCdbError } from "../../src/errors.ts";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
-import { globalScope } from "../../src/server/cdb-tenant.ts";
 import { chardb } from "../../src/server/chardb.ts";
 import { createApi } from "../../src/server/define.ts";
 import { manifestFromExports, routeMutation, routeValidatedQuery } from "../../src/server/manifest.ts";
@@ -20,6 +19,7 @@ import type {
 } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { globalScope } from "../helpers/cdb-table.ts";
 
 const { cdbTable } = globalScope();
 const entries = cdbTable(

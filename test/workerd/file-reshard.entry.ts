@@ -2,7 +2,6 @@ import { DurableObject } from "cloudflare:workers";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { renderSqliteTableDdl } from "../../src/auth/ddl.ts";
 import { file } from "../../src/files/index.ts";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
 import type { AuthCtx } from "../../src/server/define.ts";
 import {
     CDB_FILE_RESHARD_PAGE_SIZE,
@@ -27,6 +26,7 @@ import { emptyManifest } from "../../src/server/manifest.ts";
 import { collectSchemaFileResourceDescriptors } from "../../src/server/resource-descriptors.ts";
 import { defineMigrations } from "../../src/server/schema-migrations.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { forOrg } from "../helpers/cdb-table.ts";
 
 interface Env {
     readonly CDB_FILES: R2Bucket;

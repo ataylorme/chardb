@@ -25,7 +25,6 @@ import { defineAuth } from "../../src/auth/synthesize.ts";
 import type { ChardbBinding } from "../../src/binding.ts";
 import { CdbError } from "../../src/errors.ts";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
-import { forOrg, forOrgUser } from "../../src/server/cdb-tenant.ts";
 import { chardb } from "../../src/server/chardb.ts";
 import { defineMutation, defineQuery } from "../../src/server/define.ts";
 import { Cdb } from "../../src/server/do/cdb.ts";
@@ -34,6 +33,7 @@ import { defineMigrations } from "../../src/server/schema-migrations.ts";
 import type { RawJson } from "../../src/types.ts";
 import { stableJson } from "../../src/util/canonical.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { forOrg, forOrgUser } from "../helpers/cdb-table.ts";
 
 const organizationTable = sqliteTable("organization", { id: text("id").primaryKey() });
 const userTable = sqliteTable("user", { id: text("id").primaryKey() });

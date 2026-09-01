@@ -4,7 +4,6 @@ import { eq } from "drizzle-orm";
 import { text } from "drizzle-orm/sqlite-core";
 import { defineAuth } from "../../src/auth/synthesize.ts";
 import { isCdbError } from "../../src/errors.ts";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { createApi } from "../../src/server/define.ts";
 import { packagedReshardTableSpecs } from "../../src/server/do/cdb-reshard-identity-store.ts";
 import { deleteCdbVector, stageCdbVector } from "../../src/server/do/cdb-vector-mutation.ts";
@@ -31,6 +30,7 @@ import { dispatchOrganizationVectorSearch } from "../../src/server/vector-search
 import { PrincipalId, type RawJson, TenantId } from "../../src/types.ts";
 import { stableHashHex } from "../../src/util/canonical.ts";
 import { vector } from "../../src/vector.ts";
+import { forOrg } from "../helpers/cdb-table.ts";
 
 const auth = defineAuth({ appName: "vector-delivery-workerd-proof", plugins: [organization()] });
 const { cdbTable } = forOrg();

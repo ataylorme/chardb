@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { blob, integer, text } from "drizzle-orm/sqlite-core";
-import { globalScope } from "../../src/server/cdb-tenant.ts";
 import {
     CDB_RESHARD_IDENTITY_STORE_DDL,
     CDB_SPLIT_IDENTITY_LIMIT,
@@ -13,6 +12,7 @@ import {
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { defineMigrations } from "../../src/server/schema-migrations.ts";
 import { stableJson } from "../../src/util/canonical.ts";
+import { globalScope } from "../helpers/cdb-table.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];

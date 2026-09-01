@@ -15,7 +15,6 @@ import { z } from "zod";
 import { renderSqliteTableDdl } from "../../src/auth/ddl.ts";
 import { synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import { type SplitLogCapacity, type TableSpec, renderTableTriggers } from "../../src/reshard/triggers.ts";
-import { forOrgUser, globalScope } from "../../src/server/cdb-tenant.ts";
 import { createApi } from "../../src/server/define.ts";
 import { CdbOpLogRetentionStore } from "../../src/server/do/cdb-oplog-retention-store.ts";
 import { type TailTransaction, configureCdbRuntime } from "../../src/server/do/cdb.ts";
@@ -24,6 +23,7 @@ import { manifestFromExports } from "../../src/server/manifest.ts";
 import type { CdbMutationRequest } from "../../src/server/rpc.ts";
 import { defineMigrations } from "../../src/server/schema-migrations.ts";
 import type { RawJson } from "../../src/types.ts";
+import { forOrgUser, globalScope } from "../helpers/cdb-table.ts";
 
 const { cdbTable } = globalScope();
 const dedupRecords = cdbTable(

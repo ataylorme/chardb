@@ -1,7 +1,7 @@
 /**
  * Internal `cdbTable(name, columns, config)` builder. Not exported
- * directly from `@chardb/core/server` — schema files obtain a tenancy-bound
- * `cdbTable` via `forOrg() / forUser() / global()` from `cdb-tenant.ts`.
+ * directly from `@chardb/core/server`. Schema files obtain an ownership-bound
+ * `cdbTable` from `schema-ownership.ts`.
  *
  * Responsibilities:
  *   1. Delegate to Drizzle's `sqliteTable(name, columns)` so downstream
@@ -56,8 +56,8 @@ type BuiltTable<TName extends string, TCols extends CdbColumnsInput> = SQLiteTab
 }>;
 
 /**
- * Construct a single cdbTable with explicit tenancy axis. Called by the
- * factory layer (`cdb-tenant.ts`) — never exported publicly.
+ * Construct a single cdbTable with an explicit tenancy axis. Ownership
+ * factories call this after adding their managed columns.
  */
 export function createCdbTable<TName extends string, TCols extends CdbColumnsInput, K extends CdbScopeKind>(args: {
     readonly name: TName;
@@ -142,7 +142,7 @@ export function createCdbTable<TName extends string, TCols extends CdbColumnsInp
         ({} as { readonly [k: string]: ColumnSpec<TCols, RoleName> });
 
     // Reject `self` in roles/columns when the file's tenancy axis bans it
-    // ("global" + missing selfBy → user must spell selfBy first; "user" →
+    // (non-tenant + missing selfBy → the caller must spell selfBy first; "user" →
     // self is implicit, so an explicit selfBy is rejected).
     if (args.tenantKind === "user" && selfBy !== undefined) {
         throw new CdbError({
@@ -213,7 +213,7 @@ export function resolveCdbMeta(table: SQLiteTable): ResolvedCdbMeta {
     if (!meta) {
         throw new CdbError({
             code: "CDB_NOT_CDB_TABLE",
-            message: `${getTableName(table)}: this table was not created via cdbTable() — wrap it with forOrg/forUser/global`,
+            message: `${getTableName(table)}: this table was not created by a chardb ownership factory`,
         });
     }
     const tenantBy = autoDiscoverTenantColumn(table, meta);

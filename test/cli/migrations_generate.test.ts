@@ -548,7 +548,7 @@ describe("initial migration generation", () => {
             );
             await Bun.write(
                 `${source}/schema.ts`,
-                `import { text } from "drizzle-orm/sqlite-core";\nimport { globalScope } from ${JSON.stringify(`${root}/src/server/cdb-tenant.ts`)};\nconst { cdbTable } = globalScope();\nexport const notes = cdbTable("notes", { id: text("id").primaryKey() });\n`
+                `import { text } from "drizzle-orm/sqlite-core";\nimport { globalScope } from ${JSON.stringify(`${root}/test/helpers/cdb-table.ts`)};\nconst { cdbTable } = globalScope();\nexport const notes = cdbTable("notes", { id: text("id").primaryKey() });\n`
             );
             const ctx: CliContext = {
                 ...REAL_CONTEXT,
@@ -565,7 +565,7 @@ describe("initial migration generation", () => {
 
             await Bun.write(
                 `${source}/schema.ts`,
-                `import { text } from "drizzle-orm/sqlite-core";\nimport { globalScope } from ${JSON.stringify(`${root}/src/server/cdb-tenant.ts`)};\nconst { cdbTable } = globalScope();\nexport const notes = cdbTable("notes", { id: text("id").primaryKey(), note: text("note") });\n`
+                `import { text } from "drizzle-orm/sqlite-core";\nimport { globalScope } from ${JSON.stringify(`${root}/test/helpers/cdb-table.ts`)};\nconst { cdbTable } = globalScope();\nexport const notes = cdbTable("notes", { id: text("id").primaryKey(), note: text("note") });\n`
             );
             await runMigrationsGenerate(ctx, { name: "add_note" });
             expect(await readFile(`${source}/migrations/v1.ts`, "utf8")).toBe(versionOne);

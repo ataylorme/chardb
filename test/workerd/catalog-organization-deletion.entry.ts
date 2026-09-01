@@ -4,7 +4,6 @@ import { text } from "drizzle-orm/sqlite-core";
 import { bindAuthRuntime } from "../../src/auth/runtime.ts";
 import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import { file } from "../../src/files/index.ts";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { CatalogOrganizationDeletionBarrierStore } from "../../src/server/do/catalog-organization-deletion-barrier-store.ts";
 import { CatalogOrganizationDeletionStore } from "../../src/server/do/catalog-organization-deletion-store.ts";
 import { configureCatalogRuntime } from "../../src/server/do/catalog.ts";
@@ -12,6 +11,7 @@ import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { defineMigrations, defineSchemaBaseline } from "../../src/server/schema-migrations.ts";
 import { vector } from "../../src/vector.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { forOrg } from "../helpers/cdb-table.ts";
 
 const auth = defineAuth({ appName: "catalog-organization-deletion-workerd", plugins: [organization()] });
 bindAuthRuntime({

@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { text } from "drizzle-orm/sqlite-core";
-import { globalScope } from "../../src/server/cdb-tenant.ts";
 import type { ChardbEnv } from "../../src/server/entrypoint.ts";
 import { handleReshardAdminRequest } from "../../src/server/reshard-admin.ts";
+import { globalScope } from "../helpers/cdb-table.ts";
 
 const { cdbTable } = globalScope();
 const records = cdbTable(

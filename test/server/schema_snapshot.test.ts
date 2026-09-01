@@ -9,7 +9,6 @@ import {
 } from "../../src/auth/ddl.ts";
 import { synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import * as rootSurface from "../../src/index.ts";
-import { forOrgUser } from "../../src/server/cdb-tenant.ts";
 import * as serverSurface from "../../src/server/index.ts";
 import { defineMigrations } from "../../src/server/schema-migrations.ts";
 import {
@@ -18,6 +17,7 @@ import {
     inspectInitialSchemaSnapshot,
     schemaSnapshotDigest,
 } from "../../src/server/schema-snapshot.ts";
+import { forOrgUser } from "../helpers/cdb-table.ts";
 
 const projects = sqliteTable(
     "projects",

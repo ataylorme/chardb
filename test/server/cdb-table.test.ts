@@ -18,8 +18,8 @@ import { applyColumnMask, assertColumnsWritable } from "../../src/server/cdb-cls
 import { cdbPolicyDigest, compileCdbPolicies } from "../../src/server/cdb-policy.ts";
 import { getCdbMeta, isCdbTable } from "../../src/server/cdb-table-registry.ts";
 import { resolveCdbMeta } from "../../src/server/cdb-table.ts";
-import { forOrg, forOrgUser, forUser, globalScope } from "../../src/server/cdb-tenant.ts";
 import { applyPoliciesToWhere, applyRowPolicies } from "../../src/server/policy.ts";
+import { forOrg, forOrgUser, forUser, globalScope } from "../helpers/cdb-table.ts";
 
 function expectCdbError(fn: () => unknown, expectedCode: CdbErrorCode): void {
     let caught: unknown;

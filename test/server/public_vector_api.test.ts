@@ -2,7 +2,6 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
-import { forOrg, forUser } from "../../src/server/cdb-tenant.ts";
 import {
     type CdbVectorMutationContext,
     bindCdbVectorMutationContext,
@@ -17,6 +16,7 @@ import {
     searchVector,
     vector,
 } from "../../src/vector.ts";
+import { forOrg, forUser } from "../helpers/cdb-table.ts";
 
 const organization = sqliteTable("organization", { id: text("id").primaryKey() });
 const user = sqliteTable("user", { id: text("id").primaryKey() });

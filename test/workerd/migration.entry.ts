@@ -6,7 +6,6 @@ import { z } from "zod";
 import { renderSqliteTableDdl } from "../../src/auth/ddl.ts";
 import { synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
-import { globalScope } from "../../src/server/cdb-tenant.ts";
 import { api } from "../../src/server/define.ts";
 import { cdbSubscriptionRequest } from "../../src/server/do/gateway.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
@@ -15,6 +14,7 @@ import { routeValidatedQuery } from "../../src/server/manifest.ts";
 import type { GatewayInvalidationRequest, GatewayInvalidationResponse } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 import { VSHARD_COUNT, vshardOf } from "../../src/vshard.ts";
+import { globalScope } from "../helpers/cdb-table.ts";
 
 declare const CHARDB_MIGRATION_RELEASE: "v1" | "v2" | "v3" | "fresh" | "fresh3" | "legacy";
 

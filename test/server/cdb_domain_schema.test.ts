@@ -4,11 +4,11 @@ import { organization } from "better-auth/plugins/organization";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { renderSqliteTableDdl } from "../../src/auth/ddl.ts";
 import { defineAuth } from "../../src/auth/synthesize.ts";
-import { forOrg, forOrgUser, forUser, globalScope } from "../../src/server/cdb-tenant.ts";
 import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { manifestFromExports } from "../../src/server/manifest.ts";
 import { defineMigrations, migrationDigestAt } from "../../src/server/schema-migrations.ts";
+import { forOrg, forOrgUser, forUser, globalScope } from "../helpers/cdb-table.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];

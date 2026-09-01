@@ -2,12 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { and, between, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import { type QueryBuilder, integer, text } from "drizzle-orm/sqlite-core";
 import { type ChardbSelectPlanV1, createBindingSelect } from "../../src/binding-plan.ts";
-import { forOrg, forUser, globalScope } from "../../src/server/cdb-tenant.ts";
 import { createApi } from "../../src/server/define.ts";
 import { manifestFromExports, routeValidatedQuery } from "../../src/server/manifest.ts";
 import { compileRegisteredQueryPlan } from "../../src/server/registered-query-plan.ts";
 import type { ChardbRef } from "../../src/types.ts";
 import { searchVector, vector } from "../../src/vector.ts";
+import { forOrg, forUser, globalScope } from "../helpers/cdb-table.ts";
 
 const { cdbTable } = globalScope();
 const plannedRows = cdbTable(

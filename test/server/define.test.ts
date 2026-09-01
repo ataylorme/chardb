@@ -3,7 +3,6 @@ import { eq } from "drizzle-orm";
 import { text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { isCdbError } from "../../src/errors.ts";
-import { globalScope } from "../../src/server/cdb-tenant.ts";
 import {
     type MutationCtx,
     createApi,
@@ -16,6 +15,7 @@ import {
 import { defineLedger } from "../../src/server/ledger.ts";
 import { readRef } from "../../src/server/refs.ts";
 import { ChardbRef } from "../../src/types.ts";
+import { globalScope } from "../helpers/cdb-table.ts";
 
 describe("defineXxx — function-ref identity", () => {
     test("defineMutation attaches __chardbRef and __chardbKind", async () => {

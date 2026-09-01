@@ -11,7 +11,6 @@ import {
     CDB_SPLIT_TX_MAX_ROW_BYTES,
 } from "../../src/oplog/schema.ts";
 import type { TableSpec } from "../../src/reshard/triggers.ts";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { api } from "../../src/server/define.ts";
 import { Resharder as ProductionResharder, RESHARDER_PHASE } from "../../src/server/do/resharder.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
@@ -27,6 +26,7 @@ import {
 } from "../../src/server/organization-file-http.ts";
 import type { ChardbFileResourceDescriptor } from "../../src/server/resource-descriptors.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { forOrg } from "../helpers/cdb-table.ts";
 
 const auth = defineAuth({
     appName: "file-reshard-e2e",

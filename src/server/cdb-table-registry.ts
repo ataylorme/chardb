@@ -1,7 +1,7 @@
 /**
  * Runtime metadata registry for `cdbTable` instances.
  *
- * Every table built via the `forOrg() / forUser() / global()` factories
+ * Every table built via a schema ownership factory
  * carries a frozen `CdbTableMeta` record that captures the user's RLS +
  * CLS configuration alongside resolved internals (the auto-discovered
  * tenant column, the tenancy axis, the auth target table reference).

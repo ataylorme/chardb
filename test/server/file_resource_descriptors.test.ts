@@ -9,12 +9,12 @@ import {
     getChardbFileColumnConfig,
     normalizeFileColumnConfig,
 } from "../../src/files/index.ts";
-import { forOrg, forUser } from "../../src/server/cdb-tenant.ts";
 import {
     assertSchemaResourceJournal,
     collectSchemaResourceDescriptors,
 } from "../../src/server/resource-descriptors.ts";
 import { defineMigrations, defineSchemaBaseline } from "../../src/server/schema-migrations.ts";
+import { forOrg, forUser } from "../helpers/cdb-table.ts";
 
 const organization = sqliteTable("organization", { id: text("id").primaryKey() });
 const user = sqliteTable("user", { id: text("id").primaryKey() });

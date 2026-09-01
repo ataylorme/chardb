@@ -3,7 +3,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { defineAuth } from "../../src/auth/synthesize.ts";
 import { BINDING_SELECT_PLAN_PROFILE, resolveSelectPlan } from "../../src/server/binding-plan-server.ts";
-import { forOrg, forUser } from "../../src/server/cdb-tenant.ts";
 import { assertCatalogOrganizationDeletionSupported } from "../../src/server/do/catalog.ts";
 import { canonicalRegisteredTableSpecs } from "../../src/server/do/cdb-reshard-identity-store.ts";
 import { hasActiveCdbVectorResources } from "../../src/server/do/cdb-reshard-runtime.ts";
@@ -24,6 +23,7 @@ import {
 import { defineMigrations, defineSchemaBaseline, migrationDigestAt } from "../../src/server/schema-migrations.ts";
 import { renderVectorMutationTriggerSet } from "../../src/server/vector-triggers.ts";
 import { type VectorConfig, inlineVector, normalizeVectorConfig, vector } from "../../src/vector.ts";
+import { forOrg, forUser } from "../helpers/cdb-table.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];

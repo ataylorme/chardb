@@ -122,7 +122,7 @@ describe("chardb/no-raw-sqlite-table", () => {
         expect(reports.some(r => r.messageId === "rawSqliteTable")).toBe(true);
     });
 
-    test("does not flag cdbTable() calls (those flow through forOrg/forUser/globalScope)", () => {
+    test("does not flag cdbTable() calls from ownership factories", () => {
         const code = `export const t = cdbTable("t", { id: text("id") }, { roles: { admin: "*" } });`;
         const { reports } = runRule(rules["no-raw-sqlite-table"], code);
         expect(reports.some(r => r.messageId === "rawSqliteTable")).toBe(false);

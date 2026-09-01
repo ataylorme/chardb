@@ -4,7 +4,6 @@ import { and, eq } from "drizzle-orm";
 import { text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import type { TableSpec } from "../../../src/reshard/triggers.ts";
-import { forOrg } from "../../../src/server/cdb-tenant.ts";
 import { api } from "../../../src/server/define.ts";
 import type { CatalogAuthMutationRequest } from "../../../src/server/do/catalog-authority-store.ts";
 import type { OrganizationAuthorityRouteResult, RouteResult } from "../../../src/server/do/catalog.ts";
@@ -13,7 +12,7 @@ import { dispatchTrustedMutation } from "../../../src/server/do/gateway-auth-dis
 import { Resharder as ProductionResharder, RESHARDER_PHASE } from "../../../src/server/do/resharder.ts";
 import { adaptSqlStorage } from "../../../src/server/do/sql_adapter.ts";
 import { gatewayBucketName } from "../../../src/server/gateway-bucket.ts";
-import { chardb, defineAuth, defineMigrations, defineSchemaBaseline } from "../../../src/server/index.ts";
+import { chardb, defineAuth, defineMigrations, defineSchemaBaseline, forOrg } from "../../../src/server/index.ts";
 import { manifestFromExports, routeMutation } from "../../../src/server/manifest.ts";
 import type { CdbMutationRequest, CdbMutationResponse } from "../../../src/server/rpc.ts";
 import { PrincipalId, type RawJson, ShardId, TenantId } from "../../../src/types.ts";
@@ -49,14 +48,11 @@ const auth = defineAuth({
     ],
 });
 
-const { cdbTable } = forOrg();
+const { cdbTable } = forOrg(auth);
 const benchmarkParents = cdbTable(
     "benchmark_parents",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id),
         label: text("label").notNull(),
     },
     { roles: { member: { read: "*", update: ["label"] } } }
@@ -65,9 +61,6 @@ const benchmarkChildren = cdbTable(
     "benchmark_children",
     {
         id: text("id").primaryKey(),
-        organizationId: text("organization_id")
-            .notNull()
-            .references(() => auth.organization.id),
         parentId: text("parent_id")
             .notNull()
             .references(() => benchmarkParents.id),

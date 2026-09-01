@@ -4,11 +4,11 @@ import { organization } from "better-auth/plugins/organization";
 import { and, eq } from "drizzle-orm";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
-import { forOrgUser } from "../../src/server/cdb-tenant.ts";
 import { api } from "../../src/server/define.ts";
 import { gatewayBucketName } from "../../src/server/gateway-bucket.ts";
 import { chardb, defineAuth } from "../../src/server/index.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { forOrgUser } from "../helpers/cdb-table.ts";
 
 const ISSUER = "https://issuer.example";
 const AUDIENCE = "chardb-workerd";

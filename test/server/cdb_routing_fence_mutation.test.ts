@@ -4,7 +4,6 @@ import { eq } from "drizzle-orm";
 import { integer, text } from "drizzle-orm/sqlite-core";
 import { z } from "zod";
 import { cdbPolicyDigest } from "../../src/server/cdb-policy.ts";
-import { globalScope } from "../../src/server/cdb-tenant.ts";
 import { createApi } from "../../src/server/define.ts";
 import { type Cdb, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { manifestFromExports, routeValidatedQuery } from "../../src/server/manifest.ts";
@@ -17,6 +16,7 @@ import type {
 } from "../../src/server/rpc.ts";
 import { ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { globalScope } from "../helpers/cdb-table.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];

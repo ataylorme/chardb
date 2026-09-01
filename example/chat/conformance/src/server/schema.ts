@@ -1,12 +1,11 @@
-import { forOrg } from "@chardb/core/server";
+import { forOrg, forUser } from "@chardb/core/server";
 import { integer, text } from "drizzle-orm/sqlite-core";
-import { forUser, globalScope } from "../../../../../src/server/cdb-tenant.ts";
+import { createCdbTable } from "../../../../../src/server/cdb-table.ts";
 import { auth } from "./auth.ts";
 
-// Every cdbTable in this file is bound to the same organization owner.
+// Organization and user ownership use the public schema factories.
 const { cdbTable } = forOrg(auth);
-const { cdbTable: userTable } = forUser();
-const { cdbTable: globalTable } = globalScope();
+const { cdbTable: userTable } = forUser(auth);
 
 export const channels = cdbTable(
     "channels",
@@ -60,9 +59,6 @@ export const userPreferences = userTable(
     "user_preferences",
     {
         id: text("id").primaryKey(),
-        userId: text("user_id")
-            .notNull()
-            .references(() => auth.user.id, { onDelete: "cascade" }),
         theme: text("theme").notNull(),
     },
     {
@@ -73,18 +69,21 @@ export const userPreferences = userTable(
     }
 );
 
-export const globalNotices = globalTable(
-    "global_notices",
-    {
-        id: text("id").primaryKey(),
-        namespace: text("namespace").notNull(),
-        body: text("body").notNull(),
-    },
-    {
+const globalNoticeColumns = {
+    id: text("id").primaryKey(),
+    namespace: text("namespace").notNull(),
+    body: text("body").notNull(),
+};
+export const globalNotices = createCdbTable({
+    name: "global_notices",
+    columns: globalNoticeColumns,
+    config: {
         partitionBy: "namespace",
         roles: {
             user: { create: "*", read: "*" },
             admin: "*",
         },
-    }
-);
+    },
+    tenantKind: "none",
+    authTarget: null,
+});

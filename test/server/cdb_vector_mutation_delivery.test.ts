@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { type MutationCtx, createApi } from "../../src/server/define.ts";
 import { CdbReshardRuntime } from "../../src/server/do/cdb-reshard-runtime.ts";
 import { CDB_VECTOR_MAX_OUTBOX_ROWS, CdbVectorOutboxStore } from "../../src/server/do/cdb-vector-outbox-store.ts";
@@ -11,6 +10,7 @@ import { manifestFromExports } from "../../src/server/manifest.ts";
 import { cdbVectorResourceId, collectSchemaResourceDescriptors } from "../../src/server/resource-descriptors.ts";
 import { vector } from "../../src/vector.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { forOrg } from "../helpers/cdb-table.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];

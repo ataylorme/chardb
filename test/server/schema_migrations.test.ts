@@ -3,13 +3,13 @@ import { describe, expect, test } from "bun:test";
 import { organization } from "better-auth/plugins/organization";
 import { text } from "drizzle-orm/sqlite-core";
 import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
-import { forOrgUser, globalScope } from "../../src/server/cdb-tenant.ts";
 import {
     defineMigrations,
     defineSchemaBaseline,
     migrationDigestAt,
     pendingMigrations,
 } from "../../src/server/schema-migrations.ts";
+import { forOrgUser, globalScope } from "../helpers/cdb-table.ts";
 
 describe("packaged schema migration journal", () => {
     test("omits every configured auth FK from an organization-user baseline", () => {

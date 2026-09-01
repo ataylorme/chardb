@@ -28,7 +28,7 @@ import {
     createBindingSelect,
     validateChardbSelectPlanV1,
 } from "../src/binding-plan.ts";
-import { globalScope } from "../src/server/cdb-tenant.ts";
+import { globalScope } from "./helpers/cdb-table.ts";
 
 const { cdbTable } = globalScope();
 

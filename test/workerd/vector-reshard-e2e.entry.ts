@@ -7,7 +7,6 @@ import { z } from "zod";
 import { isCdbError } from "../../src/errors.ts";
 import { SPLIT_LOG_ACCOUNTED_BYTES_SQL } from "../../src/oplog/schema.ts";
 import type { TableSpec } from "../../src/reshard/triggers.ts";
-import { forOrg } from "../../src/server/cdb-tenant.ts";
 import { api } from "../../src/server/define.ts";
 import { cdbVectorLogicalId } from "../../src/server/do/cdb-vector-mutation.ts";
 import { CdbVectorOutboxStore } from "../../src/server/do/cdb-vector-outbox-store.ts";
@@ -31,6 +30,7 @@ import {
 import { renderVectorMutationTriggerSet } from "../../src/server/vector-triggers.ts";
 import { searchVector, vector } from "../../src/vector.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { forOrg } from "../helpers/cdb-table.ts";
 
 const ISSUER = "https://vector-reshard-e2e.invalid";
 const AUDIENCE = "vector-reshard-e2e";

@@ -9,10 +9,10 @@ import {
     dispatchTrustedBindingPlan,
     resolveSelectPlan,
 } from "../../src/server/binding-plan-server.ts";
-import { forOrg, forUser, globalScope } from "../../src/server/cdb-tenant.ts";
 import type { CdbBindingPlanRequest } from "../../src/server/rpc.ts";
 import { PrincipalId, ShardId, TenantId } from "../../src/types.ts";
 import { vshardOf } from "../../src/vshard.ts";
+import { forOrg, forUser, globalScope } from "../helpers/cdb-table.ts";
 
 const resolveBindingSelectPlan = (schema: Record<string, unknown>, value: unknown) =>
     resolveSelectPlan(schema, value, BINDING_SELECT_PLAN_PROFILE);
