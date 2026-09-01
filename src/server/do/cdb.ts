@@ -194,6 +194,7 @@ import {
     type SplitOpLogBatch,
     initializeSplitOpLogAccounting,
 } from "./cdb-split-oplog-store.ts";
+import { DurableObjectRecovery, abortForArmedRecoveryRestore, initializeRecoveryStorage } from "./recovery.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
 export interface CdbEnv {
@@ -287,6 +288,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     private readonly schemaMigrations: CdbSchemaMigrationStore;
     private readonly files: CdbFileRuntime;
     private readonly opLogRetention: CdbOpLogRetentionStore;
+    private readonly recovery: DurableObjectRecovery;
     private readonly resharding: CdbReshardRuntime;
     private readonly vectors: CdbVectorRuntime;
 
@@ -355,6 +357,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             },
         });
         this.opLogRetention = new CdbOpLogRetentionStore(this.ctx.storage);
+        this.recovery = new DurableObjectRecovery(state.storage, () => adaptSqlStorage(this.ctx.storage.sql));
         this.files = new CdbFileRuntime({
             storage: this.ctx.storage,
             bucket: this.env.CDB_FILES,
@@ -983,6 +986,7 @@ export class Cdb extends DurableObject<CdbEnv> {
         this.ctx.storage.transactionSync(() => initializeSplitOpLogAccounting(adaptSqlStorage(this.ctx.storage.sql)));
         initializeLiveStore(sql);
         initializeCdbAuthInvalidationStore(sql);
+        initializeRecoveryStorage(sql);
         initializeCdbReshardIdentityStore(sql);
         const hasFileResources = this.hasFileResources();
         const hasVectorResources = this.vectorResources().length > 0;
@@ -1840,7 +1844,43 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     override async alarm(): Promise<void> {
+        abortForArmedRecoveryRestore(this.ctx, adaptSqlStorage(this.ctx.storage.sql));
         await this.maintainAlarmWork({ deliverVectors: true });
+    }
+
+    async adminRecoveryBookmark(args: { readonly atMs?: number }): Promise<{
+        readonly bookmark: string;
+        readonly atMs: number;
+    }> {
+        try {
+            return await this.recovery.bookmark(args.atMs);
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    async adminArmRecoveryRestore(args: { readonly bookmark: string; readonly armedAt: number }) {
+        try {
+            return await this.recovery.arm(args.bookmark, args.armedAt);
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    async adminCancelRecoveryRestore(args: { readonly bookmark: string }) {
+        try {
+            return await this.recovery.cancel(args.bookmark);
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    async adminCommitRecoveryRestore(args: { readonly bookmark: string }) {
+        try {
+            return await this.recovery.commit(args.bookmark);
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
     }
 
     /** Execute a registered shard-local query without exposing it through Gateway yet. */

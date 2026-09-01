@@ -1,3 +1,4 @@
+import { runBackupCreate, runBackupRestore } from "./commands/backups.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInit, validateInitDirectoryName } from "./commands/init.ts";
 import { runMigrate } from "./commands/migrate.ts";
@@ -15,6 +16,10 @@ Commands:
                                 append the next immutable additive migration
   chardb vectorize prepare      create or verify required Vectorize metadata indexes
   chardb migrate --url <worker> --id <id> --target <version> [--concurrency <1-32>] [--baseline]
+  chardb backups create --url <worker> --out <file> [--at <ISO-8601>]
+                                save a native Durable Object recovery point
+  chardb backups restore --url <worker> --from <file>
+                                restore Catalog and Cdb objects from a recovery point
 `;
 
 const EXPERIMENTAL_HELP = `chardb experimental — unstable operator commands with no compatibility promise
@@ -158,6 +163,60 @@ export async function runCli(ctx: CliContext, argv: readonly string[]): Promise<
                 return 1;
             }
         }
+        case "backups": {
+            const action = rest[0];
+            const args = rest.slice(1);
+            const validArguments =
+                (action === "create" && exactFlagPairs(args, ["--url", "--out", "--at"])) ||
+                (action === "restore" && exactFlagPairs(args, ["--url", "--from"]));
+            if (!validArguments) {
+                ctx.stderr(backupUsage());
+                return 2;
+            }
+            const baseUrl = valueAfterFlag(args, "--url") ?? ctx.env.CHARDB_URL;
+            const token = ctx.env.CHARDB_ADMIN_TOKEN;
+            if (!baseUrl || !token || !ctx.fetch) {
+                ctx.stderr(backupUsage());
+                return 2;
+            }
+            try {
+                if (action === "create") {
+                    const out = valueAfterFlag(args, "--out");
+                    const rawAt = valueAfterFlag(args, "--at");
+                    if (!out) {
+                        ctx.stderr(backupUsage());
+                        return 2;
+                    }
+                    const atMs = rawAt === undefined ? undefined : parseIsoTimestamp(rawAt);
+                    if (rawAt !== undefined && !Number.isSafeInteger(atMs)) {
+                        throw new Error("--at must be an ISO-8601 timestamp");
+                    }
+                    await runBackupCreate(ctx, {
+                        baseUrl,
+                        token,
+                        fetch: ctx.fetch,
+                        out,
+                        ...(atMs === undefined ? {} : { atMs }),
+                    });
+                } else if (action === "restore") {
+                    const from = valueAfterFlag(args, "--from");
+                    if (!from) {
+                        ctx.stderr(backupUsage());
+                        return 2;
+                    }
+                    await runBackupRestore(ctx, { baseUrl, token, fetch: ctx.fetch, from });
+                } else {
+                    ctx.stderr(backupUsage());
+                    return 2;
+                }
+                return 0;
+            } catch (error) {
+                ctx.stderr(
+                    `chardb backups ${action ?? ""}: ${error instanceof Error ? error.message : String(error)}\n`
+                );
+                return 1;
+            }
+        }
         case "shards": {
             ctx.stderr(
                 "chardb shards moved to chardb experimental shards; the old command is disabled and did not run\n"
@@ -230,6 +289,30 @@ export async function runCli(ctx: CliContext, argv: readonly string[]): Promise<
             ctx.stdout(HELP);
             return 2;
     }
+}
+
+function backupUsage(): string {
+    return (
+        "usage: CHARDB_ADMIN_TOKEN=<secret> chardb backups create --url <worker> --out <file> [--at <ISO-8601>]\n" +
+        "   or: CHARDB_ADMIN_TOKEN=<secret> chardb backups restore --url <worker> --from <file>\n"
+    );
+}
+
+function exactFlagPairs(argv: readonly string[], allowed: readonly string[]): boolean {
+    if (argv.length % 2 !== 0) return false;
+    const seen = new Set<string>();
+    for (let index = 0; index < argv.length; index += 2) {
+        const flag = argv[index];
+        const value = argv[index + 1];
+        if (!flag || !allowed.includes(flag) || seen.has(flag) || !value || value.startsWith("--")) return false;
+        seen.add(flag);
+    }
+    return true;
+}
+
+function parseIsoTimestamp(value: string): number {
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return Number.NaN;
+    return Date.parse(value);
 }
 
 function valueAfterFlag(argv: readonly string[], flag: string): string | undefined {

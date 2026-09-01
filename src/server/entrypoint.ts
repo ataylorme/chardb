@@ -29,6 +29,7 @@ import { withChardbLoopbacks } from "./loopback.ts";
 import { type ChardbManifest, emptyManifest, manifestFromExports } from "./manifest.ts";
 import { CHARDB_SERVER_VERSION, decorateResponse, extractCorrelationId } from "./observability_helpers.ts";
 import { handleOrganizationDeletionAdminRequest } from "./organization-deletion-admin.ts";
+import { handleRecoveryAdminRequest } from "./recovery-admin.ts";
 import { handleReshardAdminRequest } from "./reshard-admin.ts";
 
 export { CHARDB_SERVER_VERSION, decorateResponse, extractCorrelationId } from "./observability_helpers.ts";
@@ -240,6 +241,8 @@ class ChardbEntrypoint extends WorkerEntrypoint<ChardbEnv> {
         try {
             if (url.pathname === "/ws" || url.pathname.startsWith("/ws/")) {
                 response = await this.handleWebSocket(request);
+            } else if (url.pathname.startsWith("/_chardb/backups/")) {
+                response = await handleRecoveryAdminRequest(request, this.env);
             } else if (url.pathname.startsWith("/_chardb/shards/")) {
                 response = await handleReshardAdminRequest(request, this.env, this.schema());
             } else if (url.pathname.startsWith("/_chardb/organizations/deletion/")) {

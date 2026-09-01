@@ -1,4 +1,5 @@
 const ADMIN_BODY_MAX_BYTES = 4_096;
+const ADMIN_BODY_HARD_MAX_BYTES = 2 * 1_024 * 1_024;
 const ADMIN_TOKEN_MAX_BYTES = 512;
 const ADMIN_TEXT_ENCODER = new TextEncoder();
 
@@ -36,11 +37,14 @@ export async function authorizeAdmin(request: Request, env: AdminEnv): Promise<R
     return null;
 }
 
-export async function readAdminBody(request: Request): Promise<unknown> {
+export async function readAdminBody(request: Request, maxBytes = ADMIN_BODY_MAX_BYTES): Promise<unknown> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > ADMIN_BODY_HARD_MAX_BYTES) {
+        throw new TypeError("admin request body limit is invalid");
+    }
     const declared = request.headers.get("content-length");
     if (declared !== null) {
         const bytes = Number(declared);
-        if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > ADMIN_BODY_MAX_BYTES) {
+        if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > maxBytes) {
             throw new TypeError("migration request body is too large");
         }
     }
@@ -52,7 +56,7 @@ export async function readAdminBody(request: Request): Promise<unknown> {
         const next = await reader.read();
         if (next.done) break;
         bytes += next.value.byteLength;
-        if (bytes > ADMIN_BODY_MAX_BYTES) {
+        if (bytes > maxBytes) {
             await reader.cancel();
             throw new TypeError("migration request body is too large");
         }
