@@ -476,6 +476,9 @@ describe("chardb init + doctor end-to-end", () => {
             "Select-Object ProcessId, ParentProcessId, CreationDate"
         );
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("live.get(pid) === createdAt");
+        expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain(
+            "signal: AbortSignal.timeout(READINESS_PROBE_TIMEOUT_MS)"
+        );
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("WINDOWS_WATCHDOG_ARGUMENT");
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("Promise.allSettled([");
         expect(files.get("/tmp/proj/scripts/dev.mjs")).not.toContain('"--target",\n      "1"');

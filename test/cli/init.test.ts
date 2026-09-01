@@ -231,6 +231,7 @@ describe("generated tutorial flow", () => {
         expect(generatedDev).toContain("Select-Object ProcessId, ParentProcessId, CreationDate");
         expect(generatedDev).toContain("tracked.set(child.pid, child.createdAt)");
         expect(generatedDev).toContain("live.get(pid) === createdAt");
+        expect(generatedDev.match(/AbortSignal\.timeout\(READINESS_PROBE_TIMEOUT_MS\)/g)).toHaveLength(2);
         expect(generatedTest).toContain('import.meta.resolve("vitest/package.json")');
         expect(generatedTest).toContain('realpathSync.native(join(dirname(vitestPackage), "vitest.mjs"))');
         expect(generatedTest).toContain('[nodeRuntime, vitestCli, "run", "--no-file-parallelism"');

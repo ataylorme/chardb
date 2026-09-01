@@ -974,6 +974,7 @@ import { fileURLToPath } from "node:url";
 
 const WINDOWS_WATCHDOG_ARGUMENT = "--chardb-windows-watchdog";
 const WINDOWS_UTILITY_TIMEOUT_MS = 5_000;
+const READINESS_PROBE_TIMEOUT_MS = 1_000;
 
 async function runWindowsUtility(command) {
   const child = Bun.spawn(command, { stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true });
@@ -1204,7 +1205,9 @@ async function waitForWorker() {
     if (worker.exitCode !== null) throw new Error("Wrangler exited before the health check passed");
     let response;
     try {
-      response = await fetch(new URL("/health", origin));
+      response = await fetch(new URL("/health", origin), {
+        signal: AbortSignal.timeout(READINESS_PROBE_TIMEOUT_MS),
+      });
     } catch {
       // Wrangler has not opened its local listener yet.
       await Bun.sleep(100);
@@ -1235,7 +1238,9 @@ async function waitForWeb() {
   while (Date.now() < deadline) {
     if (!web || web.exitCode !== null) throw new Error("Vite exited before the browser URL was ready");
     try {
-      const response = await fetch(webOrigin);
+      const response = await fetch(webOrigin, {
+        signal: AbortSignal.timeout(READINESS_PROBE_TIMEOUT_MS),
+      });
       if (response.ok) return;
     } catch {
       // Vite has not opened its local listener yet.
