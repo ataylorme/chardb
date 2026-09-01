@@ -41,15 +41,15 @@ function emittedCode(build: Awaited<ReturnType<typeof viteBuild>>): string {
 }
 
 describe("@chardb/core/vite", () => {
-    test("rewrites exported defineMutation to set __chardbRef", () => {
+    test("ignores removed helper APIs", () => {
         const p = makePlugin();
         const code = `
-      import { defineMutation } from "@chardb/core/server";
+      import { createApi, defineMutation } from "@chardb/core/server";
+      const legacy = createApi();
       export const createPost = defineMutation(async () => ({}));
+      export const deletePost = legacy.mutation({ ref: "api/posts#delete", handler: () => null });
     `;
-        const out = transform(p, code, "/abs/proj/src/mutations/post.ts");
-        expect(out.code).toContain("__chardbRef");
-        expect(out.code).toContain("src/mutations/post.ts#createPost");
+        expect(p.transform(code, "/abs/proj/src/mutations/post.ts")).toBeNull();
     });
 
     test("does not expose virtual modules or unused Vite hooks", () => {
@@ -59,14 +59,17 @@ describe("@chardb/core/vite", () => {
         expect("handleHotUpdate" in p).toBe(false);
     });
 
-    test("AST mode picks up aliased imports", () => {
+    test("recognizes aliased and namespaced public api imports", () => {
         const p = makePlugin();
         const code = `
-      import { defineMutation as dm } from "@chardb/core/server";
-      export const fancy = dm(async () => ({}));
+      import { api as db } from "@chardb/core/server";
+      import * as chardb from "@chardb/core/server";
+      export const fancy = db.mutation({ ref: "api/posts#fancy", handler: () => ({}) });
+      export const list = chardb.api.query({ ref: "api/posts#list", query: db => db.select().from(posts) });
     `;
         const out = transform(p, code, "/abs/proj/src/aliased.ts");
-        expect(out.code).toContain("src/aliased.ts#fancy");
+        expect(out.code).toContain("api/posts#fancy");
+        expect(out.code).toContain("api/posts#list");
         expect(out.code).toContain("__chardbRef");
     });
 
@@ -81,24 +84,18 @@ describe("@chardb/core/vite", () => {
         expect(p.transform(code, "/abs/proj/src/unrelated.ts")).toBeNull();
     });
 
-    test("stamps mutation refs and preserves planned query refs", () => {
+    test("preserves public mutation and query refs", () => {
         const p = makePlugin();
         const code = `
-      import { createApi } from "@chardb/core/server";
-      const api = createApi();
-      export const createPost = api.mutation({ handler: () => ({}) });
-      export const deletePost = api.mutation({ handler: () => ({}) });
+      import { api } from "@chardb/core/server";
+      export const createPost = api.mutation({ ref: "api/posts#create", handler: () => ({}) });
+      export const deletePost = api.mutation({ ref: "api/posts#delete", handler: () => ({}) });
       export const listPosts = api.query({ ref: "api/posts#list", query: db => db.select().from(posts) });
       export const getPost = api.query({ ref: "api/posts#get", query: db => db.select().from(posts).limit(1) });
     `;
         const out = transform(p, code, "/abs/proj/src/routes/posts.ts?worker");
         const refs = Array.from(out.code.matchAll(/value: "([^"]+)"/g), match => match[1]);
-        expect(refs).toEqual([
-            "src/routes/posts.ts#createPost",
-            "src/routes/posts.ts#deletePost",
-            "api/posts#list",
-            "api/posts#get",
-        ]);
+        expect(refs).toEqual(["api/posts#create", "api/posts#delete", "api/posts#list", "api/posts#get"]);
         expect(new Set(refs).size).toBe(4);
     });
 
@@ -112,17 +109,17 @@ describe("@chardb/core/vite", () => {
       });
     `;
         expect(() => transform(p, code, "/abs/proj/src/routes/planned.ts")).toThrow(
-            "Planned query listPosts requires a literal ref"
+            "Query listPosts requires a literal ref"
         );
     });
 
-    test("preserves explicit refs for additive planned queries", () => {
+    test("preserves explicit refs for method-form public queries", () => {
         const p = makePlugin();
         const out = transformServer(
             p,
             `
-      import { defineQuery } from "@chardb/core/server";
-      export const listPosts = defineQuery({
+      import { api } from "@chardb/core/server";
+      export const listPosts = api.query({
         ref: "api/posts#planned-list",
         args: {},
         query(db, args) { return db.select().from(posts).where(eq(posts.id, args.id)); },
@@ -150,7 +147,7 @@ describe("@chardb/core/vite", () => {
           `,
                     "/abs/proj/src/routes/planned.ts"
                 )
-            ).toThrow(`Planned query listPosts cannot mix query with ${legacy}`);
+            ).toThrow(`Query listPosts cannot mix query with ${legacy}`);
         }
     });
 
@@ -442,7 +439,7 @@ export const savePost = api.mutation((_ctx, args) => args, { ref: "api/posts#sav
                 "/abs/proj/src/routes/positional-mutation.ts",
                 { ssr: false }
             )
-        ).toThrow("supports only inline api.mutation({ ... }) exports");
+        ).toThrow("must use one inline config object");
 
         const implicitRef = makePlugin();
         expect(() =>
@@ -455,7 +452,7 @@ export const savePost = api.mutation({ handler: () => null });
                 "/abs/proj/src/routes/implicit-ref.ts",
                 { ssr: false }
             )
-        ).toThrow("requires a literal ref because Wrangler builds the Worker separately from Vite");
+        ).toThrow("Mutation savePost requires a literal ref");
     });
 
     test("erases planned queries and api mutations together without changing either handle kind", async () => {
@@ -524,7 +521,7 @@ export const listPosts = api.query({
                 "/abs/proj/src/routes/legacy.ts",
                 { ssr: false }
             )
-        ).toThrow("must use a planned query config");
+        ).toThrow("requires an inline query");
     });
 
     test("preserves explicit config refs for two mutations and a query", () => {
@@ -541,37 +538,6 @@ export const listPosts = api.query({
         expect(out.code).not.toContain("src/routes/posts.ts#createPost");
     });
 
-    test("preserves a positional mutation ref from its options object", () => {
-        const p = makePlugin();
-        const out = transform(
-            p,
-            `
-      import { defineMutation } from "@chardb/core/server";
-      export const save = defineMutation((_ctx, args) => args, { ref: "api/items#save" });
-    `,
-            "/abs/proj/src/items.ts"
-        );
-        expect(out.code).toContain('value: "api/items#save"');
-        expect(out.code).not.toContain("src/items.ts#save");
-    });
-
-    test("preserves positional api mutation authority and ref options", () => {
-        const p = makePlugin();
-        const out = transform(
-            p,
-            `
-      import { api } from "@chardb/core/server";
-      export const save = api.mutation((_ctx, args) => args, {
-        authority: "organization",
-        ref: "api/items#save",
-        partitionKey: args => args.organizationId,
-      });
-    `,
-            "/abs/proj/src/items.ts"
-        );
-        expect(out.code).toContain('value: "api/items#save"');
-    });
-
     test("rejects an organization mutation without a literal ref", () => {
         const p = makePlugin();
         expect(() =>
@@ -586,7 +552,7 @@ export const listPosts = api.query({
         `,
                 "/abs/proj/src/authority.ts"
             )
-        ).toThrow("Organization mutation save requires a literal ref");
+        ).toThrow("Mutation save requires a literal ref");
     });
 
     test("rejects a planned query without a literal ref", () => {
@@ -601,51 +567,7 @@ export const listPosts = api.query({
         `,
                 "/abs/proj/src/authority-query.ts"
             )
-        ).toThrow("Planned query list requires a literal ref");
-    });
-
-    test("preserves global query and mutation refs", () => {
-        const p = makePlugin();
-        const out = transform(
-            p,
-            `
-      import { api } from "@chardb/core/server";
-      export const save = api.mutation({
-        ref: "api/settings#save",
-        authority: "global",
-        partitionKey: () => "app",
-        handler: () => null,
-      });
-      export const read = api.query({
-        ref: "api/settings#read",
-        query: db => db.select().from(settings),
-      });
-    `,
-            "/abs/proj/src/global.ts"
-        );
-        expect(out.code).toContain('value: "api/settings#save"');
-        expect(out.code).toContain('value: "api/settings#read"');
-        expect(out.code).not.toContain("src/global.ts#save");
-        expect(out.code).not.toContain("src/global.ts#read");
-    });
-
-    test("rejects incomplete global placement metadata", () => {
-        const cases = [
-            {
-                source: `export const save = api.mutation({ authority: "global", partitionKey: () => "app", handler: () => null });`,
-                message: "Global mutation save requires a literal ref",
-            },
-            {
-                source: `export const save = api.mutation({ ref: "api/settings#save", authority: "global", handler: () => null });`,
-                message: "Global mutation save requires an explicit partitionKey extractor",
-            },
-        ];
-        for (const testCase of cases) {
-            const p = makePlugin();
-            expect(() =>
-                p.transform(`import { api } from "@chardb/core/server"; ${testCase.source}`, "/abs/proj/src/global.ts")
-            ).toThrow(testCase.message);
-        }
+        ).toThrow("Query list requires a literal ref");
     });
 
     test("rejects duplicate and nonliteral explicit refs", () => {

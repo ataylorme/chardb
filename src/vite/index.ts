@@ -4,8 +4,8 @@
  * Browser builds receive ref-only handles. Query callbacks, mutation
  * handlers, validators, schema imports, and every other server dependency
  * disappear from the emitted module. Server builds keep the original module.
- * The transform also stamps stable refs on older definitions that omit one
- * and rejects duplicate refs seen during a build.
+ * The transform rejects malformed or duplicate explicit refs seen during a
+ * build.
  */
 
 /**
@@ -54,12 +54,12 @@ function loadTypeScript(): typeof import("typescript") | null {
     return cachedTs;
 }
 
-const DEFINE_HELPERS = ["defineMutation", "defineQuery"] as const;
+type HandleKind = "mutation" | "query";
 
 interface SeenExport {
     readonly module: string;
     readonly exportName: string;
-    readonly kind: (typeof DEFINE_HELPERS)[number];
+    readonly kind: HandleKind;
     readonly ref: string;
 }
 
@@ -102,8 +102,8 @@ export function chardb(): Plugin {
                 });
             }
             seenExports.splice(0, seenExports.length, ...nextSeenExports);
-            const hasPlannedQuery = found.some(entry => entry.plannedQuery);
-            const hasApiMutation = found.some(entry => entry.apiMutation);
+            const hasPlannedQuery = found.some(entry => entry.kind === "query");
+            const hasApiMutation = found.some(entry => entry.kind === "mutation");
             if (hasPlannedQuery || hasApiMutation) {
                 const target = viteTransformTarget(this, transformOptions);
                 if (target === "unknown") {
@@ -131,29 +131,20 @@ export default chardb;
 
 interface FoundExport {
     readonly exportName: string;
-    readonly kind: (typeof DEFINE_HELPERS)[number];
+    readonly kind: HandleKind;
     readonly ref: string;
-    readonly explicitRef: boolean;
-    readonly plannedQuery: boolean;
-    readonly apiMutation: boolean;
-    readonly browserErasableMutation: boolean;
 }
 
 /**
- * Discover `export const x = defineXxx(...)` bindings in a single TS/JS
- * source. Uses the TypeScript compiler API when available so renamed
- * (`import { defineMutation as dm }`) and namespaced (`import * as cdb`)
- * helpers are picked up. If TypeScript is unavailable, the transform fails
- * closed instead of stamping lookalike local functions by name.
+ * Discover exported calls to the public `api.query` and `api.mutation`
+ * object. Aliased and namespaced imports are accepted. Local lookalikes are
+ * ignored.
  */
 function collectExports(code: string, id: string): FoundExport[] {
-    const refOf = (name: string): string => `${modulePath(id)}#${name}`;
     const ts = loadTypeScript();
     if (!ts) return [];
 
-    const aliases = new Map<string, (typeof DEFINE_HELPERS)[number]>();
     const apiObjects = new Set<string>();
-    const createApiAliases = new Set<string>();
     const namespaceAliases = new Set<string>();
     const sf = ts.createSourceFile(
         id,
@@ -162,7 +153,7 @@ function collectExports(code: string, id: string): FoundExport[] {
         true,
         /\.tsx?$/.test(id) ? ts.ScriptKind.TSX : ts.ScriptKind.TS
     );
-    const isFromChardbServer = (mod: string): boolean => mod === "@chardb/core/server" || mod === "@chardb/core";
+    const isFromChardbServer = (mod: string): boolean => mod === "@chardb/core/server";
 
     const walkImports = (node: import("typescript").Node): void => {
         if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
@@ -175,13 +166,7 @@ function collectExports(code: string, id: string): FoundExport[] {
                 for (const el of named.elements) {
                     const original = (el.propertyName ?? el.name).text;
                     const local = el.name.text;
-                    if ((DEFINE_HELPERS as readonly string[]).includes(original)) {
-                        aliases.set(local, original as (typeof DEFINE_HELPERS)[number]);
-                    } else if (original === "api") {
-                        apiObjects.add(local);
-                    } else if (original === "createApi") {
-                        createApiAliases.add(local);
-                    }
+                    if (original === "api") apiObjects.add(local);
                 }
             } else if (named && ts.isNamespaceImport(named)) {
                 namespaceAliases.add(named.name.text);
@@ -190,97 +175,30 @@ function collectExports(code: string, id: string): FoundExport[] {
     };
     sf.forEachChild(walkImports);
 
-    const walkApiBindings = (node: import("typescript").Node): void => {
-        if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-            const init = node.initializer;
-            if (ts.isCallExpression(init)) {
-                const callee = init.expression;
-                const directFactory = ts.isIdentifier(callee) && createApiAliases.has(callee.text);
-                const namespaceFactory =
-                    ts.isPropertyAccessExpression(callee) &&
-                    ts.isIdentifier(callee.expression) &&
-                    namespaceAliases.has(callee.expression.text) &&
-                    callee.name.text === "createApi";
-                if (directFactory || namespaceFactory) apiObjects.add(node.name.text);
-            }
-        }
-        ts.forEachChild(node, walkApiBindings);
-    };
-    sf.forEachChild(walkApiBindings);
-
-    const kindOf = (expression: import("typescript").LeftHandSideExpression) => {
-        if (ts.isIdentifier(expression)) return aliases.get(expression.text);
+    const kindOf = (expression: import("typescript").LeftHandSideExpression): HandleKind | undefined => {
         if (!ts.isPropertyAccessExpression(expression)) return undefined;
         const property = expression.name.text;
+        if (property !== "mutation" && property !== "query") return undefined;
         if (ts.isIdentifier(expression.expression)) {
             const objectName = expression.expression.text;
-            if (namespaceAliases.has(objectName) && (DEFINE_HELPERS as readonly string[]).includes(property)) {
-                return property as (typeof DEFINE_HELPERS)[number];
-            }
-            if (apiObjects.has(objectName)) {
-                if (property === "mutation") return "defineMutation";
-                if (property === "query") return "defineQuery";
-            }
+            if (apiObjects.has(objectName)) return property;
         }
         if (
-            (property === "mutation" || property === "query") &&
             ts.isPropertyAccessExpression(expression.expression) &&
             ts.isIdentifier(expression.expression.expression) &&
             namespaceAliases.has(expression.expression.expression.text) &&
             expression.expression.name.text === "api"
         ) {
-            return property === "mutation" ? "defineMutation" : "defineQuery";
+            return property;
         }
         return undefined;
     };
 
-    const isApiFactoryCall = (expression: import("typescript").LeftHandSideExpression): boolean => {
-        if (!ts.isPropertyAccessExpression(expression)) return false;
-        if (ts.isIdentifier(expression.expression) && apiObjects.has(expression.expression.text)) return true;
-        return (
-            ts.isPropertyAccessExpression(expression.expression) &&
-            ts.isIdentifier(expression.expression.expression) &&
-            namespaceAliases.has(expression.expression.expression.text) &&
-            expression.expression.name.text === "api"
-        );
-    };
-
-    const isPlannedQueryCall = (
-        call: import("typescript").CallExpression,
-        kind: (typeof DEFINE_HELPERS)[number]
-    ): boolean => {
-        if (kind !== "defineQuery") return false;
+    const configRef = (call: import("typescript").CallExpression, kind: HandleKind, exportName: string): string => {
         const config = call.arguments[0];
-        if (!config || !ts.isObjectLiteralExpression(config)) return false;
-        return config.properties.some(candidate => {
-            if (!("name" in candidate) || !candidate.name) return false;
-            return (
-                (ts.isIdentifier(candidate.name) || ts.isStringLiteral(candidate.name)) &&
-                candidate.name.text === "query"
-            );
-        });
-    };
-
-    const explicitConfigRef = (
-        call: import("typescript").CallExpression,
-        kind: (typeof DEFINE_HELPERS)[number],
-        exportName: string,
-        apiFactoryCall: boolean
-    ): string | undefined => {
-        if (kind !== "defineMutation" && kind !== "defineQuery") return undefined;
-        const first = call.arguments[0];
-        const positional = kind === "defineMutation" && first && !ts.isObjectLiteralExpression(first);
-        if (
-            apiFactoryCall &&
-            positional &&
-            !call.arguments[1] &&
-            !ts.isArrowFunction(first) &&
-            !ts.isFunctionExpression(first)
-        ) {
-            throw new Error(`[@chardb/core/vite] ${exportName} must use an inline config object`);
+        if (!config || !ts.isObjectLiteralExpression(config) || call.arguments.length !== 1) {
+            throw new Error(`[@chardb/core/vite] ${exportName} must use one inline config object`);
         }
-        const config = positional ? call.arguments[1] : first;
-        if (!config || !ts.isObjectLiteralExpression(config)) return undefined;
         if (config.properties.some(property => ts.isSpreadAssignment(property))) {
             throw new Error(`[@chardb/core/vite] ${exportName} config cannot spread ref metadata`);
         }
@@ -292,111 +210,48 @@ function collectExports(code: string, id: string): FoundExport[] {
                     candidate.name.text === name
                 );
             });
-        const computedProperty = config.properties.find(
-            candidate => "name" in candidate && candidate.name && ts.isComputedPropertyName(candidate.name)
-        );
-        // Preserve the legacy fail-closed handling of computed metadata. A
-        // computed key could otherwise hide ref or placement fields from the
-        // build transform.
-        const namedProperty = (name: string) => exactNamedProperty(name) ?? computedProperty;
-        const plannedQuery = kind === "defineQuery" && exactNamedProperty("query") !== undefined;
-        if (kind === "defineQuery" && !plannedQuery) {
-            throw new Error(`[@chardb/core/vite] Query ${exportName} must use a planned query config`);
+        if (
+            config.properties.some(
+                candidate => "name" in candidate && candidate.name && ts.isComputedPropertyName(candidate.name)
+            )
+        ) {
+            throw new Error(`[@chardb/core/vite] ${exportName} config cannot use computed properties`);
         }
-        if (plannedQuery) {
-            if (computedProperty) {
-                throw new Error(
-                    `[@chardb/core/vite] Planned query ${exportName} config cannot use computed properties`
-                );
-            }
+        const implementation = exactNamedProperty(kind === "query" ? "query" : "handler");
+        if (!implementation) {
+            const field = kind === "query" ? "query" : "handler";
+            throw new Error(`[@chardb/core/vite] ${kind} ${exportName} requires an inline ${field}`);
+        }
+        if (kind === "query") {
             const mixed = ["handler", "authority", "partitionKey", "intent"].filter(
                 name => exactNamedProperty(name) !== undefined
             );
             if (mixed.length > 0) {
-                throw new Error(
-                    `[@chardb/core/vite] Planned query ${exportName} cannot mix query with ${mixed.join(", ")}`
-                );
+                throw new Error(`[@chardb/core/vite] Query ${exportName} cannot mix query with ${mixed.join(", ")}`);
             }
         }
-        const refProperty = namedProperty("ref");
-        const authorityProperty = namedProperty("authority");
-        let declaredAuthority: string | undefined;
-        if (authorityProperty) {
-            if (
-                !ts.isPropertyAssignment(authorityProperty) ||
-                ts.isComputedPropertyName(authorityProperty.name) ||
-                !ts.isStringLiteralLike(authorityProperty.initializer)
-            ) {
-                throw new Error(`[@chardb/core/vite] Authority for ${exportName} must be a string literal`);
-            }
-            declaredAuthority = authorityProperty.initializer.text;
-        }
-        const stableAuthority =
-            declaredAuthority === "organization" || declaredAuthority === "user" || declaredAuthority === "global"
-                ? declaredAuthority
-                : undefined;
-        const authorityLabel = stableAuthority
-            ? `${stableAuthority[0]?.toUpperCase()}${stableAuthority.slice(1)}`
-            : undefined;
+        const refProperty = exactNamedProperty("ref");
         if (!refProperty) {
-            if (plannedQuery) {
-                throw new Error(`[@chardb/core/vite] Planned query ${exportName} requires a literal ref`);
-            }
-            if (authorityLabel) {
-                throw new Error(
-                    `[@chardb/core/vite] ${authorityLabel} ${kind === "defineMutation" ? "mutation" : "query"} ${exportName} requires a literal ref`
-                );
-            }
-            return undefined;
+            const label = kind === "query" ? "Query" : "Mutation";
+            throw new Error(`[@chardb/core/vite] ${label} ${exportName} requires a literal ref`);
         }
-        const property = config.properties.find(
-            candidate =>
-                ((ts.isPropertyAssignment(candidate) || ts.isShorthandPropertyAssignment(candidate)) &&
-                    ((ts.isIdentifier(candidate.name) && candidate.name.text === "ref") ||
-                        (ts.isStringLiteral(candidate.name) && candidate.name.text === "ref"))) ||
-                (ts.isPropertyAssignment(candidate) && ts.isComputedPropertyName(candidate.name))
-        );
-        if (!property) return undefined;
-        if (!ts.isPropertyAssignment(property) || ts.isComputedPropertyName(property.name)) {
+        if (!ts.isPropertyAssignment(refProperty) || !ts.isStringLiteralLike(refProperty.initializer)) {
             throw new Error(`[@chardb/core/vite] Explicit ref for ${exportName} must be a string literal`);
         }
-        if (!ts.isStringLiteralLike(property.initializer)) {
-            throw new Error(`[@chardb/core/vite] Explicit ref for ${exportName} must be a string literal`);
-        }
-        const explicitRef = validExplicitRef(property.initializer.text, exportName);
-        if (stableAuthority === "global" && kind === "defineMutation" && !namedProperty("partitionKey")) {
-            throw new Error(
-                `[@chardb/core/vite] Global mutation ${exportName} requires an explicit partitionKey extractor`
-            );
-        }
-        return explicitRef;
+        return validExplicitRef(refProperty.initializer.text, exportName);
     };
 
     const out: FoundExport[] = [];
     const visit = (node: import("typescript").Node): void => {
         if (ts.isVariableStatement(node) && node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) {
             for (const decl of node.declarationList.declarations) {
-                if (!ts.isIdentifier(decl.name) || !decl.initializer) continue;
-                const init = decl.initializer;
-                if (!ts.isCallExpression(init)) continue;
-                const kind = kindOf(init.expression);
+                if (!ts.isIdentifier(decl.name) || !decl.initializer || !ts.isCallExpression(decl.initializer)) {
+                    continue;
+                }
+                const kind = kindOf(decl.initializer.expression);
                 if (!kind) continue;
                 const exportName = decl.name.text;
-                const apiFactoryCall = isApiFactoryCall(init.expression);
-                const explicitRef = explicitConfigRef(init, kind, exportName, apiFactoryCall);
-                out.push({
-                    exportName,
-                    kind,
-                    plannedQuery: isPlannedQueryCall(init, kind),
-                    apiMutation: kind === "defineMutation" && apiFactoryCall,
-                    browserErasableMutation:
-                        kind === "defineMutation" &&
-                        apiFactoryCall &&
-                        init.arguments[0] !== undefined &&
-                        ts.isObjectLiteralExpression(init.arguments[0]),
-                    ref: explicitRef ?? refOf(exportName),
-                    explicitRef: explicitRef !== undefined,
-                });
+                out.push({ exportName, kind, ref: configRef(decl.initializer, kind, exportName) });
             }
         }
         ts.forEachChild(node, visit);
@@ -427,27 +282,8 @@ function viteTransformTarget(
 }
 
 function eraseBrowserHandleModule(code: string, id: string, found: readonly FoundExport[]): string {
-    const handles = found.filter(entry => entry.plannedQuery || entry.browserErasableMutation);
-    const hasMutation = handles.some(entry => entry.browserErasableMutation);
-    const handleNames = new Set(handles.map(entry => entry.exportName));
-    if (found.some(entry => entry.apiMutation && !entry.browserErasableMutation)) {
-        throw new Error(
-            `[@chardb/core/vite] Browser mutation module ${JSON.stringify(id)} supports only inline api.mutation({ ... }) exports`
-        );
-    }
-    const implicit = handles.find(entry => !entry.explicitRef);
-    if (implicit) {
-        throw new Error(
-            `[@chardb/core/vite] Browser ${implicit.kind === "defineMutation" ? "mutation" : "query"} ${implicit.exportName} requires a literal ref because Wrangler builds the Worker separately from Vite`
-        );
-    }
-    if (handles.length === 0) return code;
-    if (found.some(entry => !entry.plannedQuery && !entry.browserErasableMutation)) {
-        const message = hasMutation
-            ? `[@chardb/core/vite] Browser handle module ${JSON.stringify(id)} cannot mix erased and runtime exports`
-            : `[@chardb/core/vite] Browser planned-query module ${JSON.stringify(id)} cannot mix planned queries with runtime exports`;
-        throw new Error(message);
-    }
+    const hasMutation = found.some(entry => entry.kind === "mutation");
+    const handleNames = new Set(found.map(entry => entry.exportName));
 
     const ts = loadTypeScript();
     if (!ts) {
@@ -494,10 +330,9 @@ function eraseBrowserHandleModule(code: string, id: string, found: readonly Foun
         throw exportFailure();
     }
 
-    const definitions = handles
+    const definitions = found
         .map(entry => {
-            const kind = entry.plannedQuery ? "query" : "mutation";
-            return `export const ${entry.exportName} = __chardbBrowserHandle(${JSON.stringify(kind)}, ${JSON.stringify(entry.ref)});`;
+            return `export const ${entry.exportName} = __chardbBrowserHandle(${JSON.stringify(entry.kind)}, ${JSON.stringify(entry.ref)});`;
         })
         .join("\n");
     return [
@@ -518,10 +353,4 @@ function eraseBrowserHandleModule(code: string, id: string, found: readonly Foun
 
 function cleanModuleId(id: string): string {
     return id.replace(/[?#].*$/, "").replaceAll("\\", "/");
-}
-
-function modulePath(id: string): string {
-    const clean = cleanModuleId(id);
-    const srcIndex = clean.lastIndexOf("/src/");
-    return srcIndex === -1 ? clean : clean.slice(srcIndex + 1);
 }
