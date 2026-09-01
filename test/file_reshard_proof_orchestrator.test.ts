@@ -14,6 +14,7 @@ import {
     parseFileReshardProofOrchestratorArgs,
     provisionFileReshardProofResources,
     renderFileReshardLocalWrangler,
+    runFileReshardBrowserProof,
 } from "../scripts/file-reshard-proof-orchestrator.mjs";
 import {
     buildBrowserEvidence,
@@ -40,20 +41,30 @@ async function workspace() {
     const root = await mkdtemp(path.join(tmpdir(), "chardb-reshard-orchestrator-"));
     temporary.push(root);
     const tarball = path.join(root, "candidate.tgz");
+    const reactTarball = path.join(root, "react-candidate.tgz");
     const bytes = Buffer.from("one exact packed candidate");
+    const reactBytes = Buffer.from("one exact packed React candidate");
     await writeFile(tarball, bytes);
+    await writeFile(reactTarball, reactBytes);
     return {
         root,
         tarball,
+        reactTarball,
         output: path.join(root, "evidence"),
         privateDir: path.join(root, "private"),
         candidate: { algorithm: "sha256" as const, digest: digest(bytes), bytes: bytes.byteLength },
+        reactCandidate: {
+            algorithm: "sha256" as const,
+            digest: digest(reactBytes),
+            bytes: reactBytes.byteLength,
+        },
     };
 }
 
 function options(input: Awaited<ReturnType<typeof workspace>>) {
     return {
         tarball: input.tarball,
+        reactTarball: input.reactTarball,
         output: input.output,
         privateDir: input.privateDir,
         workersDevSubdomain: "proof-account",
@@ -67,7 +78,7 @@ async function dependencies(input: Awaited<ReturnType<typeof workspace>>, events
     const preparation = buildFileReshardPreparation(input.candidate);
     const app = path.join(input.privateDir, "app");
     const preparationPath = path.join(input.privateDir, "file-reshard-preparation.json");
-    const browser = buildBrowserEvidence(input.candidate);
+    const browser = buildBrowserEvidence(input.candidate, input.reactCandidate);
     const pair = buildFileReshardPair(input.candidate, preparation);
     return {
         prepare: async () => {
@@ -82,8 +93,18 @@ async function dependencies(input: Awaited<ReturnType<typeof workspace>>, events
             receipt: preparation,
             evidence: preparation,
         }),
-        runBrowserProof: async ({ reportPath }: { reportPath: string }) => {
+        runBrowserProof: async ({
+            reportPath,
+            reactTarball,
+            reactCandidate,
+        }: {
+            reportPath: string;
+            reactTarball: string;
+            reactCandidate: typeof input.reactCandidate;
+        }) => {
             events.push("browser");
+            expect(reactTarball).toBe(input.reactTarball);
+            expect(reactCandidate).toEqual(input.reactCandidate);
             await writeFile(reportPath, `${JSON.stringify(browser, null, 2)}\n`);
             return browser;
         },
@@ -132,10 +153,12 @@ async function dependencies(input: Awaited<ReturnType<typeof workspace>>, events
 }
 
 describe("automatic file/vector reshard proof orchestration", () => {
-    test("parses one-tarball execution and keeps public evidence outside the private tree", () => {
+    test("requires the core and React package pair and keeps public evidence outside the private tree", () => {
         const parsed = parseFileReshardProofOrchestratorArgs([
             "--tarball",
             "candidate.tgz",
+            "--react-tarball",
+            "react-candidate.tgz",
             "--output",
             "evidence",
             "--private-dir",
@@ -155,6 +178,23 @@ describe("automatic file/vector reshard proof orchestration", () => {
                 "--tarball",
                 "candidate.tgz",
                 "--output",
+                "evidence",
+                "--private-dir",
+                "private",
+                "--workers-dev-subdomain",
+                "proof-account",
+                "--account-id",
+                "a".repeat(32),
+                "--confirm-disposable-resources",
+            ])
+        ).toThrow("--react-tarball is required");
+        expect(() =>
+            parseFileReshardProofOrchestratorArgs([
+                "--tarball",
+                "candidate.tgz",
+                "--react-tarball",
+                "react-candidate.tgz",
+                "--output",
                 "private/evidence",
                 "--private-dir",
                 "private",
@@ -165,6 +205,34 @@ describe("automatic file/vector reshard proof orchestration", () => {
                 "--confirm-disposable-resources",
             ])
         ).toThrow("separate trees");
+    });
+
+    test("passes both exact tarballs to the packed browser proof and verifies both fingerprints", async () => {
+        const input = await workspace();
+        const reportPath = path.join(input.root, "browser-proof.json");
+        const browser = buildBrowserEvidence(input.candidate, input.reactCandidate);
+        const calls: string[][] = [];
+
+        const result = await runFileReshardBrowserProof(
+            {
+                tarball: input.tarball,
+                reactTarball: input.reactTarball,
+                reportPath,
+                candidate: input.candidate,
+                reactCandidate: input.reactCandidate,
+            },
+            {
+                runCommand: async (_command: string, args: string[]) => {
+                    calls.push(args);
+                    await writeFile(reportPath, `${JSON.stringify(browser, null, 2)}\n`);
+                    return { exitCode: 0, stdout: "", stderr: "" };
+                },
+            }
+        );
+
+        expect(calls).toHaveLength(1);
+        expect(calls[0]?.slice(1)).toEqual([input.tarball, "--react", input.reactTarball]);
+        expect(result).toEqual(browser);
     });
 
     test("renders the native local target with exact Workerd, R2, and vector-probe bindings", () => {

@@ -274,6 +274,7 @@ async function releaseFixture() {
         schema: "chardb.file-vector-reshard-proof.orchestration.v1",
         ok: true,
         candidate: exact,
+        reactPackage: { name: "@chardb/react", tarball: reactExact },
         target: reshardPreparation.target,
         phases: {
             browser: true,
@@ -338,7 +339,7 @@ async function releaseFixture() {
     await manifest(directories["cloudflare-vectors"], "execution.sha256", ["vectorize-proof-execution.json"]);
     await writeOsCiFixture(directories["os-ci"], exact, reactExact);
 
-    return { root, directories, exact, packageIdentity };
+    return { root, directories, exact, reactExact, packageIdentity };
 }
 
 function input(directories: Record<(typeof RELEASE_EVIDENCE_KINDS)[number], string>) {
@@ -355,6 +356,7 @@ describe("release admission", () => {
             profile: RELEASE_ADMISSION_PROFILE,
             ok: true,
             candidate: { name: "@chardb/core", version: "0.1.0", ...fixture.exact },
+            reactPackage: { name: "@chardb/react", version: "0.1.0", ...fixture.reactExact },
         });
         expect(result.evidence.map(item => item.kind)).toEqual([...RELEASE_EVIDENCE_KINDS]);
         expect(result.evidence.flatMap(item => item.checksums)).toHaveLength(12);
@@ -551,6 +553,25 @@ describe("release admission", () => {
 
         await expect(admitReleaseEvidence(input(fixture.directories))).rejects.toThrow(
             "tarball package name or version differs"
+        );
+    });
+
+    test("rejects a file reshard browser proof from another React package", async () => {
+        const fixture = await releaseFixture();
+        const directory = fixture.directories["cloudflare-file-reshard"];
+        const otherReact = { algorithm: "sha256", digest: "f".repeat(64), bytes: 123 };
+        const browserPath = path.join(directory, "browser-proof.json");
+        const browser = JSON.parse(await readFile(browserPath, "utf8"));
+        browser.reactPackage.tarball = otherReact;
+        await json(directory, "browser-proof.json", browser);
+        const orchestrationPath = path.join(directory, "orchestration.json");
+        const orchestration = JSON.parse(await readFile(orchestrationPath, "utf8"));
+        orchestration.reactPackage.tarball = otherReact;
+        await json(directory, "orchestration.json", orchestration);
+        await refreshManifest(directory, "supplemental.sha256");
+
+        await expect(admitReleaseEvidence(input(fixture.directories))).rejects.toThrow(
+            "browser evidence does not identify the preview React tarball"
         );
     });
 

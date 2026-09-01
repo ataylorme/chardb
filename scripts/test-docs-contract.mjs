@@ -4,20 +4,32 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { npmPackFilename } from "./package-identity.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const docsRoot = join(repositoryRoot, "docs");
 const rootPackage = JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8"));
+const reactPackage = JSON.parse(await readFile(join(repositoryRoot, "packages/react/package.json"), "utf8"));
 const temporaryRoot = await mkdtemp(join(tmpdir(), "chardb-docs-contract-"));
 try {
-    const tarballPath = await resolveTarball(temporaryRoot);
+    const { core: tarballPath, react: reactTarballPath } = await resolveTarballs(temporaryRoot);
     const tarball = await readFile(tarballPath).catch(() => fail(`cannot read packed artifact: ${tarballPath}`));
+    const reactTarball = await readFile(reactTarballPath).catch(() =>
+        fail(`cannot read packed React artifact: ${reactTarballPath}`)
+    );
     const digest = createHash("sha256").update(tarball).digest("hex");
+    const reactDigest = createHash("sha256").update(reactTarball).digest("hex");
 
-    run("tar", ["-xzf", tarballPath, "-C", temporaryRoot]);
+    const coreExtractRoot = join(temporaryRoot, "core-extract");
+    const reactExtractRoot = join(temporaryRoot, "react-extract");
+    await mkdir(coreExtractRoot);
+    await mkdir(reactExtractRoot);
+    run("tar", ["-xzf", tarballPath, "-C", coreExtractRoot]);
+    run("tar", ["-xzf", reactTarballPath, "-C", reactExtractRoot]);
     await symlink(join(repositoryRoot, "node_modules"), join(temporaryRoot, "node_modules"), "dir");
 
-    const packageRoot = join(temporaryRoot, "package");
+    const packageRoot = join(coreExtractRoot, "package");
+    const reactPackageRoot = join(reactExtractRoot, "package");
     const packageJson = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
     if (packageJson.name !== rootPackage.name || packageJson.version !== rootPackage.version) {
         fail(`packed identity is ${packageJson.name}@${packageJson.version}`);
@@ -26,6 +38,32 @@ try {
     if (JSON.stringify(Object.keys(packageJson.exports)) !== JSON.stringify(expectedExports)) {
         fail(`public exports must be ${expectedExports.join(", ")}`);
     }
+    const packedReactJson = JSON.parse(await readFile(join(reactPackageRoot, "package.json"), "utf8"));
+    if (packedReactJson.name !== reactPackage.name || packedReactJson.version !== reactPackage.version) {
+        fail(`packed React identity is ${packedReactJson.name}@${packedReactJson.version}`);
+    }
+    if (JSON.stringify(Object.keys(packedReactJson.exports ?? {})) !== JSON.stringify(["."])) {
+        fail("React package must export only its root entry");
+    }
+    if (packedReactJson.peerDependencies?.[rootPackage.name] !== `^${rootPackage.version}`) {
+        fail(`React package must peer-depend on ${rootPackage.name} ^${rootPackage.version}`);
+    }
+    const packedReactTypes = await readFile(join(reactPackageRoot, "dist/index.d.mts"), "utf8").catch(() =>
+        fail("packed React package is missing dist/index.d.mts")
+    );
+    requireText(
+        packedReactTypes,
+        "@chardb/core/internal/react",
+        "packed React declarations do not re-export the core React contract"
+    );
+    const packedCoreReactTypes = await readFile(join(packageRoot, "dist/internal/react.d.mts"), "utf8").catch(() =>
+        fail("packed core package is missing dist/internal/react.d.mts")
+    );
+    requireText(
+        packedCoreReactTypes,
+        "createChardbReactClient",
+        "packed core React declarations are missing createChardbReactClient"
+    );
 
     const packageReadme = await readFile(join(packageRoot, "README.md"), "utf8");
     for (const stale of [
@@ -62,6 +100,9 @@ try {
     const generatedPackage = JSON.parse(await readFile(join(appRoot, "package.json"), "utf8"));
     if (generatedPackage.dependencies?.[rootPackage.name] !== rootPackage.version) {
         fail("generated app does not pin the packed package version");
+    }
+    if (generatedPackage.dependencies?.[reactPackage.name] !== reactPackage.version) {
+        fail("generated app does not pin the packed React package version");
     }
 
     const config = JSON.parse(await readFile(join(docsRoot, "docs.json"), "utf8"));
@@ -208,7 +249,7 @@ try {
         requireText(sharedTypes, vectorSurface, `vector type surface is missing ${vectorSurface}`);
     }
 
-    await linkGeneratedDependencies(appRoot, packageRoot);
+    await linkGeneratedDependencies(appRoot, packageRoot, reactPackageRoot);
     const editedSchema = generatedSchema.replace(
         '    createdAt: integer("created_at").notNull(),',
         '    createdAt: integer("created_at").notNull(),\n    editedAt: integer("edited_at"),'
@@ -249,22 +290,29 @@ try {
     }
 
     console.log(
-        `docs contract passed: ${pageNames.length} pages, ${generatedExamples.size} generated examples, ${digest.slice(0, 12)} package`
+        `docs contract passed: ${pageNames.length} pages, ${generatedExamples.size} generated examples, ${digest.slice(0, 12)} core, ${reactDigest.slice(0, 12)} React`
     );
 } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
 }
 
-async function resolveTarball(temporaryRoot) {
-    const supplied = process.env.CHARDB_DOCS_TARBALL;
-    if (supplied) return resolve(supplied);
+async function resolveTarballs(temporaryRoot) {
+    const suppliedCore = process.env.CHARDB_DOCS_TARBALL;
+    const suppliedReact = process.env.CHARDB_DOCS_REACT_TARBALL;
+    if (Boolean(suppliedCore) !== Boolean(suppliedReact)) {
+        fail("CHARDB_DOCS_TARBALL and CHARDB_DOCS_REACT_TARBALL must be supplied together");
+    }
+    if (suppliedCore && suppliedReact) {
+        return { core: resolve(suppliedCore), react: resolve(suppliedReact) };
+    }
 
     run("bun", ["pm", "pack", "--destination", temporaryRoot]);
-    const tarballs = (await readdir(temporaryRoot))
-        .filter(entry => entry.endsWith(".tgz"))
-        .map(entry => join(temporaryRoot, entry));
-    if (tarballs.length !== 1) fail(`expected one packed artifact, found ${tarballs.length}`);
-    return tarballs[0];
+    run("bun", ["pm", "pack", "--destination", temporaryRoot], join(repositoryRoot, "packages/react"));
+    const core = join(temporaryRoot, npmPackFilename(rootPackage.name, rootPackage.version));
+    const react = join(temporaryRoot, npmPackFilename(reactPackage.name, reactPackage.version));
+    const tarballs = (await readdir(temporaryRoot)).filter(entry => entry.endsWith(".tgz"));
+    if (tarballs.length !== 2) fail(`expected two packed artifacts, found ${tarballs.length}`);
+    return { core, react };
 }
 
 function run(command, args, cwd = repositoryRoot) {
@@ -275,10 +323,11 @@ function run(command, args, cwd = repositoryRoot) {
     return result;
 }
 
-async function linkGeneratedDependencies(appRoot, packageRoot) {
+async function linkGeneratedDependencies(appRoot, packageRoot, reactPackageRoot) {
     const nodeModules = join(appRoot, "node_modules");
     await mkdir(join(nodeModules, "@chardb"), { recursive: true });
     await symlink(packageRoot, join(nodeModules, "@chardb/core"), "dir");
+    await symlink(reactPackageRoot, join(nodeModules, "@chardb/react"), "dir");
     for (const dependency of ["better-auth", "drizzle-orm", "zod"]) {
         await symlink(join(repositoryRoot, "node_modules", dependency), join(nodeModules, dependency), "dir");
     }

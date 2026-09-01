@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmod, cp, lstat, mkdir, readFile, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { fingerprintFile } from "./browser-proof-report.mjs";
 import { awaitCloudflareVectorizeWranglerChild } from "./cloudflare-vectorize-proof-orchestrator.mjs";
 import { fileReshardBenchmarkProfile } from "./file-reshard-benchmark-report.mjs";
 import {
@@ -101,6 +102,7 @@ function separateTrees(left, right) {
 export function parseFileReshardProofOrchestratorArgs(argv) {
     const valued = new Set([
         "--tarball",
+        "--react-tarball",
         "--output",
         "--private-dir",
         "--workers-dev-subdomain",
@@ -120,6 +122,7 @@ export function parseFileReshardProofOrchestratorArgs(argv) {
     const options = {
         help,
         tarball: argumentValue(argv, "--tarball"),
+        reactTarball: argumentValue(argv, "--react-tarball"),
         output: argumentValue(argv, "--output"),
         privateDir: argumentValue(argv, "--private-dir"),
         workersDevSubdomain: argumentValue(argv, "--workers-dev-subdomain"),
@@ -130,6 +133,7 @@ export function parseFileReshardProofOrchestratorArgs(argv) {
     if (help) return Object.freeze(options);
     for (const [flag, item] of [
         ["--tarball", options.tarball],
+        ["--react-tarball", options.reactTarball],
         ["--output", options.output],
         ["--private-dir", options.privateDir],
         ["--workers-dev-subdomain", options.workersDevSubdomain],
@@ -142,7 +146,7 @@ export function parseFileReshardProofOrchestratorArgs(argv) {
     if (!SUBDOMAIN.test(options.workersDevSubdomain)) {
         throw new Error("--workers-dev-subdomain must be one lowercase Cloudflare subdomain label");
     }
-    for (const field of ["tarball", "output", "privateDir", "cloudflareApiTokenFile"]) {
+    for (const field of ["tarball", "reactTarball", "output", "privateDir", "cloudflareApiTokenFile"]) {
         if (options[field] !== undefined) options[field] = path.resolve(options[field]);
     }
     if (!separateTrees(options.output, options.privateDir)) {
@@ -587,7 +591,7 @@ export async function cleanupFileReshardProofResources(input, dependencies = {})
 export async function runFileReshardBrowserProof(input, dependencies = {}) {
     const reportPath = path.resolve(input.reportPath);
     const run = dependencies.runCommand ?? defaultRunCommand;
-    const result = await run(process.execPath, [BROWSER_SCRIPT, input.tarball], {
+    const result = await run(process.execPath, [BROWSER_SCRIPT, input.tarball, "--react", input.reactTarball], {
         cwd: ROOT,
         env: { ...process.env, CDB_BROWSER_PROOF_REPORT: reportPath },
         timeoutMs: BROWSER_TIMEOUT_MS,
@@ -595,7 +599,7 @@ export async function runFileReshardBrowserProof(input, dependencies = {}) {
     });
     check(result.exitCode === 0, "packed browser proof failed");
     const report = JSON.parse(await readFile(reportPath, "utf8"));
-    assertMatchingBrowserReport(report, input.candidate);
+    assertMatchingBrowserReport(report, input.candidate, input.reactCandidate);
     return report;
 }
 
@@ -781,7 +785,7 @@ export async function orchestrateFileReshardCloudflareProof(options, dependencie
     check(options.confirmed === true, "disposable reshard proof confirmation is required");
     check(ACCOUNT_ID.test(options.accountId ?? ""), "Cloudflare account ID must be exactly 32 hexadecimal characters");
     check(SUBDOMAIN.test(options.workersDevSubdomain ?? ""), "Cloudflare workers.dev subdomain is invalid");
-    for (const field of ["tarball", "output", "privateDir"]) {
+    for (const field of ["tarball", "reactTarball", "output", "privateDir"]) {
         check(typeof options[field] === "string" && path.isAbsolute(options[field]), `${field} must be absolute`);
     }
     check(
@@ -790,6 +794,12 @@ export async function orchestrateFileReshardCloudflareProof(options, dependencie
     );
     const tarballMetadata = await lstat(options.tarball);
     check(tarballMetadata.isFile() && !tarballMetadata.isSymbolicLink(), "candidate tarball must be a regular file");
+    const reactTarballMetadata = await lstat(options.reactTarball);
+    check(
+        reactTarballMetadata.isFile() && !reactTarballMetadata.isSymbolicLink(),
+        "React candidate tarball must be a regular file"
+    );
+    const reactCandidate = await fingerprintFile(options.reactTarball);
     const canonicalPrivateDir = await assertNewDirectory(options.privateDir, "reshard proof private directory", 0o700);
     const canonicalOutput = await canonicalPlannedPath(options.output);
     check(
@@ -898,8 +908,14 @@ export async function orchestrateFileReshardCloudflareProof(options, dependencie
         vectorizeIndexAbsentVerified: false,
     };
     try {
-        browser = await runBrowser({ tarball: options.tarball, reportPath: browserPrivatePath, candidate });
-        assertMatchingBrowserReport(browser, candidate);
+        browser = await runBrowser({
+            tarball: options.tarball,
+            reactTarball: options.reactTarball,
+            reportPath: browserPrivatePath,
+            candidate,
+            reactCandidate,
+        });
+        assertMatchingBrowserReport(browser, candidate, reactCandidate);
         local = await startLocal(
             {
                 app: validated.app,
@@ -1015,6 +1031,7 @@ export async function orchestrateFileReshardCloudflareProof(options, dependencie
         schema: FILE_RESHARD_PROOF_ORCHESTRATOR_SCHEMA,
         ok: success,
         candidate,
+        reactPackage: { name: "@chardb/react", tarball: reactCandidate },
         target: prepared.evidence.target,
         phases: {
             browser: Boolean(browser),
@@ -1075,6 +1092,7 @@ export async function orchestrateFileReshardCloudflareProof(options, dependencie
         schema: FILE_RESHARD_PROOF_ORCHESTRATOR_SCHEMA,
         ok: true,
         candidate,
+        reactPackage: { name: "@chardb/react", tarball: reactCandidate },
         target: prepared.evidence.target,
         pair,
         browser,
@@ -1085,12 +1103,13 @@ export async function orchestrateFileReshardCloudflareProof(options, dependencie
 
 function usage() {
     return [
-        "Usage: bun run proof:cloudflare:reshard -- --tarball <candidate.tgz> --output <evidence-dir> \\",
+        "Usage: bun run proof:cloudflare:reshard -- --tarball <core.tgz> --react-tarball <react.tgz> \\",
+        "  --output <evidence-dir> \\",
         "  --private-dir <private-dir> --workers-dev-subdomain <label> --account-id <32-hex-id> \\",
         "  --confirm-disposable-resources [--cloudflare-api-token-file <file>]",
         "",
-        "Prepares one exact candidate, runs the packed browser and local Wrangler proofs, provisions one",
-        "disposable Worker/R2/Vectorize target, runs the paired proof, then cleans up and verifies absence.",
+        "Prepares one exact core and React package pair, runs the packed browser and local Wrangler proofs,",
+        "provisions one disposable Worker/R2/Vectorize target, runs the paired proof, then verifies cleanup.",
     ].join("\n");
 }
 

@@ -52,13 +52,16 @@ describe("proof directory canonical separation", () => {
     test("the combined reshard proof rejects the same canonical tree before preparation", async () => {
         const paths = await aliasedTrees();
         const candidate = path.join(paths.root, "candidate.tgz");
+        const reactCandidate = path.join(paths.root, "react-candidate.tgz");
         await writeFile(candidate, "candidate");
+        await writeFile(reactCandidate, "react candidate");
         await expect(
             orchestrateFileReshardCloudflareProof({
                 confirmed: true,
                 accountId: "a".repeat(32),
                 workersDevSubdomain: "example",
                 tarball: candidate,
+                reactTarball: reactCandidate,
                 output: paths.output,
                 privateDir: paths.privateDir,
             })

@@ -47,7 +47,8 @@ describe("release documentation contract", () => {
     test("describes the shipped path without construction history", () => {
         const status = read("STATUS.md");
         const plan = read("PLAN.md");
-        const publicDocs = [read("README.md"), status, plan].join("\n");
+        const preview = read("PREVIEW.md");
+        const publicDocs = [read("README.md"), status, plan, preview].join("\n");
 
         for (const capability of ["Better Auth", "Drizzle", "Durable Objects", "R2", "Vectorize", "Miniflare"]) {
             expect(publicDocs).toContain(capability);
@@ -59,6 +60,9 @@ describe("release documentation contract", () => {
         expect(publicDocs).not.toContain("github.com/zpg6/chardb/blob/main");
         expect(plan).toContain("Every release is built once and tested as the artifact users install");
         expect(plan).toContain("same paired `@chardb/core` and `@chardb/react` tarballs");
+        expect(preview).toContain("one exact `@chardb/core` and `@chardb/react` package pair");
+        expect(preview).toContain("--react-tarball artifacts/preview/chardb-react-0.1.0.tgz");
+        expect(preview).not.toContain("builds one npm tarball");
         expect(status).toContain("plus `@chardb/react`");
         expect(status).not.toContain("`/react`");
         expect(publicDocs).toContain("| `chardb-client` | Native Rust client");
@@ -114,6 +118,8 @@ describe("release documentation contract", () => {
         expect(workflow).toContain("smoke-packed-package.mjs");
         expect(workflow).toContain("smoke-packed-chat.mjs");
         expect(workflow).toContain("os-ci-evidence");
+        expect(workflow).toContain("CHARDB_DOCS_TARBALL: ci-candidate/core.tgz");
+        expect(workflow).toContain("CHARDB_DOCS_REACT_TARBALL: ci-candidate/react.tgz");
     });
 
     test("surfaces the shipped React and Rust clients", () => {

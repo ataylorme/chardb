@@ -414,6 +414,11 @@ async function validatePreview(directory) {
     return {
         root,
         candidate,
+        reactPackage: {
+            name: report.reactPackage.name,
+            version: report.reactPackage.version,
+            ...reactFingerprint,
+        },
         report: {
             path: "preview-gate.json",
             sha256: sha256(await regularBytes(path.join(root, "preview-gate.json"), "preview gate report", root)),
@@ -531,7 +536,7 @@ async function validateCloudflareFiles(directory, candidate) {
     };
 }
 
-async function validateFileReshard(directory, candidate) {
+async function validateFileReshard(directory, candidate, reactPackage) {
     const root = await evidenceDirectory(directory, "cloudflare-file-reshard");
     const evidence = await validateChecksumManifest(root, "evidence.sha256", ["paired.json", "preparation.json"]);
     const supplemental = await validateChecksumManifest(
@@ -605,11 +610,13 @@ async function validateFileReshard(directory, candidate) {
     }
     const browserEntry = supplemental.entries.find(entry => entry.path === "browser-proof.json");
     const browser = JSON.parse(browserEntry.bytes.toString("utf8"));
-    assertMatchingBrowserReport(browser, {
+    const coreFingerprint = { algorithm: "sha256", digest: candidate.digest, bytes: candidate.bytes };
+    const reactFingerprint = {
         algorithm: "sha256",
-        digest: candidate.digest,
-        bytes: candidate.bytes,
-    });
+        digest: reactPackage.digest,
+        bytes: reactPackage.bytes,
+    };
+    assertMatchingBrowserReport(browser, coreFingerprint, reactFingerprint);
     reportCandidate(browser, candidate, "file reshard browser proof");
     check(
         browser.invariants?.activeOrganizationReshardObserved === true,
@@ -629,7 +636,9 @@ async function validateFileReshard(directory, candidate) {
             orchestration.phases?.remoteCleanup === true &&
             orchestration.target?.worker === pair.deployment.worker &&
             orchestration.target?.bucket === pair.deployment.bucket &&
-            orchestration.target?.vectorizeIndex === pair.deployment.vectorizeIndex,
+            orchestration.target?.vectorizeIndex === pair.deployment.vectorizeIndex &&
+            orchestration.reactPackage?.name === reactPackage.name &&
+            isDeepStrictEqual(orchestration.reactPackage?.tarball, reactFingerprint),
         "file reshard orchestration evidence is incomplete"
     );
     reportCandidate(orchestration, candidate, "file reshard orchestration evidence");
@@ -738,7 +747,11 @@ export async function admitReleaseEvidence(input) {
         ["cloudflare-files", await validateCloudflareFiles(input.evidence["cloudflare-files"], preview.candidate)],
         [
             "cloudflare-file-reshard",
-            await validateFileReshard(input.evidence["cloudflare-file-reshard"], preview.candidate),
+            await validateFileReshard(
+                input.evidence["cloudflare-file-reshard"],
+                preview.candidate,
+                preview.reactPackage
+            ),
         ],
         [
             "cloudflare-vectors",
@@ -751,6 +764,7 @@ export async function admitReleaseEvidence(input) {
         profile: RELEASE_ADMISSION_PROFILE,
         ok: true,
         candidate: preview.candidate,
+        reactPackage: preview.reactPackage,
         evidence: results.map(([kind, result]) => ({
             kind,
             directory: result.root,

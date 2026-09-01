@@ -162,6 +162,7 @@ jobs:
       - name: Verify docs against the exact candidate
         env:
           CHARDB_DOCS_TARBALL: ci-candidate/core.tgz
+          CHARDB_DOCS_REACT_TARBALL: ci-candidate/react.tgz
         run: bun run test:docs
 
       - name: Scan Git history for high-confidence secrets
