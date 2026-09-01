@@ -415,7 +415,7 @@ bun run deploy
 
 Bun loads \`.env.local\` for these scripts. Git ignores that file. The commands never put either secret in process arguments.
 
-\`setup:cloudflare\` only probes or creates the exact R2 bucket named in \`wrangler.toml\`. It does not infer Vectorize indexes. Provision any future vector bindings explicitly, then run \`bunx @chardb/core vectorize prepare\`.
+\`setup:cloudflare\` probes or creates the exact R2 bucket named in \`wrangler.toml\` and installs the scoped 31-day Chardb recovery lifecycle. It does not infer Vectorize indexes. Provision any future vector bindings explicitly, then run \`bunx @chardb/core vectorize prepare\`.
 
 The bootstrap command refuses an invalid or implicit \`CHARDB_URL\`. On the first Worker upload it passes the two secrets through a mode-0600 temporary file, removes that file, waits for the exact packaged migration version and digest, and runs the packaged \`chardb migrate\` command with a content-derived migration ID. Rerunning it after an interrupted migration resumes without changing secrets. Routine \`deploy\` requires an existing Worker, checks that its current package and active migration agree, and never uploads secrets.
 

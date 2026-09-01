@@ -3,7 +3,7 @@ title: "Deploy"
 description: "Configure Cloudflare, deploy the Worker, and keep the limits visible."
 ---
 
-Deploy only disposable or independently rebuildable data.
+Chardb is experimental. Deploy with a tested recovery procedure and enough shard headroom for your workload.
 
 ## Set production secrets
 
@@ -29,7 +29,7 @@ bun run setup:cloudflare
 bun run deploy:bootstrap
 ```
 
-`setup:cloudflare` creates or verifies only the R2 bucket in `wrangler.toml`. Vectorize needs the explicit setup shown in [Vectors](/vectors). `deploy:bootstrap` uploads the first Worker, waits for the packaged schema identity, and applies the migration.
+`setup:cloudflare` creates or verifies the R2 bucket in `wrangler.toml` and installs Chardb's 31-day recovery lifecycle on its private `_chardb/retained/` prefix. It replaces only the lifecycle rule named `chardb-recovery-retention`. Vectorize needs the explicit setup shown in [Vectors](/vectors). `deploy:bootstrap` uploads the first Worker, waits for the packaged schema identity, and applies the migration.
 
 ## Later deploys
 
@@ -52,7 +52,7 @@ Routine `deploy` requires an existing Worker and refuses a package or migration 
 
 Chardb adds no hosted-service fee. Cloudflare bills Workers, Durable Objects, R2, and Vectorize from the bindings and traffic in your application. One application mutation can cause several Durable Object calls and SQLite row operations.
 
-The total deployed cost is unmeasured. Current evidence does not collect Worker CPU-ms, Durable Object requests or duration, SQLite rows, R2 GB-month, or complete Vectorize billing dimensions. Latency and operation counts are not an invoice estimate.
+File storage includes each live R2 object plus one recovery copy per unique payload digest. The worst case is roughly twice the uploaded bytes during the recovery window; identical payloads share a retained copy. Current evidence measures latency and operation counts, not a complete Cloudflare invoice. It does not collect every Worker CPU-ms, Durable Object duration, R2 GB-month, or Vectorize billing dimension.
 
 ## Recovery boundary
 
@@ -68,7 +68,7 @@ Store the manifest outside the deployment. Restore validates the current topolog
 bunx @chardb/core backups restore --url https://your-worker.example.com --from recovery.json
 ```
 
-Cloudflare retains Durable Object PITR history for 30 days. Recovery points rewind SQLite, not R2 or Vectorize. Chardb does not yet provide R2 object-version restore, automatic regional failover, or a production SLA.
+Cloudflare retains Durable Object PITR history for 30 days. Chardb keeps verified R2 recovery bodies for 31 days after a managed deletion and requeues restored vector heads after every Durable Object session has restarted. Provider objects created after the recovery point can remain unreachable after restore and still consume storage. Chardb does not provide automatic regional failover or a production SLA.
 
 Automatic resharding and range merging are unsupported.
 

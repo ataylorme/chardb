@@ -10,7 +10,7 @@ Chardb gives a Cloudflare Worker a typed database binding. Better Auth users or 
 The generated app includes organization messages, live queries, and an authenticated R2 attachment path. Generate it first. Its schema, tests, Wrangler config, and deployment scripts are the reference application.
 
 <Warning>
-  Chardb is experimental. Native SQLite recovery points are implemented, but R2 object-version restore, automatic regional failover, and a production SLA are not.
+  Chardb is experimental. Coordinated SQLite, R2 file, and Vectorize recovery is implemented. Automatic regional failover and a production SLA are not.
 </Warning>
 
 <CardGroup cols={2}>
