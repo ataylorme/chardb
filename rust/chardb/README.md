@@ -13,8 +13,8 @@ kind, arguments, and decoded output before the program runs. A handle is one
 `&'static str`, has no allocation, and writes that string unchanged to protocol
 v3's `ref` field.
 
-Chardb and this crate are experimental. This client does not change the
-database's current backup, restore, failover, or regional resilience status.
+Chardb and this crate are experimental. SQLite recovery points are an operator
+feature of the server CLI; this client does not manage deployment recovery.
 
 ## Install
 
@@ -73,7 +73,7 @@ struct Message {
 }
 
 const LIST_MESSAGES: Query<ListArgs, Message> =
-    Query::new("src/queries.ts#listMessages");
+    Query::new("messages#list");
 
 let contract = operation_schema(LIST_MESSAGES);
 let json = serde_json::to_value(contract)?;
@@ -92,6 +92,8 @@ parameter. The client generates one stable ID, adds it to the URL, and repeats
 the same ID in `hello`.
 
 ```rust,no_run
+# #[cfg(feature = "sync")]
+# mod sync_example {
 use std::time::Duration;
 use chardb_client::{Client, ClientConfig, Mutation, Query, SubscriptionEvent};
 use serde::{Deserialize, Serialize};
@@ -121,9 +123,9 @@ struct Posted {
 }
 
 const LIST_MESSAGES: Query<ListArgs, Message> =
-    Query::new("src/queries.ts#listMessages");
+    Query::new("messages#list");
 const POST_MESSAGE: Mutation<PostArgs, Posted> =
-    Mutation::new("src/api.ts#postMessage");
+    Mutation::new("messages#create");
 
 # fn get_jwt() -> Result<String, String> { unimplemented!() }
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -150,6 +152,7 @@ println!("posted {}", posted.id);
 client.close();
 # Ok(())
 # }
+# }
 ```
 
 `Client::connect` waits for the authenticated `welcome`, not merely the HTTP
@@ -161,13 +164,15 @@ The async API uses the same methods and event types. Its futures use channel
 wakers and work with any executor.
 
 ```rust,no_run
+# #[cfg(feature = "async")]
+# mod async_example {
 use chardb_client::{AsyncClient, ClientConfig, Mutation, Query, SubscriptionEvent};
 use serde_json::json;
 
 const LIST_MESSAGES: Query<serde_json::Value, serde_json::Value> =
-    Query::new("src/queries.ts#listMessages");
+    Query::new("messages#list");
 const POST_MESSAGE: Mutation<serde_json::Value, serde_json::Value> =
-    Mutation::new("src/api.ts#postMessage");
+    Mutation::new("messages#create");
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let client = AsyncClient::connect(ClientConfig::with_token(
@@ -190,6 +195,7 @@ let result = client.mutate(
 ).await?;
 # let _ = result;
 # Ok(())
+# }
 # }
 ```
 
@@ -227,9 +233,9 @@ pub struct Posted {
 }
 
 pub const LIST_MESSAGES: Query<ListMessages, Message> =
-    Query::new("src/queries.ts#listMessages");
+    Query::new("messages#list");
 pub const POST_MESSAGE: Mutation<PostMessage, Posted> =
-    Mutation::new("src/api.ts#postMessage");
+    Mutation::new("messages#create");
 ```
 
 `Query::new` and `Mutation::new` apply the wire codec's reference check. Since
@@ -243,11 +249,11 @@ constant, then replace the string argument at each call site:
 
 ```rust,ignore
 // Before
-let rows = client.subscribe::<_, Message>("src/queries.ts#listMessages", &args)?;
+let rows = client.subscribe::<_, Message>("messages#list", &args)?;
 
 // After
 const LIST_MESSAGES: Query<ListArgs, Message> =
-    Query::new("src/queries.ts#listMessages");
+    Query::new("messages#list");
 let rows = client.subscribe(LIST_MESSAGES, &args)?;
 ```
 

@@ -34,6 +34,10 @@ uuid = { version = "1.23", features = ["v7"], optional = true }
 [dev-dependencies]
 futures-lite = "2"
 
+[[example]]
+name = "workerd_conformance"
+required-features = ["sync"]
+
 [lints.rust]
 unsafe_code = "forbid"
 
