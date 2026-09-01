@@ -13,7 +13,7 @@ kind, arguments, and decoded output before the program runs. A handle is one
 `&'static str`, has no allocation, and writes that string unchanged to protocol
 v3's `ref` field.
 
-Chardb and this crate are experimental. SQLite recovery points are an operator
+Chardb and this crate are experimental. `SQLite` recovery points are an operator
 feature of the server CLI; this client does not manage deployment recovery.
 
 ## Install
