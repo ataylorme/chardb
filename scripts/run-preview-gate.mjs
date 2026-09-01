@@ -222,8 +222,6 @@ try {
         "bun",
         "scripts/smoke-packed-org-user.mjs",
         tarballPath,
-        "--react",
-        reactTarballPath,
         "--report",
         packedOrgUserPath,
     ]);
@@ -241,6 +239,8 @@ try {
         "bun",
         "scripts/smoke-generated-project.mjs",
         tarballPath,
+        "--react",
+        reactTarballPath,
         "--report",
         generatedProjectPath,
     ]);

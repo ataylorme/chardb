@@ -62,6 +62,31 @@ function browserReport() {
 }
 
 describe("preview release gate evidence", () => {
+    test("passes each proof exactly the package artifacts it consumes", async () => {
+        const source = await readFile(new URL("../scripts/run-preview-gate.mjs", import.meta.url), "utf8");
+        const orgUserStart = source.indexOf('await step("packed organization user"');
+        const orgUserEnd = source.indexOf("await internalStep(", orgUserStart);
+        const generatedStart = source.indexOf('await step("generated organization app"');
+        const generatedEnd = source.indexOf("await internalStep(", generatedStart);
+
+        expect(orgUserStart).toBeGreaterThan(-1);
+        expect(orgUserEnd).toBeGreaterThan(orgUserStart);
+        expect(generatedStart).toBeGreaterThan(-1);
+        expect(generatedEnd).toBeGreaterThan(generatedStart);
+
+        const orgUserCommand = source.slice(orgUserStart, orgUserEnd);
+        expect(orgUserCommand).toContain('"scripts/smoke-packed-org-user.mjs"');
+        expect(orgUserCommand).toContain("tarballPath");
+        expect(orgUserCommand).not.toContain('"--react"');
+        expect(orgUserCommand).not.toContain("reactTarballPath");
+
+        const generatedCommand = source.slice(generatedStart, generatedEnd);
+        expect(generatedCommand).toContain('"scripts/smoke-generated-project.mjs"');
+        expect(generatedCommand).toContain("tarballPath");
+        expect(generatedCommand).toContain('"--react"');
+        expect(generatedCommand).toContain("reactTarballPath");
+    });
+
     test("excludes interrupted Workerd build products from a candidate snapshot", async () => {
         const gitignore = await readFile(new URL("../.gitignore", import.meta.url), "utf8");
         expect(gitignore).toContain("test/workerd/.test-*.bundle.mjs");
