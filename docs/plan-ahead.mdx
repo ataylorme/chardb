@@ -1,32 +1,37 @@
 ---
 title: "Plan Ahead"
-description: "Design for Chardb's current durability, recovery, and capacity limits."
+description: "Know the recovery and scale boundaries before a Chardb experiment grows."
 ---
 
-Chardb is an experimental database. Use it only when every stored value is disposable or can be rebuilt from an independent source.
+Chardb's supported path has strong correctness tests and real Cloudflare deployment proofs. It is still an experimental database. Decide how you will recover it and when you will move a shard before either becomes urgent.
 
-## Keep an independent source of data
+## Take recovery points
 
-Chardb has no supported backup, export, restore, or point-in-time recovery command. R2 objects and Vectorize records do not fill that gap. Chardb still needs the SQLite rows that hold ownership, routing, file metadata, vector state, and application data.
+Deployed SQLite-backed Durable Objects retain native point-in-time recovery history for 30 days. Chardb can capture one recovery point across the Catalog and every active Cdb shard:
 
-Design the application so it can rebuild a new Chardb deployment without reading from the failed one. Keep stable application IDs in the independent source, define how you will replay them, and test a full rebuild and readback before storing data you care about.
+```sh
+export CHARDB_ADMIN_TOKEN="your-32-byte-or-longer-secret"
+bunx @chardb/core backups create --url https://api.example.com --out recovery.json
+```
 
-Do not treat a local Miniflare directory, a live-query snapshot, mutation replay records, migration checkpoints, or range-movement copies as a backup.
+Store the manifest outside the deployment. To restore it:
 
-## Write an incident plan
+```sh
+bunx @chardb/core backups restore --url https://api.example.com --from recovery.json
+```
 
-Chardb can resume some interrupted work while the original Durable Object storage remains intact. Live clients reconnect, retryable mutations can reuse the same mutation ID, forward migrations resume from durable checkpoints, and an experimental range movement exposes status, drive, recover, and abort operations.
+Restore validates the manifest and topology, fences new traffic, arms every shard, and restarts the Durable Objects at their recorded bookmarks. Test the procedure against a disposable deployed Worker. Native PITR is not available in Miniflare.
 
-Those mechanisms do not recover missing or corrupt data. There is no replica to promote, regional failover, reverse migration, repair tool for a lost Catalog or Cdb, or supported way to merge data written into the wrong Durable Object namespace.
+The recovery point covers Durable Object SQLite. It does not rewind R2 or Vectorize. Copy objects to an independent retention bucket before deletion when file restoration matters; Chardb does not do that automatically. Treat Vectorize as a derived index and plan to rebuild it from authoritative SQLite vector heads after a restore.
 
-Before a deployment, record the Worker bundle, migration journal, schema version and epoch, Durable Object class names, namespace bindings, and any active migration ID. Monitor Chardb error codes and add business-level counts or checksums for data whose absence you need to detect. Keep traffic closed when a migration or range movement has an unknown outcome.
+## Record the deployed shape
 
-Read [Deploy](/deploy) and [Schema migrations](/schema-migrations) before changing a running experiment.
+Keep the Worker version, migration journal, schema version and digest, Durable Object namespace bindings, recovery-point manifest, and any active migration or range-movement ID together.
 
-## Leave capacity headroom
+Monitor Chardb error codes and business-level row counts for data whose absence matters. If a migration, restore, or range movement has an unknown outcome, keep traffic closed until its durable state is known.
 
-One organization is the placement and transaction boundary. Chardb does not split one organization's transaction across shards, and it does not watch load or move ranges automatically.
+## Leave shard headroom
 
-Range movement exists as a private experimental operator command. It needs an explicit virtual-shard range, a fresh destination, an admin token, and operator supervision. It is not an automatic balancer, merge service, or recovery copy.
+An organization or user is the placement and transaction boundary. Chardb can explicitly move a virtual-shard range, including its rows, file metadata, vector state, outboxes, and tombstones. It does not yet balance ranges from live load automatically.
 
-Set organization size and traffic limits in the application. Leave room for spikes, watch per-organization latency and rate-limit errors, and plan a maintenance window before a shard reaches its limit. If the application requires automatic resharding, regional failover, or an availability target, Chardb does not meet that requirement today.
+Set owner-level size and traffic limits in the application. Watch latency and rate-limit errors, leave room for spikes, and move a range before a physical shard is full. Workloads that require automatic balancing, cross-partition transactions, operator-controlled regional failover, or a production availability SLA are outside the current release.

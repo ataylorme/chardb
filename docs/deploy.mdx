@@ -56,7 +56,19 @@ The total deployed cost is unmeasured. Current evidence does not collect Worker 
 
 ## Recovery boundary
 
-There is no backup, export, restore, point-in-time recovery, replica promotion, regional failover, or SLA. A successful restart proves reconstruction against storage that still exists. It does not prove recovery after storage loss or corruption.
+Capture a native SQLite recovery point after a healthy deploy and before a migration:
+
+```bash
+bunx @chardb/core backups create --url https://your-worker.example.com --out recovery.json
+```
+
+Store the manifest outside the deployment. Restore validates the current topology, fences new traffic, and restarts the Catalog and every active shard at their recorded Durable Object PITR bookmarks:
+
+```bash
+bunx @chardb/core backups restore --url https://your-worker.example.com --from recovery.json
+```
+
+Cloudflare retains Durable Object PITR history for 30 days. Recovery points rewind SQLite, not R2 or Vectorize. Chardb does not yet provide R2 object-version restore, automatic regional failover, or a production SLA.
 
 Automatic resharding and range merging are unsupported.
 
