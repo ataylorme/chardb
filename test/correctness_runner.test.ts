@@ -6,6 +6,7 @@ import path from "node:path";
 import {
     ChildProcessFailure,
     compareWorkerdHarnesses,
+    isIsolatedNativeTest,
     isTransientWorkerdStartupFailure,
     run,
     runWithRetries,
@@ -76,6 +77,12 @@ async function expectProcessGone(pid: number): Promise<void> {
 const posixTest = process.platform === "win32" ? test.skip : test;
 
 describe("correctness runner process control", () => {
+    test("isolates the real Wrangler reshard producer from Bun's parallel unit-test pool", () => {
+        expect(isIsolatedNativeTest("test/native_reshard_benchmark_producer.test.ts")).toBe(true);
+        expect(isIsolatedNativeTest("test/native_reshard_benchmark_report.test.ts")).toBe(false);
+        expect(isIsolatedNativeTest("test/workerd/reshard.harness.test.ts")).toBe(false);
+    });
+
     test("runs the restart-in-place file store before actor-only Workerd harnesses", () => {
         const files = [
             "/repo/test/workerd/gateway.harness.test.ts",

@@ -6,6 +6,7 @@ const ROOT = path.resolve(import.meta.dirname, "..");
 const TEST_ROOT = path.join(ROOT, "test");
 const WORKERD_ROOT = path.join(TEST_ROOT, "workerd");
 const WORKERD_SUFFIX = ".harness.test.ts";
+const ISOLATED_NATIVE_TESTS = new Set(["native_reshard_benchmark_producer.test.ts"]);
 const RESTART_IN_PLACE_HARNESS = "file-store.harness.test.ts";
 const TERMINATION_GRACE_MS = 2_000;
 const WORKERD_PROCESS_SETTLE_MS = 5_000;
@@ -76,6 +77,10 @@ export function compareWorkerdHarnesses(left, right) {
     const rightRestarts = path.basename(right) === RESTART_IN_PLACE_HARNESS;
     if (leftRestarts !== rightRestarts) return leftRestarts ? -1 : 1;
     return left.localeCompare(right);
+}
+
+export function isIsolatedNativeTest(file) {
+    return ISOLATED_NATIVE_TESTS.has(path.basename(file));
 }
 
 export async function run(label, args, timeoutMs, options = {}) {
@@ -152,10 +157,16 @@ export async function main(argv = process.argv.slice(2)) {
     const workerdTests = allTests
         .filter(file => file.startsWith(`${WORKERD_ROOT}${path.sep}`) && file.endsWith(WORKERD_SUFFIX))
         .sort(compareWorkerdHarnesses);
-    const nonWorkerdTests = allTests.filter(file => !workerdTests.includes(file));
+    const isolatedNativeTests = watch ? [] : allTests.filter(isIsolatedNativeTest);
+    const nonWorkerdTests = allTests.filter(
+        file => !workerdTests.includes(file) && !isolatedNativeTests.includes(file)
+    );
 
     if (nonWorkerdTests.length === 0) throw new Error("No non-workerd correctness tests found");
     if (!watch && workerdTests.length === 0) throw new Error("No workerd correctness harnesses found");
+    if (!watch && isolatedNativeTests.length !== ISOLATED_NATIVE_TESTS.size) {
+        throw new Error("An isolated native correctness test is missing");
+    }
 
     await run(watch ? "non-workerd correctness tests in watch mode" : "non-workerd correctness tests", [
         "bun",
@@ -167,6 +178,11 @@ export async function main(argv = process.argv.slice(2)) {
     if (!watch) {
         const timeoutMs = outerTimeoutMs();
         const attempts = workerdAttempts();
+        for (const test of isolatedNativeTests) {
+            const file = relative(test);
+            await run(file, ["bun", "test", file], timeoutMs);
+            await Bun.sleep(WORKERD_PROCESS_SETTLE_MS);
+        }
         for (const [index, harness] of workerdTests.entries()) {
             const file = relative(harness);
             await runWithRetries(file, ["bun", "test", file], timeoutMs, {

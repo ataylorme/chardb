@@ -24,6 +24,8 @@ export function isTransientWorkerdStartupFailure(error: unknown): boolean;
 
 export function compareWorkerdHarnesses(left: string, right: string): number;
 
+export function isIsolatedNativeTest(file: string): boolean;
+
 export function run(
     label: string,
     args: readonly string[],
