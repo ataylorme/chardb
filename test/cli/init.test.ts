@@ -214,6 +214,7 @@ describe("generated tutorial flow", () => {
         const generatedVite = files.get("/tmp/generated/vite.config.ts") ?? "";
         const generatedVitest = files.get("/tmp/generated/vitest.config.ts") ?? "";
         const generatedWorkerTest = files.get("/tmp/generated/test/worker.test.ts") ?? "";
+        const generatedTest = files.get("/tmp/generated/scripts/test.mjs") ?? "";
         const generatedSetup = files.get("/tmp/generated/scripts/setup-cloudflare.mjs") ?? "";
         const generatedDeploy = files.get("/tmp/generated/scripts/deploy.mjs") ?? "";
         const generatedPackage = files.get("/tmp/generated/package.json") ?? "";
@@ -227,6 +228,13 @@ describe("generated tutorial flow", () => {
         expect(generatedDev).toContain("nodeRuntime,\n    wranglerModule");
         expect(generatedDev).toContain('["taskkill.exe", "/PID", String(pid), "/T", "/F"]');
         expect(generatedDev).toContain("runWindowsWatchdog(rootPid)");
+        expect(generatedDev).toContain("Select-Object ProcessId, ParentProcessId, CreationDate");
+        expect(generatedDev).toContain("tracked.set(child.pid, child.createdAt)");
+        expect(generatedDev).toContain("live.get(pid) === createdAt");
+        expect(generatedTest).toContain('import.meta.resolve("vitest/package.json")');
+        expect(generatedTest).toContain('realpathSync.native(join(dirname(vitestPackage), "vitest.mjs"))');
+        expect(generatedTest).toContain('[nodeRuntime, vitestCli, "run", "--no-file-parallelism"');
+        expect(JSON.parse(generatedPackage).scripts.test).toBe("bun scripts/test.mjs");
 
         expect(generatedWorker).toContain("{ DB, Catalog, Cdb, Gateway, Resharder }");
         expect(generatedWorker).toContain("attachment?: string | null");

@@ -27,7 +27,7 @@ const PACKAGE_TEMPLATE = (name: string, corePackage: string, reactPackage: strin
             packageManager: "bun@1.2.22",
             scripts: {
                 typecheck: "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
-                test: "vitest run --no-file-parallelism",
+                test: "bun scripts/test.mjs",
                 build: "bun scripts/build.mjs",
                 "build:web": "vite build",
                 "build:worker": "wrangler deploy --dry-run --outdir dist/worker",
@@ -144,6 +144,26 @@ export default defineConfig({
     testTimeout: 60_000,
   },
 });
+`;
+
+const TEST_SCRIPT_TEMPLATE = `import { realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const nodeRuntime = Bun.which("node");
+if (!nodeRuntime) throw new Error("Cloudflare Vitest requires Node.js on PATH");
+
+// A canonical CLI path prevents Windows drive-letter casing from loading the
+// Vitest runner twice.
+const project = realpathSync.native(fileURLToPath(new URL("..", import.meta.url)));
+const vitestPackage = fileURLToPath(import.meta.resolve("vitest/package.json"));
+const vitestCli = realpathSync.native(join(dirname(vitestPackage), "vitest.mjs"));
+const child = Bun.spawn(
+  [nodeRuntime, vitestCli, "run", "--no-file-parallelism", ...process.argv.slice(2)],
+  { cwd: project, stdin: "inherit", stdout: "inherit", stderr: "inherit" },
+);
+const exitCode = await child.exited;
+if (exitCode !== 0) process.exit(exitCode);
 `;
 
 const TEST_TSCONFIG_TEMPLATE = `${JSON.stringify(
@@ -974,7 +994,7 @@ async function runWindowsUtility(command) {
 async function windowsProcessSnapshot() {
   const script = [
     "$ErrorActionPreference = 'Stop'",
-    "@(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId) | ConvertTo-Json -Compress",
+    "@(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CreationDate) | ConvertTo-Json -Compress",
   ].join("; ");
   const result = await runWindowsUtility([
     "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script,
@@ -985,26 +1005,33 @@ async function windowsProcessSnapshot() {
   const parsed = JSON.parse(result.stdout || "[]");
   const rows = Array.isArray(parsed) ? parsed : [parsed];
   return rows
-    .map(row => ({ pid: Number(row.ProcessId), parentPid: Number(row.ParentProcessId) }))
-    .filter(row => Number.isSafeInteger(row.pid) && row.pid > 0 && Number.isSafeInteger(row.parentPid));
+    .map(row => ({
+      pid: Number(row.ProcessId),
+      parentPid: Number(row.ParentProcessId),
+      createdAt: typeof row.CreationDate === "string" ? row.CreationDate : "",
+    }))
+    .filter(row =>
+      Number.isSafeInteger(row.pid) && row.pid > 0 &&
+      Number.isSafeInteger(row.parentPid) && row.createdAt.length > 0
+    );
 }
 
-function descendantPids(snapshot, rootPid) {
+function descendantProcesses(snapshot, rootPid) {
   const children = new Map();
   for (const row of snapshot) {
     const entries = children.get(row.parentPid) ?? [];
-    entries.push(row.pid);
+    entries.push(row);
     children.set(row.parentPid, entries);
   }
   const descendants = [];
   const pending = [...(children.get(rootPid) ?? [])];
   const seen = new Set([rootPid]);
   while (pending.length > 0) {
-    const pid = pending.pop();
-    if (seen.has(pid)) continue;
-    seen.add(pid);
-    descendants.push(pid);
-    pending.push(...(children.get(pid) ?? []));
+    const child = pending.pop();
+    if (seen.has(child.pid)) continue;
+    seen.add(child.pid);
+    descendants.push(child);
+    pending.push(...(children.get(child.pid) ?? []));
   }
   return descendants;
 }
@@ -1020,7 +1047,7 @@ async function forceWindowsProcessTree(pid) {
 }
 
 async function runWindowsWatchdog(rootPid) {
-  const tracked = new Set();
+  const tracked = new Map();
   let inputClosed = false;
   const close = (async () => {
     for await (const _chunk of Bun.stdin.stream()) {
@@ -1030,20 +1057,20 @@ async function runWindowsWatchdog(rootPid) {
   })();
   while (!inputClosed) {
     const snapshot = await windowsProcessSnapshot();
-    for (const pid of descendantPids(snapshot, rootPid)) {
-      if (pid !== process.pid) tracked.add(pid);
+    for (const child of descendantProcesses(snapshot, rootPid)) {
+      if (child.pid !== process.pid) tracked.set(child.pid, child.createdAt);
     }
     await Bun.sleep(50);
   }
   await close;
   for (let pass = 0; pass < 3; pass++) {
     const snapshot = await windowsProcessSnapshot();
-    for (const pid of descendantPids(snapshot, rootPid)) {
-      if (pid !== process.pid) tracked.add(pid);
+    for (const child of descendantProcesses(snapshot, rootPid)) {
+      if (child.pid !== process.pid) tracked.set(child.pid, child.createdAt);
     }
-    const live = new Set(snapshot.map(row => row.pid));
-    for (const pid of tracked) {
-      if (live.has(pid)) await forceWindowsProcessTree(pid);
+    const live = new Map(snapshot.map(row => [row.pid, row.createdAt]));
+    for (const [pid, createdAt] of tracked) {
+      if (live.get(pid) === createdAt) await forceWindowsProcessTree(pid);
     }
     await Bun.sleep(25);
   }
@@ -1464,6 +1491,7 @@ export async function runInit(ctx: CliContext, opts: InitOptions): Promise<void>
         { path: `${root}/test/env.d.ts`, contents: TEST_ENV_TEMPLATE },
         { path: `${root}/test/worker.test.ts`, contents: WORKER_TEST_TEMPLATE },
         { path: `${root}/scripts/build.mjs`, contents: BUILD_SCRIPT_TEMPLATE },
+        { path: `${root}/scripts/test.mjs`, contents: TEST_SCRIPT_TEMPLATE },
         { path: `${root}/scripts/dev.mjs`, contents: DEV_SCRIPT_TEMPLATE },
         {
             path: `${root}/scripts/setup-cloudflare.mjs`,

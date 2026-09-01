@@ -383,6 +383,7 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.has("/tmp/proj/test/env.d.ts")).toBe(true);
         expect(files.has("/tmp/proj/test/worker.test.ts")).toBe(true);
         expect(files.has("/tmp/proj/scripts/build.mjs")).toBe(true);
+        expect(files.has("/tmp/proj/scripts/test.mjs")).toBe(true);
         expect(files.has("/tmp/proj/scripts/dev.mjs")).toBe(true);
         expect(files.has("/tmp/proj/index.html")).toBe(true);
         expect(files.has("/tmp/proj/public/.gitkeep")).toBe(true);
@@ -399,7 +400,7 @@ describe("chardb init + doctor end-to-end", () => {
             },
             scripts: {
                 typecheck: "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
-                test: "vitest run --no-file-parallelism",
+                test: "bun scripts/test.mjs",
                 build: "bun scripts/build.mjs",
                 "build:web": "vite build",
                 "build:worker": "wrangler deploy --dry-run --outdir dist/worker",
@@ -464,9 +465,17 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("await waitForWeb()");
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain('"--persist-to"');
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain('import.meta.resolve("wrangler/package.json")');
+        expect(files.get("/tmp/proj/scripts/test.mjs")).toContain('import.meta.resolve("vitest/package.json")');
+        expect(files.get("/tmp/proj/scripts/test.mjs")).toContain(
+            'realpathSync.native(join(dirname(vitestPackage), "vitest.mjs"))'
+        );
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain('Bun.which("node")');
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain('import.meta.resolve("vite/package.json")');
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain('["taskkill.exe", "/PID", String(pid), "/T", "/F"]');
+        expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain(
+            "Select-Object ProcessId, ParentProcessId, CreationDate"
+        );
+        expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("live.get(pid) === createdAt");
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("WINDOWS_WATCHDOG_ARGUMENT");
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("Promise.allSettled([");
         expect(files.get("/tmp/proj/scripts/dev.mjs")).not.toContain('"--target",\n      "1"');
