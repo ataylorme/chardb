@@ -186,7 +186,7 @@ describe("Cdb file store on real Durable Object SQLite", () => {
                     status: "ready",
                     row_id: null,
                     size: 8,
-                    sha256: HASH_B,
+                    sha256: HASH_SURVIVOR,
                 },
             ],
             dueDeletes: cleaned.dueDeletes,
@@ -209,5 +209,6 @@ describe("Cdb file store on real Durable Object SQLite", () => {
     }, 20_000);
 });
 
-const HASH_A = "a".repeat(64);
-const HASH_B = "b".repeat(64);
+const HASH_A = "f28d6cfd0ebc466e6358e1f4f90edc071d0ba3d413255cdc0ec7917189033ad8";
+const HASH_B = "804f51f71254c4081e37e7c887073560f4a6fa6cdad202e9ac67e032c43ed1e1";
+const HASH_SURVIVOR = "7a01ac37408614bcf58069bb6b6a543f6c473cdded552c491de4eb36aacce235";

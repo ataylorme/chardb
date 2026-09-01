@@ -9,6 +9,11 @@ interface RecoveryStub {
     adminArmRecoveryRestore(args: { bookmark: string; armedAt: number }): Promise<{ targetBookmark: string }>;
     adminCancelRecoveryRestore(args: { bookmark: string }): Promise<{ cancelled: boolean }>;
     adminCommitRecoveryRestore(args: { bookmark: string }): Promise<{ scheduled: true }>;
+    adminRequeueRecoveryVectors(args: {
+        afterCreatedSeq: number;
+        limit: number;
+        nowMs: number;
+    }): Promise<{ processed: number; afterCreatedSeq: number; done: boolean }>;
 }
 
 interface TestRecoveryPoint {
@@ -66,10 +71,14 @@ function recoveryStub(name: string, events: string[], failArm = false, armDelayM
             events.push(`${name}:commit:${args.bookmark}`);
             return { scheduled: true };
         },
+        async adminRequeueRecoveryVectors(args) {
+            events.push(`${name}:reconcile:${args.afterCreatedSeq}:${args.limit}`);
+            return { processed: 1, afterCreatedSeq: args.afterCreatedSeq + 1, done: true };
+        },
     };
 }
 
-function environment(failShard = "", delayedShard = ""): { env: ChardbEnv; events: string[] } {
+function environment(failShard = "", delayedShard = "", routingEpoch = 11): { env: ChardbEnv; events: string[] } {
     const events: string[] = [];
     const catalog = {
         ...recoveryStub("catalog", events),
@@ -82,7 +91,7 @@ function environment(failShard = "", delayedShard = ""): { env: ChardbEnv; event
                     activeDigest: "a".repeat(64),
                     status: "active" as const,
                 },
-                routingEpoch: 11,
+                routingEpoch,
                 shardIds: ["ShardDO_0", "ShardDO_1"],
             };
         },
@@ -144,7 +153,12 @@ describe("recovery admin", () => {
         );
         expect(restored.status).toBe(202);
         const restoredBody = (await restored.json()) as unknown;
-        expect(restoredBody).toEqual({ ok: true, accepted: true, recoveryPointDigest: point.digest });
+        expect(restoredBody).toEqual({
+            ok: true,
+            accepted: true,
+            recoveryPointDigest: point.digest,
+            reconcileAfterMs: 6_000,
+        });
         expect(events[0]).toBe("catalog:inventory");
         expect(events[1]).toBe(`catalog:arm:${point.catalog.bookmark}`);
         expect(events.at(-1)).toBe(`catalog:commit:${point.catalog.bookmark}`);
@@ -160,6 +174,48 @@ describe("recovery admin", () => {
         expect(rejected.status).toBe(400);
         const rejectedBody = (await rejected.json()) as unknown;
         expect(rejectedBody).toEqual({ ok: false, error: "recovery point digest does not match its contents" });
+    });
+
+    test("reconciles every restored shard and requeues authoritative vector heads", async () => {
+        const { env, events } = environment();
+        const created = await handleRecoveryAdminRequest(request("/_chardb/backups/create", {}), env);
+        const point = ((await created.json()) as { readonly recoveryPoint: TestRecoveryPoint }).recoveryPoint;
+        events.length = 0;
+
+        const response = await handleRecoveryAdminRequest(
+            request("/_chardb/backups/reconcile", { recoveryPoint: point }),
+            env
+        );
+        expect(response.status).toBe(200);
+        expect((await response.json()) as unknown).toEqual({
+            ok: true,
+            reconciled: true,
+            recoveryPointDigest: point.digest,
+            vectorsRequeued: 2,
+        });
+        expect(events[0]).toBe("catalog:inventory");
+        expect(events).toContain("ShardDO_0:reconcile:0:500");
+        expect(events).toContain("ShardDO_1:reconcile:0:500");
+    });
+
+    test("rejects topology drift before arming any Durable Object", async () => {
+        const healthy = environment();
+        const created = await handleRecoveryAdminRequest(request("/_chardb/backups/create", {}), healthy.env);
+        const point = ((await created.json()) as { readonly recoveryPoint: TestRecoveryPoint }).recoveryPoint;
+        const changed = environment("", "", 12);
+
+        const response = await handleRecoveryAdminRequest(
+            request("/_chardb/backups/restore", { recoveryPoint: point }),
+            changed.env
+        );
+        expect(response.status).toBe(409);
+        expect((await response.json()) as unknown).toEqual({
+            ok: false,
+            error: "current topology does not match the recovery point",
+            code: "CDB_STALE_EPOCH",
+            retryable: true,
+        });
+        expect(changed.events).toEqual(["catalog:inventory"]);
     });
 
     test("cancels every completed arm when another shard cannot arm", async () => {

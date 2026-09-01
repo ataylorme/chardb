@@ -103,10 +103,12 @@ function reportFor(exactCandidate = candidate()) {
             schemaVersion: 1,
             routingEpoch: 2,
             acceptedStatus: 202,
+            vectorsRequeued: 0,
             postPointRowReadableBeforeRestore: true,
             pointRowReadableAfterRestore: true,
             postPointRowHiddenAfterRestore: true,
             postPointR2ObjectRetained: true,
+            pointFileRecoveredFromRetention: true,
         },
         lifecycle: {
             uploadIdempotent: true,
@@ -290,7 +292,7 @@ describe("Cloudflare R2 proof report validator", () => {
                 },
             ],
             [
-                "SQLite rewind",
+                "coordinated recovery",
                 value => {
                     value.recovery.postPointRowHiddenAfterRestore = false;
                 },

@@ -86,21 +86,70 @@ describe("chardb backups CLI", () => {
     });
 
     test("posts the saved point and requires an exact acknowledgement", async () => {
-        let body: unknown;
-        const state = context(async (_input, init) => {
-            body = JSON.parse(String(init?.body));
-            return Response.json(
-                { ok: true, accepted: true, recoveryPointDigest: RECOVERY_POINT.digest },
-                { status: 202 }
-            );
+        const calls: { readonly url: string; readonly body: unknown }[] = [];
+        const state = context(async (input, init) => {
+            calls.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+            if (String(input).endsWith("/restore")) {
+                return Response.json(
+                    { ok: true, accepted: true, recoveryPointDigest: RECOVERY_POINT.digest, reconcileAfterMs: 0 },
+                    { status: 202 }
+                );
+            }
+            return Response.json({
+                ok: true,
+                reconciled: true,
+                recoveryPointDigest: RECOVERY_POINT.digest,
+                vectorsRequeued: 7,
+            });
         });
         state.files.set("/tmp/chardb-backups/recovery.json", JSON.stringify(RECOVERY_POINT));
         expect(
             await runCli(state.ctx, ["backups", "restore", "--url", "https://db.example", "--from", "recovery.json"])
         ).toBe(0);
-        expect(body).toEqual({ recoveryPoint: RECOVERY_POINT });
-        expect(state.out.join("")).toContain("Durable Objects will restart");
+        expect(calls).toEqual([
+            {
+                url: "https://db.example/_chardb/backups/restore",
+                body: { recoveryPoint: RECOVERY_POINT },
+            },
+            {
+                url: "https://db.example/_chardb/backups/reconcile",
+                body: { recoveryPoint: RECOVERY_POINT },
+            },
+        ]);
+        expect(state.out.join("")).toContain("7 vectors were requeued");
         expect(state.err).toEqual([]);
+    });
+
+    test("waits for every Durable Object restore before recovery reconciliation", async () => {
+        let reconciles = 0;
+        const state = context(async input => {
+            if (String(input).endsWith("/restore")) {
+                return Response.json(
+                    { ok: true, accepted: true, recoveryPointDigest: RECOVERY_POINT.digest, reconcileAfterMs: 0 },
+                    { status: 202 }
+                );
+            }
+            reconciles++;
+            if (reconciles === 1) {
+                return Response.json(
+                    { ok: false, code: "CDB_STALE_EPOCH", error: "point-in-time restore is in progress" },
+                    { status: 409 }
+                );
+            }
+            return Response.json({
+                ok: true,
+                reconciled: true,
+                recoveryPointDigest: RECOVERY_POINT.digest,
+                vectorsRequeued: 2,
+            });
+        });
+        state.files.set("/tmp/chardb-backups/recovery.json", JSON.stringify(RECOVERY_POINT));
+
+        expect(
+            await runCli(state.ctx, ["backups", "restore", "--url", "https://db.example", "--from", "recovery.json"])
+        ).toBe(0);
+        expect(reconciles).toBe(2);
+        expect(state.out.join("")).toContain("2 vectors were requeued");
     });
 
     test("rejects ambiguous flags, unsafe URLs, bad timestamps, and malformed files before fetch", async () => {

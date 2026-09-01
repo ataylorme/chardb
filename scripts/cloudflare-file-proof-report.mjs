@@ -3,7 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
-export const CLOUDFLARE_FILE_PROOF_REPORT_SCHEMA = "chardb.cloudflare-r2-proof.report.v2";
+export const CLOUDFLARE_FILE_PROOF_REPORT_SCHEMA = "chardb.cloudflare-r2-proof.report.v3";
 export const CLOUDFLARE_FILE_PROOF_VALIDATION_SCHEMA = "chardb.cloudflare-r2-proof.validation.v1";
 
 const EMPTY_SHA256 = createHash("sha256").update("").digest("hex");
@@ -188,10 +188,12 @@ function assertRecovery(value) {
         "schemaVersion",
         "routingEpoch",
         "acceptedStatus",
+        "vectorsRequeued",
         "postPointRowReadableBeforeRestore",
         "pointRowReadableAfterRestore",
         "postPointRowHiddenAfterRestore",
         "postPointR2ObjectRetained",
+        "pointFileRecoveredFromRetention",
     ]);
     if (value.format !== "chardb-recovery-point/v1") {
         throw new Error("Cloudflare file recovery proof format is invalid");
@@ -202,12 +204,15 @@ function assertRecovery(value) {
     assertPositiveInteger(value.routingEpoch, "Cloudflare file recovery routing epoch");
     if (
         value.acceptedStatus !== 202 ||
+        !Number.isSafeInteger(value.vectorsRequeued) ||
+        value.vectorsRequeued < 0 ||
         value.postPointRowReadableBeforeRestore !== true ||
         value.pointRowReadableAfterRestore !== true ||
         value.postPointRowHiddenAfterRestore !== true ||
-        value.postPointR2ObjectRetained !== true
+        value.postPointR2ObjectRetained !== true ||
+        value.pointFileRecoveredFromRetention !== true
     ) {
-        throw new Error("Cloudflare file recovery proof did not demonstrate an exact SQLite rewind");
+        throw new Error("Cloudflare file recovery proof did not demonstrate coordinated recovery");
     }
 }
 

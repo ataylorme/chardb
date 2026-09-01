@@ -94,7 +94,7 @@ const TABLES = Object.freeze([
 ]) satisfies readonly TableSpec[];
 
 const SOURCE = "ShardDO_0";
-const HASH = "a".repeat(64);
+const RETAINED_FILE_PREFIX = "_chardb/retained/";
 const FILE_RESOURCE = Object.freeze({
     kind: "file",
     version: 1,
@@ -455,7 +455,8 @@ export class Catalog extends app.Catalog {
             .all<{ sequence: number; operation: "put" | "delete"; keys_json: string }>(
                 "SELECT sequence, operation, keys_json FROM fixture_r2_operations ORDER BY sequence"
             )
-            .map(row => ({ sequence: row.sequence, operation: row.operation, keys: JSON.parse(row.keys_json) }));
+            .map(row => ({ sequence: row.sequence, operation: row.operation, keys: JSON.parse(row.keys_json) }))
+            .filter(operation => operation.keys.every((key: string) => !key.startsWith(RETAINED_FILE_PREFIX)));
         return {
             putCalls: operations.filter(operation => operation.operation === "put").length,
             deleteCalls: operations.filter(operation => operation.operation === "delete").length,
@@ -764,26 +765,30 @@ export class Cdb extends app.Cdb {
     }): Promise<Record<string, unknown>> {
         const nowMs = Date.now();
         const fileId = FileId(input.fileId);
+        const body = new TextEncoder().encode(input.body);
+        const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", body))]
+            .map(byte => byte.toString(16).padStart(2, "0"))
+            .join("");
         const reserved = await this.reserveFile({
             fileId,
             organizationId: input.organizationId,
             table: "file_move_documents",
             column: "attachment",
             contentType: "image/png",
-            size: new TextEncoder().encode(input.body).byteLength,
+            size: body.byteLength,
             nowMs,
             schemaEpoch: input.schemaEpoch,
             domainSchemaEpoch: input.domainSchemaEpoch,
             auth: fileAuth(input.organizationId),
         });
         if (!this.env.CDB_FILES) throw new Error("CDB_FILES binding is missing");
-        await this.env.CDB_FILES.put(reserved.objectKey, input.body, {
-            customMetadata: { fixture: input.fileId },
+        await this.env.CDB_FILES.put(reserved.objectKey, body, {
+            customMetadata: { chardbFileId: fileId, chardbSha256: digest },
         });
         const ready = this.markFileReady({
             fileId,
             organizationId: input.organizationId,
-            sha256: HASH,
+            sha256: digest,
             size: reserved.size,
             nowMs: nowMs + 1,
             schemaEpoch: input.schemaEpoch,
@@ -916,7 +921,7 @@ export class Cdb extends app.Cdb {
             extraId,
             input.organizationId,
             `v1/${input.organizationId}/${extraId}`,
-            HASH,
+            "a".repeat(64),
             vshard(input.organizationId)
         );
     }
@@ -1190,9 +1195,10 @@ async function httpUploadAcrossCutover(
         get(target, property) {
             if (property === "put") {
                 return async (key: string, ...args: unknown[]) => {
-                    putCalls++;
+                    const livePut = !key.startsWith(RETAINED_FILE_PREFIX);
+                    if (livePut) putCalls++;
                     const written = await Reflect.apply(target.put, target, [key, ...args]);
-                    if (putCalls === 1) {
+                    if (livePut && putCalls === 1) {
                         objectAfterFirstPut = await r2State(env, [key]);
                         await driveMigrationTo(env, input.migId, RESHARDER_PHASE.DUAL_WRITE_OPEN);
                         const sha256 = objectAfterFirstPut[0]?.customMetadata;

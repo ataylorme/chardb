@@ -101,7 +101,7 @@ app.get("/proof/r2-state", async c => {
     const runId = c.req.header("x-chardb-proof-run-id") ?? "";
     if (!(await proofAuthorized(c.req, env, runId))) return c.json({ error: "not found" }, 404);
     const organizationId = c.req.query("organizationId") ?? "";
-    const prefix = organizationId ? `v1/${organizationId}/` : "";
+    const prefix = organizationId ? `v1/${organizationId}/` : "v1/";
     const objects = await listObjects(env.CDB_FILES, prefix);
     return c.json({
         count: objects.length,

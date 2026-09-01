@@ -58,6 +58,14 @@ function fixture(
               readonly customMetadata: Record<string, string>;
           }
         | undefined;
+    let retained:
+        | {
+              readonly key: string;
+              readonly size: number;
+              readonly bytes: Uint8Array;
+              readonly customMetadata: Record<string, string>;
+          }
+        | undefined;
     let status: "pending" | "ready" = "pending";
     let downloadCalls = 0;
     const cdb: OrganizationFileUploadCdb & {
@@ -158,25 +166,31 @@ function fixture(
     const bucket = {
         async put(key: string, value: Uint8Array, putOptions: R2PutOptions) {
             calls.push("r2.put");
-            if (object) return null;
-            object = {
+            const target = key.startsWith("_chardb/retained/") ? retained : object;
+            if (target) return null;
+            const stored = {
                 key,
                 size: value.byteLength,
                 bytes: Uint8Array.from(value),
                 customMetadata: putOptions.customMetadata ?? {},
             };
-            return object;
+            if (key.startsWith("_chardb/retained/")) retained = stored;
+            else object = stored;
+            return stored;
         },
         async head(key: string) {
             calls.push("r2.head");
-            return object?.key === key ? object : null;
+            if (object?.key === key) return object;
+            return retained?.key === key ? retained : null;
         },
         async get(key: string) {
             calls.push("r2.get");
-            if (options.downloadObjectMissing || object?.key !== key) return null;
+            if (options.downloadObjectMissing) return null;
+            const stored = object?.key === key ? object : retained?.key === key ? retained : undefined;
+            if (!stored) return null;
             return {
-                ...object,
-                body: new Response(object.bytes.buffer as ArrayBuffer).body,
+                ...stored,
+                body: new Response(Uint8Array.from(stored.bytes)).body,
             };
         },
     } as unknown as R2Bucket;
@@ -252,6 +266,7 @@ describe("private organization file HTTP upload", () => {
             "catalog.route",
             "cdb.reserve",
             "r2.put",
+            "r2.put",
             "catalog.route",
             "cdb.ready",
         ]);
@@ -277,6 +292,7 @@ describe("private organization file HTTP upload", () => {
             "cdb.reserve",
             "r2.put",
             "r2.head",
+            "r2.put",
             "catalog.route",
             "cdb.ready",
         ]);
@@ -318,11 +334,13 @@ describe("private organization file HTTP upload", () => {
             "catalog.route",
             "cdb.reserve",
             "r2.put",
+            "r2.put",
             "catalog.route",
             "catalog.route",
             "cdb.reserve",
             "r2.put",
             "r2.head",
+            "r2.put",
             "catalog.route",
             "cdb.ready",
         ]);
@@ -340,7 +358,7 @@ describe("private organization file HTTP upload", () => {
         });
         expect(response.status).toBe(409);
         expect(f.calls.filter(call => call === "cdb.reserve")).toHaveLength(2);
-        expect(f.calls.filter(call => call === "r2.put")).toHaveLength(2);
+        expect(f.calls.filter(call => call === "r2.put")).toHaveLength(4);
         expect(f.calls.filter(call => call === "cdb.ready")).toHaveLength(0);
         expect(f.calls.filter(call => call === "catalog.route")).toHaveLength(4);
         expect(new Set(f.reservedFileIds).size).toBe(1);
@@ -511,7 +529,14 @@ describe("private organization file HTTP upload", () => {
             resources: [resource],
         });
         expect(corruptResponse.status).toBe(500);
-        expect(corrupt.calls).toEqual(["auth.session", "catalog.route", "catalog.route", "cdb.download", "r2.get"]);
+        expect(corrupt.calls).toEqual([
+            "auth.session",
+            "catalog.route",
+            "catalog.route",
+            "cdb.download",
+            "r2.get",
+            "r2.get",
+        ]);
 
         const ranged = fixture();
         const rangeRequest = ranged.downloadRequest();

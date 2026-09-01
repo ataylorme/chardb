@@ -148,7 +148,10 @@ describe("Catalog organization deletion on native Durable Object SQLite", () => 
             deletion: { status: "complete", completedAt: expect.any(Number) },
             shards: [{ shardId: "ShardDO_0", status: "complete", attempts: 0 }],
         });
-        expect(await call("probeState", { shardId: "ShardDO_0" })).toMatchObject({ calls: 1 });
+        const probe = await call<ProbeState>("probeState", { shardId: "ShardDO_0" });
+        expect(probe.calls).toBeGreaterThanOrEqual(1);
+        expect(probe.failed_calls).toBe(0);
+        expect(probe.successful_calls).toBe(probe.calls);
     });
 
     test("rolls back auth, tombstone, shard outbox, and alarm together, then resumes after reconstruction", async () => {

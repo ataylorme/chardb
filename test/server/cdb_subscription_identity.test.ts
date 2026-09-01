@@ -149,6 +149,15 @@ describe("Cdb live subscription identity", () => {
 
     afterEach(() => db.close());
 
+    test("recovery reconciliation skips vector storage for a file-only schema", async () => {
+        await expect(
+            cdb.adminRequeueRecoveryVectors({ afterCreatedSeq: 0, limit: 500, nowMs: 1_000 })
+        ).resolves.toEqual({ processed: 0, afterCreatedSeq: 0, done: true });
+        expect(
+            db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_chardb_vectors'").get()
+        ).toBeNull();
+    });
+
     test("preserves active registrations with colliding client subIds across reconstruction", async () => {
         const first = subscription("gateway-do-1", "client-1");
         const second = subscription("gateway-do-1", "client-2");

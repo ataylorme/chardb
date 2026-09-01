@@ -8,7 +8,7 @@ import { runPairedFileBenchmark, validateFileBenchmarkEvidence } from "./run-fil
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const FIXTURE = path.join(ROOT, "test", "fixtures", "cloudflare-file-proof");
-const REPORT_SCHEMA = "chardb.cloudflare-r2-proof.report.v2";
+const REPORT_SCHEMA = "chardb.cloudflare-r2-proof.report.v3";
 const LEDGER_SCHEMA = "chardb.cloudflare-r2-proof.ownership.v3";
 const LEDGER_FIELDS = Object.freeze(
     [
@@ -727,6 +727,29 @@ async function restoreRecoveryPoint(origin, adminToken, recoveryPoint) {
     return result.response.status;
 }
 
+async function reconcileRecoveryPoint(origin, adminToken, recoveryPoint) {
+    const result = await request(origin, "/_chardb/backups/reconcile", {
+        method: "POST",
+        headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ recoveryPoint }),
+    });
+    const reconciled =
+        result.response.ok &&
+        result.body?.reconciled === true &&
+        result.body?.recoveryPointDigest === recoveryPoint.digest &&
+        Number.isSafeInteger(result.body?.vectorsRequeued) &&
+        result.body.vectorsRequeued >= 0;
+    const diagnostic =
+        typeof result.body === "object" && result.body !== null
+            ? [result.body.code, result.body.error].filter(value => typeof value === "string").join(": ")
+            : "";
+    check(
+        reconciled,
+        `recovery reconciliation returned ${result.response.status}${diagnostic ? `: ${diagnostic}` : ""}`
+    );
+    return result.body.vectorsRequeued;
+}
+
 function boundedDiagnostic(value) {
     const text = String(value);
     return text.length <= 512 ? text : text.slice(0, 512);
@@ -1056,13 +1079,13 @@ async function main() {
                     health.body?.proofConfigured === true,
                 "proof health is not ready"
             );
-            return health.body;
+            const state = await migrationState(origin, adminToken);
+            check(
+                state.status === "active" && state.activeVersion === 0 && state.activeEpoch === 1,
+                "fresh file proof Worker did not start at schema version 0 epoch 1"
+            );
+            return state;
         });
-        const preMigration = await migrationState(origin, adminToken);
-        check(
-            preMigration.status === "active" && preMigration.activeVersion === 0 && preMigration.activeEpoch === 1,
-            "fresh file proof Worker did not start at schema version 0 epoch 1"
-        );
         const cli = path.join(app, "node_modules", "@chardb", "core", "dist", "cli", "bin.mjs");
         const migrationId = `r2-${candidateSha256.slice(0, 10)}-${nonce}`;
         const begunMigration = await migrationAdmin(origin, adminToken, "begin", {
@@ -1384,6 +1407,19 @@ async function main() {
         check(mutation.response.ok, "survivor attachment failed");
 
         const recoveryPoint = await createRecoveryPoint(origin, adminToken);
+        const survivorObject = `v1/${organizationB}/${survivor.fileId}`;
+        const pointFileState = await proofState(origin, adminToken, runId, organizationB);
+        await runWrangler(["r2", "object", "delete", `${names.bucket}/${survivorObject}`, "--remote", "--force"], {
+            cwd: app,
+            label: "recovery retained-file fault",
+            secrets,
+        });
+        const missingPointFileState = await proofState(origin, adminToken, runId, organizationB);
+        check(
+            missingPointFileState.count === pointFileState.count - 1 &&
+                missingPointFileState.digest !== pointFileState.digest,
+            "recovery retained-file fault did not remove exactly one live object"
+        );
         const afterPointBytes = new TextEncoder().encode(`after-recovery-point-${nonce}`);
         const afterPointFile = await upload(
             origin,
@@ -1411,17 +1447,25 @@ async function main() {
         );
         const acceptedStatus = await restoreRecoveryPoint(origin, adminToken, recoveryPoint);
         await retry(async () => {
-            const [restoredSurvivor, restoredAfterPoint] = await Promise.all([
-                download(origin, principal, organizationB, survivorRow),
-                download(origin, principal, organizationB, afterPointRow),
-            ]);
-            check(
-                restoredSurvivor.response.ok && sha256(restoredSurvivor.bytes) === survivor.sha256,
-                "recovery point did not preserve its existing row"
-            );
+            const restoredAfterPoint = await download(origin, principal, organizationB, afterPointRow);
             check(restoredAfterPoint.response.status === 404, "recovery point did not remove the later row");
             return true;
         }, 120_000);
+        const vectorsRequeued = await retry(() => reconcileRecoveryPoint(origin, adminToken, recoveryPoint), 120_000);
+        const restoredSurvivor = await download(origin, principal, organizationB, survivorRow);
+        check(
+            restoredSurvivor.response.ok && sha256(restoredSurvivor.bytes) === survivor.sha256,
+            "recovery point did not restore its retained file"
+        );
+        const restoredSurvivorPath = path.join(privateDir, "restored-survivor-object.bin");
+        await runWrangler(
+            ["r2", "object", "get", `${names.bucket}/${survivorObject}`, "--remote", "--file", restoredSurvivorPath],
+            { cwd: app, label: "restored retained-file verification", secrets }
+        );
+        check(
+            sha256(await readFile(restoredSurvivorPath)) === survivor.sha256,
+            "retained file was not restored to its canonical live R2 key"
+        );
         const afterPointObject = `v1/${organizationB}/${afterPointFile.fileId}`;
         const afterPointObjectPath = path.join(privateDir, "after-recovery-point-object.bin");
         await runWrangler(
@@ -1444,10 +1488,12 @@ async function main() {
             schemaVersion: recoveryPoint.schema.version,
             routingEpoch: recoveryPoint.routingEpoch,
             acceptedStatus,
+            vectorsRequeued,
             postPointRowReadableBeforeRestore: true,
             pointRowReadableAfterRestore: true,
             postPointRowHiddenAfterRestore: true,
             postPointR2ObjectRetained: true,
+            pointFileRecoveredFromRetention: true,
         };
 
         const inputAfterSeed = await fingerprintDeployment(
@@ -1721,7 +1767,7 @@ async function main() {
         try {
             const currentLedger = JSON.parse(await readFile(ledgerPath, "utf8"));
             const commands = cleanupCommands(currentLedger, candidateSha256, options.accountId);
-            if (!proofSucceeded && currentLedger.bucketCreateIntent && (await exists(app))) {
+            if (currentLedger.bucketCreateIntent && (await exists(app))) {
                 const purge = await request(origin, "/proof/r2-purge", {
                     method: "POST",
                     headers: {
@@ -1731,8 +1777,13 @@ async function main() {
                     },
                     body: JSON.stringify({ confirm: "PURGE_DISPOSABLE_BUCKET" }),
                 }).catch(() => null);
-                report.cleanup.fallbackPurge = Boolean(purge?.response.ok);
-                if (!report.cleanup.fallbackPurge) {
+                const purged = Boolean(purge?.response.ok);
+                if (proofSucceeded) {
+                    check(purged, "retained R2 recovery object cleanup failed");
+                } else {
+                    report.cleanup.fallbackPurge = purged;
+                }
+                if (!proofSucceeded && !purged) {
                     const objectCommands = exactObjectCleanupCommands(
                         currentLedger,
                         candidateSha256,

@@ -16,23 +16,25 @@ const auth: AuthCtx = {
 
 function fixture() {
     const calls: string[] = [];
-    let object:
-        | { readonly key: string; readonly size: number; readonly customMetadata: Record<string, string> }
-        | undefined;
+    const objects = new Map<
+        string,
+        { readonly key: string; readonly size: number; readonly customMetadata: Record<string, string> }
+    >();
     const bucket = {
         async put(key: string, value: Uint8Array, options: R2PutOptions) {
             calls.push("r2.put");
-            if (object) return null;
-            object = { key, size: value.byteLength, customMetadata: options.customMetadata ?? {} };
+            if (objects.has(key)) return null;
+            const object = { key, size: value.byteLength, customMetadata: options.customMetadata ?? {} };
+            objects.set(key, object);
             return object;
         },
         async head(key: string) {
             calls.push("r2.head");
-            return object?.key === key ? object : null;
+            return objects.get(key) ?? null;
         },
         async delete(key: string) {
             calls.push("r2.delete");
-            if (object?.key === key) object = undefined;
+            objects.delete(key);
         },
     } as unknown as R2Bucket;
     let status: "pending" | "ready" = "pending";
@@ -92,7 +94,7 @@ function fixture() {
                 return refreshAuthority();
             },
         });
-    return { calls, upload, object: () => object };
+    return { calls, upload, object: () => objects.get("v1/org-1/file_a"), objects };
 }
 
 describe("organization file upload sequence", () => {
@@ -104,11 +106,15 @@ describe("organization file upload sequence", () => {
             size: 11,
             sha256: "e38e581aade78b64cc86f7ac9f3555ca78c2dcca747942a7f1d9b3275a834f75",
         });
-        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "auth.refresh", "cdb.ready"]);
+        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "r2.put", "auth.refresh", "cdb.ready"]);
         expect(f.object()).toMatchObject({
             key: "v1/org-1/file_a",
             size: 11,
             customMetadata: { chardbFileId: "file_a", chardbSha256: result.sha256 },
+        });
+        expect(f.objects.get(`_chardb/retained/sha256/${result.sha256}`)).toMatchObject({
+            size: 11,
+            customMetadata: { chardbRetainedSha256: result.sha256, chardbRetainedSize: "11" },
         });
     });
 
@@ -118,7 +124,7 @@ describe("organization file upload sequence", () => {
         f.calls.splice(0);
         const retry = await f.upload();
         expect(retry).toEqual(first);
-        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "r2.head", "auth.refresh", "cdb.ready"]);
+        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "r2.head", "r2.put", "auth.refresh", "cdb.ready"]);
     });
 
     test("does not mark ready when the post-write authority refresh fails", async () => {
@@ -128,7 +134,7 @@ describe("organization file upload sequence", () => {
                 throw new Error("membership revoked");
             })
         ).rejects.toThrow(/membership revoked/);
-        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "auth.refresh"]);
+        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "r2.put", "auth.refresh"]);
         expect(f.object()).toBeDefined();
     });
 
@@ -139,7 +145,7 @@ describe("organization file upload sequence", () => {
                 throw new CdbError({ code: "CDB_FORBIDDEN", message: "organization deleted" });
             })
         ).rejects.toMatchObject({ code: "CDB_FORBIDDEN" });
-        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "auth.refresh", "r2.delete"]);
+        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "r2.put", "auth.refresh", "r2.delete"]);
         expect(f.object()).toBeUndefined();
     });
 });

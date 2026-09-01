@@ -29,6 +29,7 @@ describe("generated Cloudflare workflow", () => {
         const source = renderCloudflareSetupScript(input);
         const generated = await importGenerated<{
             isMissingBucket(result: { exitCode: number; stdout: string; stderr: string }): boolean;
+            isMissingLifecycleRule(result: { exitCode: number; stdout: string; stderr: string }): boolean;
             configuredIdentity(raw: string): { workerName: string; filesBucket: string };
             assertGeneratedConfig(raw: string): { workerName: string; filesBucket: string };
         }>(source, "setup-cloudflare.mjs");
@@ -47,6 +48,19 @@ describe("generated Cloudflare workflow", () => {
                 stderr: "Authentication error",
             })
         ).toBe(false);
+        expect(
+            generated.isMissingLifecycleRule({
+                exitCode: 1,
+                stdout: "",
+                stderr: "Lifecycle rule with ID 'chardb-recovery-retention' not found in configuration for 'native-app-files'.",
+            })
+        ).toBe(true);
+        expect(generated.isMissingLifecycleRule({ exitCode: 1, stdout: "", stderr: "Authentication error" })).toBe(
+            false
+        );
+        expect(source).toContain(
+            '"lifecycle", "add", filesBucket, recoveryLifecycleRule, recoveryPrefix,\n    "--expire-days", recoveryDays, "--force"'
+        );
         expect(
             generated.configuredIdentity(`name = "native-app"
 

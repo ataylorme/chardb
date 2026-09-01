@@ -39,6 +39,9 @@ const auth = {
     claims: {},
 };
 
+const FILE_BYTES = new TextEncoder().encode("data");
+const FILE_SHA256 = "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7";
+
 describe("Cdb file runtime", () => {
     let db: Database;
     let storage: DurableObjectStorage;
@@ -54,13 +57,37 @@ describe("Cdb file runtime", () => {
         initializeFileStore(adaptSqlStorage(storage.sql));
         initializeCdbFileReshardStore(adaptSqlStorage(storage.sql));
         deleted = [];
+        const retained = new Map<string, { size: number; customMetadata: Record<string, string> }>();
         runtime = new CdbFileRuntime({
             storage,
             bucket: {
+                async get(key: string) {
+                    if (key.startsWith("v1/")) {
+                        const fileId = key.slice(key.lastIndexOf("/") + 1);
+                        return {
+                            key,
+                            size: FILE_BYTES.byteLength,
+                            customMetadata: { chardbFileId: fileId, chardbSha256: FILE_SHA256 },
+                            body: new Response(Uint8Array.from(FILE_BYTES)).body,
+                        };
+                    }
+                    const stored = retained.get(key);
+                    return stored ? { ...stored, key, body: new Response(Uint8Array.from(FILE_BYTES)).body } : null;
+                },
+                async put(key: string, value: Uint8Array, options: R2PutOptions) {
+                    if (retained.has(key)) return null;
+                    const stored = { size: value.byteLength, customMetadata: options.customMetadata ?? {} };
+                    retained.set(key, stored);
+                    return { key, ...stored };
+                },
+                async head(key: string) {
+                    const stored = retained.get(key);
+                    return stored ? { key, ...stored } : null;
+                },
                 async delete(key: string) {
                     deleted.push(key);
                 },
-            } as R2Bucket,
+            } as unknown as R2Bucket,
             resources: () => [
                 {
                     kind: "file",
@@ -144,7 +171,7 @@ describe("Cdb file runtime", () => {
         runtime.markReady({
             fileId: "file_a",
             organizationId: "org-1",
-            sha256: "a".repeat(64),
+            sha256: FILE_SHA256,
             size: 4,
             nowMs: 101,
             domainSchemaEpoch: 2,
@@ -184,7 +211,7 @@ describe("Cdb file runtime", () => {
         runtime.markReady({
             fileId: "future_ready",
             organizationId: "org-1",
-            sha256: "b".repeat(64),
+            sha256: FILE_SHA256,
             size: 4,
             nowMs: 1_001,
             domainSchemaEpoch: 2,
@@ -206,7 +233,7 @@ describe("Cdb file runtime", () => {
         runtime.markReady({
             fileId: "attached",
             organizationId: "org-1",
-            sha256: "a".repeat(64),
+            sha256: FILE_SHA256,
             size: 4,
             nowMs: 102,
             domainSchemaEpoch: 2,
@@ -256,7 +283,7 @@ describe("Cdb file runtime", () => {
         runtime.markReady({
             fileId: "attached",
             organizationId: "org-1",
-            sha256: "a".repeat(64),
+            sha256: FILE_SHA256,
             size: 4,
             nowMs: 101,
             domainSchemaEpoch: 2,
@@ -293,10 +320,23 @@ describe("Cdb file runtime", () => {
         const guarded = new CdbFileRuntime({
             storage,
             bucket: {
-                async delete(key: string) {
-                    events.push(`r2:${key}`);
+                async get(key: string) {
+                    events.push(`r2.get:${key}`);
+                    return {
+                        key,
+                        size: FILE_BYTES.byteLength,
+                        customMetadata: { chardbFileId: "captured", chardbSha256: FILE_SHA256 },
+                        body: new Response(Uint8Array.from(FILE_BYTES)).body,
+                    };
                 },
-            } as R2Bucket,
+                async put(key: string, value: Uint8Array, options: R2PutOptions) {
+                    events.push(`r2.put:${key}`);
+                    return { key, size: value.byteLength, customMetadata: options.customMetadata ?? {} };
+                },
+                async delete(key: string) {
+                    events.push(`r2.delete:${key}`);
+                },
+            } as unknown as R2Bucket,
             resources: runtime.resources,
             assertActiveEpoch: runtime.assertActiveEpoch,
             assertOwnership(organizationId) {
@@ -326,7 +366,7 @@ describe("Cdb file runtime", () => {
         guarded.markReady({
             fileId: request.fileId,
             organizationId: request.organizationId,
-            sha256: "c".repeat(64),
+            sha256: FILE_SHA256,
             size: request.size,
             nowMs: 11,
             domainSchemaEpoch: 2,
@@ -347,7 +387,9 @@ describe("Cdb file runtime", () => {
             "capture-begin:org-1",
             "capture-end:org-1",
             "admit:org-1",
-            "r2:v1/org-1/captured",
+            "r2.get:v1/org-1/captured",
+            `r2.put:_chardb/retained/sha256/${FILE_SHA256}`,
+            "r2.delete:v1/org-1/captured",
             "capture-begin:org-1",
             "capture-end:org-1",
         ]);

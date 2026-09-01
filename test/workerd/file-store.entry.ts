@@ -6,8 +6,14 @@ import type { ChardbEnv } from "../../src/server/entrypoint.ts";
 import { renderFileAttachmentTriggers } from "../../src/server/file-triggers.ts";
 import { handleOrganizationFileRequest } from "../../src/server/organization-file-http.ts";
 
-const HASH_A = "a".repeat(64);
-const HASH_B = "b".repeat(64);
+const HASH_A = "f28d6cfd0ebc466e6358e1f4f90edc071d0ba3d413255cdc0ec7917189033ad8";
+const HASH_B = "804f51f71254c4081e37e7c887073560f4a6fa6cdad202e9ac67e032c43ed1e1";
+const HASH_SURVIVOR = "7a01ac37408614bcf58069bb6b6a543f6c473cdded552c491de4eb36aacce235";
+
+async function sha256(value: string): Promise<string> {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+    return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
 
 interface FileStoreEnv {
     readonly CDB_FILES: R2Bucket;
@@ -46,7 +52,7 @@ export class FileStoreProof extends DurableObject<FileStoreEnv> {
 
     async seed(): Promise<Record<string, unknown>> {
         await Promise.all([
-            this.env.CDB_FILES.put("v1/org-1/file_old", "old", {
+            this.env.CDB_FILES.put("v1/org-1/file_old", "old!", {
                 httpMetadata: { contentType: "image/png" },
                 customMetadata: { chardbFileId: "file_old", chardbSha256: HASH_A },
             }),
@@ -205,16 +211,17 @@ export class FileStoreProof extends DurableObject<FileStoreEnv> {
 
     async bulkOrganizationDeletion(): Promise<Record<string, unknown>> {
         const fileIds = Array.from({ length: 40 }, (_, index) => `bulk_${String(index).padStart(2, "0")}`);
+        const hashes = await Promise.all(fileIds.map(fileId => sha256(fileId)));
         await Promise.all([
-            ...fileIds.map(fileId =>
+            ...fileIds.map((fileId, index) =>
                 this.env.CDB_FILES.put(`v1/org-bulk/${fileId}`, fileId, {
                     httpMetadata: { contentType: "image/png" },
-                    customMetadata: { chardbFileId: fileId, chardbSha256: HASH_A },
+                    customMetadata: { chardbFileId: fileId, chardbSha256: hashes[index] as string },
                 })
             ),
             this.env.CDB_FILES.put("v1/org-safe/survivor", "survivor", {
                 httpMetadata: { contentType: "image/png" },
-                customMetadata: { chardbFileId: "survivor", chardbSha256: HASH_B },
+                customMetadata: { chardbFileId: "survivor", chardbSha256: HASH_SURVIVOR },
             }),
         ]);
         this.ctx.storage.transactionSync(() => {
@@ -230,7 +237,7 @@ export class FileStoreProof extends DurableObject<FileStoreEnv> {
                     size: fileId.length,
                     nowMs: 2_000 + index,
                 });
-                store.markReady(fileId, HASH_A, fileId.length, 3_000 + index);
+                store.markReady(fileId, hashes[index] as string, fileId.length, 3_000 + index);
             }
             store.reserve({
                 fileId: "survivor",
@@ -241,7 +248,7 @@ export class FileStoreProof extends DurableObject<FileStoreEnv> {
                 size: 8,
                 nowMs: 4_000,
             });
-            store.markReady("survivor", HASH_B, 8, 4_001);
+            store.markReady("survivor", HASH_SURVIVOR, 8, 4_001);
         });
 
         const runtime = this.runtime();

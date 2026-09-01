@@ -286,7 +286,7 @@ export function buildCloudflareFileProof(candidate: ExactCandidate, pairSha256: 
     const firstSha256 = fixtureSha256("first");
     const name = `chardb-r2-proof-${candidate.digest.slice(0, 10)}-${nonce}`;
     return {
-        schema: "chardb.cloudflare-r2-proof.report.v2",
+        schema: "chardb.cloudflare-r2-proof.report.v3",
         ok: true,
         startedAt: "2026-08-28T00:00:00.000Z",
         completedAt: "2026-08-28T00:01:00.000Z",
@@ -335,10 +335,12 @@ export function buildCloudflareFileProof(candidate: ExactCandidate, pairSha256: 
             schemaVersion: 1,
             routingEpoch: 2,
             acceptedStatus: 202,
+            vectorsRequeued: 0,
             postPointRowReadableBeforeRestore: true,
             pointRowReadableAfterRestore: true,
             postPointRowHiddenAfterRestore: true,
             postPointR2ObjectRetained: true,
+            pointFileRecoveredFromRetention: true,
         },
         lifecycle: {
             uploadIdempotent: true,

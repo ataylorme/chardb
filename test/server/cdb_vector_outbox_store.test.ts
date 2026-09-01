@@ -118,6 +118,71 @@ describe("Cdb vector head and outbox store", () => {
         ).toBe(12);
     });
 
+    test("requeues ready, pending, and deleting heads in stable pages after point-in-time recovery", () => {
+        store.stageUpsert(UPSERT_INPUT);
+        const first = claimUpsert(101);
+        store.acknowledgeUpsert(first, 102);
+        store.stageUpsert({
+            ...UPSERT_INPUT,
+            vectorId: "vec_beta",
+            rowPk: "message-2",
+            nowMs: 103,
+        });
+        store.stageUpsert({
+            ...UPSERT_INPUT,
+            vectorId: "vec_gamma",
+            rowPk: "message-3",
+            nowMs: 104,
+        });
+        store.stageDelete({ vectorId: "vec_gamma", organizationId: "org_alpha", nowMs: 105 });
+
+        expect(store.requeueRecoveryPage({ afterCreatedSeq: 0, limit: 1, nowMs: 200 })).toEqual({
+            processed: 1,
+            afterCreatedSeq: 1,
+            done: false,
+        });
+        expect(store.read("vec_alpha")).toMatchObject({ state: "pending", deliveredVersion: 0, version: 1 });
+        expect(store.requeueRecoveryPage({ afterCreatedSeq: 1, limit: 1, nowMs: 200 })).toEqual({
+            processed: 1,
+            afterCreatedSeq: 2,
+            done: false,
+        });
+        expect(store.requeueRecoveryPage({ afterCreatedSeq: 2, limit: 1, nowMs: 200 })).toEqual({
+            processed: 1,
+            afterCreatedSeq: 3,
+            done: false,
+        });
+        expect(store.requeueRecoveryPage({ afterCreatedSeq: 3, limit: 1, nowMs: 200 })).toEqual({
+            processed: 0,
+            afterCreatedSeq: 3,
+            done: true,
+        });
+
+        const recoveredFirst = store.claimNext({
+            nowMs: 200,
+            leaseMs: 50,
+            settlementMs: 100,
+            claimToken: TOKEN_B,
+        });
+        const recoveredSecond = store.claimNext({
+            nowMs: 200,
+            leaseMs: 50,
+            settlementMs: 100,
+            claimToken: TOKEN_C,
+        });
+        const recoveredThird = store.claimNext({
+            nowMs: 200,
+            leaseMs: 50,
+            settlementMs: 100,
+            claimToken: "claim_token_recovery_gamma_0001",
+        });
+        const recovered = [recoveredFirst, recoveredSecond, recoveredThird];
+        expect(new Set(recovered.map(claim => claim?.vectorId))).toEqual(
+            new Set(["vec_alpha", "vec_beta", "vec_gamma"])
+        );
+        expect(recovered.find(claim => claim?.vectorId === "vec_gamma")?.operation).toBe("delete");
+    });
+
     test("indexes the effective alarm deadline and does not hide an earlier unleased row", () => {
         store.stageUpsert(UPSERT_INPUT);
         store.stageUpsert({
