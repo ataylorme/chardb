@@ -4,6 +4,7 @@ import { arch, release, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { fingerprintFile, writeJsonAtomically } from "../scripts/browser-proof-report.mjs";
 import { buildWindowsOsCiReport, githubActionsRunFromEnvironment } from "../scripts/os-ci-evidence.mjs";
+import { isOccupiedPortFailure } from "./helpers/windows-port-collision.ts";
 
 if (process.platform !== "win32") throw new Error("windows-dev-tree.mjs must run on Windows");
 
@@ -244,13 +245,9 @@ try {
             if (!exited) throw new Error(`generated dev did not exit after ${service} startup failure`);
             if (failedStartup.exitCode === 0) throw new Error(`generated dev accepted an occupied ${service} port`);
             const output = `${await failedStdout}\n${await failedStderr}`;
-            const occupiedPort = String(blockedPort);
-            if (
-                !output.includes(occupiedPort) ||
-                !/(?:address already in use|eaddrinuse|failed to listen|port .*already in use)/i.test(output)
-            ) {
+            if (!isOccupiedPortFailure(output, blockedPort)) {
                 throw new Error(
-                    `generated dev failed for an unrelated reason instead of occupied ${service} port ${occupiedPort}: ${output}`
+                    `generated dev failed for an unrelated reason instead of occupied ${service} port ${blockedPort}: ${output}`
                 );
             }
         } finally {
