@@ -134,15 +134,19 @@ async function createRecoveryPoint(env: ChardbEnv, atMs: number | undefined): Pr
 
 async function restoreRecoveryPoint(env: ChardbEnv, point: ChardbRecoveryPoint): Promise<void> {
     const catalog = catalogRpc(env);
-    await catalog.adminRecoveryInventory();
+    await recoveryPhase("preflight", () => catalog.adminRecoveryInventory());
     const armedAt = Date.now();
     const armedShards: { readonly shardId: string; readonly bookmark: string }[] = [];
     let catalogArmed = false;
     try {
-        await catalog.adminArmRecoveryRestore({ bookmark: point.catalog.bookmark, armedAt });
+        await recoveryPhase("Catalog arm", () =>
+            catalog.adminArmRecoveryRestore({ bookmark: point.catalog.bookmark, armedAt })
+        );
         catalogArmed = true;
         await mapWithConcurrency(point.shards, 4, async shard => {
-            await shardRpc(env, shard.shardId).adminArmRecoveryRestore({ bookmark: shard.bookmark, armedAt });
+            await recoveryPhase("shard arm", () =>
+                shardRpc(env, shard.shardId).adminArmRecoveryRestore({ bookmark: shard.bookmark, armedAt })
+            );
             armedShards.push(shard);
         });
     } catch (error) {
@@ -158,9 +162,23 @@ async function restoreRecoveryPoint(env: ChardbEnv, point: ChardbRecoveryPoint):
     }
 
     await mapWithConcurrency(point.shards, 4, shard =>
-        shardRpc(env, shard.shardId).adminCommitRecoveryRestore({ bookmark: shard.bookmark })
+        recoveryPhase("shard commit", () =>
+            shardRpc(env, shard.shardId).adminCommitRecoveryRestore({ bookmark: shard.bookmark })
+        )
     );
-    await catalog.adminCommitRecoveryRestore({ bookmark: point.catalog.bookmark });
+    await recoveryPhase("Catalog commit", () =>
+        catalog.adminCommitRecoveryRestore({ bookmark: point.catalog.bookmark })
+    );
+}
+
+async function recoveryPhase<T>(phase: string, operation: () => Promise<T>): Promise<T> {
+    try {
+        return await operation();
+    } catch (error) {
+        const projected = rehydrateCdbRpcError(error);
+        if (isCdbError(projected)) throw projected;
+        throw new CdbError({ code: "CDB_INVARIANT", message: `point-in-time recovery ${phase} failed` });
+    }
 }
 
 function parseCreateRequest(value: unknown): { readonly atMs?: number } {
@@ -282,6 +300,8 @@ async function mapWithConcurrency<T, R>(
             results[index] = await operation(values[index] as T);
         }
     });
-    await Promise.all(workers);
+    const settled = await Promise.allSettled(workers);
+    const failure = settled.find(result => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
     return results;
 }

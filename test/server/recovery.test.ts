@@ -103,8 +103,10 @@ describe("Durable Object point-in-time recovery", () => {
         expect(await recovery.arm("00000000-history", 44)).toEqual(armed);
         expect(() => assertRecoveryAvailable(adaptSqlStorage(storage.sql))).toThrow("restore is in progress");
 
+        const committedAt = Date.now();
         expect(await recovery.commit("00000000-history")).toEqual({ scheduled: true });
         expect(alarms).toHaveLength(1);
+        expect(alarms[0]).toBeGreaterThanOrEqual(committedAt + 4_900);
     });
 
     test("cancels an armed restore by replacing the native target with current storage", async () => {

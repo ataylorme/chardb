@@ -46,7 +46,7 @@ function namespace(stubs: ReadonlyMap<string, unknown>): DurableObjectNamespace 
     } as unknown as DurableObjectNamespace;
 }
 
-function recoveryStub(name: string, events: string[], failArm = false): RecoveryStub {
+function recoveryStub(name: string, events: string[], failArm = false, armDelayMs = 0): RecoveryStub {
     return {
         async adminRecoveryBookmark(args) {
             events.push(`${name}:bookmark:${args.atMs ?? "now"}`);
@@ -54,6 +54,7 @@ function recoveryStub(name: string, events: string[], failArm = false): Recovery
         },
         async adminArmRecoveryRestore(args) {
             events.push(`${name}:arm:${args.bookmark}`);
+            if (armDelayMs > 0) await Bun.sleep(armDelayMs);
             if (failArm) throw new Error(`${name} arm failed`);
             return { targetBookmark: args.bookmark };
         },
@@ -68,7 +69,7 @@ function recoveryStub(name: string, events: string[], failArm = false): Recovery
     };
 }
 
-function environment(failShard = ""): { env: ChardbEnv; events: string[] } {
+function environment(failShard = "", delayedShard = ""): { env: ChardbEnv; events: string[] } {
     const events: string[] = [];
     const catalog = {
         ...recoveryStub("catalog", events),
@@ -87,8 +88,14 @@ function environment(failShard = ""): { env: ChardbEnv; events: string[] } {
         },
     };
     const shards = new Map<string, unknown>([
-        ["ShardDO_0", recoveryStub("ShardDO_0", events, failShard === "ShardDO_0")],
-        ["ShardDO_1", recoveryStub("ShardDO_1", events, failShard === "ShardDO_1")],
+        [
+            "ShardDO_0",
+            recoveryStub("ShardDO_0", events, failShard === "ShardDO_0", delayedShard === "ShardDO_0" ? 10 : 0),
+        ],
+        [
+            "ShardDO_1",
+            recoveryStub("ShardDO_1", events, failShard === "ShardDO_1", delayedShard === "ShardDO_1" ? 10 : 0),
+        ],
     ]);
     return {
         events,
@@ -165,9 +172,29 @@ describe("recovery admin", () => {
             failing.env
         );
         expect(response.status).toBe(500);
+        expect((await response.json()) as unknown).toEqual({
+            ok: false,
+            error: "point-in-time recovery shard arm failed",
+            code: "CDB_INVARIANT",
+            retryable: false,
+        });
         expect(failing.events).toContain(`ShardDO_0:cancel:${shardBookmark(point, "ShardDO_0")}`);
         expect(failing.events).toContain(`catalog:cancel:${point.catalog.bookmark}`);
         expect(failing.events.some(event => event.includes(":commit:"))).toBe(false);
+    });
+
+    test("waits for an in-flight arm before cancelling after a neighboring failure", async () => {
+        const healthy = environment();
+        const created = await handleRecoveryAdminRequest(request("/_chardb/backups/create", {}), healthy.env);
+        const point = ((await created.json()) as { readonly recoveryPoint: TestRecoveryPoint }).recoveryPoint;
+        const failing = environment("ShardDO_1", "ShardDO_0");
+        const response = await handleRecoveryAdminRequest(
+            request("/_chardb/backups/restore", { recoveryPoint: point }),
+            failing.env
+        );
+        expect(response.status).toBe(500);
+        expect(failing.events).toContain(`ShardDO_0:cancel:${shardBookmark(point, "ShardDO_0")}`);
+        expect(failing.events).toContain(`catalog:cancel:${point.catalog.bookmark}`);
     });
 
     test("keeps recovery controls private", async () => {

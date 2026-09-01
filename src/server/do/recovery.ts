@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS _chardb_recovery_restore (
 
 const BOOKMARK = /^[A-Za-z0-9-]{1,512}$/;
 const PITR_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const RECOVERY_ACTIVATION_DELAY_MS = 5_000;
 
 export interface RecoveryBookmark {
     readonly bookmark: string;
@@ -152,7 +153,10 @@ export class DurableObjectRecovery {
                 message: "point-in-time restore is not armed for this bookmark",
             });
         }
-        await this.storage.setAlarm(Date.now() + 1);
+        // Give the commit RPC response time to cross the Durable Object
+        // boundary before the alarm aborts this session. Catalog remains
+        // armed, so public traffic stays fenced while shards restart.
+        await this.storage.setAlarm(Date.now() + RECOVERY_ACTIVATION_DELAY_MS);
         return { scheduled: true };
     }
 }
