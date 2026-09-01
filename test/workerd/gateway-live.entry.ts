@@ -391,7 +391,7 @@ export class Gateway extends ProductionGateway {
 
 export class Cdb extends ProductionCdb {
     private readonly fixtureInstanceId = crypto.randomUUID();
-    private fixtureLoseNextAuthInvalidationResponse = false;
+    private fixtureRejectAuthInvalidationResponses = false;
 
     protected override mutationSchema(): Record<string, unknown> {
         liveCdbSchema ??= Object.freeze({ ...super.mutationSchema(), ...LIVE_QUERY_SCHEMA });
@@ -406,14 +406,13 @@ export class Cdb extends ProductionCdb {
         return super.alarm();
     }
 
-    fixtureLoseNextAuthInvalidation(): void {
-        this.fixtureLoseNextAuthInvalidationResponse = true;
+    fixtureSetAuthInvalidationResponseFailure(input: { readonly enabled: boolean }): void {
+        this.fixtureRejectAuthInvalidationResponses = input.enabled;
     }
 
     override async invalidateAuthScope(args: CdbAuthInvalidationRequest): Promise<CdbAuthInvalidationResult> {
         const result = await super.invalidateAuthScope(args);
-        if (this.fixtureLoseNextAuthInvalidationResponse) {
-            this.fixtureLoseNextAuthInvalidationResponse = false;
+        if (this.fixtureRejectAuthInvalidationResponses) {
             throw new Error("injected auth invalidation response loss");
         }
         return result;
@@ -493,7 +492,7 @@ interface CdbFixtureRpc {
     fixtureDrain(): Promise<void>;
     fixtureLiveState(): Promise<CdbLiveState>;
     fixtureSeedPublicRows(): Promise<void>;
-    fixtureLoseNextAuthInvalidation(): Promise<void>;
+    fixtureSetAuthInvalidationResponseFailure(input: { readonly enabled: boolean }): Promise<void>;
 }
 
 type MembershipMutation =
@@ -687,11 +686,17 @@ export default {
             await (env.CDB_SHARD.get(id) as unknown as CdbFixtureRpc).fixtureDrain();
             return Response.json({ ok: true });
         }
-        if (url.pathname === "/live-cdb-lose-auth-response") {
+        if (url.pathname === "/live-cdb-auth-response-failure") {
             const shardId = url.searchParams.get("shardId");
             if (!shardId) return new Response("missing shardId", { status: 400 });
+            const enabled = url.searchParams.get("enabled");
+            if (enabled !== "true" && enabled !== "false") {
+                return new Response("enabled must be true or false", { status: 400 });
+            }
             const id = env.CDB_SHARD.idFromName(shardId);
-            await (env.CDB_SHARD.get(id) as unknown as CdbFixtureRpc).fixtureLoseNextAuthInvalidation();
+            await (env.CDB_SHARD.get(id) as unknown as CdbFixtureRpc).fixtureSetAuthInvalidationResponseFailure({
+                enabled: enabled === "true",
+            });
             return Response.json({ ok: true });
         }
         if (url.pathname === "/live-principal-invalidation-due") {

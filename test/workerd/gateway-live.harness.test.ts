@@ -1998,75 +1998,92 @@ describe("public durable live queries in real workerd", () => {
         acknowledge(opened.socket, settledPrimary);
         acknowledge(crossShard.socket, settledCrossShard);
 
-        await fixtureFetch("/live-cdb-lose-auth-response", { shardId: crossShardId });
-        expect((await mutateMembership("delete")).affected).toBe(1);
-        const revokedMessage = nextDown(opened.socket);
-        const isolatedNoChange = expectNoDown(isolated.socket);
-        const crossShardRefresh = nextDown(crossShard.socket);
-        await drainAuthInvalidations([crossShardId]);
-        expect(
-            await fixtureFetch<{ readonly state: Record<string, unknown> | null }>(
-                "/live-principal-invalidation-state",
-                { principalId: "workerd-user" }
-            )
-        ).toMatchObject({ state: { scopeId: "workerd-user", attempts: 1, cursorShardId: null } });
-        await drainGateway(clientId);
-        await expect(revokedMessage).resolves.toMatchObject({
-            t: "error",
-            subId: 12,
-            code: "CDB_FORBIDDEN",
-            retryable: false,
-        });
-        expect((await gatewayState(clientId)).registrations.some(row => row.subId === 12 && row.currentHead)).toBe(
-            false
-        );
-        await drainGateway(isolatedClientId);
-        await isolatedNoChange;
-        expect(
-            (await gatewayState(isolatedClientId)).registrations.some(row => row.subId === 13 && row.currentHead)
-        ).toBe(true);
-        await drainGateway(crossShardClientId);
-        await expect(crossShardRefresh).resolves.toMatchObject({ t: "snapshot", subId: 14, rows: [] });
-        expect(
-            (await gatewayState(crossShardClientId)).registrations.some(row => row.subId === 14 && row.currentHead)
-        ).toBe(true);
-        await fixtureFetch("/live-principal-invalidation-due", { principalId: "workerd-user" });
-        await fixtureFetch("/live-catalog-drain", {});
-        await fixtureFetch("/live-catalog-drain", {});
-        expect(
-            await fixtureFetch<{ readonly state: Record<string, unknown> | null }>(
-                "/live-principal-invalidation-state",
-                { principalId: "workerd-user" }
-            )
-        ).toEqual({ state: null });
+        let authResponsesBlocked = false;
+        let membershipDeleted = false;
+        try {
+            await fixtureFetch("/live-cdb-auth-response-failure", { shardId: crossShardId, enabled: "true" });
+            authResponsesBlocked = true;
+            expect((await mutateMembership("delete")).affected).toBe(1);
+            membershipDeleted = true;
+            const revokedMessage = nextDown(opened.socket);
+            const isolatedNoChange = expectNoDown(isolated.socket);
+            const crossShardRefresh = nextDown(crossShard.socket);
+            await drainAuthInvalidations([crossShardId]);
+            const failedInvalidation = await fixtureFetch<{
+                readonly state: { readonly attempts?: number; readonly [key: string]: unknown } | null;
+            }>("/live-principal-invalidation-state", { principalId: "workerd-user" });
+            expect(failedInvalidation).toMatchObject({
+                state: { scopeId: "workerd-user", cursorShardId: null },
+            });
+            expect(failedInvalidation.state?.attempts).toBeGreaterThanOrEqual(1);
+            await drainGateway(clientId);
+            await expect(revokedMessage).resolves.toMatchObject({
+                t: "error",
+                subId: 12,
+                code: "CDB_FORBIDDEN",
+                retryable: false,
+            });
+            expect((await gatewayState(clientId)).registrations.some(row => row.subId === 12 && row.currentHead)).toBe(
+                false
+            );
+            await drainGateway(isolatedClientId);
+            await isolatedNoChange;
+            expect(
+                (await gatewayState(isolatedClientId)).registrations.some(row => row.subId === 13 && row.currentHead)
+            ).toBe(true);
+            await drainGateway(crossShardClientId);
+            await expect(crossShardRefresh).resolves.toMatchObject({ t: "snapshot", subId: 14, rows: [] });
+            expect(
+                (await gatewayState(crossShardClientId)).registrations.some(row => row.subId === 14 && row.currentHead)
+            ).toBe(true);
+            await fixtureFetch("/live-cdb-auth-response-failure", { shardId: crossShardId, enabled: "false" });
+            authResponsesBlocked = false;
+            await fixtureFetch("/live-principal-invalidation-due", { principalId: "workerd-user" });
+            await fixtureFetch("/live-catalog-drain", {});
+            await fixtureFetch("/live-catalog-drain", {});
+            expect(
+                await fixtureFetch<{ readonly state: Record<string, unknown> | null }>(
+                    "/live-principal-invalidation-state",
+                    { principalId: "workerd-user" }
+                )
+            ).toEqual({ state: null });
 
-        const noReplacement = expectNoDown(opened.socket);
-        await write("live-authority-after-revoke", "live-authority-row-4");
-        await drainGateway(clientId);
-        await noReplacement;
+            const noReplacement = expectNoDown(opened.socket);
+            await write("live-authority-after-revoke", "live-authority-row-4");
+            await drainGateway(clientId);
+            await noReplacement;
 
-        expect((await mutateMembership("upsert", "member")).affected).toBe(1);
-        const fresh = await subscribe(opened, clientId, 12, ORGANIZATION_A, "authority-proof");
-        expect(fresh.rows).toHaveLength(4);
-        expect(fresh.rows).toEqual(
-            expect.arrayContaining([
-                expect.objectContaining({ id: "live-authority-row-1", viewerId: "workerd-user" }),
-                expect.objectContaining({ id: "live-authority-row-4", viewerId: "workerd-user" }),
-            ])
-        );
-        acknowledge(opened.socket, fresh);
-
-        opened.socket.close();
-        writer.socket.close();
-        isolated.socket.close();
-        crossShard.socket.close();
-        await Promise.all([opened.closed, writer.closed, isolated.closed, crossShard.closed]);
-        await Promise.all([
-            drainGateway(clientId),
-            drainGateway(writerId),
-            drainGateway(isolatedClientId),
-            drainGateway(crossShardClientId),
-        ]);
+            expect((await mutateMembership("upsert", "member")).affected).toBe(1);
+            membershipDeleted = false;
+            const fresh = await subscribe(opened, clientId, 12, ORGANIZATION_A, "authority-proof");
+            expect(fresh.rows).toHaveLength(4);
+            expect(fresh.rows).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({ id: "live-authority-row-1", viewerId: "workerd-user" }),
+                    expect.objectContaining({ id: "live-authority-row-4", viewerId: "workerd-user" }),
+                ])
+            );
+            acknowledge(opened.socket, fresh);
+        } finally {
+            if (authResponsesBlocked) {
+                await fixtureFetch("/live-cdb-auth-response-failure", { shardId: crossShardId, enabled: "false" });
+            }
+            if (membershipDeleted) {
+                await mutateMembership("upsert", "member");
+                await settleAuthInvalidations([crossShardId]);
+            }
+            opened.socket.close();
+            writer.socket.close();
+            isolated.socket.close();
+            crossShard.socket.close();
+            await Promise.all([opened.closed, writer.closed, isolated.closed, crossShard.closed]);
+            await Promise.all([
+                drainGateway(clientId),
+                drainGateway(writerId),
+                drainGateway(isolatedClientId),
+                drainGateway(crossShardClientId),
+            ]);
+        }
         expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
     });
 
