@@ -47,6 +47,9 @@ const PACKAGE_TEMPLATE = (name: string, corePackage: string, reactPackage: strin
                 uuidv7: "1.2.1",
                 zod: "4.4.3",
             },
+            overrides: {
+                "@chardb/core": "$@chardb/core",
+            },
             devDependencies: {
                 "@cloudflare/vitest-plugin": "1.1.2",
                 "@cloudflare/workers-types": "5.20260820.1",

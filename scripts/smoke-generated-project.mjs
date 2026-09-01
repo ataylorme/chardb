@@ -86,6 +86,9 @@ try {
     if (packageJson.dependencies["@chardb/react"] !== `file:${reactTarballPath}`) {
         throw new Error(`generated @chardb/react specifier does not match file:${reactTarballPath}`);
     }
+    if (packageJson.overrides?.["@chardb/core"] !== "$@chardb/core") {
+        throw new Error("generated package does not bind the React peer to its direct core dependency");
+    }
     assertExactDependencyVersions(packageJson, `file:${tarballPath}`, `file:${reactTarballPath}`);
 
     if (!JSON.stringify(packageJson).includes(`file:${tarballPath}`)) {
@@ -175,6 +178,7 @@ try {
             fullMigrationDigestChainValidated: true,
             immutablePriorMigrationHistoryPreserved: true,
             exactDependenciesPinned: true,
+            bunInstallPassed: true,
             typecheckPassed: true,
             cloudflareVitestPassed: true,
             generatedBrowserBuilt: true,
@@ -270,6 +274,18 @@ async function proveInitBoundaries(root, bootstrap, extraEnvironment, candidate,
     }
     if (bunPackage.dependencies["@chardb/react"] !== `file:${reactCandidate}`) {
         throw new Error("bunx @chardb/core init did not preserve the exact React package specifier");
+    }
+    if (bunPackage.overrides?.["@chardb/core"] !== "$@chardb/core") {
+        throw new Error("bunx @chardb/core init did not bind the React peer to its direct core dependency");
+    }
+    run("bun", ["install", "--ignore-scripts"], join(bootstrap, "bun app"), extraEnvironment);
+    for (const packageName of ["core", "react"]) {
+        const manifest = JSON.parse(
+            await readFile(join(bootstrap, "bun app", "node_modules", "@chardb", packageName, "package.json"), "utf8")
+        );
+        if (manifest.name !== `@chardb/${packageName}`) {
+            throw new Error(`bun install resolved the wrong @chardb/${packageName} package`);
+        }
     }
 
     for (const name of [".", "..", "../outside", "nested/app", "nested\\app", "/absolute", "C:\\absolute"]) {

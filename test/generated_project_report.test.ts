@@ -62,6 +62,7 @@ describe("generated-project evidence", () => {
         expect(report.invariants.versionTwoAdditiveSqlGenerated).toBe(true);
         expect(report.invariants.fullMigrationDigestChainValidated).toBe(true);
         expect(report.invariants.immutablePriorMigrationHistoryPreserved).toBe(true);
+        expect(report.invariants.bunInstallPassed).toBe(true);
         expect(report.invariants.cloudflareVitestPassed).toBe(true);
 
         expect(() =>
@@ -103,6 +104,7 @@ describe("generated-project evidence", () => {
         expect(source).toContain("`file:${tarballPath}`");
         expect(source).toContain('"--react-package"');
         expect(source).toContain("`file:${reactTarballPath}`");
+        expect(source).toContain('run("bun", ["install", "--ignore-scripts"]');
         expect(source.match(/"doctor", "wrangler"/g)).toHaveLength(3);
         expect(source).toContain("VERSION_THREE_MIGRATION_NAME");
         expect(source).toContain("VERSION_FOUR_MIGRATION_NAME");

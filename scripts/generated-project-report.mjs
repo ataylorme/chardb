@@ -17,6 +17,7 @@ export const GENERATED_PROJECT_INVARIANTS = Object.freeze([
     "fullMigrationDigestChainValidated",
     "immutablePriorMigrationHistoryPreserved",
     "exactDependenciesPinned",
+    "bunInstallPassed",
     "typecheckPassed",
     "cloudflareVitestPassed",
     "generatedBrowserBuilt",
