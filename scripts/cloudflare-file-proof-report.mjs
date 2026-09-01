@@ -3,7 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
-export const CLOUDFLARE_FILE_PROOF_REPORT_SCHEMA = "chardb.cloudflare-r2-proof.report.v1";
+export const CLOUDFLARE_FILE_PROOF_REPORT_SCHEMA = "chardb.cloudflare-r2-proof.report.v2";
 export const CLOUDFLARE_FILE_PROOF_VALIDATION_SCHEMA = "chardb.cloudflare-r2-proof.validation.v1";
 
 const EMPTY_SHA256 = createHash("sha256").update("").digest("hex");
@@ -180,6 +180,37 @@ function assertMigration(value, candidate, nonce) {
     }
 }
 
+function assertRecovery(value) {
+    assertObject(value, "Cloudflare file recovery proof", [
+        "format",
+        "digest",
+        "shardCount",
+        "schemaVersion",
+        "routingEpoch",
+        "acceptedStatus",
+        "postPointRowReadableBeforeRestore",
+        "pointRowReadableAfterRestore",
+        "postPointRowHiddenAfterRestore",
+        "postPointR2ObjectRetained",
+    ]);
+    if (value.format !== "chardb-recovery-point/v1") {
+        throw new Error("Cloudflare file recovery proof format is invalid");
+    }
+    assertSha256(value.digest, "Cloudflare file recovery-point digest");
+    assertPositiveInteger(value.shardCount, "Cloudflare file recovery shard count");
+    assertPositiveInteger(value.schemaVersion, "Cloudflare file recovery schema version");
+    assertPositiveInteger(value.routingEpoch, "Cloudflare file recovery routing epoch");
+    if (
+        value.acceptedStatus !== 202 ||
+        value.postPointRowReadableBeforeRestore !== true ||
+        value.pointRowReadableAfterRestore !== true ||
+        value.postPointRowHiddenAfterRestore !== true ||
+        value.postPointR2ObjectRetained !== true
+    ) {
+        throw new Error("Cloudflare file recovery proof did not demonstrate an exact SQLite rewind");
+    }
+}
+
 function assertEmptyObjectState(value, label) {
     assertObject(value, label, ["count", "bytes", "digest"]);
     if (value.count !== 0 || value.bytes !== 0 || value.digest !== EMPTY_SHA256) {
@@ -342,6 +373,7 @@ export function assertCloudflareFileProofReport(report, expectedCandidate) {
         "deploymentInput",
         "versions",
         "migration",
+        "recovery",
         "lifecycle",
         "cleanup",
         "error",
@@ -362,6 +394,7 @@ export function assertCloudflareFileProofReport(report, expectedCandidate) {
     assertDeploymentInput(report.deploymentInput, candidate);
     assertVersions(report.versions);
     assertMigration(report.migration, candidate, nonce);
+    assertRecovery(report.recovery);
     assertLifecycle(report.lifecycle);
     assertCleanup(report.cleanup);
     assertEvidence(report.evidence);

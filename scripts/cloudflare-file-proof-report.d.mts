@@ -11,7 +11,7 @@ export interface CloudflareFileProofValidation {
     readonly reportSha256: string;
 }
 
-export const CLOUDFLARE_FILE_PROOF_REPORT_SCHEMA: "chardb.cloudflare-r2-proof.report.v1";
+export const CLOUDFLARE_FILE_PROOF_REPORT_SCHEMA: "chardb.cloudflare-r2-proof.report.v2";
 export const CLOUDFLARE_FILE_PROOF_VALIDATION_SCHEMA: "chardb.cloudflare-r2-proof.validation.v1";
 
 export function assertCloudflareFileProofReport<T>(report: T, expectedCandidate: CloudflareFileProofCandidate): T;

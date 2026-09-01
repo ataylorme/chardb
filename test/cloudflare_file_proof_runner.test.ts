@@ -662,7 +662,7 @@ describe("Cloudflare R2 proof runner", () => {
         const finalized = await finalizeFileProofEvidence(
             output,
             {
-                schema: "chardb.cloudflare-r2-proof.report.v1",
+                schema: "chardb.cloudflare-r2-proof.report.v2",
                 ok: true,
                 lifecycle: { bulkObjects: 34 },
             },

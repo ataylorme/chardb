@@ -96,6 +96,18 @@ function reportFor(exactCandidate = candidate()) {
             after: { activeVersion: 1, activeEpoch: 2 },
             idempotentRetry: true,
         },
+        recovery: {
+            format: "chardb-recovery-point/v1",
+            digest: sha256("recovery point"),
+            shardCount: 2,
+            schemaVersion: 1,
+            routingEpoch: 2,
+            acceptedStatus: 202,
+            postPointRowReadableBeforeRestore: true,
+            pointRowReadableAfterRestore: true,
+            postPointRowHiddenAfterRestore: true,
+            postPointR2ObjectRetained: true,
+        },
         lifecycle: {
             uploadIdempotent: true,
             boundaryRejections: {
@@ -275,6 +287,12 @@ describe("Cloudflare R2 proof report validator", () => {
                 "replacement",
                 value => {
                     value.lifecycle.replacementCleanup = false;
+                },
+            ],
+            [
+                "SQLite rewind",
+                value => {
+                    value.recovery.postPointRowHiddenAfterRestore = false;
                 },
             ],
             [

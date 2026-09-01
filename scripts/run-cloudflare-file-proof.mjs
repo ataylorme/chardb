@@ -8,7 +8,7 @@ import { runPairedFileBenchmark, validateFileBenchmarkEvidence } from "./run-fil
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const FIXTURE = path.join(ROOT, "test", "fixtures", "cloudflare-file-proof");
-const REPORT_SCHEMA = "chardb.cloudflare-r2-proof.report.v1";
+const REPORT_SCHEMA = "chardb.cloudflare-r2-proof.report.v2";
 const LEDGER_SCHEMA = "chardb.cloudflare-r2-proof.ownership.v3";
 const LEDGER_FIELDS = Object.freeze(
     [
@@ -691,6 +691,42 @@ async function migrationAdmin(origin, adminToken, pathName, body) {
     return result.body;
 }
 
+async function createRecoveryPoint(origin, adminToken) {
+    const result = await request(origin, "/_chardb/backups/create", {
+        method: "POST",
+        headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
+        body: "{}",
+    });
+    check(result.response.ok, `recovery-point creation failed with ${result.response.status}`);
+    const point = result.body?.recoveryPoint;
+    check(
+        point?.format === "chardb-recovery-point/v1" &&
+            /^[a-f0-9]{64}$/.test(point.digest ?? "") &&
+            Array.isArray(point.shards) &&
+            point.shards.length > 0,
+        "recovery-point creation returned an invalid manifest"
+    );
+    return point;
+}
+
+async function restoreRecoveryPoint(origin, adminToken, recoveryPoint) {
+    const result = await request(origin, "/_chardb/backups/restore", {
+        method: "POST",
+        headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ recoveryPoint }),
+    });
+    const accepted =
+        result.response.status === 202 &&
+        result.body?.accepted === true &&
+        result.body?.recoveryPointDigest === recoveryPoint.digest;
+    const diagnostic =
+        typeof result.body === "object" && result.body !== null
+            ? [result.body.code, result.body.error].filter(value => typeof value === "string").join(": ")
+            : "";
+    check(accepted, `recovery-point restore returned ${result.response.status}${diagnostic ? `: ${diagnostic}` : ""}`);
+    return result.response.status;
+}
+
 function boundedDiagnostic(value) {
     const text = String(value);
     return text.length <= 512 ? text : text.slice(0, 512);
@@ -879,6 +915,7 @@ async function main() {
         deploymentInput: null,
         versions: {},
         migration: null,
+        recovery: null,
         lifecycle: null,
         cleanup: { workerDeleted: false, bucketDeleted: false, fallbackPurge: false },
         error: null,
@@ -1345,6 +1382,73 @@ async function main() {
             `survivor-create-${nonce}`
         );
         check(mutation.response.ok, "survivor attachment failed");
+
+        const recoveryPoint = await createRecoveryPoint(origin, adminToken);
+        const afterPointBytes = new TextEncoder().encode(`after-recovery-point-${nonce}`);
+        const afterPointFile = await upload(
+            origin,
+            principal,
+            organizationB,
+            afterPointBytes,
+            `after-recovery-point-${nonce}`
+        );
+        await recordObject(organizationB, afterPointFile.fileId);
+        const afterPointRow = `after-recovery-point-row-${nonce}`;
+        const afterPointMutation = await mutateDocument(
+            origin,
+            principal,
+            "create",
+            afterPointRow,
+            organizationB,
+            afterPointFile.fileId,
+            `after-recovery-point-create-${nonce}`
+        );
+        check(afterPointMutation.response.ok, "post-recovery-point attachment failed");
+        const beforeRestore = await download(origin, principal, organizationB, afterPointRow);
+        check(
+            beforeRestore.response.ok && sha256(beforeRestore.bytes) === afterPointFile.sha256,
+            "post-recovery-point row was not readable before restore"
+        );
+        const acceptedStatus = await restoreRecoveryPoint(origin, adminToken, recoveryPoint);
+        await retry(async () => {
+            const [restoredSurvivor, restoredAfterPoint] = await Promise.all([
+                download(origin, principal, organizationB, survivorRow),
+                download(origin, principal, organizationB, afterPointRow),
+            ]);
+            check(
+                restoredSurvivor.response.ok && sha256(restoredSurvivor.bytes) === survivor.sha256,
+                "recovery point did not preserve its existing row"
+            );
+            check(restoredAfterPoint.response.status === 404, "recovery point did not remove the later row");
+            return true;
+        }, 120_000);
+        const afterPointObject = `v1/${organizationB}/${afterPointFile.fileId}`;
+        const afterPointObjectPath = path.join(privateDir, "after-recovery-point-object.bin");
+        await runWrangler(
+            ["r2", "object", "get", `${names.bucket}/${afterPointObject}`, "--remote", "--file", afterPointObjectPath],
+            { cwd: app, label: "post-restore R2 independence check", secrets }
+        );
+        check(
+            sha256(await readFile(afterPointObjectPath)) === afterPointFile.sha256,
+            "restore unexpectedly changed the later R2 object"
+        );
+        await runWrangler(["r2", "object", "delete", `${names.bucket}/${afterPointObject}`, "--remote", "--force"], {
+            cwd: app,
+            label: "post-restore orphan cleanup",
+            secrets,
+        });
+        report.recovery = {
+            format: recoveryPoint.format,
+            digest: recoveryPoint.digest,
+            shardCount: recoveryPoint.shards.length,
+            schemaVersion: recoveryPoint.schema.version,
+            routingEpoch: recoveryPoint.routingEpoch,
+            acceptedStatus,
+            postPointRowReadableBeforeRestore: true,
+            pointRowReadableAfterRestore: true,
+            postPointRowHiddenAfterRestore: true,
+            postPointR2ObjectRetained: true,
+        };
 
         const inputAfterSeed = await fingerprintDeployment(
             app,
