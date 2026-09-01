@@ -485,7 +485,7 @@ import { z } from "zod";
 import { messages } from "./schema.ts";
 
 export const listMessages = api.query({
-  ref: "src/queries.ts#listMessages",
+  ref: "messages#list",
   args: z.object({
     organizationId: z.string(),
     limit: z.number().int().min(1).max(100).default(50),
@@ -1343,7 +1343,7 @@ import { z } from "zod";
 import { messages } from "./schema.ts";
 
 export const postMessage = api.mutation({
-  ref: "src/api.ts#postMessage",
+  ref: "messages#create",
   authority: "organization",
   args: z.object({
     id: z.string(),
@@ -1371,7 +1371,7 @@ export const postMessage = api.mutation({
 });
 
 export const replaceMessageAttachment = api.mutation({
-  ref: "src/api.ts#replaceMessageAttachment",
+  ref: "messages#replaceAttachment",
   authority: "organization",
   args: z.object({
     id: z.string(),
