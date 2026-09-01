@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS _chardb_recovery_restore (
 
 const BOOKMARK = /^[A-Za-z0-9-]{1,512}$/;
 const PITR_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
-const RECOVERY_ACTIVATION_DELAY_MS = 5_000;
+export const RECOVERY_ACTIVATION_DELAY_MS = 5_000;
 
 export interface RecoveryBookmark {
     readonly bookmark: string;

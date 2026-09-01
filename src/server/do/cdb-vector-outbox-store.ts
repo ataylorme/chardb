@@ -172,6 +172,12 @@ export interface CdbVectorDeliveryStatus {
     readonly lastError: string | null;
 }
 
+export interface CdbVectorRecoveryPage {
+    readonly processed: number;
+    readonly afterCreatedSeq: number;
+    readonly done: boolean;
+}
+
 interface StoredHead {
     readonly vector_id: string;
     readonly created_seq: number | bigint;
@@ -836,6 +842,53 @@ export class CdbVectorOutboxStore {
         if (this.sql.changes() !== 1) stale("vector head changed before delete staging");
         this.coalesce(vectorId, version, "delete", nowMs);
         return this.read(vectorId);
+    }
+
+    /** Requeue one stable insertion-order page after SQLite point-in-time recovery. */
+    requeueRecoveryPage(input: {
+        readonly afterCreatedSeq: number;
+        readonly limit: number;
+        readonly nowMs: number;
+    }): CdbVectorRecoveryPage {
+        const afterCreatedSeq = inputInteger(input.afterCreatedSeq, "recovery cursor");
+        const limit = inputInteger(input.limit, "recovery page size", 1);
+        const nowMs = inputInteger(input.nowMs, "recovery timestamp");
+        if (limit > 500) invalid("recovery page size exceeds 500");
+        const rows = this.sql.all<StoredHead>(
+            `SELECT * FROM _chardb_vectors
+             WHERE created_seq > ?
+             ORDER BY created_seq LIMIT ?`,
+            afterCreatedSeq,
+            limit
+        );
+        let cursor = afterCreatedSeq;
+        for (const row of rows) {
+            const createdSeq = safeInteger(row.created_seq, "vector head insertion generation", 1);
+            if (createdSeq <= cursor) invariant("recovery page is not strictly ordered");
+            cursor = createdSeq;
+            const head = projectHead(row);
+            if (head.state === "ready") {
+                this.sql.exec(
+                    `UPDATE _chardb_vectors
+                     SET state = 'pending', delivered_version = version - 1, updated_at = MAX(updated_at, ?)
+                     WHERE vector_id = ? AND version = ? AND state = 'ready'`,
+                    nowMs,
+                    head.vectorId,
+                    head.version
+                );
+                if (this.sql.changes() !== 1) stale("vector head changed during recovery requeue");
+            }
+            this.sql.exec(
+                `UPDATE _chardb_vector_attempts
+                 SET visibility_confirmed = 0, response_ambiguous = 0,
+                     delete_confirmed = 0, delete_claim_token = NULL
+                 WHERE vector_id = ? AND physical_version = ?`,
+                head.vectorId,
+                head.version
+            );
+            this.coalesce(head.vectorId, head.version, head.state === "deleting" ? "delete" : "upsert", nowMs);
+        }
+        return Object.freeze({ processed: rows.length, afterCreatedSeq: cursor, done: rows.length < limit });
     }
 
     claimNext(input: {

@@ -4,6 +4,8 @@ import type { CliContext, CliFetch } from "../context.ts";
 const RESPONSE_MAX_BYTES = 2 * 1_024 * 1_024;
 const REQUEST_ATTEMPTS = 3;
 const REQUEST_TIMEOUT_MS = 30_000;
+const RECONCILE_ATTEMPTS = 60;
+const RECONCILE_RETRY_MS = 1_000;
 
 interface BackupCommonOptions {
     readonly baseUrl: string;
@@ -65,10 +67,30 @@ export async function runBackupRestore(
         method: "POST",
         body: JSON.stringify({ recoveryPoint }),
     });
-    if (response.accepted !== true || response.recoveryPointDigest !== digest) {
+    if (
+        response.accepted !== true ||
+        response.recoveryPointDigest !== digest ||
+        !Number.isSafeInteger(response.reconcileAfterMs) ||
+        (response.reconcileAfterMs as number) < 0 ||
+        (response.reconcileAfterMs as number) > 30_000
+    ) {
         throw new Error("backup endpoint returned an invalid restore acknowledgement");
     }
-    ctx.stdout(`restore ${digest} accepted; Durable Objects will restart at the recovery point\n`);
+    const reconcileAfterMs = response.reconcileAfterMs as number;
+    if (reconcileAfterMs > 0) await new Promise(resolve => setTimeout(resolve, reconcileAfterMs));
+    const reconciled = await request("reconcile", {
+        method: "POST",
+        body: JSON.stringify({ recoveryPoint }),
+    });
+    if (
+        reconciled.reconciled !== true ||
+        reconciled.recoveryPointDigest !== digest ||
+        !Number.isSafeInteger(reconciled.vectorsRequeued) ||
+        (reconciled.vectorsRequeued as number) < 0
+    ) {
+        throw new Error("backup endpoint returned an invalid recovery reconciliation");
+    }
+    ctx.stdout(`restored ${digest}; files are recoverable and ${reconciled.vectorsRequeued} vectors were requeued\n`);
 }
 
 function backupRequest(options: BackupCommonOptions) {
@@ -76,9 +98,10 @@ function backupRequest(options: BackupCommonOptions) {
     if (options.token.length < 1 || new TextEncoder().encode(options.token).byteLength > 512) {
         throw new TypeError("backup token is invalid");
     }
-    return async (action: "create" | "restore", init: RequestInit): Promise<Record<string, unknown>> => {
+    return async (action: "create" | "restore" | "reconcile", init: RequestInit): Promise<Record<string, unknown>> => {
         let lastError: unknown;
-        for (let attempt = 1; attempt <= REQUEST_ATTEMPTS; attempt++) {
+        const attempts = action === "reconcile" ? RECONCILE_ATTEMPTS : REQUEST_ATTEMPTS;
+        for (let attempt = 1; attempt <= attempts; attempt++) {
             let response: Response;
             try {
                 response = await options.fetch(`${baseUrl}/_chardb/backups/${action}`, {
@@ -91,7 +114,8 @@ function backupRequest(options: BackupCommonOptions) {
                 });
             } catch (error) {
                 lastError = error;
-                if (attempt === REQUEST_ATTEMPTS) throw error;
+                if (attempt === attempts) throw error;
+                if (action === "reconcile") await new Promise(resolve => setTimeout(resolve, RECONCILE_RETRY_MS));
                 continue;
             }
             const body = await boundedJson(response);
@@ -103,8 +127,14 @@ function backupRequest(options: BackupCommonOptions) {
                     ? String((body as Record<string, unknown>).error ?? response.statusText)
                     : response.statusText;
             const error = new Error(`backup endpoint returned ${response.status}: ${message}`);
-            if (![429, 502, 503, 504].includes(response.status) || attempt === REQUEST_ATTEMPTS) throw error;
+            const code =
+                typeof body === "object" && body !== null && !Array.isArray(body)
+                    ? (body as Record<string, unknown>).code
+                    : undefined;
+            const activating = action === "reconcile" && response.status === 409 && code === "CDB_STALE_EPOCH";
+            if ((!activating && ![429, 502, 503, 504].includes(response.status)) || attempt === attempts) throw error;
             lastError = error;
+            if (action === "reconcile") await new Promise(resolve => setTimeout(resolve, RECONCILE_RETRY_MS));
         }
         throw lastError instanceof Error ? lastError : new Error("backup request failed");
     };

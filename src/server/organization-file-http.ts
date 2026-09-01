@@ -10,6 +10,7 @@ import {
     type OrganizationFileLocator,
     dispatchOrganizationFileOperation,
 } from "./file-auth-dispatch.ts";
+import { readRecoverableFile } from "./file-retention.ts";
 import { cdbHttpErrorResponse } from "./http-errors.ts";
 import { type OrganizationFileUploadCdb, uploadOrganizationFile } from "./organization-file-upload.ts";
 import type { ChardbFileResourceDescriptor } from "./resource-descriptors.ts";
@@ -280,16 +281,7 @@ export async function handleOrganizationFileDownloadRequest(input: {
                     stored = await resolve(refreshed.route, refreshed.auth);
                 }
                 if (!stored) return null;
-                const object = await context.bucket.get(stored.objectKey);
-                if (
-                    !object ||
-                    stored.sha256 === null ||
-                    object.size !== stored.size ||
-                    object.customMetadata?.chardbFileId !== stored.fileId ||
-                    object.customMetadata?.chardbSha256 !== stored.sha256
-                ) {
-                    throw new CdbError({ code: "CDB_INVARIANT", message: "attached R2 object is missing or corrupt" });
-                }
+                const object = await readRecoverableFile(context.bucket, stored);
                 return { object, stored };
             },
         });

@@ -1,5 +1,6 @@
 import { CdbError } from "../../errors.ts";
 import type { AuthCtx } from "../define.ts";
+import { deleteRecoverableFile } from "../file-retention.ts";
 import type { ChardbFileResourceDescriptor } from "../resource-descriptors.ts";
 import {
     CDB_FILE_DELETE_BATCH_SIZE,
@@ -223,7 +224,7 @@ export class CdbFileRuntime {
             if (!this.bucket) break;
             try {
                 this.assertOwnership(file.organizationId);
-                await this.bucket.delete(file.objectKey);
+                await deleteRecoverableFile(this.bucket, file);
                 this.metadataTransaction(file.organizationId, store => {
                     const current = store.read(file.fileId);
                     if (current?.status === "deleting" && current.objectKey === file.objectKey) {

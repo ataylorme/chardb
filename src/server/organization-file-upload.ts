@@ -3,6 +3,7 @@ import { FileId, type FileId as FileIdType } from "../files/index.ts";
 import type { AuthCtx } from "./define.ts";
 import type { CdbFileReadyRequest, CdbFileReserveRequest } from "./do/cdb-file-runtime.ts";
 import type { StoredFile } from "./do/cdb-file-store.ts";
+import { retainUploadedFile } from "./file-retention.ts";
 
 export interface OrganizationFileUploadCdb {
     reserveFile(request: CdbFileReserveRequest & { readonly schemaEpoch: number }): Promise<StoredFile>;
@@ -72,6 +73,12 @@ export async function uploadOrganizationFile(input: {
             throw new CdbError({ code: "CDB_INVARIANT", message: "immutable file object does not match its retry" });
         }
     }
+    await retainUploadedFile(input.bucket, {
+        sha256,
+        size: ownedBytes.byteLength,
+        contentType: reserved.contentType,
+        bytes: ownedBytes,
+    });
 
     let ready: StoredFile;
     try {

@@ -1,6 +1,7 @@
 import { CdbError, isCdbError, rehydrateCdbRpcError } from "../errors.ts";
 import { stableJson } from "../util/canonical.ts";
 import { adminJsonError, authorizeAdmin, exactAdminObject, readAdminBody } from "./admin-http.ts";
+import { RECOVERY_ACTIVATION_DELAY_MS } from "./do/recovery.ts";
 import type { ChardbEnv } from "./entrypoint.ts";
 import { httpStatusForCdbError } from "./http-errors.ts";
 
@@ -10,6 +11,9 @@ const SHARD_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const BOOKMARK = /^[A-Za-z0-9-]{1,512}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
 const MAX_RECOVERY_SHARDS = 16_384;
+const RECOVERY_RECONCILE_DELAY_MS = RECOVERY_ACTIVATION_DELAY_MS + 1_000;
+const RECOVERY_VECTOR_PAGE_SIZE = 500;
+const MAX_RECOVERY_VECTOR_PAGES = 1_000;
 
 interface RecoveryRpc {
     adminRecoveryBookmark(args: { readonly atMs?: number }): Promise<{
@@ -22,6 +26,11 @@ interface RecoveryRpc {
     }): Promise<{ readonly targetBookmark: string }>;
     adminCancelRecoveryRestore(args: { readonly bookmark: string }): Promise<{ readonly cancelled: boolean }>;
     adminCommitRecoveryRestore(args: { readonly bookmark: string }): Promise<{ readonly scheduled: true }>;
+    adminRequeueRecoveryVectors(args: {
+        readonly afterCreatedSeq: number;
+        readonly limit: number;
+        readonly nowMs: number;
+    }): Promise<{ readonly processed: number; readonly afterCreatedSeq: number; readonly done: boolean }>;
 }
 
 interface CatalogRecoveryRpc extends RecoveryRpc {
@@ -73,8 +82,22 @@ export async function handleRecoveryAdminRequest(request: Request, env: ChardbEn
             const recoveryPoint = await parseRecoveryPoint(input.recoveryPoint);
             await restoreRecoveryPoint(env, recoveryPoint);
             return Response.json(
-                { ok: true, accepted: true, recoveryPointDigest: recoveryPoint.digest },
+                {
+                    ok: true,
+                    accepted: true,
+                    recoveryPointDigest: recoveryPoint.digest,
+                    reconcileAfterMs: RECOVERY_RECONCILE_DELAY_MS,
+                },
                 { status: 202, headers: { "cache-control": "no-store" } }
+            );
+        }
+        if (url.pathname === "/_chardb/backups/reconcile") {
+            const input = exactAdminObject(body, ["recoveryPoint"]);
+            const recoveryPoint = await parseRecoveryPoint(input.recoveryPoint);
+            const vectorsRequeued = await reconcileRecoveryPoint(env, recoveryPoint);
+            return Response.json(
+                { ok: true, reconciled: true, recoveryPointDigest: recoveryPoint.digest, vectorsRequeued },
+                { headers: { "cache-control": "no-store" } }
             );
         }
         return new Response("not found", { status: 404 });
@@ -134,7 +157,8 @@ async function createRecoveryPoint(env: ChardbEnv, atMs: number | undefined): Pr
 
 async function restoreRecoveryPoint(env: ChardbEnv, point: ChardbRecoveryPoint): Promise<void> {
     const catalog = catalogRpc(env);
-    await recoveryPhase("preflight", () => catalog.adminRecoveryInventory());
+    const inventory = await recoveryPhase("preflight", () => catalog.adminRecoveryInventory());
+    assertRecoveryTopology(inventory, point);
     const armedAt = Date.now();
     const armedShards: { readonly shardId: string; readonly bookmark: string }[] = [];
     let catalogArmed = false;
@@ -169,6 +193,63 @@ async function restoreRecoveryPoint(env: ChardbEnv, point: ChardbRecoveryPoint):
     await recoveryPhase("Catalog commit", () =>
         catalog.adminCommitRecoveryRestore({ bookmark: point.catalog.bookmark })
     );
+}
+
+async function reconcileRecoveryPoint(env: ChardbEnv, point: ChardbRecoveryPoint): Promise<number> {
+    const inventory = await recoveryPhase("reconcile preflight", () => catalogRpc(env).adminRecoveryInventory());
+    assertRecoveryTopology(inventory, point);
+    const nowMs = Date.now();
+    const totals = await mapWithConcurrency(point.shards, 4, async shard => {
+        const rpc = shardRpc(env, shard.shardId);
+        let afterCreatedSeq = 0;
+        let processed = 0;
+        for (let page = 0; page < MAX_RECOVERY_VECTOR_PAGES; page++) {
+            const result = await recoveryPhase("vector reconcile", () =>
+                rpc.adminRequeueRecoveryVectors({
+                    afterCreatedSeq,
+                    limit: RECOVERY_VECTOR_PAGE_SIZE,
+                    nowMs,
+                })
+            );
+            if (
+                !Number.isSafeInteger(result.processed) ||
+                result.processed < 0 ||
+                result.processed > RECOVERY_VECTOR_PAGE_SIZE ||
+                !Number.isSafeInteger(result.afterCreatedSeq) ||
+                result.afterCreatedSeq < afterCreatedSeq ||
+                typeof result.done !== "boolean" ||
+                (!result.done && result.afterCreatedSeq <= afterCreatedSeq)
+            ) {
+                throw new CdbError({ code: "CDB_INVARIANT", message: "vector recovery returned an invalid page" });
+            }
+            processed += result.processed;
+            afterCreatedSeq = result.afterCreatedSeq;
+            if (result.done) return processed;
+        }
+        throw new CdbError({ code: "CDB_RATE_LIMITED", message: "vector recovery exceeded its page bound" });
+    });
+    return totals.reduce((sum, value) => sum + value, 0);
+}
+
+function assertRecoveryTopology(
+    inventory: Awaited<ReturnType<CatalogRecoveryRpc["adminRecoveryInventory"]>>,
+    point: ChardbRecoveryPoint
+): void {
+    const shardIds = [...inventory.shardIds];
+    assertShardIds(shardIds);
+    if (
+        inventory.schema.status !== "active" ||
+        inventory.schema.activeVersion !== point.schema.version ||
+        inventory.schema.activeEpoch !== point.schema.epoch ||
+        inventory.schema.activeDigest !== point.schema.digest ||
+        inventory.routingEpoch !== point.routingEpoch ||
+        stableJson(shardIds) !== stableJson(point.shards.map(shard => shard.shardId))
+    ) {
+        throw new CdbError({
+            code: "CDB_STALE_EPOCH",
+            message: "current topology does not match the recovery point",
+        });
+    }
 }
 
 async function recoveryPhase<T>(phase: string, operation: () => Promise<T>): Promise<T> {

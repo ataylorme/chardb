@@ -11,6 +11,9 @@ import { fileURLToPath } from "node:url";
 
 const workerName = ${JSON.stringify(input.workerName)};
 const filesBucket = ${JSON.stringify(input.filesBucket)};
+const recoveryLifecycleRule = "chardb-recovery-retention";
+const recoveryPrefix = "_chardb/retained/";
+const recoveryDays = "31";
 const wranglerModule = fileURLToPath(import.meta.resolve("wrangler"));
 const chardbModule = join(dirname(fileURLToPath(import.meta.resolve(${JSON.stringify(input.packageName)}))), "cli", "bin.mjs");
 const wrangler = (...args) => [process.execPath, wranglerModule, ...args];
@@ -45,6 +48,12 @@ function detail(result) {
 
 export function isMissingBucket(result) {
   return result.exitCode !== 0 && /The specified bucket does not exist\\./i.test(result.stderr + "\\n" + result.stdout);
+}
+
+export function isMissingLifecycleRule(result) {
+  return result.exitCode !== 0 && (result.stderr + "\\n" + result.stdout).includes(
+    "Lifecycle rule with ID '" + recoveryLifecycleRule + "' not found in configuration",
+  );
 }
 
 function parseTomlString(line, key) {
@@ -123,6 +132,22 @@ async function probeBucket() {
   return { result, parsed };
 }
 
+async function configureRecoveryLifecycle() {
+  const removed = await command(wrangler(
+    "r2", "bucket", "lifecycle", "remove", filesBucket, "--name", recoveryLifecycleRule,
+  ), { capture: true });
+  if (removed.exitCode !== 0 && !isMissingLifecycleRule(removed)) {
+    throw new Error("could not inspect or replace the Chardb R2 recovery lifecycle: " + detail(removed));
+  }
+  const added = await command(wrangler(
+    "r2", "bucket", "lifecycle", "add", filesBucket, recoveryLifecycleRule, recoveryPrefix,
+    "--expire-days", recoveryDays, "--force",
+  ), { capture: true });
+  if (added.exitCode !== 0) {
+    throw new Error("could not configure the Chardb R2 recovery lifecycle: " + detail(added));
+  }
+}
+
 async function main() {
   for (const path of [wranglerModule, chardbModule]) {
     if (!(await Bun.file(path).exists())) throw new Error("missing local dependencies; run bun install first");
@@ -132,19 +157,29 @@ async function main() {
   await requireCurrentConfig();
 
   const before = await probeBucket();
-  if (before.parsed) {
-    console.log("Cloudflare R2 bucket " + filesBucket + " already exists for " + workerName);
-    return;
+  let createdBucket = false;
+  if (!before.parsed) {
+    if (!isMissingBucket(before.result)) {
+      throw new Error("could not inspect R2 bucket " + filesBucket + ": " + detail(before.result));
+    }
+    const created = await command(wrangler("r2", "bucket", "create", filesBucket));
+    if (created.exitCode !== 0) throw new Error("could not create R2 bucket " + filesBucket);
+    createdBucket = true;
+    const after = await probeBucket();
+    if (!after.parsed) throw new Error("R2 bucket " + filesBucket + " was not visible after creation");
   }
-  if (!isMissingBucket(before.result)) {
-    throw new Error("could not inspect R2 bucket " + filesBucket + ": " + detail(before.result));
+  try {
+    await configureRecoveryLifecycle();
+  } catch (error) {
+    if (createdBucket) {
+      const rollback = await command(wrangler("r2", "bucket", "delete", filesBucket), { capture: true });
+      if (rollback.exitCode !== 0) {
+        throw new AggregateError([error, new Error("could not roll back the new R2 bucket: " + detail(rollback))]);
+      }
+    }
+    throw error;
   }
-
-  const created = await command(wrangler("r2", "bucket", "create", filesBucket));
-  if (created.exitCode !== 0) throw new Error("could not create R2 bucket " + filesBucket);
-  const after = await probeBucket();
-  if (!after.parsed) throw new Error("R2 bucket " + filesBucket + " was not visible after creation");
-  console.log("Cloudflare R2 bucket " + filesBucket + " is ready for " + workerName);
+  console.log("Cloudflare R2 bucket " + filesBucket + " and its recovery lifecycle are ready for " + workerName);
 }
 
 if (import.meta.main) await main();

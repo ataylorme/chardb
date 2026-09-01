@@ -194,7 +194,12 @@ import {
     type SplitOpLogBatch,
     initializeSplitOpLogAccounting,
 } from "./cdb-split-oplog-store.ts";
-import { DurableObjectRecovery, abortForArmedRecoveryRestore, initializeRecoveryStorage } from "./recovery.ts";
+import {
+    DurableObjectRecovery,
+    abortForArmedRecoveryRestore,
+    assertRecoveryAvailable,
+    initializeRecoveryStorage,
+} from "./recovery.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
 export interface CdbEnv {
@@ -1878,6 +1883,42 @@ export class Cdb extends DurableObject<CdbEnv> {
     async adminCommitRecoveryRestore(args: { readonly bookmark: string }) {
         try {
             return await this.recovery.commit(args.bookmark);
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    async adminRequeueRecoveryVectors(args: {
+        readonly afterCreatedSeq: number;
+        readonly limit: number;
+        readonly nowMs: number;
+    }) {
+        try {
+            let result: ReturnType<CdbVectorOutboxStore["requeueRecoveryPage"]> | undefined;
+            this.ctx.storage.transactionSync(() => {
+                const sql = adaptSqlStorage(this.ctx.storage.sql);
+                assertRecoveryAvailable(sql);
+                const schema = this.schemaMigrations.state(sql);
+                if (schema.status !== "active") {
+                    throw new CdbError({
+                        code: "CDB_STALE_EPOCH",
+                        message: "vector recovery requires an active schema",
+                    });
+                }
+                if (this.vectorResources().length === 0) {
+                    result = Object.freeze({
+                        processed: 0,
+                        afterCreatedSeq: args.afterCreatedSeq,
+                        done: true,
+                    });
+                    return;
+                }
+                result = new CdbVectorOutboxStore(sql).requeueRecoveryPage(args);
+            });
+            if (!result)
+                throw new CdbError({ code: "CDB_INVARIANT", message: "vector recovery page was not recorded" });
+            if (result.processed > 0) await this.scheduleAlarmNoLaterThan(args.nowMs + 1);
+            return result;
         } catch (error) {
             throwCdbRpcError(error);
         }
