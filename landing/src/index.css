@@ -81,14 +81,6 @@ body {
     -webkit-backdrop-filter: saturate(140%) blur(8px);
 }
 
-.pullquote {
-    font-size: clamp(1.25rem, 2.2vw, 1.75rem);
-    line-height: 1.45;
-    color: #ededed;
-    border-left: 1px solid #ec5713;
-    padding-left: 1rem;
-}
-
 @media (prefers-reduced-motion: no-preference) {
     .shard-pulse {
         animation: shardPulse 4s ease-in-out infinite;
@@ -133,6 +125,76 @@ body {
     background: rgba(236, 87, 19, 0.12);
 }
 
+.sdk-grid {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 0.55rem;
+}
+
+.sdk-chip {
+    display: grid;
+    grid-template-columns: 36px 1fr;
+    grid-template-rows: auto auto;
+    column-gap: 0.65rem;
+    min-width: 0;
+    padding: 0.75rem;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 12px;
+    background: linear-gradient(145deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0.005));
+    color: #8d8d8d;
+}
+
+.sdk-chip.is-available {
+    border-color: rgba(236, 87, 19, 0.24);
+    background: linear-gradient(145deg, rgba(236, 87, 19, 0.12), rgba(236, 87, 19, 0.025));
+    color: #ededed;
+}
+
+.sdk-icon-shell {
+    grid-row: 1 / span 2;
+    display: grid;
+    width: 36px;
+    height: 36px;
+    place-items: center;
+    align-self: center;
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.045);
+}
+
+.sdk-icon-shell img {
+    width: 23px;
+    height: 23px;
+    object-fit: contain;
+    filter: saturate(0.15);
+    opacity: 0.42;
+}
+
+.sdk-chip.is-available .sdk-icon-shell img {
+    filter: none;
+    opacity: 1;
+}
+
+.sdk-name {
+    align-self: end;
+    overflow: hidden;
+    font-size: 0.78rem;
+    font-weight: 500;
+    text-overflow: ellipsis;
+}
+
+.sdk-status {
+    align-self: start;
+    color: #666666;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 0.55rem;
+    letter-spacing: 0.02em;
+}
+
+.sdk-chip.is-available .sdk-status {
+    color: #f07b46;
+}
+
 .worker-lockup {
     position: relative;
     display: flex;
@@ -163,6 +225,18 @@ body {
 
 .worker-cloudflare {
     color: #ffb162;
+}
+
+@media (max-width: 900px) {
+    .sdk-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 520px) {
+    .sdk-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
 }
 
 .toast {

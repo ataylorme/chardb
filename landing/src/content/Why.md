@@ -1,4 +1,4 @@
-# Why I built Chardb.
+# Why I built CharDB.
 
 I want to share the inspiration for why I built this and what I think it could become.
 
@@ -16,7 +16,7 @@ Realistically, you have to use Hyperdrive to bring in a Postgres or MySQL databa
 
 ## Why not use auth to shard organization data?
 
-I came up with the idea to combine my auth with my need for a scalable database and use organization identity as the stable placement key. One organization operation still belongs to one physical Cdb transaction. Range movement can redistribute organizations between Cdbs without changing application keys, but it does not split one organization's rows across several Cdbs today.
+I came up with the idea to combine my auth with my need for a scalable database and use organization identity as the stable placement key. One organization operation still belongs to one physical SQLite transaction. Range movement can redistribute organizations between SQLite shards without changing application keys, but it does not split one organization's rows across several shards today.
 
 Because we're built on Durable Objects and SQLite, you can run real queries and get live updates through the same organization route. Durable Objects already provide the SQLite transaction and WebSocket primitives that path needs.
 
@@ -24,18 +24,16 @@ Because we're built on Durable Objects and SQLite, you can run real queries and 
 
 I think the next big enabler is that Better Auth Cloudflare has already mastered how to map a user and their database records to files stored in R2. I've always dreamed of a database that had files as a first-class object, as a column data type.
 
-It has always been a pain to store a key and then have to look up the file somewhere else. Can't I just get it from the database? Can't the database route that for me? Chardb treats organization-owned files and vectors as first-class schema values. The row keeps an opaque identity while the database handles policy, delivery, and cleanup. It's 2026. These should feel native.
+It has always been a pain to store a key and then have to look up the file somewhere else. Can't I just get it from the database? Can't the database route that for me? CharDB treats organization-owned files and vectors as first-class schema values. The row keeps an opaque identity while the database handles policy, delivery, and cleanup. It's 2026. These should feel native.
 
 ## It has to feel native
 
-The idea is a database that can add physical Cdbs behind stable organization routing. The only remaining question is how to host it. Chardb lives as an extension of Wrangler, Drizzle, and Miniflare, so you can use it within an existing Cloudflare project and test it locally with Miniflare.
+The idea is a database that can add physical SQLite shards behind stable organization routing. The only remaining question is how to host it. CharDB lives as an extension of Wrangler, Drizzle, and Miniflare, so you can use it within an existing Cloudflare project and test it locally with Miniflare.
 
 I'm especially proud of how it extends the Drizzle migration experience. That was a key requirement for me. When you grow something big, already have users, and need to make changes, you need something you can rely on. For me, that has always been Drizzle. `chardb migrations generate` now inspects the application's Drizzle and Better Auth definitions twice in fresh processes. It writes an immutable initial snapshot and conservative sequential additive migrations without a second hand-maintained schema. The runner resumes interrupted work, fences old code, and publishes the new epoch only after every shard finishes.
 
-This is an experimental database, but the developer experience is something I've always dreamed of, and the initial performance measurements are promising. The package is built to run the same way through Wrangler, local Workerd, and real Cloudflare services. I think this could be something special with community contributions.
-
-> this is an experimental database, but the developer experience is something I've always dreamed of.
+The developer experience is something I've always dreamed of, and the initial performance measurements are promising. The package is built to run the same way through Wrangler, local Workerd, and real Cloudflare services. I think this could be something special with community contributions.
 
 ## P.S. Cloudflare
 
-If you would just release an auto-scaling database that's as amazing as the rest of your pricing, I would end this now, delete this repo, and you would never hear from me about this again.
+If you would just release a scalable database that's as amazing as the rest of your pricing, I would just end this now and delete this repo, and you would never hear from me about this again.

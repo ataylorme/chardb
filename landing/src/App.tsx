@@ -1,6 +1,7 @@
 import { Footer } from "./components/Footer";
 import { Hero } from "./components/Hero";
 import { ProductOverview } from "./components/ProductOverview";
+import { SdkStrip } from "./components/SdkStrip";
 import { TopNav } from "./components/TopNav";
 
 export function App() {
@@ -17,6 +18,7 @@ export function App() {
 
             <main id="main">
                 <Hero />
+                <SdkStrip />
                 <ProductOverview />
             </main>
 

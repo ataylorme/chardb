@@ -1,11 +1,7 @@
 import type { ReactNode } from "react";
 import whyMarkdown from "../../content/Why.md?raw";
-import { PullQuote } from "../Section";
 
-type MarkdownBlock =
-    | { kind: "heading"; level: 1 | 2; text: string }
-    | { kind: "paragraph"; text: string }
-    | { kind: "quote"; text: string };
+type MarkdownBlock = { kind: "heading"; level: 1 | 2; text: string } | { kind: "paragraph"; text: string };
 
 function parseMarkdown(source: string): MarkdownBlock[] {
     return source
@@ -15,7 +11,6 @@ function parseMarkdown(source: string): MarkdownBlock[] {
         .map(block => {
             if (block.startsWith("## ")) return { kind: "heading", level: 2, text: block.slice(3) } as const;
             if (block.startsWith("# ")) return { kind: "heading", level: 1, text: block.slice(2) } as const;
-            if (block.startsWith("> ")) return { kind: "quote", text: block.slice(2) } as const;
             return { kind: "paragraph", text: block } as const;
         });
 }
@@ -59,13 +54,9 @@ const blocks = parseMarkdown(whyMarkdown);
 const title = blocks.find(block => block.kind === "heading" && block.level === 1)?.text ?? "Why I built CharDB";
 const intro = blocks.find(block => block.kind === "paragraph")?.text ?? "";
 const articleBlocks = blocks.slice(blocks.findIndex(block => block.kind === "heading" && block.level === 2));
-const quote = articleBlocks.find(block => block.kind === "quote");
 const postscriptIndex = articleBlocks.findIndex(block => block.kind === "heading" && block.text === "P.S. Cloudflare");
 const postscript = articleBlocks.slice(postscriptIndex + 1).find(block => block.kind === "paragraph");
-const storyBlocks = articleBlocks.slice(
-    0,
-    articleBlocks.findIndex(block => block.kind === "quote")
-);
+const storyBlocks = articleBlocks.slice(0, postscriptIndex);
 const stories = storyBlocks.reduce<Array<{ title: string; paragraphs: string[] }>>((sections, block) => {
     if (block.kind === "heading") {
         sections.push({ title: block.text, paragraphs: [] });
@@ -99,7 +90,7 @@ export function Why() {
                                 className="border-t border-line pt-8 first:border-t-0 first:pt-0"
                                 key={story.title}
                             >
-                                <h3 className="text-xl font-semibold tracking-tight text-fg">{story.title}</h3>
+                                <h2 className="text-xl font-semibold tracking-tight text-fg">{story.title}</h2>
                                 <div className="mt-4 space-y-4 leading-7 text-fg-muted">
                                     {story.paragraphs.map(paragraph => (
                                         <p key={paragraph}>{renderInline(paragraph)}</p>
@@ -108,12 +99,10 @@ export function Why() {
                             </section>
                         ))}
 
-                        {quote?.kind === "quote" ? <PullQuote>{quote.text}</PullQuote> : null}
-
                         <aside className="border-t border-accent/50 pt-8" aria-labelledby="cloudflare-postscript">
-                            <h3 id="cloudflare-postscript" className="font-mono text-sm tracking-tight text-accent">
+                            <h2 id="cloudflare-postscript" className="font-mono text-sm tracking-tight text-accent">
                                 P.S. Cloudflare
-                            </h3>
+                            </h2>
                             {postscript?.kind === "paragraph" ? (
                                 <p className="mt-4 text-xl leading-8 tracking-tight text-fg sm:text-2xl sm:leading-9">
                                     {renderInline(postscript.text)}

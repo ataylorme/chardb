@@ -44,7 +44,7 @@ Your application computes the embedding values. This release does not call an em
 
 ```ts src/api.ts
 export const putMessage = api.mutation({
-  ref: "src/api.ts#putMessage",
+  ref: "messages#put",
   authority: "organization",
   partitionKey: "organizationId",
   args: z.object({
@@ -70,7 +70,7 @@ Keep `ctx.vector.delete()` and the row deletion in the same mutation.
 
 ```ts src/queries.ts
 export const searchMessages = api.query({
-  ref: "src/queries.ts#searchMessages",
+  ref: "messages#search",
   args: z.object({
     organizationId: z.string(),
     values: z.array(z.number()).length(768),
