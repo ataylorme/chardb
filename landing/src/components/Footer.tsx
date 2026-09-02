@@ -12,7 +12,7 @@ export function Footer() {
                     GitHub
                 </a>
                 <span aria-hidden="true">·</span>
-                <span>infrastructure billed by Cloudflare · no Chardb service fee</span>
+                <span>infrastructure billed by Cloudflare · no CharDB service fee</span>
             </div>
         </footer>
     );

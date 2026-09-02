@@ -4,48 +4,26 @@ import { GITHUB_URL } from "../lib/constants";
 function DatabaseSnippet() {
     return (
         <code>
-            <span className="syntax-comment">{"// Better Auth config"}</span>
-            {"\n"}
-            <span className="syntax-keyword">export const</span> <span className="syntax-variable">auth</span> {"= "}
-            <span className="syntax-function">defineAuth</span>
+            <span className="syntax-keyword">const</span> <span className="syntax-variable">app</span> {"= "}
+            <span className="syntax-function">chardb</span>
             <span className="syntax-punctuation">({"{"}</span>
             {"\n  "}
-            <span className="syntax-property">plugins</span>: [<span className="syntax-function">anonymous</span>(),{" "}
-            <span className="syntax-function">organization</span>(), <span className="syntax-function">jwt</span>()],
-            {"\n"}
+            <span className="syntax-property">ownership</span>: <span className="syntax-string">"organization"</span>,
+            {"\n  "}
+            <span className="syntax-property">auth</span>, <span className="syntax-property">schema</span>,{" "}
+            <span className="syntax-property">api</span>, <span className="syntax-property">migrations</span>,{"\n"}
             <span className="syntax-punctuation">{"});"}</span>
             {"\n\n"}
-            <span className="syntax-comment">{"// Drizzle + Better Auth ownership"}</span>
+            <span className="syntax-keyword">export default</span> <span className="syntax-variable">app</span>
+            <span className="syntax-punctuation">;</span>
             {"\n"}
-            <span className="syntax-keyword">const</span> {"{ "}
-            <span className="syntax-variable">cdbTable</span>
+            <span className="syntax-keyword">export const</span> {"{ "}
+            <span className="syntax-variable">DB</span>, <span className="syntax-variable">Catalog</span>,{" "}
+            <span className="syntax-variable">Cdb</span>, <span className="syntax-variable">Gateway</span>,{" "}
+            <span className="syntax-variable">Resharder</span>
             {" } = "}
-            <span className="syntax-function">forOrg</span>
-            <span className="syntax-punctuation">(auth);</span>
-            {"\n\n"}
-            <span className="syntax-keyword">export const</span> <span className="syntax-variable">messages</span>{" "}
-            {"= "}
-            <span className="syntax-function">cdbTable</span>
-            <span className="syntax-punctuation">(</span>
-            <span className="syntax-string">"messages"</span>
-            <span className="syntax-punctuation">, {"{"}</span>
-            {"\n  "}
-            <span className="syntax-property">id</span>: <span className="syntax-function">text</span>(
-            <span className="syntax-string">"id"</span>).<span className="syntax-function">primaryKey</span>(),
-            {"\n  "}
-            <span className="syntax-property">body</span>: <span className="syntax-function">text</span>(
-            <span className="syntax-string">"body"</span>).<span className="syntax-function">notNull</span>(),
-            {"\n"}
-            <span className="syntax-punctuation">{"});"}</span>
-            {"\n\n"}
-            <span className="syntax-keyword">export default</span> <span className="syntax-function">chardb</span>
-            <span className="syntax-punctuation">({"{"}</span>
-            {"\n  "}
-            <span className="syntax-property">auth</span>, <span className="syntax-property">schema</span>: {"{ "}
-            <span className="syntax-variable">messages</span>
-            {" },"}
-            {"\n"}
-            <span className="syntax-punctuation">{"});"}</span>
+            <span className="syntax-variable">app</span>
+            <span className="syntax-punctuation">;</span>
         </code>
     );
 }
@@ -59,19 +37,12 @@ function ReactClientSnippet() {
             <span className="syntax-keyword">from</span> <span className="syntax-string">"@chardb/react"</span>
             <span className="syntax-punctuation">;</span>
             {"\n\n"}
-            <span className="syntax-keyword">const</span> <span className="syntax-variable">url</span> {"= "}
-            <span className="syntax-variable">import</span>.<span className="syntax-property">meta</span>.
-            <span className="syntax-property">env</span>.<span className="syntax-property">VITE_CHARD_DB_URL</span>
-            {" ?? "}
-            <span className="syntax-variable">window</span>.<span className="syntax-property">location</span>.
-            <span className="syntax-property">origin</span>
-            <span className="syntax-punctuation">;</span>
-            {"\n\n"}
             <span className="syntax-keyword">export const</span> <span className="syntax-variable">db</span> {"= "}
             <span className="syntax-function">createChardbReactClient</span>
             <span className="syntax-punctuation">({"{"}</span>
             {"\n  "}
-            <span className="syntax-property">url</span>,{"\n  "}
+            <span className="syntax-property">url</span>: <span className="syntax-variable">window</span>.
+            <span className="syntax-property">location</span>.<span className="syntax-property">origin</span>,{"\n  "}
             <span className="syntax-property">ownership</span>: <span className="syntax-string">"organization"</span>,
             {"\n  "}
             <span className="syntax-property">auth</span>: ({"{ "}
@@ -163,7 +134,7 @@ function RustClientSnippet() {
             <span className="syntax-variable">messages</span>.<span className="syntax-function">recv</span>().
             <span className="syntax-keyword">await</span>?;
             {"\n  "}
-            <span className="syntax-keyword">if</span> <span className="syntax-function">matches!</span>(
+            <span className="syntax-keyword">if</span> <span className="syntax-function">matches!</span>( &amp;
             <span className="syntax-variable">event</span>, <span className="syntax-type">SubscriptionEvent</span>::
             <span className="syntax-property">Closed</span>) {"{ break; }"}
             {"\n  "}
@@ -175,12 +146,8 @@ function RustClientSnippet() {
 }
 
 const clientSdks = [
-    { name: "React", icon: "/brands/react.svg", fileIcon: "/brands/file-react-ts.svg", available: true },
-    { name: "Rust", icon: "/brands/rust.svg", fileIcon: "/brands/file-rust.svg", available: true },
-    { name: "Python", icon: "/brands/python.svg", fileIcon: "/brands/python.svg", available: false },
-    { name: "Swift", icon: "/brands/swift.svg", fileIcon: "/brands/swift.svg", available: false },
-    { name: "Flutter", icon: "/brands/flutter.svg", fileIcon: "/brands/flutter.svg", available: false },
-    { name: "Expo", icon: "/brands/expo.svg", fileIcon: "/brands/expo.svg", available: false },
+    { name: "React", icon: "/brands/react.svg", fileIcon: "/brands/file-react-ts.svg" },
+    { name: "Rust", icon: "/brands/rust.svg", fileIcon: "/brands/file-rust.svg" },
 ] as const;
 type ClientSdk = (typeof clientSdks)[number]["name"];
 
@@ -208,7 +175,7 @@ export function ProductOverview() {
 
     return (
         <>
-            <section id="files" className="border-y border-line bg-ink-900/50">
+            <section id="worker-client" className="border-y border-line bg-ink-900/50">
                 <div className="mx-auto max-w-page px-5 py-20 sm:px-8 sm:py-28">
                     <div className="max-w-2xl">
                         <p className="eyebrow">Worker → client</p>
@@ -216,7 +183,7 @@ export function ProductOverview() {
                             Set up your Worker. Use it like an app SDK.
                         </h2>
                         <p className="mt-5 text-base leading-7 text-fg-muted">
-                            Pick organization or user ownership once. Chardb carries the successful Better Auth identity
+                            Pick organization or user ownership once. CharDB carries the successful Better Auth identity
                             through routing, policy, typed handles, and every client query.
                         </p>
                     </div>
@@ -234,7 +201,7 @@ export function ProductOverview() {
                                     width="18"
                                     height="18"
                                 />
-                                <code>src/database.ts</code>
+                                <code>src/worker.ts</code>
                                 <span className="code-surface">Worker</span>
                             </header>
                             <pre>
@@ -273,7 +240,6 @@ export function ProductOverview() {
                                             type="button"
                                             role="tab"
                                             aria-selected={clientSdk === sdk.name}
-                                            disabled={!sdk.available}
                                             onClick={() => setClientSdk(sdk.name)}
                                             key={sdk.name}
                                         >
@@ -285,7 +251,6 @@ export function ProductOverview() {
                                                 height="14"
                                             />
                                             {sdk.name}
-                                            {!sdk.available ? <span>soon</span> : null}
                                         </button>
                                     );
                                 })}
@@ -313,7 +278,7 @@ export function ProductOverview() {
                     </p>
                     <div className="flex items-center gap-5 text-sm">
                         <a href="/why/" className="text-fg hover:text-accent transition-colors">
-                            Why Chardb
+                            Why CharDB
                         </a>
                         <a href={GITHUB_URL} rel="noopener" className="text-fg hover:text-accent transition-colors">
                             GitHub

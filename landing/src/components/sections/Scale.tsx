@@ -10,7 +10,7 @@ export function Scale() {
                     </p>
                     <SectionHeading>Scale should not become an app migration.</SectionHeading>
                     <SectionLead>
-                        Application code keeps addressing an organization while Chardb moves physical ranges underneath
+                        Application code keeps addressing an organization while CharDB moves physical ranges underneath
                         it. The range protocol copies rows, file ownership, and vector state, converges its tail, cuts
                         over, and drains the source without changing application keys.
                     </SectionLead>

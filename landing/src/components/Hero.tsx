@@ -21,30 +21,33 @@ export function Hero() {
                             </span>
                         </span>
                     </h1>
+                    <span className="mt-5 inline-flex rounded-full border border-accent/35 bg-accent/10 px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-accent">
+                        Experimental
+                    </span>
                     <p
                         className="mt-6 text-fg-muted max-w-2xl"
                         style={{ fontSize: "clamp(16px, 1.4vw, 18px)", lineHeight: 1.6 }}
                     >
-                        Organization-sharded SQL, live queries, files, and vectors. One Drizzle schema. One Cloudflare
+                        Organization-sharded SQL, live queries, files, and vectors. One Drizzle schema. One app-facing
                         Worker binding.
                     </p>
 
-                    <div className="mt-8 max-w-full overflow-x-auto pb-2">
+                    <div className="mt-8 max-w-full pb-2">
                         <CopyPill />
                     </div>
 
                     <div className="mt-6 flex flex-col sm:flex-row sm:items-center gap-4">
                         <a
-                            href="/why/"
-                            className="inline-flex items-center gap-1 text-sm text-fg hover:text-accent transition-colors"
+                            href="/docs/quickstart"
+                            className="inline-flex items-center gap-1 text-sm text-fg transition-colors hover:text-accent"
                         >
-                            Why I built Chardb <span aria-hidden="true">→</span>
+                            Read the quickstart <span aria-hidden="true">→</span>
                         </a>
                         <a
-                            href="#files"
-                            className="inline-flex items-center gap-1 text-sm text-fg-muted hover:text-fg transition-colors"
+                            href="#worker-client"
+                            className="inline-flex items-center gap-1 text-sm text-fg-muted transition-colors hover:text-fg"
                         >
-                            See the project <span aria-hidden="true">→</span>
+                            See Worker to client <span aria-hidden="true">→</span>
                         </a>
                     </div>
 

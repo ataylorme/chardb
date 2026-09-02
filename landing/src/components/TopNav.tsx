@@ -18,7 +18,7 @@ export function TopNav({ homeHref = "#top", storyActive = false }: TopNavProps) 
                 </a>
 
                 <nav aria-label="Primary" className="flex items-center gap-5">
-                    <ul className="hidden sm:flex items-center gap-5 text-sm text-fg-muted">
+                    <ul className="flex items-center gap-4 text-xs text-fg-muted sm:gap-5 sm:text-sm">
                         <li>
                             <a
                                 href="/why/"

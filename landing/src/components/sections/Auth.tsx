@@ -9,7 +9,7 @@ export function Auth() {
             <SectionLead>
                 Better Auth identities, tenant membership, roles, row rules, and column masks belong in the same typed
                 model as application data. Better Auth owns sign-in, sessions, organizations, membership, and JWTs;
-                Chardb uses that authority to route and enforce every organization operation.
+                CharDB uses that authority to route and enforce every organization operation.
             </SectionLead>
 
             <BulletList
@@ -52,26 +52,6 @@ export function Auth() {
                     <P>.</P>
                     <Fn>references</Fn>
                     <P>(()</P> <Kw>{"=>"}</Kw> <Id>channels</Id>
-                    <P>.</P>
-                    <Id>id</Id>
-                    <P>,</P> <P>{"{"}</P> <Id>onDelete</Id>
-                    <P>:</P> <Str>"cascade"</Str> <P>{"}"}),</P>
-                    {"\n        "}
-                    <Id>organizationId</Id>
-                    <P>:</P> <Fn>text</Fn>
-                    <P>(</P>
-                    <Str>"organization_id"</Str>
-                    <P>)</P>
-                    {"\n            "}
-                    <P>.</P>
-                    <Fn>notNull</Fn>
-                    <P>()</P>
-                    {"\n            "}
-                    <P>.</P>
-                    <Fn>references</Fn>
-                    <P>(()</P> <Kw>{"=>"}</Kw> <Id>auth</Id>
-                    <P>.</P>
-                    <Id>organization</Id>
                     <P>.</P>
                     <Id>id</Id>
                     <P>,</P> <P>{"{"}</P> <Id>onDelete</Id>

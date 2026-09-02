@@ -22,12 +22,6 @@ export function Today() {
                 ]}
             />
 
-            <p className="mt-8 max-w-2xl text-sm text-fg-muted">
-                Chardb is experimental software. The first public query path is full-row, single-table, exact-partition,
-                and capped at 100 rows. Backup, restore, automatic balancing, and cross-partition transactions are not
-                part of this release.
-            </p>
-
             <PullQuote>one model from sign-in to live data.</PullQuote>
         </Section>
     );
