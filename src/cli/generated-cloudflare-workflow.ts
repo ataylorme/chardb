@@ -5,6 +5,8 @@ export interface GeneratedCloudflareWorkflowInput {
     readonly deploymentId: string;
 }
 
+export const GENERATED_WRANGLER_VERSION = "4.125.0";
+
 const DEPLOYMENT_ID = /^chardb\.app\.v1\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function requireDeploymentId(input: GeneratedCloudflareWorkflowInput): void {
@@ -267,7 +269,7 @@ if (import.meta.main) await main();
 /** Render the resumable bootstrap and routine deployment driver used by generated projects. */
 export function renderCloudflareDeployScript(input: GeneratedCloudflareWorkflowInput): string {
     requireDeploymentId(input);
-    return `import { mkdtemp, open, rm } from "node:fs/promises";
+    return `import { mkdir, mkdtemp, open, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -275,17 +277,23 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const workerName = ${JSON.stringify(input.workerName)};
 const filesBucket = ${JSON.stringify(input.filesBucket)};
 const deploymentId = ${JSON.stringify(input.deploymentId)};
+const pinnedWranglerVersion = ${JSON.stringify(GENERATED_WRANGLER_VERSION)};
 const wranglerModule = fileURLToPath(import.meta.resolve("wrangler"));
+const wranglerPackage = fileURLToPath(import.meta.resolve("wrangler/package.json"));
 const chardbModule = join(dirname(fileURLToPath(import.meta.resolve(${JSON.stringify(input.packageName)}))), "cli", "bin.mjs");
 const wrangler = (...args) => [process.execPath, wranglerModule, ...args];
 const chardb = (...args) => [process.execPath, chardbModule, ...args];
 const bootstrap = process.argv.slice(2).includes("--bootstrap");
+const deploymentDirectory = join(process.cwd(), ".wrangler");
+const deploymentCachePath = join(deploymentDirectory, "chardb-deployment.json");
+const wranglerOutputPath = join(deploymentDirectory, "chardb-deploy-output.jsonl");
 
 function childEnvironment(extra = {}) {
   const env = { ...process.env };
   delete env.CHARDB_URL;
   delete env.CHARDB_ADMIN_TOKEN;
   delete env.BETTER_AUTH_SECRET;
+  delete env.WRANGLER_OUTPUT_FILE_PATH;
   return { ...env, ...extra };
 }
 
@@ -329,6 +337,155 @@ export function validateChardbUrl(raw) {
     throw new Error("CHARDB_URL must be an HTTPS origin without credentials, a path, a query, or a fragment");
   }
   return url.origin;
+}
+
+function exactKeys(value, expected) {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+function plainRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) &&
+    (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+
+export function validateWranglerPackage(value) {
+  if (!plainRecord(value) || !exactKeys(value, ["version"]) || value.version !== pinnedWranglerVersion) {
+    throw new Error("generated deployment requires Wrangler " + pinnedWranglerVersion);
+  }
+  return value.version;
+}
+
+async function requirePinnedWrangler() {
+  let parsed;
+  try {
+    parsed = JSON.parse(await Bun.file(wranglerPackage).text());
+  } catch {
+    throw new Error("could not read the installed Wrangler package version");
+  }
+  return validateWranglerPackage({ version: parsed?.version });
+}
+
+function validateDeployRecord(value) {
+  const keys = [
+    "timestamp", "type", "version", "version_id", "worker_name", "worker_name_overridden", "worker_tag", "targets",
+  ];
+  if (!plainRecord(value) || !exactKeys(value, keys)) {
+    throw new Error("Wrangler deployment output does not match the pinned deploy-v1 schema");
+  }
+  if (
+    value.type !== "deploy" || value.version !== 1 || value.worker_name !== workerName ||
+    value.worker_name_overridden !== false ||
+    (value.worker_tag !== null && (typeof value.worker_tag !== "string" || !value.worker_tag)) ||
+    typeof value.version_id !== "string" || !value.version_id ||
+    typeof value.timestamp !== "string" || !/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$/.test(value.timestamp) ||
+    !Number.isFinite(Date.parse(value.timestamp)) ||
+    !Array.isArray(value.targets) || value.targets.length > 64 ||
+    value.targets.some(target => typeof target !== "string" || !target || target.length > 2_048) ||
+    new Set(value.targets).size !== value.targets.length
+  ) {
+    throw new Error("Wrangler deployment output contains an invalid deploy-v1 record");
+  }
+  return value;
+}
+
+function workersDevOrigin(target) {
+  let origin;
+  try {
+    origin = validateChardbUrl(target);
+  } catch {
+    return null;
+  }
+  const hostname = new URL(origin).hostname.toLowerCase();
+  if (!hostname.endsWith(".workers.dev") || !hostname.startsWith(workerName.toLowerCase() + ".")) return null;
+  return origin;
+}
+
+export function originFromWranglerOutput(raw) {
+  const lines = raw.split(/\\r?\\n/).filter(line => line.trim().length > 0);
+  if (lines.length !== 1) {
+    throw new Error("Wrangler deployment output must contain exactly one deploy-v1 record");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(lines[0]);
+  } catch {
+    throw new Error("Wrangler deployment output is not valid JSON");
+  }
+  const record = validateDeployRecord(parsed);
+  const candidates = record.targets.map(workersDevOrigin).filter(Boolean);
+  if (candidates.length !== 1) {
+    throw new Error(
+      "Wrangler deployed the Worker without one unambiguous workers.dev URL. " +
+      "Set CHARDB_URL=https://your-worker.example.com in .env.local, then rerun bun run deploy:bootstrap.",
+    );
+  }
+  return candidates[0];
+}
+
+export function validateDeploymentCache(value) {
+  const keys = ["deploymentId", "format", "origin", "workerName", "wranglerVersion"];
+  if (
+    !plainRecord(value) || !exactKeys(value, keys) || value.format !== "chardb.deployment.v1" ||
+    value.deploymentId !== deploymentId || value.workerName !== workerName ||
+    value.wranglerVersion !== pinnedWranglerVersion || typeof value.origin !== "string"
+  ) {
+    throw new Error("the cached CharDB deployment identity does not match this generated project");
+  }
+  return validateChardbUrl(value.origin);
+}
+
+async function readJsonFile(path, label) {
+  if (!(await Bun.file(path).exists())) return null;
+  try {
+    return JSON.parse(await Bun.file(path).text());
+  } catch {
+    throw new Error(label + " is not valid JSON");
+  }
+}
+
+export async function cacheDeploymentOrigin(origin, path = deploymentCachePath) {
+  const normalized = validateChardbUrl(origin);
+  const value = {
+    format: "chardb.deployment.v1",
+    deploymentId,
+    workerName,
+    wranglerVersion: pinnedWranglerVersion,
+    origin: normalized,
+  };
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = path + "." + crypto.randomUUID() + ".tmp";
+  try {
+    const file = await open(temporary, "wx", 0o600);
+    try {
+      await file.writeFile(JSON.stringify(value) + "\\n");
+    } finally {
+      await file.close();
+    }
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+  return value;
+}
+
+export async function existingDeploymentOrigin(
+  rawExplicit,
+  { cachePath = deploymentCachePath, outputPath = wranglerOutputPath } = {},
+) {
+  if (rawExplicit) return validateChardbUrl(rawExplicit);
+  const cached = await readJsonFile(cachePath, "the cached CharDB deployment identity");
+  if (cached) return validateDeploymentCache(cached);
+  if (await Bun.file(outputPath).exists()) {
+    const recovered = originFromWranglerOutput(await Bun.file(outputPath).text());
+    await cacheDeploymentOrigin(recovered, cachePath);
+    return recovered;
+  }
+  throw new Error(
+    "Worker exists but no public origin is cached. " +
+    "Set CHARDB_URL=https://your-worker.example.com in .env.local, then rerun bun run deploy:bootstrap.",
+  );
 }
 
 export function migrationIdentity(journal) {
@@ -580,9 +737,15 @@ async function deployBootstrap() {
   if (!authSecret || new TextEncoder().encode(authSecret).byteLength < 32) {
     throw new Error("BETTER_AUTH_SECRET must contain at least 32 UTF-8 bytes for bootstrap");
   }
+  await mkdir(deploymentDirectory, { recursive: true });
+  await rm(wranglerOutputPath, { force: true });
+  const output = await open(wranglerOutputPath, "wx", 0o600);
+  await output.close();
   const secretFile = await createSecretFile({ CDB_ADMIN_TOKEN: adminToken, BETTER_AUTH_SECRET: authSecret });
   try {
-    await mustRun(wrangler("deploy", "--strict", "--secrets-file", secretFile.path));
+    await mustRun(wrangler("deploy", "--strict", "--secrets-file", secretFile.path), {
+      env: childEnvironment({ WRANGLER_OUTPUT_FILE_PATH: wranglerOutputPath }),
+    });
   } finally {
     await rm(secretFile.directory, { recursive: true, force: true });
   }
@@ -595,7 +758,8 @@ async function main() {
   for (const path of [wranglerModule, chardbModule]) {
     if (!(await Bun.file(path).exists())) throw new Error("missing local dependencies; run bun install first");
   }
-  const origin = validateChardbUrl(process.env.CHARDB_URL);
+  await requirePinnedWrangler();
+  const explicitOrigin = process.env.CHARDB_URL ? validateChardbUrl(process.env.CHARDB_URL) : null;
   const adminToken = validateAdminToken(process.env.CHARDB_ADMIN_TOKEN);
   const imported = await import(pathToFileURL(join(process.cwd(), "src", "migrations.ts")).href);
   const expected = migrationIdentity(imported.migrations);
@@ -604,6 +768,7 @@ async function main() {
   await requireCurrentConfig();
   await requireFilesBucket();
   const exists = await workerExists();
+  let origin = exists ? await existingDeploymentOrigin(explicitOrigin) : explicitOrigin;
   const beforeHealth = exists ? await health(origin) : null;
   const beforeState = exists ? await migrationState(origin, adminToken) : null;
   const decision = deploymentDecision({ bootstrap, exists, health: beforeHealth, state: beforeState, expected });
@@ -615,10 +780,14 @@ async function main() {
   await mustRun([process.execPath, "run", "test"]);
   await mustRun([process.execPath, "run", "build:web"]);
   await mustRun([process.execPath, "run", "build:worker"]);
-  if (decision === "bootstrap-upload") await deployBootstrap();
+  if (decision === "bootstrap-upload") {
+    await deployBootstrap();
+    origin ??= originFromWranglerOutput(await Bun.file(wranglerOutputPath).text());
+  }
   if (decision === "routine-upload") await mustRun(wrangler("deploy", "--strict"));
 
   await waitForHealth(origin, expected);
+  await cacheDeploymentOrigin(origin);
   const migrated = await command(
     chardb(
       "migrate",

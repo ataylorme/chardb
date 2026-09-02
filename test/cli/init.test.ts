@@ -222,5 +222,7 @@ describe("generated tutorial flow", () => {
 
         const packageJson = JSON.parse(files.get("/tmp/generated/package.json") ?? "null");
         expect(packageJson.engines).toEqual({ node: ">=22", bun: ">=1.2.22" });
+        expect(packageJson.devDependencies.wrangler).toBe("4.125.0");
+        expect(files.get("/tmp/generated/scripts/deploy.mjs")).toContain('const pinnedWranglerVersion = "4.125.0"');
     });
 });

@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -185,7 +185,7 @@ bucket_name = "stale-files"
         expect(rollback.operations.at(-1)?.slice(0, 3)).toEqual(["r2", "bucket", "delete"]);
     });
 
-    test("deployment requires an explicit HTTPS origin and content-addresses migrations", async () => {
+    test("deployment validates optional HTTPS origins and content-addresses migrations", async () => {
         const source = renderCloudflareDeployScript(input);
         const generated = await importGenerated<{
             validateChardbUrl(raw: string): string;
@@ -235,6 +235,130 @@ bucket_name = "stale-files"
         ).toThrow("expected Worker");
         expect(source.indexOf("const beforeHealth = exists ? await health(origin) : null;")).toBeLessThan(
             source.indexOf("const beforeState = exists ? await migrationState(origin, adminToken) : null;")
+        );
+        expect(source).toContain("delete env.WRANGLER_OUTPUT_FILE_PATH");
+        expect(source).toContain("delete env.CHARDB_URL");
+        expect(source).toContain("delete env.CHARDB_ADMIN_TOKEN");
+        expect(source).toContain("delete env.BETTER_AUTH_SECRET");
+        expect(source).toContain("WRANGLER_OUTPUT_FILE_PATH: wranglerOutputPath");
+        expect(source).not.toContain("result.stdout.match");
+        expect(source.indexOf("await deployBootstrap();")).toBeLessThan(
+            source.indexOf("origin ??= originFromWranglerOutput")
+        );
+    });
+
+    test("reads only the pinned Wrangler deploy-v1 workers.dev target", async () => {
+        const generated = await importGenerated<{
+            originFromWranglerOutput(raw: string): string;
+            validateWranglerPackage(value: unknown): string;
+        }>(renderCloudflareDeployScript(input), "deploy-output.mjs");
+        const record = {
+            type: "deploy",
+            version: 1,
+            worker_name: input.workerName,
+            worker_tag: null,
+            version_id: "11111111-1111-4111-8111-111111111111",
+            targets: ["https://native-app.example.workers.dev", "example.com/*"],
+            worker_name_overridden: false,
+            timestamp: "2026-09-01T20:00:00.000Z",
+        };
+
+        expect(generated.validateWranglerPackage({ version: "4.125.0" })).toBe("4.125.0");
+        expect(() => generated.validateWranglerPackage({ version: "4.126.0" })).toThrow("Wrangler 4.125.0");
+        expect(() => generated.validateWranglerPackage({ version: "4.125.0", name: "wrangler" })).toThrow(
+            "Wrangler 4.125.0"
+        );
+        expect(generated.originFromWranglerOutput(`${JSON.stringify(record)}\n`)).toBe(
+            "https://native-app.example.workers.dev"
+        );
+        expect(
+            generated.originFromWranglerOutput(
+                JSON.stringify({ ...record, targets: ["https://native-app.example.fedramp.workers.dev"] })
+            )
+        ).toBe("https://native-app.example.fedramp.workers.dev");
+
+        for (const invalid of [
+            "not json",
+            "",
+            `${JSON.stringify(record)}\n${JSON.stringify(record)}`,
+            JSON.stringify({ ...record, version: 2 }),
+            JSON.stringify({ ...record, worker_name: "another-worker" }),
+            JSON.stringify({ ...record, wrangler_environment: "production" }),
+            JSON.stringify({ ...record, targets: ["https://another-worker.example.workers.dev"] }),
+            JSON.stringify({
+                ...record,
+                targets: ["https://native-app.one.workers.dev", "https://native-app.two.workers.dev"],
+            }),
+            JSON.stringify({
+                ...record,
+                targets: ["https://native-app.example.workers.dev", "https://native-app.example.workers.dev"],
+            }),
+        ]) {
+            expect(() => generated.originFromWranglerOutput(invalid)).toThrow();
+        }
+        expect(() =>
+            generated.originFromWranglerOutput(
+                JSON.stringify({ ...record, targets: ["db.example.com (custom domain)"] })
+            )
+        ).toThrow("Set CHARDB_URL=https://your-worker.example.com in .env.local, then rerun bun run deploy:bootstrap.");
+    });
+
+    test("atomically caches discovery and recovers an accepted bootstrap response", async () => {
+        const generated = await importGenerated<{
+            cacheDeploymentOrigin(origin: string, path: string): Promise<Record<string, unknown>>;
+            existingDeploymentOrigin(
+                explicit: string | undefined,
+                paths: { cachePath: string; outputPath: string }
+            ): Promise<string>;
+            validateDeploymentCache(value: unknown): string;
+        }>(renderCloudflareDeployScript(input), "deploy-cache.mjs");
+        const directory = await mkdtemp(join(tmpdir(), "chardb-deploy-cache-test-"));
+        temporaryDirectories.push(directory);
+        const state = join(directory, "state");
+        const cachePath = join(state, "deployment.json");
+        const outputPath = join(state, "wrangler.jsonl");
+        const origin = "https://native-app.example.workers.dev";
+        const output = {
+            type: "deploy",
+            version: 1,
+            worker_name: input.workerName,
+            worker_tag: null,
+            version_id: "11111111-1111-4111-8111-111111111111",
+            targets: [origin],
+            worker_name_overridden: false,
+            timestamp: "2026-09-01T20:00:00.000Z",
+        };
+
+        await mkdir(state, { recursive: true });
+        await writeFile(outputPath, `${JSON.stringify(output)}\n`);
+        expect(await generated.existingDeploymentOrigin(undefined, { cachePath, outputPath })).toBe(origin);
+        const cached = JSON.parse(await readFile(cachePath, "utf8"));
+        expect(generated.validateDeploymentCache(cached)).toBe(origin);
+        expect((await stat(cachePath)).mode & 0o777).toBe(0o600);
+        expect((await readdir(state)).sort()).toEqual(["deployment.json", "wrangler.jsonl"]);
+
+        await writeFile(cachePath, "not json");
+        await writeFile(outputPath, "not json");
+        expect(await generated.existingDeploymentOrigin("https://custom.example.com", { cachePath, outputPath })).toBe(
+            "https://custom.example.com"
+        );
+
+        await rm(cachePath);
+        await rm(outputPath);
+        await expect(generated.existingDeploymentOrigin(undefined, { cachePath, outputPath })).rejects.toThrow(
+            "Set CHARDB_URL=https://your-worker.example.com in .env.local, then rerun bun run deploy:bootstrap."
+        );
+
+        const cache = await generated.cacheDeploymentOrigin(origin, cachePath);
+        expect(cache).toEqual({
+            format: "chardb.deployment.v1",
+            deploymentId,
+            workerName: input.workerName,
+            wranglerVersion: "4.125.0",
+            origin,
+        });
+        expect(() => generated.validateDeploymentCache({ ...cache, deploymentId: "wrong" })).toThrow(
+            "does not match this generated project"
         );
     });
 

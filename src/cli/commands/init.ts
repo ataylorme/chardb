@@ -1,6 +1,10 @@
 import { resolve } from "node:path";
 import type { CliContext } from "../context.ts";
-import { renderCloudflareDeployScript, renderCloudflareSetupScript } from "../generated-cloudflare-workflow.ts";
+import {
+    GENERATED_WRANGLER_VERSION,
+    renderCloudflareDeployScript,
+    renderCloudflareSetupScript,
+} from "../generated-cloudflare-workflow.ts";
 import { renderInitialMigrationArtifacts } from "../migration-artifacts.ts";
 import { SCAFFOLD_INITIAL_SNAPSHOT } from "../scaffold-initial-snapshot.ts";
 import { renderWrangler } from "../wrangler_template.ts";
@@ -66,7 +70,7 @@ const PACKAGE_TEMPLATE = (name: string, corePackage: string, reactPackage: strin
                 typescript: "5.9.3",
                 vite: "8.2.2",
                 vitest: "4.1.11",
-                wrangler: "4.125.0",
+                wrangler: GENERATED_WRANGLER_VERSION,
             },
         },
         null,
@@ -110,7 +114,8 @@ dist/
 worker-configuration.d.ts
 `;
 
-const ENV_EXAMPLE_TEMPLATE = `CHARDB_URL=https://your-worker.example.com
+const ENV_EXAMPLE_TEMPLATE = `# Optional for a custom domain or when workers.dev is disabled:
+# CHARDB_URL=https://your-worker.example.com
 CHARDB_ADMIN_TOKEN=replace-with-32-to-512-byte-secret
 BETTER_AUTH_SECRET=replace-with-at-least-32-byte-secret
 `;
@@ -423,7 +428,7 @@ Bun loads \`.env.local\` for these scripts. Git ignores that file. The commands 
 
 \`setup:cloudflare\` probes or creates the exact R2 bucket named in \`wrangler.toml\`. It does not install an expiry rule because Chardb's private content-addressed objects are the authoritative file bytes. It does not infer Vectorize indexes. Provision any future vector bindings explicitly, then run \`bunx @chardb/core vectorize prepare\`.
 
-The bootstrap command refuses an invalid or implicit \`CHARDB_URL\`. On the first Worker upload it passes the two secrets through a mode-0600 temporary file, removes that file, waits for the exact packaged migration version and digest, and runs the packaged \`chardb migrate\` command with a content-derived migration ID. Rerunning it after an interrupted migration resumes without changing secrets. Routine \`deploy\` requires an existing Worker, checks that its current package and active migration agree, and never uploads secrets.
+The bootstrap command reads the first workers.dev URL from Wrangler's versioned deployment output and caches the nonsecret identity under \`.wrangler/\`. Set \`CHARDB_URL\` only to use a custom domain or when workers.dev is disabled. On the first Worker upload the command passes the two secrets through a mode-0600 temporary file, removes it, verifies the generated deployment identity at \`/health\`, and runs the packaged \`chardb migrate\` command with a content-derived migration ID. Rerunning it after an interrupted upload or migration resumes without changing secrets. Routine \`deploy\` requires an existing Worker, checks that its current package and active migration agree, and never uploads secrets.
 
 The current chardb package is experimental. Test its deployed recovery command before putting data you care about into it.
 `;
