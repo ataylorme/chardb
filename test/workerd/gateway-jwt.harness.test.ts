@@ -35,6 +35,7 @@ let closedMutationRef: ChardbRef | undefined;
 let queryRef: ChardbRef | undefined;
 let unconstrainedQueryRef: ChardbRef | undefined;
 let invalidQueryRef: ChardbRef | undefined;
+let shardId: string | undefined;
 
 interface TokenOverrides {
     readonly subject?: string;
@@ -252,7 +253,7 @@ beforeAll(async () => {
         shardA: string;
         shardB: string;
     };
-    ({ unconstrainedQueryRef, invalidQueryRef } = seedResult);
+    ({ unconstrainedQueryRef, invalidQueryRef, shardA: shardId } = seedResult);
     expect(seedResult).toMatchObject({ mutationRef, closedMutationRef, queryRef });
     expect(seedResult.shardA).toBe(seedResult.shardB);
 });
@@ -480,6 +481,19 @@ async function authorityControl(pathname: "/authority-waiting" | "/authority-rel
     if (!mf) throw new Error("miniflare not initialized");
     const response = await mf.dispatchFetch(`http://example.com${pathname}`, { method: "POST" });
     if (!response.ok) throw new Error(`authority control failed: ${pathname} ${response.status}`);
+}
+
+async function mutationResponseControl(
+    pathname: "/mutation-response-hold" | "/mutation-response-waiting" | "/mutation-response-release",
+    mutId?: string
+): Promise<void> {
+    if (!mf || !shardId) throw new Error("mutation response control is not initialized");
+    const response = await mf.dispatchFetch(`http://example.com${pathname}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ shardId, ...(mutId ? { mutId } : {}) }),
+    });
+    if (!response.ok) throw new Error(`mutation response control failed: ${pathname} ${response.status}`);
 }
 
 describe("configured Gateway JWT handshake in real workerd", () => {
@@ -1123,41 +1137,60 @@ describe("configured Gateway JWT handshake in real workerd", () => {
         socket.close();
     });
 
-    test("concurrent completions keep the last delivered cookie for later failures", async () => {
+    test("an older mutation response cannot regress the delivered cookie watermark", async () => {
         if (!mutationRef || !closedMutationRef) throw new Error("mutation refs were not seeded");
         const { socket, first } = await openSocket(await signed());
         await first;
-        const responses = nextDowns(socket, 2);
+        const heldMutId = "cookie-held-older";
+        await mutationResponseControl("/mutation-response-hold", heldMutId);
+
+        const newerResponse = nextDown(socket);
         socket.send(
             encodeWire({
                 t: "mut",
-                mutId: MutId("concurrent-a"),
+                mutId: MutId(heldMutId),
                 ref: mutationRef,
-                args: { id: "concurrent-a", organizationId: "workerd-org", body: "a", createdAt: 2 },
+                args: { id: heldMutId, organizationId: "workerd-org", body: "older", createdAt: 2 },
             })
         );
+        await mutationResponseControl("/mutation-response-waiting");
         socket.send(
             encodeWire({
                 t: "mut",
-                mutId: MutId("concurrent-b"),
+                mutId: MutId("cookie-newer"),
                 ref: mutationRef,
-                args: { id: "concurrent-b", organizationId: "workerd-org", body: "b", createdAt: 3 },
+                args: { id: "cookie-newer", organizationId: "workerd-org", body: "newer", createdAt: 3 },
             })
         );
-        const completed = await responses;
-        expect(completed.every(message => message.t === "poke")).toBe(true);
-        const last = completed.at(-1);
-        if (!last || last.t !== "poke") throw new Error("expected final mutation poke");
+        const newer = await newerResponse;
+        expect(newer).toMatchObject({
+            t: "poke",
+            mutResults: [{ mutId: "cookie-newer", ok: true }],
+        });
+        if (newer.t !== "poke") throw new Error("expected newer mutation poke");
+
+        const olderResponse = nextDown(socket);
+        await mutationResponseControl("/mutation-response-release");
+        const older = await olderResponse;
+        expect(older).toMatchObject({
+            t: "poke",
+            cookie: newer.cookie,
+            mutResults: [{ mutId: heldMutId, ok: true }],
+        });
+        if (older.t !== "poke") throw new Error("expected held mutation poke");
+        const olderResult = older.mutResults?.[0];
+        if (!olderResult?.ok) throw new Error("expected held mutation success");
+        expect(olderResult.cookie).not.toBe(newer.cookie);
 
         const failure = await sendAndReceive(socket, {
             t: "mut",
-            mutId: MutId("after-concurrent"),
+            mutId: MutId("after-out-of-order"),
             ref: closedMutationRef,
             args: { organizationId: "workerd-org" },
         });
         expect(failure).toMatchObject({
             t: "poke",
-            cookie: last.cookie,
+            cookie: newer.cookie,
             mutResults: [{ ok: false, error: { code: "CDB_AUTH_NOT_BOUND" } }],
         });
         socket.close();

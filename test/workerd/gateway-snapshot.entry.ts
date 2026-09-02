@@ -1,3 +1,5 @@
+import { CdbError } from "../../src/errors.ts";
+import type { SubscribeArgs } from "../../src/server/do/cdb.ts";
 import {
     type GatewayDirtyRun,
     type GatewayRegistrationInstall,
@@ -9,6 +11,7 @@ import {
 } from "../../src/server/do/gateway-registration-store.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { gatewayBucketName } from "../../src/server/gateway-bucket.ts";
+import type { CdbSubscriptionResponse } from "../../src/server/rpc.ts";
 import { ChardbRef, ClientId, Cookie, PrincipalId, type RawJson, SubId, TenantId } from "../../src/types.ts";
 import { stableHashHex } from "../../src/util/canonical.ts";
 import baseWorker, { Catalog, Cdb as LiveCdb, Gateway as LiveGateway } from "./gateway-live.entry.ts";
@@ -299,10 +302,27 @@ export class Gateway extends LiveGateway {
 }
 
 export class Cdb extends LiveCdb {
+    private rejectNextSubscription = false;
+
     override async alarm(): Promise<void> {}
 
     override async fixtureDrain(): Promise<void> {
         await super.alarm();
+    }
+
+    fixtureRejectNextSubscription(): void {
+        this.rejectNextSubscription = true;
+    }
+
+    override async subscribe(input: SubscribeArgs): Promise<CdbSubscriptionResponse> {
+        if (!this.rejectNextSubscription) return super.subscribe(input);
+        this.rejectNextSubscription = false;
+        return {
+            ok: false,
+            registrationState: "absent",
+            subscription: input.subscription,
+            error: new CdbError({ code: "CDB_FORBIDDEN", message: "injected subscription rejection" }).toJSON(),
+        };
     }
 
     fixtureMakeLegacyOverlimit(
@@ -408,6 +428,7 @@ interface GatewayFixtureRpc {
 
 interface CdbFixtureRpc {
     fixtureDrain(): Promise<void>;
+    fixtureRejectNextSubscription(): Promise<void>;
     fixtureMakeLegacyOverlimit(
         clientId: string,
         subId: number
@@ -423,6 +444,13 @@ export default {
             if (!shardId) return new Response("missing shardId", { status: 400 });
             const cdb = env.CDB_SHARD.get(env.CDB_SHARD.idFromName(shardId)) as unknown as CdbFixtureRpc;
             await cdb.fixtureDrain();
+            return Response.json({ ok: true });
+        }
+        if (url.pathname === "/snapshot-cdb-reject-next-subscribe") {
+            const shardId = url.searchParams.get("shardId");
+            if (!shardId) return new Response("missing shardId", { status: 400 });
+            const cdb = env.CDB_SHARD.get(env.CDB_SHARD.idFromName(shardId)) as unknown as CdbFixtureRpc;
+            await cdb.fixtureRejectNextSubscription();
             return Response.json({ ok: true });
         }
         if (url.pathname === "/snapshot-cdb-legacy-overlimit") {

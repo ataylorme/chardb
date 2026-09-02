@@ -618,11 +618,14 @@ export class Gateway extends DurableObject<GatewayEnv> {
         // the same identity. Protected work remains paused throughout grace.
         const nowSeconds = Math.floor(nowMs / 1_000);
         const refreshDeadline = gatewayAuthRefreshDeadlineMs(attachment);
-        if (refreshDeadline === null) return { status: "terminal" };
+        if (refreshDeadline === null) {
+            this.rejectExpiredGatewaySocket(ws);
+            return { status: "terminal" };
+        }
         if (attachment.jwtExp <= nowSeconds) {
-            return nowMs < refreshDeadline
-                ? { status: "refreshing", retryAt: refreshDeadline }
-                : { status: "terminal" };
+            if (nowMs < refreshDeadline) return { status: "refreshing", retryAt: refreshDeadline };
+            this.rejectExpiredGatewaySocket(ws);
+            return { status: "terminal" };
         }
         if (
             this.authRefreshBarriers.has(identity.connectionId) &&
@@ -637,6 +640,15 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return { status: "refreshing", retryAt: Math.ceil(attachment.jwtNbf * 1_000) };
         }
         return { status: "ready", ws, attachment };
+    }
+
+    private rejectExpiredGatewaySocket(ws: WebSocket): void {
+        try {
+            this.rejectAuth(ws, "CDB_FORBIDDEN");
+        } catch {
+            // The alarm caller still owns durable retirement when the socket
+            // cannot receive or complete the terminal close.
+        }
     }
 
     private trackGatewayTask(connectionId: string, task: Promise<void>): Promise<void> {
@@ -1539,7 +1551,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const resumeRefetchPendingSubIds = attachment.resumeRefetchPendingSubIds;
         let resumeReplayAttempt = false;
         if (resumeRefetchPendingSubIds !== undefined) {
-            if (!resumeRefetchPendingSubIds.includes(msg.subId)) {
+            if (!resumeRefetchPendingSubIds.includes(msg.subId) && !attachment.snapshotSubIds?.includes(msg.subId)) {
                 if (resumeRefetchPendingSubIds.length >= MAX_INITIAL_SNAPSHOTS_PER_CONNECTION) {
                     this.sendError(ws, "CDB_RATE_LIMITED", msg.subId);
                     return;
@@ -1785,27 +1797,6 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return;
         }
 
-        // Consume the one-shot resume decision only after routing, authority,
-        // and placement admission succeed. A rejected request must not turn a
-        // later corrected request into the fallback attempt.
-        const resumePending = currentBeforeInstall.resumeRefetchPendingSubIds;
-        if (resumePending !== undefined) {
-            const nextResumePending = pending.resumeReplayAttempt
-                ? resumePending.includes(msg.subId)
-                    ? resumePending
-                    : [...resumePending, msg.subId].sort((left, right) => left - right).map(SubId)
-                : resumePending.filter(subId => subId !== msg.subId);
-            if (
-                nextResumePending.length !== resumePending.length ||
-                nextResumePending.some((subId, index) => subId !== resumePending[index])
-            ) {
-                ws.serializeAttachment({
-                    ...currentBeforeInstall,
-                    resumeRefetchPendingSubIds: nextResumePending,
-                } satisfies VerifiedGwAttachment);
-            }
-        }
-
         const cdbId = this.env.CDB_SHARD.idFromName(shardId);
         const sourceCdbId = cdbId.toString();
         if (sourceCdbId.length === 0) {
@@ -1842,26 +1833,31 @@ export class Gateway extends DurableObject<GatewayEnv> {
                           nowMs: replayAt,
                       });
             });
-            if (!replaySnapshot) {
-                this.send(ws, { t: "mustRefetch", subIds: [msg.subId], reason: "lagged" });
-                return;
-            }
             const currentAfterReplayLookup = ws.deserializeAttachment() as GwAttachment | null;
             if (
+                pending.cancelled ||
+                this.pendingSubscriptions.get(operationKey) !== pending ||
                 !isVerifiedAttachment(currentAfterReplayLookup) ||
+                !isCurrentVerifiedAttachment(currentAfterReplayLookup) ||
                 currentAfterReplayLookup.connectionId !== att.connectionId ||
                 currentAfterReplayLookup.clientId !== att.clientId ||
                 currentAfterReplayLookup.principalId !== att.principalId
             ) {
                 return;
             }
-            const remainingResumeSubIds = currentAfterReplayLookup.resumeRefetchPendingSubIds?.filter(
-                subId => subId !== msg.subId
-            );
-            ws.serializeAttachment({
-                ...currentAfterReplayLookup,
-                ...(remainingResumeSubIds !== undefined ? { resumeRefetchPendingSubIds: remainingResumeSubIds } : {}),
-            } satisfies VerifiedGwAttachment);
+            if (!replaySnapshot) {
+                this.send(ws, { t: "mustRefetch", subIds: [msg.subId], reason: "lagged" });
+                const resumePending = currentAfterReplayLookup.resumeRefetchPendingSubIds;
+                if (resumePending !== undefined && !resumePending.includes(msg.subId)) {
+                    ws.serializeAttachment({
+                        ...currentAfterReplayLookup,
+                        resumeRefetchPendingSubIds: [...resumePending, msg.subId]
+                            .sort((left, right) => left - right)
+                            .map(SubId),
+                    } satisfies VerifiedGwAttachment);
+                }
+                return;
+            }
         }
         const registrationId = crypto.randomUUID();
         const installedAt = this.gatewayNowMs();
@@ -2010,7 +2006,14 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const snapshotSubIds = [...new Set([...(current.snapshotSubIds ?? []), msg.subId])]
             .sort((left, right) => left - right)
             .map(SubId);
-        ws.serializeAttachment({ ...current, snapshotSubIds } satisfies VerifiedGwAttachment);
+        const resumeRefetchPendingSubIds = pending.resumeReplayAttempt
+            ? current.resumeRefetchPendingSubIds
+            : current.resumeRefetchPendingSubIds?.filter(subId => subId !== msg.subId);
+        ws.serializeAttachment({
+            ...current,
+            snapshotSubIds,
+            ...(resumeRefetchPendingSubIds !== undefined ? { resumeRefetchPendingSubIds } : {}),
+        } satisfies VerifiedGwAttachment);
         if (replaySnapshot) {
             try {
                 this.send(ws, {

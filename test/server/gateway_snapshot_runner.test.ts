@@ -942,9 +942,9 @@ describe("Gateway active snapshot runner", () => {
         expect(currentAlarm).toBeNull();
     });
 
-    test("bounds expired-socket retries at the auth-refresh deadline, then retires", async () => {
+    test("bounds expired-socket retries, then reports auth expiry and retires at the deadline", async () => {
         installActive();
-        attach(registration(), { jwtExp: 1 });
+        const socket = attach(registration(), { jwtExp: 1 });
         let release: (value: unknown) => void = () => {};
         queryBehavior = () =>
             new Promise(resolve => {
@@ -987,6 +987,25 @@ describe("Gateway active snapshot runner", () => {
         expect(unsubscribeCalls).toHaveLength(1);
         expect(finalizeCalls).toEqual(unsubscribeCalls);
         expect(currentAlarm).toBeNull();
+        expect(socket.sent.map(message => JSON.parse(message))).toEqual([
+            expect.objectContaining({ t: "error", code: "CDB_FORBIDDEN", retryable: false }),
+        ]);
+        expect(socket.attachment).toMatchObject({ kind: "rejected", connectionId: "connection-1" });
+    });
+
+    test("terminal auth notification failure cannot block durable retirement", async () => {
+        installActive();
+        const socket = attach(registration(), { jwtExp: 1 });
+        socket.throwOnSend = true;
+        clock = 1_000 + GATEWAY_AUTH_REFRESH_GRACE_MS;
+
+        await fireAlarm();
+
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toBeNull();
+        expect(unsubscribeCalls).toHaveLength(1);
+        expect(finalizeCalls).toEqual(unsubscribeCalls);
+        expect(socket.attachment).toMatchObject({ kind: "rejected", connectionId: "connection-1" });
     });
 
     function socketMessages(): string[] {

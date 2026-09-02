@@ -666,7 +666,7 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
         expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
     }, 15_000);
 
-    test("an unknown resume cookie falls back once before installing an authoritative subscription", async () => {
+    test("a rejected resumed fallback keeps its one install opportunity", async () => {
         const clientId = "snapshot-fallback-01";
         const opened = await openSocket(clientId, Cookie("snapshot-fallback-01:unknown"));
         expect(opened.welcome).toMatchObject({
@@ -677,6 +677,12 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
         const fallback = nextDown(opened.socket);
         sendSubscription(opened.socket, 1, "snapshot-fallback-proof");
         expect(await fallback).toEqual({ t: "mustRefetch", subIds: [SubId(1)], reason: "lagged" });
+
+        await fixtureFetch("/snapshot-cdb-reject-next-subscribe", { shardId });
+        const rejected = nextDown(opened.socket);
+        sendSubscription(opened.socket, 1, "snapshot-fallback-proof");
+        expect(await rejected).toMatchObject({ t: "error", subId: SubId(1), code: "CDB_FORBIDDEN" });
+        expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
 
         const authoritative = nextDown(opened.socket);
         sendSubscription(opened.socket, 1, "snapshot-fallback-proof");

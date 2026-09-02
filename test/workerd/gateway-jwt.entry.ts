@@ -149,7 +149,47 @@ const app = chardb({
         invalidOrganizationRows,
     },
 });
-export const { Cdb, Gateway } = app;
+export const { Gateway } = app;
+
+export class Cdb extends app.Cdb {
+    private heldMutationId: string | undefined;
+    private heldMutationResponse: Promise<void> = Promise.resolve();
+    private releaseHeldMutationResponse: (() => void) | undefined;
+    private heldMutationEntered: Promise<void> = Promise.resolve();
+    private markHeldMutationEntered: (() => void) | undefined;
+
+    holdMutationResponse(mutId: string): void {
+        this.heldMutationId = mutId;
+        this.heldMutationResponse = new Promise(resolve => {
+            this.releaseHeldMutationResponse = resolve;
+        });
+        this.heldMutationEntered = new Promise(resolve => {
+            this.markHeldMutationEntered = resolve;
+        });
+    }
+
+    async waitForHeldMutationResponse(): Promise<void> {
+        await this.heldMutationEntered;
+    }
+
+    releaseMutationResponse(): void {
+        this.heldMutationId = undefined;
+        this.releaseHeldMutationResponse?.();
+        this.releaseHeldMutationResponse = undefined;
+    }
+
+    override async mutate(
+        input: Parameters<InstanceType<typeof app.Cdb>["mutate"]>[0]
+    ): ReturnType<InstanceType<typeof app.Cdb>["mutate"]> {
+        const response = await super.mutate(input);
+        if (input.mutId === this.heldMutationId) {
+            this.markHeldMutationEntered?.();
+            this.markHeldMutationEntered = undefined;
+            await this.heldMutationResponse;
+        }
+        return response;
+    }
+}
 
 type AuthorityFault =
     | "none"
@@ -471,6 +511,26 @@ export default {
             const id = env.CDB_CATALOG.idFromName("global");
             const catalog = env.CDB_CATALOG.get(id) as unknown as { releaseHeldAuthority(): Promise<void> };
             await catalog.releaseHeldAuthority();
+            return Response.json({ ok: true });
+        }
+        if (url.pathname.startsWith("/mutation-response-")) {
+            const body = (await request.json()) as { readonly shardId: string; readonly mutId?: string };
+            const id = env.CDB_SHARD.idFromName(body.shardId);
+            const cdb = env.CDB_SHARD.get(id) as unknown as {
+                holdMutationResponse(mutId: string): Promise<void>;
+                waitForHeldMutationResponse(): Promise<void>;
+                releaseMutationResponse(): Promise<void>;
+            };
+            if (url.pathname === "/mutation-response-hold") {
+                if (!body.mutId) return new Response("mutId is required", { status: 400 });
+                await cdb.holdMutationResponse(body.mutId);
+            } else if (url.pathname === "/mutation-response-waiting") {
+                await cdb.waitForHeldMutationResponse();
+            } else if (url.pathname === "/mutation-response-release") {
+                await cdb.releaseMutationResponse();
+            } else {
+                return new Response("not found", { status: 404 });
+            }
             return Response.json({ ok: true });
         }
         if (url.pathname === "/ws") {
