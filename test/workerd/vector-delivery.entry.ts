@@ -20,6 +20,7 @@ import {
 } from "../../src/server/do/cdb-vectorize-adapter.ts";
 import { cdbVectorizePhysicalIdFromCanonical } from "../../src/server/do/cdb-vectorize-wire.ts";
 import { type CdbEnv, configureCdbRuntime } from "../../src/server/do/cdb.ts";
+import { Resharder as ProductionResharder } from "../../src/server/do/resharder.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { manifestFromExports } from "../../src/server/manifest.ts";
 import {
@@ -160,6 +161,8 @@ const manifest = manifestFromExports({
 interface VectorProofEnv extends CdbEnv {
     readonly VECTOR_INDEX: DurableObjectNamespace;
 }
+
+export class Resharder extends ProductionResharder {}
 
 type FaultMode = "none" | "reject_before" | "accept_then_throw" | "delete_accept_then_throw";
 const PROOF_CLOCK_OFFSET_MS = 60 * 60 * 1_000;
@@ -709,6 +712,7 @@ function requestFor(body: Record<string, unknown>) {
             claims: {},
         },
         placement: { authority: "organization" as const, partitionKey: organizationId },
+        recoveryGeneration: 0,
         schemaEpoch: 1,
         domainSchemaEpoch: 1,
     };
@@ -801,12 +805,14 @@ export default {
                                 authority: {
                                     principalId: PrincipalId("vector-proof-user"),
                                     organizationId: TenantId(organizationId),
+                                    recoveryGeneration: 0,
                                     role: "member",
                                     roles: ["member"],
                                     authEpochs: { global: 1, tenant: 1, principal: 1 },
                                 },
                                 route: {
                                     shardId: "vector-proof-shard" as never,
+                                    recoveryGeneration: 0,
                                     schemaEpoch: 1,
                                     domainSchemaEpoch: Number(input.domainSchemaEpoch ?? 1),
                                 },

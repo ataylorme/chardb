@@ -9,6 +9,7 @@ import {
     installGatewayRegistration,
     stageGatewaySnapshot,
 } from "../../src/server/do/gateway-registration-store.ts";
+import { Resharder as ProductionResharder } from "../../src/server/do/resharder.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { gatewayBucketName } from "../../src/server/gateway-bucket.ts";
 import type { CdbSubscriptionResponse } from "../../src/server/rpc.ts";
@@ -16,12 +17,15 @@ import { ChardbRef, ClientId, Cookie, PrincipalId, type RawJson, SubId, TenantId
 import { stableHashHex } from "../../src/util/canonical.ts";
 import baseWorker, { Catalog, Cdb as LiveCdb, Gateway as LiveGateway } from "./gateway-live.entry.ts";
 
+export class Resharder extends ProductionResharder {}
+
 const REGISTRATION: GatewayRegistrationInstall = {
     registrationId: "registration-workerd-snapshot",
     principalId: PrincipalId("principal-workerd"),
     clientId: ClientId("client-workerd"),
     subId: SubId(7),
     connectionId: "connection-workerd",
+    recoveryGeneration: 0,
     organizationId: TenantId("organization-workerd"),
     ref: ChardbRef("queries.ts#messages"),
     args: { organizationId: "organization-workerd" },
@@ -205,6 +209,7 @@ export class Gateway extends LiveGateway {
                 cookie: Cookie("cookie-target-5"),
                 rows: [{ id: "row-from-target-5" }],
                 authEpochs: { global: 10, tenant: 11, principal: 12 },
+                recoveryGeneration: 0,
                 nowMs: 220,
             })
         );

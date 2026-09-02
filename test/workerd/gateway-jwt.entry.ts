@@ -191,6 +191,8 @@ export class Cdb extends app.Cdb {
     }
 }
 
+export class Resharder extends app.Resharder {}
+
 type AuthorityFault =
     | "none"
     | "throw"
@@ -338,127 +340,160 @@ export default {
             const id = env.CDB_CATALOG.idFromName("global");
             const catalog = env.CDB_CATALOG.get(id) as unknown as {
                 seedJwkForTest(jwksUrl: string, kid: string, jwkJson: string, ttlMs: number): Promise<void>;
-                mutateAuth(args: {
-                    readonly model: string;
-                    readonly op: "create";
-                    readonly payload: Record<string, unknown>;
-                }): Promise<unknown>;
+                mutateAuth(
+                    args: {
+                        readonly model: string;
+                        readonly op: "create";
+                        readonly payload: Record<string, unknown>;
+                    },
+                    _recoveryGeneration: number
+                ): Promise<unknown>;
                 route(vshard: number): Promise<{ readonly shardId: string }>;
             };
             if (body.kid !== undefined && body.jwk !== undefined) {
                 await catalog.seedJwkForTest(JWKS_URL, body.kid, JSON.stringify(body.jwk), 60_000);
             }
             const now = Date.parse("2026-08-23T00:00:00Z");
-            await catalog.mutateAuth({
-                model: "user",
-                op: "create",
-                payload: {
-                    id: USER_ID,
-                    name: "Workerd User",
-                    email: "workerd@example.com",
-                    emailVerified: true,
-                    role: "admin",
-                    createdAt: now,
-                    updatedAt: now,
+            await catalog.mutateAuth(
+                {
+                    model: "user",
+                    op: "create",
+                    payload: {
+                        id: USER_ID,
+                        name: "Workerd User",
+                        email: "workerd@example.com",
+                        emailVerified: true,
+                        role: "admin",
+                        createdAt: now,
+                        updatedAt: now,
+                    },
                 },
-            });
-            await catalog.mutateAuth({
-                model: "organization",
-                op: "create",
-                payload: { id: ORGANIZATION_ID, name: "Workerd Org", slug: "workerd-org", createdAt: now },
-            });
-            await catalog.mutateAuth({
-                model: "organization",
-                op: "create",
-                payload: {
-                    id: OTHER_ORGANIZATION_ID,
-                    name: "Workerd Org B",
-                    slug: "workerd-org-b",
-                    createdAt: now,
+                0
+            );
+            await catalog.mutateAuth(
+                {
+                    model: "organization",
+                    op: "create",
+                    payload: { id: ORGANIZATION_ID, name: "Workerd Org", slug: "workerd-org", createdAt: now },
                 },
-            });
-            await catalog.mutateAuth({
-                model: "member",
-                op: "create",
-                payload: {
-                    id: "workerd-member",
-                    organizationId: ORGANIZATION_ID,
-                    userId: USER_ID,
-                    role: "member",
-                    createdAt: now,
+                0
+            );
+            await catalog.mutateAuth(
+                {
+                    model: "organization",
+                    op: "create",
+                    payload: {
+                        id: OTHER_ORGANIZATION_ID,
+                        name: "Workerd Org B",
+                        slug: "workerd-org-b",
+                        createdAt: now,
+                    },
                 },
-            });
-            await catalog.mutateAuth({
-                model: "user",
-                op: "create",
-                payload: {
-                    id: "workerd-user-b",
-                    name: "Workerd User B",
-                    email: "workerd-b@example.com",
-                    emailVerified: true,
-                    role: "admin",
-                    createdAt: now,
-                    updatedAt: now,
+                0
+            );
+            await catalog.mutateAuth(
+                {
+                    model: "member",
+                    op: "create",
+                    payload: {
+                        id: "workerd-member",
+                        organizationId: ORGANIZATION_ID,
+                        userId: USER_ID,
+                        role: "member",
+                        createdAt: now,
+                    },
                 },
-            });
-            await catalog.mutateAuth({
-                model: "member",
-                op: "create",
-                payload: {
-                    id: "workerd-member-b",
-                    organizationId: OTHER_ORGANIZATION_ID,
-                    userId: "workerd-user-b",
-                    role: "member",
-                    createdAt: now,
+                0
+            );
+            await catalog.mutateAuth(
+                {
+                    model: "user",
+                    op: "create",
+                    payload: {
+                        id: "workerd-user-b",
+                        name: "Workerd User B",
+                        email: "workerd-b@example.com",
+                        emailVerified: true,
+                        role: "admin",
+                        createdAt: now,
+                        updatedAt: now,
+                    },
                 },
-            });
-            await catalog.mutateAuth({
-                model: "user",
-                op: "create",
-                payload: {
-                    id: "workerd-user-2",
-                    name: "Workerd User 2",
-                    email: "workerd-2@example.com",
-                    emailVerified: true,
-                    createdAt: now,
-                    updatedAt: now,
+                0
+            );
+            await catalog.mutateAuth(
+                {
+                    model: "member",
+                    op: "create",
+                    payload: {
+                        id: "workerd-member-b",
+                        organizationId: OTHER_ORGANIZATION_ID,
+                        userId: "workerd-user-b",
+                        role: "member",
+                        createdAt: now,
+                    },
                 },
-            });
-            await catalog.mutateAuth({
-                model: "member",
-                op: "create",
-                payload: {
-                    id: "workerd-member-2",
-                    organizationId: ORGANIZATION_ID,
-                    userId: "workerd-user-2",
-                    role: "admin",
-                    createdAt: now,
+                0
+            );
+            await catalog.mutateAuth(
+                {
+                    model: "user",
+                    op: "create",
+                    payload: {
+                        id: "workerd-user-2",
+                        name: "Workerd User 2",
+                        email: "workerd-2@example.com",
+                        emailVerified: true,
+                        createdAt: now,
+                        updatedAt: now,
+                    },
                 },
-            });
-            await catalog.mutateAuth({
-                model: "user",
-                op: "create",
-                payload: {
-                    id: "workerd-writer",
-                    name: "Workerd Writer",
-                    email: "workerd-writer@example.com",
-                    emailVerified: true,
-                    role: "admin",
-                    createdAt: now,
-                    updatedAt: now,
+                0
+            );
+            await catalog.mutateAuth(
+                {
+                    model: "member",
+                    op: "create",
+                    payload: {
+                        id: "workerd-member-2",
+                        organizationId: ORGANIZATION_ID,
+                        userId: "workerd-user-2",
+                        role: "admin",
+                        createdAt: now,
+                    },
                 },
-            });
-            await catalog.mutateAuth({
-                model: "member",
-                op: "create",
-                payload: {
-                    id: "workerd-writer-member",
-                    organizationId: ORGANIZATION_ID,
-                    userId: "workerd-writer",
-                    role: "member",
-                    createdAt: now,
+                0
+            );
+            await catalog.mutateAuth(
+                {
+                    model: "user",
+                    op: "create",
+                    payload: {
+                        id: "workerd-writer",
+                        name: "Workerd Writer",
+                        email: "workerd-writer@example.com",
+                        emailVerified: true,
+                        role: "admin",
+                        createdAt: now,
+                        updatedAt: now,
+                    },
                 },
-            });
+                0
+            );
+            await catalog.mutateAuth(
+                {
+                    model: "member",
+                    op: "create",
+                    payload: {
+                        id: "workerd-writer-member",
+                        organizationId: ORGANIZATION_ID,
+                        userId: "workerd-writer",
+                        role: "member",
+                        createdAt: now,
+                    },
+                },
+                0
+            );
             const routeA = await catalog.route(Number(vshardOf([ORGANIZATION_ID])));
             const routeB = await catalog.route(Number(vshardOf([OTHER_ORGANIZATION_ID])));
             return Response.json({

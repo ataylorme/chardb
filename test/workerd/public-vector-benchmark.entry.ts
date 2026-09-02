@@ -27,11 +27,14 @@ interface Env {
 }
 
 interface CatalogFixture {
-    mutateAuth(args: {
-        readonly model: string;
-        readonly op: "create";
-        readonly payload: Record<string, unknown>;
-    }): Promise<unknown>;
+    mutateAuth(
+        args: {
+            readonly model: string;
+            readonly op: "create";
+            readonly payload: Record<string, unknown>;
+        },
+        _recoveryGeneration: number
+    ): Promise<unknown>;
     fixtureRouteOrganization(input: { readonly organizationId: string; readonly shardId: string }): Promise<void>;
     route(vshard: number): Promise<{ readonly shardId: string }>;
 }
@@ -105,27 +108,33 @@ async function seedBenchmark(request: Request, env: Env): Promise<Response> {
             usedVshards.add(vshard);
             const shardId = shardIds[organizationIndex % shardIds.length];
             if (!shardId) throw new Error("benchmark shard assignment is missing");
-            await catalog.mutateAuth({
-                model: "organization",
-                op: "create",
-                payload: {
-                    id: organizationId,
-                    name: `Public vector benchmark ${scenarioIndex}-${organizationIndex}`,
-                    slug: organizationId,
-                    createdAt: now,
+            await catalog.mutateAuth(
+                {
+                    model: "organization",
+                    op: "create",
+                    payload: {
+                        id: organizationId,
+                        name: `Public vector benchmark ${scenarioIndex}-${organizationIndex}`,
+                        slug: organizationId,
+                        createdAt: now,
+                    },
                 },
-            });
-            await catalog.mutateAuth({
-                model: "member",
-                op: "create",
-                payload: {
-                    id: `pvb-member-${body.run}-${scenarioIndex}-${organizationIndex}`,
-                    organizationId,
-                    userId: BENCHMARK_USER_ID,
-                    role: "member",
-                    createdAt: now,
+                0
+            );
+            await catalog.mutateAuth(
+                {
+                    model: "member",
+                    op: "create",
+                    payload: {
+                        id: `pvb-member-${body.run}-${scenarioIndex}-${organizationIndex}`,
+                        organizationId,
+                        userId: BENCHMARK_USER_ID,
+                        role: "member",
+                        createdAt: now,
+                    },
                 },
-            });
+                0
+            );
             await catalog.fixtureRouteOrganization({ organizationId, shardId });
             const route = await catalog.route(vshard);
             if (route.shardId !== shardId) throw new Error("benchmark route did not activate");

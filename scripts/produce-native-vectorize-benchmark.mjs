@@ -112,6 +112,7 @@ export async function produceNativeVectorizeBenchmark() {
             script: bundle.source,
             durableObjects: {
                 CDB: { className: "VectorProofCdb", useSQLite: true },
+                CDB_RESHARD: { className: "Resharder", useSQLite: true },
                 VECTOR_INDEX: { className: "VectorIndexProbe", useSQLite: true },
             },
             durableObjectsPersist: path.join(temporaryPath, "durable-objects"),

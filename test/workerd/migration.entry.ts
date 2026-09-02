@@ -264,6 +264,7 @@ export class Cdb extends app.Cdb {
                 principalId: PrincipalId("migration-user"),
                 organizationId,
                 authority: routed.authority,
+                recoveryGeneration: 0,
                 schemaEpoch: 1,
                 vshard: Number(vshardOf([organizationId])),
                 domainSchemaEpoch: this.schemaState().activeEpoch,
@@ -314,6 +315,8 @@ export class Cdb extends app.Cdb {
         };
     }
 }
+
+export class Resharder extends app.Resharder {}
 
 export class Gateway extends DurableObject<Env> {
     async invalidateSubscriptions(request: GatewayInvalidationRequest): Promise<GatewayInvalidationResponse> {
@@ -409,6 +412,7 @@ async function mutate(cdb: InstanceType<typeof Cdb>, input: MutationInput): Prom
         ref: MUTATION_REF as never,
         args,
         auth: { userId: "migration-user", role: "member", roles: ["member"], claims: {} },
+        recoveryGeneration: 0,
         schemaEpoch: 1,
         domainSchemaEpoch: input.domainSchemaEpoch,
     });
@@ -422,18 +426,21 @@ export default {
         }
         if (url.pathname === "/fixture/seed") {
             const { catalog, cdb, route } = await catalogAndCdb(env);
-            await catalog.mutateAuth({
-                model: "user",
-                op: "create",
-                payload: {
-                    id: "migration-user",
-                    name: "Migration User",
-                    email: "migration@example.com",
-                    emailVerified: true,
-                    createdAt: 1,
-                    updatedAt: 1,
+            await catalog.mutateAuth(
+                {
+                    model: "user",
+                    op: "create",
+                    payload: {
+                        id: "migration-user",
+                        name: "Migration User",
+                        email: "migration@example.com",
+                        emailVerified: true,
+                        createdAt: 1,
+                        updatedAt: 1,
+                    },
                 },
-            });
+                0
+            );
             const result = await mutate(cdb, {
                 mutId: "seed-mutation",
                 domainSchemaEpoch: route.domainSchemaEpoch,

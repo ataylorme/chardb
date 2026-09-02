@@ -157,6 +157,7 @@ async function main() {
                 CDB_CATALOG: { className: "Catalog", useSQLite: true },
                 CDB_GATEWAY: { className: "Gateway", useSQLite: true },
                 CDB_SHARD: { className: "Cdb", useSQLite: true },
+                CDB_RESHARD: { className: "Resharder", useSQLite: true },
             },
             durableObjectsPersist: control.persistencePath,
             compatibilityDate: "2025-09-01",

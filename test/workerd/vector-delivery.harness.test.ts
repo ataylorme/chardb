@@ -83,6 +83,7 @@ async function startRuntime(): Promise<Miniflare> {
         script: workerSource,
         durableObjects: {
             CDB: { className: "VectorProofCdb", useSQLite: true },
+            CDB_RESHARD: { className: "Resharder", useSQLite: true },
             PLATFORM_CDB: { className: "PlatformAlarmVectorProofCdb", useSQLite: true },
             VECTOR_INDEX: { className: "VectorIndexProbe", useSQLite: true },
         },
@@ -434,6 +435,7 @@ describe("native asynchronous Vectorize delivery", () => {
                 organizationId,
                 values,
                 limit: 1,
+                recoveryGeneration: 0,
                 domainSchemaEpoch: 2,
             })
         ).toEqual({

@@ -216,6 +216,7 @@ function startMiniflare(): Miniflare {
             CDB_CATALOG: { className: "Catalog", useSQLite: true },
             CDB_GATEWAY: { className: "Gateway", useSQLite: true },
             CDB_SHARD: { className: "Cdb", useSQLite: true },
+            CDB_RESHARD: { className: "Resharder", useSQLite: true },
         },
         durableObjectsPersist: persistencePath,
         compatibilityDate: "2025-09-01",
@@ -924,6 +925,10 @@ describe("Gateway snapshot delivery durability in real workerd", () => {
         if (failure !== null) throw failure.value;
         await drainGateway(clientId);
         expect((await gatewayState(clientId)).registrations.every(row => !row.currentHead)).toBe(true);
+        // Socket-close retirement and a manually forced alarm can overlap. The
+        // retirement alarm owns the follow-up Cdb cleanup pass.
+        await drainGateway(clientId);
+        expect((await gatewayState(clientId)).registrations.filter(row => row.clientId === clientId)).toEqual([]);
         const cdbAfterCleanup = await fixtureFetch<CdbLiveState>("/live-cdb-state", { shardId });
         expect(
             cdbAfterCleanup.subscriptions.filter(row => row.clientId === clientId && row.state === "active")

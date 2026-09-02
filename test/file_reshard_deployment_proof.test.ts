@@ -46,7 +46,7 @@ function sample(kind: "local" | "deployed", sequence: number, multiplier = 1) {
         excluded: sequence === -1,
         candidateSha256: DIGEST,
         runKey: `deployment_proof_${sequence < 0 ? "warmup" : sequence}`,
-        workload: { id: "file-vector-aware-range-move", version: 2, profile },
+        workload: { id: "file-vector-aware-range-move", version: 3, profile },
         target: target(kind),
         execution: {
             startedAt: "2026-08-29T00:00:00.000Z",
@@ -123,8 +123,9 @@ function sample(kind: "local" | "deployed", sequence: number, multiplier = 1) {
             invoked: true,
             durable: true,
             ownerShard: "cdb-destination",
-            deletedObjects: 1,
-            remainingObjects: profile.files - 1,
+            deletedMetadataRows: 1,
+            remainingMetadataRows: profile.files - 1,
+            retainedObjects: profile.files,
         },
         correctness: Object.fromEntries(FILE_RESHARD_DEPLOYMENT_CORRECTNESS.map(name => [name, true])),
     };
@@ -177,6 +178,7 @@ describe("file reshard deployment evidence", () => {
                 freshDisposableData: true,
                 providerVectorMutationTrace: false,
                 publicVectorSearch: true,
+                retainedFileRecovery: true,
                 vectorAwareReshard: true,
             },
         };

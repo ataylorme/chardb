@@ -25,10 +25,11 @@ interface Route {
     readonly shardId: string;
     readonly schemaEpoch: number;
     readonly domainSchemaEpoch: number;
+    readonly recoveryGeneration: number;
 }
 
 interface CatalogRpc {
-    mutateAuth(args: Record<string, unknown>): Promise<unknown>;
+    mutateAuth(args: Record<string, unknown>, _recoveryGeneration: number): Promise<unknown>;
     route(vshard: number): Promise<Route>;
 }
 
@@ -39,6 +40,7 @@ interface CdbRpc {
         fileId: string;
         schemaEpoch: number;
         domainSchemaEpoch: number;
+        recoveryGeneration: number;
         body: string;
     }): Promise<Record<string, unknown>>;
     fixtureState(input: { organizationIds: readonly string[]; migId: string }): Promise<Record<string, unknown>>;
@@ -107,16 +109,19 @@ async function prepareOrganizations(
     if (route.shardId !== SOURCE) throw new Error(`prepared range is owned by ${route.shardId}`);
     const seeded = [];
     for (const [index, organizationId] of input.organizationIds.entries()) {
-        await cat.mutateAuth({
-            model: "organization",
-            op: "create",
-            payload: {
-                id: organizationId,
-                name: organizationId,
-                slug: organizationId,
-                createdAt: Date.now(),
+        await cat.mutateAuth(
+            {
+                model: "organization",
+                op: "create",
+                payload: {
+                    id: organizationId,
+                    name: organizationId,
+                    slug: organizationId,
+                    createdAt: Date.now(),
+                },
             },
-        });
+            route.recoveryGeneration
+        );
         const hex = `${targetPlacement.toString(16)}${input.label.length.toString(16)}${index.toString(16)}`
             .padEnd(64, String((index % 9) + 1))
             .slice(0, 64);
@@ -127,6 +132,7 @@ async function prepareOrganizations(
                 fileId: `fil_${hex}`,
                 schemaEpoch: route.schemaEpoch,
                 domainSchemaEpoch: route.domainSchemaEpoch,
+                recoveryGeneration: route.recoveryGeneration,
                 body: `prepared-${input.label}-${index}`,
             })
         );
@@ -172,6 +178,7 @@ async function unrelatedTraffic(
         fileId,
         schemaEpoch: route.schemaEpoch,
         domainSchemaEpoch: route.domainSchemaEpoch,
+        recoveryGeneration: route.recoveryGeneration,
         body: `unrelated-${input.sequence}`,
     });
     const resolved = await shard.resolveFileDownload({
@@ -179,6 +186,7 @@ async function unrelatedTraffic(
         table: "file_move_documents",
         column: "attachment",
         rowId,
+        recoveryGeneration: route.recoveryGeneration,
         schemaEpoch: route.schemaEpoch,
         domainSchemaEpoch: route.domainSchemaEpoch,
         auth: fileAuth(input.organizationId),

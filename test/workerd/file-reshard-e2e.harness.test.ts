@@ -724,10 +724,10 @@ describe("combined native file-aware range movement", () => {
         expect(result.putCalls).toBe(2);
         expect(result.objectAfterFirstPut).toEqual([
             expect.objectContaining({
-                key: `v1/${organizations[0]}/${result.expectedFileId}`,
+                key: expect.stringMatching(/^_chardb\/retained\/sha256\/[a-f0-9]{64}$/),
                 present: true,
                 size: fileBody.length,
-                customMetadata: expect.objectContaining({ chardbFileId: result.expectedFileId }),
+                customMetadata: expect.objectContaining({ chardbRetainedSize: String(fileBody.length) }),
             }),
         ]);
         expect(result.staleSourceReadyError).toContain("CDB_STALE_EPOCH");
@@ -755,11 +755,16 @@ describe("combined native file-aware range movement", () => {
         expect(finished.destination.files).toContainEqual(
             expect.objectContaining({ file_id: result.expectedFileId, status: "attached", row_id: "row-http-race" })
         );
-        expect(
-            await call<readonly Record<string, unknown>[]>("r2Prefix", {
-                prefix: `v1/${organizations[0]}/${result.expectedFileId}`,
-            })
-        ).toEqual(result.objectAfterFirstPut);
+        const retainedKey = result.objectAfterFirstPut[0]?.key;
+        if (typeof retainedKey !== "string") throw new Error("retained HTTP upload key is missing");
+        expect(await call<readonly Record<string, unknown>[]>("r2", { keys: [retainedKey] })).toEqual([
+            expect.objectContaining({
+                key: retainedKey,
+                present: true,
+                size: fileBody.length,
+                customMetadata: expect.objectContaining({ chardbRetainedSize: String(fileBody.length) }),
+            }),
+        ]);
     }, 30_000);
 
     test("bounds current-owner cleanup above one delete batch across cold reconstruction", async () => {

@@ -209,6 +209,7 @@ describe("native file metadata resharding", () => {
                     contentType: "image/png",
                     size: 4,
                     nowMs: sourceNow,
+                    recoveryGeneration: 0,
                     schemaEpoch: 1,
                     domainSchemaEpoch: 2,
                     auth: runtimeAuth(sourceOrganization),
@@ -225,6 +226,7 @@ describe("native file metadata resharding", () => {
                     sha256: FILE_HASH,
                     size: 4,
                     nowMs: sourceNow + 1,
+                    recoveryGeneration: 0,
                     schemaEpoch: 1,
                     domainSchemaEpoch: 2,
                     auth: runtimeAuth(sourceOrganization),
@@ -238,6 +240,7 @@ describe("native file metadata resharding", () => {
                 body: {
                     organizationId: sourceOrganization,
                     nowMs: sourceNow + 2,
+                    recoveryGeneration: 0,
                     domainSchemaEpoch: 2,
                 },
             })
@@ -298,6 +301,7 @@ describe("native file metadata resharding", () => {
             contentType: "image/png",
             size: 4,
             nowMs: sourceNow,
+            recoveryGeneration: 0,
             schemaEpoch: 2,
             domainSchemaEpoch: 2,
             auth: runtimeAuth(destinationOrganization),
@@ -324,6 +328,7 @@ describe("native file metadata resharding", () => {
                 sha256: FILE_HASH,
                 size: 4,
                 nowMs: sourceNow + 1,
+                recoveryGeneration: 0,
                 schemaEpoch: 2,
                 domainSchemaEpoch: 2,
                 auth: runtimeAuth(destinationOrganization),
@@ -343,6 +348,7 @@ describe("native file metadata resharding", () => {
                     table: "runtime_file_messages",
                     column: "attachment",
                     rowId: "row-destination",
+                    recoveryGeneration: 0,
                     schemaEpoch: 2,
                     domainSchemaEpoch: 2,
                     auth: runtimeAuth(destinationOrganization),
@@ -353,7 +359,7 @@ describe("native file metadata resharding", () => {
             rpc({
                 op: "reserveFile",
                 target: destination,
-                body: { ...destinationRequest, fileId: `fil_${"c".repeat(64)}`, schemaEpoch: 1 },
+                body: { ...destinationRequest, fileId: `fil_${"c".repeat(64)}`, recoveryGeneration: 0, schemaEpoch: 1 },
             })
         ).rejects.toThrow("CDB_STALE_EPOCH");
     }, 30_000);
@@ -376,6 +382,7 @@ describe("native file metadata resharding", () => {
                 contentType: "image/png",
                 size: 4,
                 nowMs,
+                recoveryGeneration: 0,
                 schemaEpoch: 1,
                 domainSchemaEpoch: 2,
                 auth: runtimeAuth(organizationId),
@@ -390,6 +397,7 @@ describe("native file metadata resharding", () => {
                 sha256: FILE_HASH,
                 size: 4,
                 nowMs: nowMs + 1,
+                recoveryGeneration: 0,
                 schemaEpoch: 1,
                 domainSchemaEpoch: 2,
                 auth: runtimeAuth(organizationId),
@@ -405,6 +413,7 @@ describe("native file metadata resharding", () => {
                     table: "runtime_file_messages",
                     column: "attachment",
                     rowId,
+                    recoveryGeneration: 0,
                     schemaEpoch: 1,
                     domainSchemaEpoch: 2,
                     auth: runtimeAuth(organizationId),
@@ -417,7 +426,15 @@ describe("native file metadata resharding", () => {
             rpc({
                 op: "_resolveDownloadAfterFence",
                 target,
-                body: { migId, organizationId, fileId, rowId, domainSchemaEpoch: 2, auth: runtimeAuth(organizationId) },
+                body: {
+                    migId,
+                    organizationId,
+                    fileId,
+                    rowId,
+                    recoveryGeneration: 0,
+                    domainSchemaEpoch: 2,
+                    auth: runtimeAuth(organizationId),
+                },
             })
         ).rejects.toThrow("CDB_STALE_EPOCH");
     }, 30_000);
@@ -560,7 +577,7 @@ describe("native file metadata resharding", () => {
         await rpc({
             op: "reserve",
             target: sourceName,
-            body: { organizationId: seed.movedOrganizationId, fileId, schemaEpoch: 1 },
+            body: { organizationId: seed.movedOrganizationId, fileId, recoveryGeneration: 0, schemaEpoch: 1 },
         });
         await rpc({ op: "put", target: sourceName, body: { organizationId: seed.movedOrganizationId, fileId } });
         await copyTombstones(seed.identity, sourceName, destinationName);
@@ -570,14 +587,14 @@ describe("native file metadata resharding", () => {
             rpc({
                 op: "ready",
                 target: sourceName,
-                body: { organizationId: seed.movedOrganizationId, fileId, schemaEpoch: 1 },
+                body: { organizationId: seed.movedOrganizationId, fileId, recoveryGeneration: 0, schemaEpoch: 1 },
             })
         ).rejects.toThrow("CDB_STALE_EPOCH");
         await expect(
             rpc({
                 op: "reserve",
                 target: destinationName,
-                body: { organizationId: seed.movedOrganizationId, fileId, schemaEpoch: 2 },
+                body: { organizationId: seed.movedOrganizationId, fileId, recoveryGeneration: 0, schemaEpoch: 2 },
             })
         ).rejects.toThrow("CDB_STALE_EPOCH");
         await rpc({ op: "activate", target: destinationName, body: seed.identity });
@@ -585,14 +602,14 @@ describe("native file metadata resharding", () => {
             rpc({
                 op: "ready",
                 target: destinationName,
-                body: { organizationId: seed.movedOrganizationId, fileId, schemaEpoch: 2 },
+                body: { organizationId: seed.movedOrganizationId, fileId, recoveryGeneration: 0, schemaEpoch: 2 },
             })
         ).resolves.toMatchObject({ fileId, status: "ready" });
         await expect(
             rpc({
                 op: "delete",
                 target: sourceName,
-                body: { organizationId: seed.movedOrganizationId, fileId, schemaEpoch: 1 },
+                body: { organizationId: seed.movedOrganizationId, fileId, recoveryGeneration: 0, schemaEpoch: 1 },
             })
         ).rejects.toThrow("CDB_STALE_EPOCH");
     }, 30_000);

@@ -85,7 +85,7 @@ function sample(kind: "local" | "deployed", sequence: number, runKey: string, ca
         excluded: sequence === -1,
         candidateSha256,
         runKey,
-        workload: { id: "file-vector-aware-range-move", version: 2, profile },
+        workload: { id: "file-vector-aware-range-move", version: 3, profile },
         target: {
             kind,
             runtime: kind === "local" ? "miniflare/workerd" : "cloudflare-workers",
@@ -166,8 +166,9 @@ function sample(kind: "local" | "deployed", sequence: number, runKey: string, ca
             invoked: true,
             durable: true,
             ownerShard: "cdb-destination",
-            deletedObjects: 1,
-            remainingObjects: 15,
+            deletedMetadataRows: 1,
+            remainingMetadataRows: 15,
+            retainedObjects: 16,
         },
         correctness: Object.fromEntries(FILE_RESHARD_DEPLOYMENT_CORRECTNESS.map(name => [name, true])),
     };
@@ -586,7 +587,7 @@ describe("file reshard deployment proof runner", () => {
             const kind = parsed.hostname === "127.0.0.1" ? "local" : "deployed";
             if (parsed.pathname.endsWith("/capabilities")) {
                 return Response.json({
-                    schema: "chardb.file-vector-reshard-proof-capabilities.v2",
+                    schema: "chardb.file-vector-reshard-proof-capabilities.v3",
                     releaseSha256: candidateSha256,
                     runId: RUN_ID,
                     target: sample(kind, 0, "unused_run_key_1234", candidateSha256).target,
@@ -599,6 +600,7 @@ describe("file reshard deployment proof runner", () => {
                         freshDisposableData: true,
                         providerVectorMutationTrace: kind === "local",
                         publicVectorSearch: true,
+                        retainedFileRecovery: true,
                         vectorAwareReshard: true,
                     },
                 });

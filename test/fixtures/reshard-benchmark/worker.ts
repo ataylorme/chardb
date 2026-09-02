@@ -159,7 +159,7 @@ interface CatalogRpc {
     completeSchemaMigration(args: { migrationId: string }): Promise<unknown>;
     recordBenchmarkBulkApply(): Promise<void>;
     benchmarkBulkApplies(): Promise<number>;
-    mutateAuth(args: CatalogAuthMutationRequest): Promise<unknown>;
+    mutateAuth(args: CatalogAuthMutationRequest, _recoveryGeneration: number): Promise<unknown>;
     route(vshard: number): Promise<RouteResult>;
     resolveOrganizationAuthorityRoute(args: {
         principalId: PrincipalId;
@@ -317,6 +317,7 @@ export class Catalog extends app.Catalog {
 
     override async cutover(args: {
         migId: string;
+        recoveryGeneration: number;
         lo: number;
         hi: number;
         fromShard: string;
@@ -382,6 +383,7 @@ export class Cdb extends app.Cdb {
                     authEpochs: { global: 1, tenant: 1, principal: 1 },
                     claims: {},
                 },
+                recoveryGeneration: route.recoveryGeneration,
                 schemaEpoch: route.schemaEpoch,
                 domainSchemaEpoch: route.domainSchemaEpoch,
             });
@@ -443,6 +445,7 @@ export class Cdb extends app.Cdb {
 
     override async bulkCopyBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         table: TableSpec;
         range: { lo: number; hi: number };
         afterRowid: number;
@@ -463,6 +466,7 @@ export class Cdb extends app.Cdb {
 
     override async applyBulkBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         table: TableSpec;
         range: { lo: number; hi: number };
         rows: readonly Record<string, RawJson>[];
@@ -488,7 +492,12 @@ export class Cdb extends app.Cdb {
         return result;
     }
 
-    override async readTailBatch(args: { migId: string; afterLsn: number; limit: number }) {
+    override async readTailBatch(args: {
+        migId: string;
+        recoveryGeneration: number;
+        afterLsn: number;
+        limit: number;
+    }) {
         const started = performance.now();
         const result = await super.readTailBatch(args);
         metric(this as unknown as BenchmarkDoAccess, "tail_read_batches", 1);
@@ -519,7 +528,12 @@ export class Cdb extends app.Cdb {
         return result;
     }
 
-    override async readSplitOpLogBatch(args: { migId: string; afterLsn: number; limit: number }) {
+    override async readSplitOpLogBatch(args: {
+        migId: string;
+        recoveryGeneration: number;
+        afterLsn: number;
+        limit: number;
+    }) {
         const started = performance.now();
         const result = await super.readSplitOpLogBatch(args);
         metric(this as unknown as BenchmarkDoAccess, "oplog_read_batches", 1);
@@ -777,7 +791,7 @@ async function prepareBenchmark(env: BenchmarkEnv, request: Request): Promise<un
             },
         },
     ] as const) {
-        await cat.mutateAuth(mutation);
+        await cat.mutateAuth(mutation, 0);
     }
     const seeded = await cdb(env, SOURCE_SHARD).benchmarkSeed();
     const route = await cat.route(Number(vshardOf([ORGANIZATION_ID])));

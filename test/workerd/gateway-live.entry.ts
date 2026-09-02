@@ -16,6 +16,7 @@ import baseWorker, {
     Catalog as ProductionCatalog,
     Cdb as ProductionCdb,
     Gateway as ProductionGateway,
+    Resharder as ProductionResharder,
 } from "./gateway-jwt.entry.ts";
 
 const PUBLIC_QUERY_REF = "test/workerd/gateway-live.entry.ts#listPublicOrganizationRows";
@@ -245,6 +246,8 @@ export class Catalog extends ProductionCatalog {
     }
 }
 
+export class Resharder extends ProductionResharder {}
+
 export class Gateway extends ProductionGateway {
     private readonly fixtureInstanceId = crypto.randomUUID();
     private fixtureNowSequence: number[] = [];
@@ -471,12 +474,15 @@ interface CatalogFixtureRpc {
         readonly nextTargetAt: number | null;
         readonly lastTargetError: string | null;
     }>;
-    mutateAuth(args: {
-        readonly model: string;
-        readonly op: "create" | "update" | "delete";
-        readonly where?: { readonly [key: string]: string };
-        readonly payload?: { readonly [key: string]: string | number | boolean };
-    }): Promise<{ readonly affected?: number }>;
+    mutateAuth(
+        args: {
+            readonly model: string;
+            readonly op: "create" | "update" | "delete";
+            readonly where?: { readonly [key: string]: string };
+            readonly payload?: { readonly [key: string]: string | number | boolean };
+        },
+        _recoveryGeneration: number
+    ): Promise<{ readonly affected?: number }>;
 }
 
 export default {
@@ -511,26 +517,32 @@ export default {
                 userId: mutation.userId,
             };
             if (mutation.action === "delete") {
-                return Response.json(await catalog.mutateAuth({ model: "member", op: "delete", where }));
+                return Response.json(await catalog.mutateAuth({ model: "member", op: "delete", where }, 0));
             }
-            const updated = await catalog.mutateAuth({
-                model: "member",
-                op: "update",
-                where,
-                payload: { role: mutation.role },
-            });
+            const updated = await catalog.mutateAuth(
+                {
+                    model: "member",
+                    op: "update",
+                    where,
+                    payload: { role: mutation.role },
+                },
+                0
+            );
             if ((updated.affected ?? 0) > 0) return Response.json(updated);
             return Response.json(
-                await catalog.mutateAuth({
-                    model: "member",
-                    op: "create",
-                    payload: {
-                        id: `fixture-${mutation.organizationId}-${mutation.userId}`,
-                        ...where,
-                        role: mutation.role,
-                        createdAt: Date.parse("2026-08-23T00:00:00Z"),
+                await catalog.mutateAuth(
+                    {
+                        model: "member",
+                        op: "create",
+                        payload: {
+                            id: `fixture-${mutation.organizationId}-${mutation.userId}`,
+                            ...where,
+                            role: mutation.role,
+                            createdAt: Date.parse("2026-08-23T00:00:00Z"),
+                        },
                     },
-                })
+                    0
+                )
             );
         }
         if (url.pathname === "/live-user") {
@@ -542,32 +554,40 @@ export default {
             const id = env.CDB_CATALOG.idFromName("global");
             const catalog = env.CDB_CATALOG.get(id) as unknown as CatalogFixtureRpc;
             if (user.action === "delete") {
-                return Response.json(await catalog.mutateAuth({ model: "user", op: "delete", where: { id: user.id } }));
+                return Response.json(
+                    await catalog.mutateAuth({ model: "user", op: "delete", where: { id: user.id } }, 0)
+                );
             }
             if (user.action === "role") {
                 return Response.json(
-                    await catalog.mutateAuth({
-                        model: "user",
-                        op: "update",
-                        where: { id: user.id },
-                        payload: { role: user.role ?? "user" },
-                    })
+                    await catalog.mutateAuth(
+                        {
+                            model: "user",
+                            op: "update",
+                            where: { id: user.id },
+                            payload: { role: user.role ?? "user" },
+                        },
+                        0
+                    )
                 );
             }
             return Response.json(
-                await catalog.mutateAuth({
-                    model: "user",
-                    op: "create",
-                    payload: {
-                        id: user.id,
-                        name: user.id,
-                        email: `${user.id}@example.com`,
-                        emailVerified: true,
-                        role: "user",
-                        createdAt: Date.parse("2026-08-25T00:00:00Z"),
-                        updatedAt: Date.parse("2026-08-25T00:00:00Z"),
+                await catalog.mutateAuth(
+                    {
+                        model: "user",
+                        op: "create",
+                        payload: {
+                            id: user.id,
+                            name: user.id,
+                            email: `${user.id}@example.com`,
+                            emailVerified: true,
+                            role: "user",
+                            createdAt: Date.parse("2026-08-25T00:00:00Z"),
+                            updatedAt: Date.parse("2026-08-25T00:00:00Z"),
+                        },
                     },
-                })
+                    0
+                )
             );
         }
         if (url.pathname === "/live-organization") {
@@ -579,20 +599,23 @@ export default {
             const catalog = env.CDB_CATALOG.get(id) as unknown as CatalogFixtureRpc;
             if (organization.action === "delete") {
                 return Response.json(
-                    await catalog.mutateAuth({ model: "organization", op: "delete", where: { id: organization.id } })
+                    await catalog.mutateAuth({ model: "organization", op: "delete", where: { id: organization.id } }, 0)
                 );
             }
             return Response.json(
-                await catalog.mutateAuth({
-                    model: "organization",
-                    op: "create",
-                    payload: {
-                        id: organization.id,
-                        name: organization.id,
-                        slug: organization.id,
-                        createdAt: Date.parse("2026-08-28T00:00:00Z"),
+                await catalog.mutateAuth(
+                    {
+                        model: "organization",
+                        op: "create",
+                        payload: {
+                            id: organization.id,
+                            name: organization.id,
+                            slug: organization.id,
+                            createdAt: Date.parse("2026-08-28T00:00:00Z"),
+                        },
                     },
-                })
+                    0
+                )
             );
         }
         if (url.pathname === "/live-route-organization") {
