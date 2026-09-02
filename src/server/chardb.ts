@@ -13,6 +13,7 @@ import { type ChardbAuthAdapterEnv, chardbAuthAdapter } from "../auth/chardb_ada
 import { type AuthOptionsInput, type ChardbAuth, type SynthesizedAuthSchema, defineAuth } from "../auth/synthesize.ts";
 import type { ChardbBinding } from "../binding.ts";
 import { CdbError } from "../errors.ts";
+import { attachChardbAuthRuntimeEnv } from "./auth-runtime-context.ts";
 import { type DB, configureDbBindingRuntime } from "./binding.ts";
 import { collectCdbTables } from "./cdb-table-registry.ts";
 import { type Catalog, configureCatalogRuntime } from "./do/catalog.ts";
@@ -325,15 +326,24 @@ function buildDefaultAuthRuntime<TPlugins extends readonly BetterAuthPlugin[]>(
         const cached = cache.get(e);
         let instance = cached?.key === cacheKey ? cached.instance : undefined;
         if (!instance) {
-            instance = betterAuth({
-                ...authOptions,
-                // Workers can serve workers.dev, custom, preview, and local hosts.
-                // Pin an otherwise-unconfigured Better Auth instance to the
-                // canonical request origin instead of trusting an arbitrary
-                // Host header or forcing a wildcard allow-list.
-                ...(authOptions.baseURL === undefined ? { baseURL: requestOrigin } : {}),
-                database: chardbAuthAdapter({ env: env as unknown as ChardbAuthAdapterEnv }),
-            }) as unknown as ChardbAuthRuntime<TPlugins>;
+            instance = betterAuth(
+                attachChardbAuthRuntimeEnv(
+                    {
+                        ...authOptions,
+                        // Workers can serve workers.dev, custom, preview, and local hosts.
+                        // Pin an otherwise-unconfigured Better Auth instance to the
+                        // canonical request origin instead of trusting an arbitrary
+                        // Host header or forcing a wildcard allow-list.
+                        ...(authOptions.baseURL === undefined ? { baseURL: requestOrigin } : {}),
+                        database: chardbAuthAdapter({ env: env as unknown as ChardbAuthAdapterEnv }),
+                        // Better Auth preserves its server-side options on
+                        // endpoint contexts. The helper attaches this env so
+                        // plugin callbacks can use Worker bindings without a
+                        // process-global mutable "current env".
+                    },
+                    env
+                )
+            ) as unknown as ChardbAuthRuntime<TPlugins>;
             // Keep the cache bounded when one Worker serves many custom hosts.
             // A host switch replaces the previous unconfigured instance.
             cache.set(e, { key: cacheKey, instance });
