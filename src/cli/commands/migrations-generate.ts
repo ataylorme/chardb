@@ -13,6 +13,12 @@ export interface MigrationsGenerateOptions {
     readonly name: string;
 }
 
+export interface MigrationsRebaselineOptions {
+    readonly name: string;
+    /** Explicit acknowledgement that all local database state has been discarded. */
+    readonly confirmLocalReset: true;
+}
+
 interface StoredMigrationHistory {
     readonly latest: ChardbSchemaSnapshotInput;
     readonly journal: string;
@@ -231,4 +237,54 @@ export async function runMigrationsGenerate(ctx: CliContext, options: Migrations
         { path: journalPath, contents: artifacts.journal, expectedContents: history.journal },
     ]);
     ctx.stdout(`chardb: generated immutable additive migration v${nextVersion} (${options.name})\n`);
+}
+
+/**
+ * Replace a version-one migration baseline before a project has been deployed.
+ *
+ * This command intentionally cannot rewrite an append-only history. It exists
+ * for local-only projects that have explicitly discarded all state and need a
+ * new initial schema after selecting an auth plugin profile.
+ */
+export async function runMigrationsRebaseline(ctx: CliContext, options: MigrationsRebaselineOptions): Promise<void> {
+    if (!options.confirmLocalReset) throw new Error("--confirm-local-reset is required");
+    if (!MIGRATION_NAME.test(options.name)) {
+        throw new Error("migration name must match [a-z0-9][a-z0-9_-]{0,127}");
+    }
+    const journalPath = `${ctx.cwd}/src/migrations.ts`;
+    const migrationDirectory = `${ctx.cwd}/src/migrations`;
+    const versionOnePath = `${migrationDirectory}/v1.ts`;
+    const snapshotOnePath = `${migrationDirectory}/v1.json`;
+    if (!(await ctx.exists(`${ctx.cwd}/src/schema.ts`))) throw new Error("src/schema.ts does not exist");
+    if (!(await ctx.exists(`${ctx.cwd}/src/auth.ts`))) throw new Error("src/auth.ts does not exist");
+    if (
+        !(await ctx.exists(journalPath)) ||
+        !(await ctx.exists(versionOnePath)) ||
+        !(await ctx.exists(snapshotOnePath))
+    ) {
+        throw new Error("version 1 migration history does not exist");
+    }
+    if (!ctx.readDirectory || !ctx.writeFilesAtomic) {
+        throw new Error("atomic migration history writes are unavailable");
+    }
+    const names = await ctx.readDirectory(migrationDirectory);
+    if (names.some(name => /^v(?:[2-9]|[1-9][0-9]+)\.(?:json|ts)$/.test(name))) {
+        throw new Error("rebaseline only supports a version 1 migration history");
+    }
+    const [previousJournal, previousVersionOne, previousSnapshotOne] = await Promise.all([
+        ctx.read(journalPath),
+        ctx.read(versionOnePath),
+        ctx.read(snapshotOnePath),
+    ]);
+    const snapshot = await inspectTwice(ctx, options.name, 1, null);
+    if (!defineSchemaSnapshot(snapshot).initialMigration) {
+        throw new Error("schema inspector did not return an initial snapshot");
+    }
+    const artifacts = renderInitialMigrationArtifacts(snapshot);
+    await ctx.writeFilesAtomic([
+        { path: versionOnePath, contents: artifacts.versionOne, expectedContents: previousVersionOne },
+        { path: snapshotOnePath, contents: artifacts.snapshotOne, expectedContents: previousSnapshotOne },
+        { path: journalPath, contents: artifacts.journal, expectedContents: previousJournal },
+    ]);
+    ctx.stdout(`chardb: rebaselined immutable migration v1 (${options.name}); local state must be reset\n`);
 }

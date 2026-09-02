@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { runMigrationsGenerate } from "../../src/cli/commands/migrations-generate.ts";
+import { runMigrationsGenerate, runMigrationsRebaseline } from "../../src/cli/commands/migrations-generate.ts";
 import { type CliContext, REAL_CONTEXT } from "../../src/cli/context.ts";
 import { renderInitialMigrationArtifacts } from "../../src/cli/migration-artifacts.ts";
 import { SCAFFOLD_INITIAL_SNAPSHOT } from "../../src/cli/scaffold-initial-snapshot.ts";
@@ -577,4 +577,22 @@ describe("initial migration generation", () => {
             await rm(project, { recursive: true, force: true });
         }
     }, 20_000);
+});
+
+describe("migration rebaseline", () => {
+    test("replaces only a version-one history after explicit local-reset acknowledgement", async () => {
+        const project = fakeProject();
+        await runMigrationsGenerate(project.ctx, { name: "initial_schema" });
+        await runMigrationsRebaseline(project.ctx, { name: "initial_schema", confirmLocalReset: true });
+
+        expect(project.output.at(-1)).toContain("rebaselined immutable migration v1 (initial_schema)");
+        expect(project.invocations.at(-1)?.args).toEqual([
+            "/chardb",
+            "__migrations-inspect",
+            "initial_schema",
+            "1",
+            "-",
+        ]);
+        expect(project.files.get("/project/src/migrations/v1.json")).toContain('"name":"initial_schema"');
+    });
 });
