@@ -17,7 +17,7 @@ export function SdkStrip() {
                             Client SDKs
                         </p>
                         <p className="mt-2 text-sm text-fg-muted">
-                            React and Rust ship today. More clients are planned.
+                            React and Rust are included in the repository. More clients are planned.
                         </p>
                     </div>
                 </div>
@@ -28,7 +28,7 @@ export function SdkStrip() {
                                 <img src={sdk.icon} alt="" width="28" height="28" />
                             </span>
                             <span className="sdk-name">{sdk.name}</span>
-                            <span className="sdk-status">{sdk.available ? "Available" : "Coming soon"}</span>
+                            <span className="sdk-status">{sdk.available ? "Included" : "Coming soon"}</span>
                         </li>
                     ))}
                 </ul>

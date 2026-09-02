@@ -1,9 +1,78 @@
 import { useState } from "react";
-import { GITHUB_URL } from "../lib/constants";
+
+type CodeLanguage = "rust" | "typescript";
+
+const CODE_TOKEN =
+    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b/g;
+const TYPESCRIPT_KEYWORDS = new Set([
+    "as",
+    "async",
+    "await",
+    "const",
+    "export",
+    "from",
+    "function",
+    "if",
+    "import",
+    "new",
+    "return",
+    "true",
+]);
+const RUST_KEYWORDS = new Set([
+    "as",
+    "async",
+    "await",
+    "break",
+    "const",
+    "derive",
+    "if",
+    "let",
+    "loop",
+    "mut",
+    "struct",
+    "use",
+]);
+
+function syntaxClass(source: string, token: string, index: number, language: CodeLanguage): string {
+    if (token.startsWith("//") || token.startsWith("/*")) return "syntax-comment";
+    if (token.startsWith('"') || token.startsWith("'")) return "syntax-string";
+    if (/^\d/.test(token)) return "syntax-number";
+    if ((language === "rust" ? RUST_KEYWORDS : TYPESCRIPT_KEYWORDS).has(token)) return "syntax-keyword";
+    if (/^[A-Z]/.test(token)) return "syntax-type";
+
+    const before = source.slice(0, index).trimEnd().at(-1);
+    const after = source
+        .slice(index + token.length)
+        .trimStart()
+        .at(0);
+    if (before === ".") return "syntax-property";
+    if (after === "(" || after === "!") return "syntax-function";
+    return "syntax-variable";
+}
+
+function highlightCode(source: string, language: CodeLanguage) {
+    const nodes: Array<string | React.JSX.Element> = [];
+    let cursor = 0;
+
+    for (const match of source.matchAll(CODE_TOKEN)) {
+        const index = match.index ?? 0;
+        if (index > cursor) nodes.push(source.slice(cursor, index));
+        nodes.push(
+            <span className={syntaxClass(source, match[0], index, language)} key={`${index}-${match[0]}`}>
+                {match[0]}
+            </span>
+        );
+        cursor = index + match[0].length;
+    }
+    if (cursor < source.length) nodes.push(source.slice(cursor));
+    return nodes;
+}
 
 function DatabaseSnippet() {
     return (
-        <code>{`// src/auth.ts
+        <code>
+            {highlightCode(
+                `// src/auth.ts
 import { defineAuth } from "@chardb/core/server";
 import { anonymous } from "better-auth/plugins/anonymous";
 import { jwt } from "better-auth/plugins/jwt";
@@ -40,13 +109,18 @@ const app = chardb({
 });
 
 export default app;
-export const { DB, Catalog, Cdb, Gateway, Resharder } = app;`}</code>
+export const { DB, Catalog, Cdb, Gateway, Resharder } = app;`,
+                "typescript"
+            )}
+        </code>
     );
 }
 
 function ReactClientSnippet() {
     return (
-        <code>{`import { createChardbReactClient } from "@chardb/react";
+        <code>
+            {highlightCode(
+                `import { createChardbReactClient } from "@chardb/react";
 import { anonymousClient, jwtClient, organizationClient } from "better-auth/client/plugins";
 import { createAuthClient } from "better-auth/react";
 import { listMessages } from "./messages.ts";
@@ -86,14 +160,24 @@ export function App() {
   if (!session.data) {
     return <button onClick={() => db.auth.signIn.anonymous()}>Sign in</button>;
   }
-  return <db.Provider><Messages /></db.Provider>;
-}`}</code>
+  return (
+    <db.Provider>
+      <Messages />
+      <button onClick={() => db.auth.signOut()}>Sign out</button>
+    </db.Provider>
+  );
+}`,
+                "typescript"
+            )}
+        </code>
     );
 }
 
 function RustClientSnippet() {
     return (
-        <code>{`// Application-authored types and operation handle.
+        <code>
+            {highlightCode(
+                `// Application-authored types and operation handle.
 use chardb_client::{AsyncClient, ClientConfig, Query, SubscriptionEvent};
 use serde::{Deserialize, Serialize};
 
@@ -123,7 +207,10 @@ loop {
   let event = messages.recv().await?;
   if matches!(&event, SubscriptionEvent::Closed) { break; }
   render(event);
-}`}</code>
+}`,
+                "rust"
+            )}
+        </code>
     );
 }
 
@@ -187,7 +274,7 @@ export function ProductOverview() {
                                     width="18"
                                     height="18"
                                 />
-                                <code>src/worker.ts</code>
+                                <code>Worker setup</code>
                                 <span className="code-surface">Worker</span>
                             </header>
                             <pre>
@@ -268,10 +355,6 @@ export function ProductOverview() {
                         <a href="/why/" className="text-fg hover:text-accent transition-colors">
                             Why CharDB
                         </a>
-                        <a href={GITHUB_URL} rel="noopener" className="text-fg hover:text-accent transition-colors">
-                            GitHub
-                        </a>
-                        <span className="text-fg-dim">Docs soon</span>
                     </div>
                 </div>
             </section>

@@ -6,6 +6,8 @@ CharDB turns a Better Auth user or organization into the ownership, authorizatio
 
 ## Build one
 
+Use Bun 1.2.22 or newer and Node.js 22 or newer.
+
 ```sh
 bunx @chardb/core init my-chardb-app
 cd my-chardb-app
@@ -202,7 +204,12 @@ export function App() {
     if (!session.data) {
         return <button onClick={() => void db.auth.signIn.anonymous()}>Sign in</button>;
     }
-    return <db.Provider><Messages /></db.Provider>;
+    return (
+        <db.Provider>
+            <Messages />
+            <button onClick={() => void db.auth.signOut()}>Sign out</button>
+        </db.Provider>
+    );
 }
 ```
 
@@ -252,9 +259,9 @@ The public migration path accepts additive SQLite changes that do not require a 
 
 Capture and restore a coordinated Durable Object recovery point with the CLI:
 
-```sh
-export CHARDB_ADMIN_TOKEN="$(openssl rand -hex 32)"
+Use the `CHARDB_ADMIN_TOKEN` already configured for the deployed Worker. Do not generate a different token for recovery.
 
+```sh
 bunx @chardb/core backups create \
     --url https://api.example.com \
     --out recovery-2026-09-01.json
@@ -301,8 +308,8 @@ bun run test:correctness
 | Package | Purpose |
 | --- | --- |
 | `@chardb/core` | Worker runtime, browser client, native binding client, CLI, files, vectors, Vite, and shared types |
-| `@chardb/react` | Better Auth-connected React provider and owner-scoped hooks |
-| `chardb-client` | Low-dependency Rust client with blocking and runtime-neutral async APIs |
+| `@chardb/react` | React client included in this repository; registry publication is pending |
+| `chardb-client` | Rust client included in this repository; registry publication is pending |
 
 Generated projects use `wrangler.toml`. The CLI also reads `wrangler.json` and `wrangler.jsonc`.
 

@@ -3,15 +3,11 @@ title: "Clients"
 description: "Connect from React or native Rust."
 ---
 
-CharDB has a React client for browser applications and a native Rust client for services and command-line programs. Both use registered query and mutation handles rather than accepting SQL from the caller.
+CharDB includes a React client for browser applications and a native Rust client for services and command-line programs in this repository. Registry publication is still pending. Both use registered query and mutation handles rather than accepting SQL from the caller.
 
 ## React
 
-Install the configured React client beside the core package:
-
-```bash
-bun add @chardb/core @chardb/react
-```
+The React client lives in `packages/react` and is wired into the generated workspace. The npm package is not public yet.
 
 Configure the client with the same public URL that serves Better Auth and the CharDB Worker:
 
@@ -36,15 +32,10 @@ Follow [Live queries](/live-queries) for the client setup and [Files](/files) fo
 
 ## Rust
 
-The `chardb-client` crate provides blocking and runtime-neutral async APIs over protocol version 3:
-
-```toml
-[dependencies]
-chardb-client = "0.1"
-```
+The `chardb-client` crate lives in `rust/chardb` and provides blocking and runtime-neutral async APIs over protocol version 3. The crate is not public on crates.io yet.
 
 Typed `Query<Arguments, Row>` and `Mutation<Arguments, Output>` handles bind each server reference to its Serde request and response types. The default build includes both client styles and Rustls; optional features select native roots or JSON Schema introspection.
 
 The Rust client supports registered live queries, mutations, reconnects, mutation replay, and auth refresh. Your application must obtain the initial Better Auth JWT and provide refreshed JWTs when the client requests one. The crate does not perform sign-in. It also does not implement files, vectors, `workers-rs`, or `wasm32` transport.
 
-See the [crate README](https://github.com/zpg6/chardb/tree/main/rust/chardb) for connection, TLS, timeout, and feature details.
+The crate README at `rust/chardb/README.md` covers connection, TLS, timeout, and feature details.

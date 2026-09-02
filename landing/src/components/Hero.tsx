@@ -37,7 +37,6 @@ export function Hero() {
                     </div>
 
                     <div className="mt-6 flex flex-col sm:flex-row sm:items-center gap-4">
-                        <span className="inline-flex items-center text-sm text-fg-dim">Docs soon</span>
                         <a
                             href="#worker-client"
                             className="inline-flex items-center gap-1 text-sm text-fg-muted transition-colors hover:text-fg"

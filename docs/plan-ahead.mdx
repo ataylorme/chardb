@@ -9,8 +9,9 @@ CharDB is experimental. It has no production availability SLA, automatic regiona
 
 Deployed SQLite-backed Durable Objects retain native point-in-time recovery history for 30 days. CharDB can capture one recovery point across the Catalog and every active Cdb shard:
 
+Run the command with the same `CHARDB_ADMIN_TOKEN` configured for the deployed Worker.
+
 ```sh
-export CHARDB_ADMIN_TOKEN="your-32-byte-or-longer-secret"
 bunx @chardb/core backups create --url https://api.example.com --out recovery.json
 ```
 

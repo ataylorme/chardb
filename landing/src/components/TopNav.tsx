@@ -1,5 +1,3 @@
-import { GITHUB_URL } from "../lib/constants";
-
 type TopNavProps = {
     homeHref?: string;
     storyActive?: boolean;
@@ -34,13 +32,6 @@ export function TopNav({ homeHref = "#top", storyActive = false }: TopNavProps) 
                             </span>
                         </li>
                     </ul>
-                    <a
-                        href={GITHUB_URL}
-                        rel="noopener"
-                        className="text-sm text-fg hover:text-accent transition-colors inline-flex items-center gap-1"
-                    >
-                        GitHub <span aria-hidden="true">→</span>
-                    </a>
                 </nav>
             </div>
         </header>

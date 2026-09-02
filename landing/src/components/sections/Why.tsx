@@ -1,7 +1,10 @@
 import type { ReactNode } from "react";
 import whyMarkdown from "../../content/Why.md?raw";
 
-type MarkdownBlock = { kind: "heading"; level: 1 | 2; text: string } | { kind: "paragraph"; text: string };
+type MarkdownBlock =
+    | { kind: "heading"; level: 1 | 2; text: string }
+    | { kind: "paragraph"; text: string }
+    | { kind: "quote"; text: string };
 
 function parseMarkdown(source: string): MarkdownBlock[] {
     return source
@@ -11,6 +14,7 @@ function parseMarkdown(source: string): MarkdownBlock[] {
         .map(block => {
             if (block.startsWith("## ")) return { kind: "heading", level: 2, text: block.slice(3) } as const;
             if (block.startsWith("# ")) return { kind: "heading", level: 1, text: block.slice(2) } as const;
+            if (block.startsWith("> ")) return { kind: "quote", text: block.slice(2) } as const;
             return { kind: "paragraph", text: block } as const;
         });
 }
@@ -54,9 +58,11 @@ const blocks = parseMarkdown(whyMarkdown);
 const title = blocks.find(block => block.kind === "heading" && block.level === 1)?.text ?? "Why I built CharDB";
 const intro = blocks.find(block => block.kind === "paragraph")?.text ?? "";
 const articleBlocks = blocks.slice(blocks.findIndex(block => block.kind === "heading" && block.level === 2));
+const quoteIndex = articleBlocks.findIndex(block => block.kind === "quote");
+const quote = quoteIndex >= 0 ? articleBlocks[quoteIndex] : undefined;
 const postscriptIndex = articleBlocks.findIndex(block => block.kind === "heading" && block.text === "P.S. Cloudflare");
 const postscript = articleBlocks.slice(postscriptIndex + 1).find(block => block.kind === "paragraph");
-const storyBlocks = articleBlocks.slice(0, postscriptIndex);
+const storyBlocks = articleBlocks.slice(0, quoteIndex >= 0 ? quoteIndex : postscriptIndex);
 const stories = storyBlocks.reduce<Array<{ title: string; paragraphs: string[] }>>((sections, block) => {
     if (block.kind === "heading") {
         sections.push({ title: block.text, paragraphs: [] });
@@ -98,6 +104,12 @@ export function Why() {
                                 </div>
                             </section>
                         ))}
+
+                        {quote?.kind === "quote" ? (
+                            <blockquote className="border-l-2 border-accent pl-5 text-xl leading-8 tracking-tight text-fg sm:text-2xl sm:leading-9">
+                                {quote.text}
+                            </blockquote>
+                        ) : null}
 
                         <aside className="border-t border-accent/50 pt-8" aria-labelledby="cloudflare-postscript">
                             <h2 id="cloudflare-postscript" className="font-mono text-sm tracking-tight text-accent">

@@ -8,20 +8,18 @@ Linux.
 
 Application calls use typed `Query<Arguments, Row>` and
 `Mutation<Arguments, Output>` handles. The raw TypeScript reference lives in
-one API declaration instead of every call site. Rust then checks the operation
-kind, arguments, and decoded output before the program runs. A handle is one
+one API declaration instead of every call site. Rust checks the operation kind
+and binds the argument and result types at compile time. The client serializes
+arguments and validates and decodes server output at runtime. A handle is one
 `&'static str`, has no allocation, and writes that string unchanged to protocol
 v3's `ref` field.
 
 ## Install
 
+This repository includes the crate at `rust/chardb`. It is not public on crates.io yet.
+
 The default build includes the blocking client, the runtime-neutral async
 client, and Rustls with Mozilla `WebPKI` roots.
-
-```toml
-[dependencies]
-chardb-client = "0.1"
-```
 
 Available features:
 
