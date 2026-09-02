@@ -6,7 +6,7 @@ use crate::Operation;
 
 pub use schemars::{JsonSchema, Schema};
 
-/// The argument and result schemas attached to one CharDB reference.
+/// The argument and result schemas attached to one `CharDB` reference.
 #[derive(Clone, Debug, Serialize)]
 pub struct OperationSchema {
     pub reference: String,
