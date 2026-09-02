@@ -172,6 +172,7 @@ function subscription(registration: LiveSubscriptionId, tables: readonly string[
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-1"),
         schemaEpoch: 1,
+        recoveryGeneration: 0,
         vshard: Number(vshardOf(["org-1"])),
         domainSchemaEpoch: 1,
         ref: ChardbRef("queries.ts#outboxProbe"),
@@ -194,6 +195,7 @@ function mutation(
         args,
         auth: AUTH,
         schemaEpoch: 1,
+        recoveryGeneration: 0,
         domainSchemaEpoch: 1,
     };
 }
@@ -273,6 +275,16 @@ describe("Cdb invalidation outbox", () => {
             idFromString: (id: string) => ({ toString: () => id }),
             get: () => gatewayRpc,
         } as unknown as DurableObjectNamespace;
+        const recoveryNamespace = {
+            idFromName: () => "global",
+            get: () => ({
+                adminRecoveryAdmissionClock: async () => ({
+                    generation: 0,
+                    activeOperationId: null,
+                    activeDigest: null,
+                }),
+            }),
+        } as unknown as DurableObjectNamespace;
         let ready: Promise<unknown> = Promise.resolve();
         const state = {
             id: { toString: () => "outbox-shard-1" },
@@ -301,7 +313,7 @@ describe("Cdb invalidation outbox", () => {
                 return clock.value;
             }
         }
-        const cdb = new TestCdb(state, { CDB_GATEWAY: gatewayNamespace });
+        const cdb = new TestCdb(state, { CDB_GATEWAY: gatewayNamespace, CDB_RESHARD: recoveryNamespace });
         await ready;
         return { db, cdb, clock, alarms, restoreTargets, gateway, alarm };
     }
@@ -312,7 +324,12 @@ describe("Cdb invalidation outbox", () => {
         await cdb.mutate(mutation(putMessage, "recovery-fence", { id: "recovery-fence", value: 1 }));
         const deliveryCalls = gateway.calls.length;
 
-        await cdb.adminArmRecoveryRestore({ bookmark: "00000000-history", armedAt: 42 });
+        await cdb.adminArmRecoveryRestore({
+            bookmark: "00000000-history",
+            armedAt: 42,
+            operationId: "00000000-0000-4000-8000-000000000001",
+            generation: 1,
+        });
         await cdb.alarm();
 
         expect(gateway.calls).toHaveLength(deliveryCalls);
@@ -322,9 +339,16 @@ describe("Cdb invalidation outbox", () => {
         ).toEqual({ target_bookmark: "00000000-history", commit_at: null });
     });
 
-    test("rejects every private file and vector RPC at the local recovery boundary", async () => {
+    test("rejects stale mutation and provider RPCs after recovery release without side effects", async () => {
         const { db, cdb, alarms } = await setup();
-        await cdb.adminArmRecoveryRestore({ bookmark: "00000000-history", armedAt: 42 });
+        const operationId = "00000000-0000-4000-8000-000000000001";
+        await cdb.adminArmRecoveryRestore({
+            bookmark: "00000000-history",
+            armedAt: 42,
+            operationId,
+            generation: 1,
+        });
+        await cdb.adminReleaseRecovery({ operationId, generation: 1 });
         const auth = {
             userId: "user-1",
             tenantId: "org-1",
@@ -343,9 +367,10 @@ describe("Cdb invalidation outbox", () => {
                 nowMs: 100,
                 domainSchemaEpoch: 1,
                 schemaEpoch: 1,
+                recoveryGeneration: 0,
                 auth,
             })
-        ).rejects.toThrow("CDB_STALE_EPOCH: point-in-time restore is in progress");
+        ).rejects.toThrow("request belongs to another recovery generation");
         await expect(
             Promise.resolve().then(() =>
                 cdb.markFileReady({
@@ -356,10 +381,11 @@ describe("Cdb invalidation outbox", () => {
                     nowMs: 101,
                     domainSchemaEpoch: 1,
                     schemaEpoch: 1,
+                    recoveryGeneration: 0,
                     auth,
                 })
             )
-        ).rejects.toThrow("CDB_STALE_EPOCH: point-in-time restore is in progress");
+        ).rejects.toThrow("request belongs to another recovery generation");
         await expect(
             cdb.resolveFileDownload({
                 organizationId: "org-1",
@@ -368,9 +394,10 @@ describe("Cdb invalidation outbox", () => {
                 rowId: "row-1",
                 domainSchemaEpoch: 1,
                 schemaEpoch: 1,
+                recoveryGeneration: 0,
                 auth,
             })
-        ).rejects.toThrow("CDB_STALE_EPOCH: point-in-time restore is in progress");
+        ).rejects.toThrow("request belongs to another recovery generation");
         await expect(
             cdb.resolveOrganizationVectorSearch({
                 auth,
@@ -379,25 +406,79 @@ describe("Cdb invalidation outbox", () => {
                 resourceId: "resource-1",
                 matches: [],
                 limit: 1,
-                route: { shardId: "ShardDO_0" as never, schemaEpoch: 1, domainSchemaEpoch: 1 },
+                route: {
+                    shardId: "ShardDO_0" as never,
+                    schemaEpoch: 1,
+                    recoveryGeneration: 0,
+                    domainSchemaEpoch: 1,
+                },
             })
-        ).rejects.toThrow("CDB_STALE_EPOCH: point-in-time restore is in progress");
+        ).rejects.toThrow("CDB_STALE_EPOCH: request belongs to another recovery generation");
         await expect(
-            cdb.deleteOrganizationFiles({ organizationId: "org-1", nowMs: 102, domainSchemaEpoch: 1 })
+            cdb.deleteOrganizationFiles({
+                organizationId: "org-1",
+                nowMs: 102,
+                recoveryGeneration: 0,
+                domainSchemaEpoch: 1,
+            })
         ).rejects.toMatchObject({ code: "CDB_STALE_EPOCH" });
         await expect(
             Promise.resolve().then(() =>
                 cdb.vectorOrganizationPurgeStatus({
                     organizationId: "org-1",
+                    recoveryGeneration: 0,
                     domainSchemaEpoch: 1,
                     schemaEpoch: 1,
                 })
             )
-        ).rejects.toThrow("CDB_STALE_EPOCH: point-in-time restore is in progress");
+        ).rejects.toThrow("CDB_STALE_EPOCH: request belongs to another recovery generation");
+        await expect(
+            cdb.mutate(mutation(putMessage, "stale-after-release", { id: "stale-after-release", value: 1 }))
+        ).resolves.toMatchObject({ ok: false, error: { code: "CDB_STALE_EPOCH" } });
+        await expect(
+            cdb.invalidateAuthScope({
+                scope: "tenant",
+                scopeId: "org-1",
+                epoch: 9,
+                recoveryGeneration: 0,
+            })
+        ).rejects.toThrow("request belongs to another recovery generation");
+        expect(db.prepare("SELECT * FROM _chardb_auth_invalidation_epochs").all()).toEqual([]);
+        await expect(
+            cdb.invalidateAuthScope({
+                scope: "tenant",
+                scopeId: "org-1",
+                epoch: 9,
+                recoveryGeneration: 1,
+            })
+        ).resolves.toMatchObject({ accepted: true, recoveryGeneration: 1 });
 
         expect(alarms).toEqual([]);
         expect(db.prepare("SELECT * FROM outbox_messages").all()).toEqual([]);
         expect(db.prepare("SELECT * FROM _chardb_op_log").all()).toEqual([]);
+    });
+
+    test("release wakes a quiet generation-zero subscription without another mutation", async () => {
+        const { db, cdb, alarms, gateway } = await setup();
+        const registration = identity("quiet-recovery-release", 1);
+        await cdb.subscribe(subscription(registration, ["outbox_messages"]));
+        const operationId = "00000000-0000-4000-8000-000000000001";
+        await cdb.adminArmRecoveryRestore({
+            bookmark: "00000000-history",
+            armedAt: 42,
+            operationId,
+            generation: 1,
+        });
+        db.exec("DELETE FROM _chardb_recovery_restore");
+        alarms.length = 0;
+
+        await cdb.adminReleaseRecovery({ operationId, generation: 1 });
+        expectInvalidationAlarms(alarms, [10_001]);
+        expect(gateway.calls).toHaveLength(0);
+
+        await cdb.alarm();
+        expect(gateway.calls).toHaveLength(1);
+        expect(gateway.calls[0]?.invalidations).toEqual([{ subscription: registration, changeSeq: 1 }]);
     });
 
     test("rejects hostile mutation args before descriptor lookup, alarm, handler, or transaction", async () => {
@@ -419,6 +500,7 @@ describe("Cdb invalidation outbox", () => {
             args: nestedArray(CDB_MUTATION_ARGS_MAX_DEPTH + 1),
             auth: AUTH,
             schemaEpoch: 1,
+            recoveryGeneration: 0,
             domainSchemaEpoch: 1,
         });
         expect(overDepth).toMatchObject({ ok: false, error: { code: "CDB_INVALID_ARGS", retryable: false } });
@@ -507,6 +589,7 @@ describe("Cdb invalidation outbox", () => {
             args: callerArgs as RawJson,
             auth: callerAuth,
             schemaEpoch: 1,
+            recoveryGeneration: 0,
             domainSchemaEpoch: 1,
         };
         let ownKeysRuns = 0;
@@ -676,7 +759,7 @@ describe("Cdb invalidation outbox", () => {
         expect(outbox(db)).toEqual([{ gateway_id: "gateway-1", registration_id: "messages", change_seq: 2 }]);
         expect(db.prepare("SELECT id FROM outbox_messages WHERE id = 'failed'").get()).toBeNull();
 
-        await cdb.unsubscribe(messageRegistration);
+        await cdb.unsubscribe({ subscription: messageRegistration, recoveryGeneration: 0 });
         expect(outbox(db)).toEqual([]);
         expect(
             db.prepare("SELECT * FROM _chardb_live_subscription_tables WHERE registration_id = 'messages'").all()
@@ -765,11 +848,11 @@ describe("Cdb invalidation outbox", () => {
              )
              INSERT INTO _chardb_live_subscriptions
                (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                principal_id, organization_id, schema_epoch, vshard, domain_schema_epoch,
+                principal_id, organization_id, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
                 ref, args_json, policy_digest, query_hash,
                 tables_json, intervals_json)
              SELECT 'gateway-fanout', 'registration-fanout-' || n, 'connection-fanout-' || n,
-                    'client-fanout-' || n, n, 'active', 'legacy-hash', 'principal-fanout', 'org-1', 1,
+                    'client-fanout-' || n, n, 'active', 'legacy-hash', 'principal-fanout', 'org-1', 1, 0,
                     ${Number(vshardOf(["org-1"]))}, 1,
                     'queries.ts#legacy', 'null', 'legacy-policy', 'legacy-query',
                     '["outbox_messages"]', '[]'
@@ -793,11 +876,11 @@ describe("Cdb invalidation outbox", () => {
         db.prepare(
             `INSERT INTO _chardb_live_subscriptions
              (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-              principal_id, organization_id, schema_epoch, vshard, domain_schema_epoch,
+              principal_id, organization_id, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
               ref, args_json, policy_digest, query_hash,
               tables_json, intervals_json)
              VALUES ('gateway-fanout', 'registration-fanout-4097', 'connection-fanout-4097',
-                     'client-fanout-4097', 4097, 'active', 'legacy-hash', 'principal-fanout', 'org-1', 1,
+                     'client-fanout-4097', 4097, 'active', 'legacy-hash', 'principal-fanout', 'org-1', 1, 0,
                      ${Number(vshardOf(["org-1"]))}, 1,
                      'queries.ts#legacy', 'null', 'legacy-policy', 'legacy-query', '["outbox_messages"]', '[]')`
         ).run();

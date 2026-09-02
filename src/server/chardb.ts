@@ -27,7 +27,7 @@ import {
     defineChardb,
     mountChardb,
 } from "./entrypoint.ts";
-import { cdbHttpErrorResponse, chardbHttpErrorHandler } from "./http-errors.ts";
+import { chardbHttpErrorHandler } from "./http-errors.ts";
 import { sourceChardbEnv } from "./loopback.ts";
 import { type OrganizationFileHttpAuth, handleOrganizationFileRequest } from "./organization-file-http.ts";
 import { assertSchemaResourceJournal, collectSchemaFileResourceDescriptors } from "./resource-descriptors.ts";
@@ -158,7 +158,7 @@ export function chardb<
         auth: jwtConfig,
     });
 
-    const authRuntime = buildDefaultAuthRuntime<TPlugins>(auth.options as BetterAuthOptions);
+    const authRuntime = buildDefaultAuthRuntime<TPlugins>(auth.options as BetterAuthOptions, migrationJournal.version);
     const hono = new Hono<ChardbHonoEnv<TPlugins>>();
     hono.onError(chardbHttpErrorHandler);
     hono.use("*", async (c, next) => {
@@ -186,21 +186,13 @@ export function chardb<
         Chardb,
         { fetch: honoFetch as Parameters<typeof mountChardb>[1]["fetch"] },
         {
-            authHandler: async (request, env, ctx) => {
-                const catalog = env.CDB_CATALOG.get(env.CDB_CATALOG.idFromName("global")) as unknown as {
-                    schemaState(): Promise<{ readonly activeVersion: number; readonly status: "active" | "migrating" }>;
-                };
-                const state = await catalog.schemaState();
-                if (state.status !== "active" || state.activeVersion !== migrationJournal.version) {
-                    return cdbHttpErrorResponse(
-                        new CdbError({
-                            code: "CDB_STALE_EPOCH",
-                            message: "Catalog auth schema migration is not active",
-                            hint: "retry after the schema migration activates",
-                        })
-                    );
+            authHandler: async (request, env) => {
+                try {
+                    await catalogAuthAdmission(env, migrationJournal.version);
+                    return authRuntime.get(env, request).handler(request);
+                } catch (error) {
+                    return chardbHttpErrorHandler(error instanceof Error ? error : new Error(String(error)));
                 }
-                return authRuntime.handler(request, env, ctx);
             },
             authBasePath,
             fileHandler: (request, env) =>
@@ -312,10 +304,10 @@ export function gatewayJwtConfigFromAuthOptions(
  * stubs).
  */
 function buildDefaultAuthRuntime<TPlugins extends readonly BetterAuthPlugin[]>(
-    authOptions: BetterAuthOptions
+    authOptions: BetterAuthOptions,
+    expectedVersion: number
 ): {
     get: (env: ChardbEnv, request: Request) => ChardbAuthRuntime<TPlugins>;
-    handler: NonNullable<MountChardbOptions["authHandler"]>;
 } {
     const cache = new WeakMap<object, { key: string; instance: ChardbAuthRuntime<TPlugins> }>();
     const get = (env: ChardbEnv, request: Request): ChardbAuthRuntime<TPlugins> => {
@@ -332,7 +324,10 @@ function buildDefaultAuthRuntime<TPlugins extends readonly BetterAuthPlugin[]>(
                 // canonical request origin instead of trusting an arbitrary
                 // Host header or forcing a wildcard allow-list.
                 ...(authOptions.baseURL === undefined ? { baseURL: requestOrigin } : {}),
-                database: chardbAuthAdapter({ env: env as unknown as ChardbAuthAdapterEnv }),
+                database: chardbAuthAdapter({
+                    env: env as unknown as ChardbAuthAdapterEnv,
+                    recoveryGeneration: () => catalogAuthAdmission(env, expectedVersion),
+                }),
             }) as unknown as ChardbAuthRuntime<TPlugins>;
             // Keep the cache bounded when one Worker serves many custom hosts.
             // A host switch replaces the previous unconfigured instance.
@@ -340,8 +335,27 @@ function buildDefaultAuthRuntime<TPlugins extends readonly BetterAuthPlugin[]>(
         }
         return instance;
     };
-    return {
-        get,
-        handler: (request, env) => get(env, request).handler(request),
+    return { get };
+}
+
+async function catalogAuthAdmission(env: ChardbEnv, expectedVersion: number): Promise<number> {
+    const catalog = env.CDB_CATALOG.get(env.CDB_CATALOG.idFromName("global")) as unknown as {
+        schemaState(): Promise<{
+            readonly activeVersion: number;
+            readonly status: "active" | "migrating";
+            readonly recoveryGeneration: number;
+        }>;
     };
+    const state = await catalog.schemaState();
+    if (state.status !== "active" || state.activeVersion !== expectedVersion) {
+        throw new CdbError({
+            code: "CDB_STALE_EPOCH",
+            message: "Catalog auth schema migration is not active",
+            hint: "retry after the schema migration activates",
+        });
+    }
+    if (!Number.isSafeInteger(state.recoveryGeneration) || state.recoveryGeneration < 0) {
+        throw new CdbError({ code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog recovery generation is invalid" });
+    }
+    return state.recoveryGeneration;
 }

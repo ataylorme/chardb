@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { CdbError } from "../../src/errors.ts";
 import { RecoveryCoordinatorStore } from "../../src/server/do/recovery-coordinator.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import type { ChardbEnv } from "../../src/server/entrypoint.ts";
@@ -7,10 +8,17 @@ import { handleRecoveryAdminRequest } from "../../src/server/recovery-admin.ts";
 import { signRecoveryContinuation } from "../../src/server/recovery-continuation.ts";
 
 const TOKEN = "recovery-admin-secret";
+const OPERATION_ID = "00000000-0000-4000-8000-000000000001";
 
 interface RecoveryStub {
     adminRecoveryBookmark(args: { atMs?: number }): Promise<{ bookmark: string; atMs: number }>;
-    adminArmRecoveryRestore(args: { bookmark: string; armedAt: number }): Promise<{ targetBookmark: string }>;
+    adminArmRecoveryRestore(args: {
+        bookmark: string;
+        armedAt: number;
+        operationId: string;
+        generation: number;
+    }): Promise<{ targetBookmark: string }>;
+    adminReleaseRecovery(args: { operationId: string; generation: number }): Promise<{ released: true }>;
     adminCancelRecoveryRestore(args: { bookmark: string }): Promise<{ cancelled: boolean }>;
     adminCommitRecoveryRestore(args: { bookmark: string }): Promise<{ scheduled: true }>;
     adminRecoveryRestoreStatus(args: { bookmark: string }): Promise<{ state: "armed" | "absent" }>;
@@ -47,10 +55,17 @@ interface TestRecoveryPoint {
 }
 
 function request(path: string, body: unknown, token = TOKEN): Request {
+    const payload =
+        (path.endsWith("/restore") || path.endsWith("/reconcile")) &&
+        typeof body === "object" &&
+        body !== null &&
+        !("operationId" in body)
+            ? { ...body, operationId: OPERATION_ID }
+            : body;
     return new Request(`https://example.test${path}`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
     });
 }
 
@@ -79,44 +94,67 @@ function recoveryCoordinator() {
     const transaction = <T>(callback: (store: RecoveryCoordinatorStore) => T): T =>
         db.transaction(() => callback(new RecoveryCoordinatorStore(sql)))();
     return {
-        async adminRecoveryCoordinatorState(args: { digest: string }) {
-            return new RecoveryCoordinatorStore(sql).read(args.digest);
+        async adminRecoveryAdmissionClock() {
+            return new RecoveryCoordinatorStore(sql).admissionClock();
         },
-        async adminClaimRecoveryPreparation(args: { digest: string; continuationJson: string }) {
-            return transaction(store => store.claimPreparation(args.digest, args.continuationJson));
+        async adminRecoveryCoordinatorState(args: { operationId: string }) {
+            return new RecoveryCoordinatorStore(sql).read(args.operationId);
         },
-        async adminSaveRecoveryPreparation(args: { digest: string; continuationJson: string }) {
-            return transaction(store => store.savePreparation(args.digest, args.continuationJson));
+        async adminActiveRecoveryForDigest(args: { digest: string }) {
+            return new RecoveryCoordinatorStore(sql).activeForDigest(args.digest);
+        },
+        async adminClaimRecoveryPreparation(args: {
+            operationId: string;
+            digest: string;
+            continuationJson: string;
+        }) {
+            return transaction(store => store.claimPreparation(args.operationId, args.digest, args.continuationJson));
+        },
+        async adminSaveRecoveryPreparation(args: { operationId: string; continuationJson: string }) {
+            return transaction(store => store.savePreparation(args.operationId, args.continuationJson));
+        },
+        async adminCancelRecoveryPreparation(args: { operationId: string }) {
+            return transaction(store => store.cancelPreparation(args.operationId));
         },
         async adminBeginRecoveryCommits(args: {
-            digest: string;
+            operationId: string;
             counts: { files: number; filesRetained: number; vectors: number };
         }) {
-            return transaction(store => store.beginCommits(args.digest, args.counts));
+            return transaction(store => store.beginCommits(args.operationId, args.counts));
         },
-        async adminFinishRecoveryShardCommits(args: { digest: string; continuationJson: string; shardCount: number }) {
-            return transaction(store => store.finishShards(args.digest, args.continuationJson, args.shardCount));
+        async adminFinishRecoveryShardCommits(args: {
+            operationId: string;
+            continuationJson: string;
+            shardCount: number;
+        }) {
+            return transaction(store => store.finishShards(args.operationId, args.continuationJson, args.shardCount));
         },
-        async adminAdvanceRecoveryShardCommit(args: { digest: string; index: number; objectId: string }) {
-            return transaction(store => store.advanceShard(args.digest, args.index, args.objectId));
+        async adminAdvanceRecoveryShardCommit(args: { operationId: string; index: number; objectId: string }) {
+            return transaction(store => store.advanceShard(args.operationId, args.index, args.objectId));
         },
-        async adminSaveRecoveryReconcile(args: { digest: string; continuationJson: string }) {
-            return transaction(store => store.saveReconcile(args.digest, args.continuationJson));
+        async adminSaveRecoveryReconcile(args: { operationId: string; continuationJson: string }) {
+            return transaction(store => store.saveReconcile(args.operationId, args.continuationJson));
         },
-        async adminBeginRecoveryCatalogCommit(args: {
-            digest: string;
+        async adminBeginRecoveryReleases(args: {
+            operationId: string;
             counts: { filesRehydrated: number; vectorsRequeued: number };
         }) {
-            return transaction(store => store.beginCatalog(args.digest, args.counts));
+            return transaction(store => store.beginReleases(args.operationId, args.counts));
         },
-        async adminCompleteRecovery(args: { digest: string }) {
-            return transaction(store => store.complete(args.digest));
+        async adminAdvanceRecoveryRelease(args: { operationId: string; index: number }) {
+            return transaction(store => store.advanceRelease(args.operationId, args.index));
         },
-        async adminBeginRecoveryObjectCommit(args: { digest: string; objectId: string; bookmark: string }) {
-            return transaction(store => store.beginObject(args.digest, args.objectId, args.bookmark));
+        async adminBeginRecoveryCatalogCommit(args: { operationId: string; shardCount: number }) {
+            return transaction(store => store.beginCatalog(args.operationId, args.shardCount));
         },
-        async adminFinishRecoveryObjectCommit(args: { digest: string; objectId: string; bookmark: string }) {
-            return transaction(store => store.finishObject(args.digest, args.objectId, args.bookmark));
+        async adminCompleteRecovery(args: { operationId: string }) {
+            return transaction(store => store.complete(args.operationId));
+        },
+        async adminBeginRecoveryObjectCommit(args: { operationId: string; objectId: string; bookmark: string }) {
+            return transaction(store => store.beginObject(args.operationId, args.objectId, args.bookmark));
+        },
+        async adminFinishRecoveryObjectCommit(args: { operationId: string; objectId: string; bookmark: string }) {
+            return transaction(store => store.finishObject(args.operationId, args.objectId, args.bookmark));
         },
     };
 }
@@ -166,6 +204,10 @@ function recoveryStub(
             }
             armedBookmark = args.bookmark;
             return { targetBookmark: args.bookmark };
+        },
+        async adminReleaseRecovery(args) {
+            events.push(`${name}:release:${args.operationId}:${args.generation}`);
+            return { released: true };
         },
         async adminCancelRecoveryRestore(args) {
             events.push(`${name}:cancel:${args.bookmark}`);
@@ -235,7 +277,12 @@ function environment(
     scrubPagesShard = "",
     scrubPages = 0,
     shardCount = 2
-): { env: ChardbEnv; events: string[]; stubs: Map<string, unknown> } {
+): {
+    env: ChardbEnv;
+    events: string[];
+    stubs: Map<string, unknown>;
+    coordinator: ReturnType<typeof recoveryCoordinator>;
+} {
     const events: string[] = [];
     const shardIds = Array.from({ length: shardCount }, (_, index) => `ShardDO_${index}`).sort();
     const catalog = {
@@ -272,14 +319,16 @@ function environment(
         )
     );
     shards.set("catalog", catalog);
+    const coordinator = recoveryCoordinator();
     return {
         events,
         stubs: shards,
+        coordinator,
         env: {
             CDB_ADMIN_TOKEN: TOKEN,
             CDB_CATALOG: namespace(new Map([["global", catalog]])),
             CDB_SHARD: namespace(shards),
-            CDB_RESHARD: namespace(new Map([["global", recoveryCoordinator()]])),
+            CDB_RESHARD: namespace(new Map([["global", coordinator]])),
         } as unknown as ChardbEnv,
     };
 }
@@ -336,6 +385,7 @@ describe("recovery admin", () => {
         expect(restoredBody).toEqual({
             ok: true,
             accepted: true,
+            operationId: OPERATION_ID,
             recoveryPointDigest: point.digest,
             reconcileAfterMs: 6_000,
             providerReset: { files: 0, filesRetained: 0, vectors: 0 },
@@ -378,6 +428,11 @@ describe("recovery admin", () => {
             env
         );
         expect(pending.status).toBe(202);
+        const released = await handleRecoveryAdminRequest(
+            request("/_chardb/backups/reconcile", { recoveryPoint: point }),
+            env
+        );
+        expect(released.status).toBe(202);
         const response = await handleRecoveryAdminRequest(
             request("/_chardb/backups/reconcile", { recoveryPoint: point }),
             env
@@ -386,6 +441,7 @@ describe("recovery admin", () => {
         expect((await response.json()) as unknown).toEqual({
             ok: true,
             reconciled: true,
+            operationId: OPERATION_ID,
             recoveryPointDigest: point.digest,
             filesRehydrated: 0,
             vectorsRequeued: 2,
@@ -395,7 +451,7 @@ describe("recovery admin", () => {
         expect(events).toContain("ShardDO_1:reconcile:0:500");
         expect(events).toContain("ShardDO_0:rehydrate::8");
         expect(events).toContain("ShardDO_1:rehydrate::8");
-        expect(events.at(-2)).toBe(`catalog:commit:${point.catalog.bookmark}`);
+        expect(events).toContain(`catalog:commit:${point.catalog.bookmark}`);
     });
 
     test("keeps Catalog fenced until every vector outbox settles", async () => {
@@ -424,6 +480,11 @@ describe("recovery admin", () => {
         );
         expect(second.status).toBe(202);
         expect(setup.events.some(event => event.startsWith("catalog:commit:"))).toBe(false);
+        const released = await handleRecoveryAdminRequest(
+            request("/_chardb/backups/reconcile", { recoveryPoint: point }),
+            setup.env
+        );
+        expect(released.status).toBe(202);
         const completed = await handleRecoveryAdminRequest(
             request("/_chardb/backups/reconcile", { recoveryPoint: point }),
             setup.env
@@ -473,6 +534,11 @@ describe("recovery admin", () => {
             setup.env
         );
         expect(pending.status).toBe(202);
+        const released = await handleRecoveryAdminRequest(
+            request("/_chardb/backups/reconcile", { recoveryPoint: point }),
+            setup.env
+        );
+        expect(released.status).toBe(202);
         const settling = await handleRecoveryAdminRequest(
             request("/_chardb/backups/reconcile", { recoveryPoint: point }),
             setup.env
@@ -750,7 +816,7 @@ describe("recovery admin", () => {
             afterFileId: `${args.afterFileId}x`,
             done: false,
         });
-        const continuation = await signRecoveryContinuation(endless.env, point.digest, {
+        const continuation = await signRecoveryContinuation(endless.env, OPERATION_ID, point.digest, {
             kind: "restore",
             phase: "retention",
             shardIndex: 0,
@@ -783,7 +849,7 @@ describe("recovery admin", () => {
         const created = await handleRecoveryAdminRequest(request("/_chardb/backups/create", {}), healthy.env);
         const point = ((await created.json()) as { readonly recoveryPoint: TestRecoveryPoint }).recoveryPoint;
         const endless = environment("", "", 11, "", "", "ShardDO_0", 20_000);
-        const continuation = await signRecoveryContinuation(endless.env, point.digest, {
+        const continuation = await signRecoveryContinuation(endless.env, OPERATION_ID, point.digest, {
             kind: "restore",
             phase: "vectors",
             shardIndex: 0,
@@ -818,7 +884,7 @@ describe("recovery admin", () => {
         const created = await handleRecoveryAdminRequest(request("/_chardb/backups/create", {}), healthy.env);
         const point = ((await created.json()) as { readonly recoveryPoint: TestRecoveryPoint }).recoveryPoint;
         const continued = environment();
-        const continuation = await signRecoveryContinuation(continued.env, point.digest, {
+        const continuation = await signRecoveryContinuation(continued.env, OPERATION_ID, point.digest, {
             kind: "restore",
             phase: "files",
             shardIndex: 0,
@@ -875,6 +941,47 @@ describe("recovery admin", () => {
             retryable: true,
         });
         expect(changed.events).toEqual(["catalog:inventory"]);
+    });
+
+    test("cancels an unarmed claim when Catalog changes after preflight", async () => {
+        const healthy = environment();
+        const created = await handleRecoveryAdminRequest(request("/_chardb/backups/create", {}), healthy.env);
+        const point = ((await created.json()) as { readonly recoveryPoint: TestRecoveryPoint }).recoveryPoint;
+        const setup = environment();
+        const catalog = setup.stubs.get("catalog") as RecoveryStub;
+        const arm = catalog.adminArmRecoveryRestore.bind(catalog);
+        let drift = true;
+        catalog.adminArmRecoveryRestore = async args => {
+            if (drift) {
+                drift = false;
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "Catalog changed after recovery preflight" });
+            }
+            return arm(args);
+        };
+
+        const rejected = await handleRecoveryAdminRequest(
+            request("/_chardb/backups/restore", { recoveryPoint: point }),
+            setup.env
+        );
+        expect(rejected.status).toBe(409);
+        expect(await setup.coordinator.adminRecoveryAdmissionClock()).toEqual({
+            generation: 1,
+            activeOperationId: null,
+            activeDigest: null,
+        });
+
+        const retried = await handleRecoveryAdminRequest(
+            request("/_chardb/backups/restore", {
+                recoveryPoint: point,
+                operationId: "00000000-0000-4000-8000-000000000002",
+            }),
+            setup.env
+        );
+        expect(retried.status).toBe(202);
+        expect(await setup.coordinator.adminRecoveryAdmissionClock()).toMatchObject({
+            generation: 2,
+            activeOperationId: "00000000-0000-4000-8000-000000000002",
+        });
     });
 
     test("keeps prior fences and retries the exact failed shard arm", async () => {

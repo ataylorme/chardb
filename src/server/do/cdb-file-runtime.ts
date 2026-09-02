@@ -13,6 +13,7 @@ import { adaptSqlStorage } from "./sql_adapter.ts";
 export const CDB_FILE_CLEANUP_RETRY_MS = 1_000;
 
 export interface CdbFileReserveRequest {
+    readonly recoveryGeneration: number;
     readonly fileId: string;
     readonly organizationId: string;
     readonly table: string;
@@ -25,6 +26,7 @@ export interface CdbFileReserveRequest {
 }
 
 export interface CdbFileReadyRequest {
+    readonly recoveryGeneration: number;
     readonly fileId: string;
     readonly organizationId: string;
     readonly sha256: string;
@@ -35,6 +37,7 @@ export interface CdbFileReadyRequest {
 }
 
 export interface CdbFileDownloadRequest {
+    readonly recoveryGeneration: number;
     readonly organizationId: string;
     readonly table: string;
     readonly column: string;
@@ -44,6 +47,7 @@ export interface CdbFileDownloadRequest {
 }
 
 export interface CdbOrganizationFileDeletionRequest {
+    readonly recoveryGeneration: number;
     readonly organizationId: string;
     readonly nowMs: number;
     readonly domainSchemaEpoch: number;

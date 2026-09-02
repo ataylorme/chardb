@@ -2,6 +2,7 @@ import { CdbError, isCdbError, rehydrateCdbRpcError } from "../errors.ts";
 import { stableJson } from "../util/canonical.ts";
 import { adminJsonError, authorizeAdmin, exactAdminObject, readAdminBody } from "./admin-http.ts";
 import type {
+    RecoveryAdmissionClock,
     RecoveryCoordinatorState,
     RecoveryProviderCounts,
     RecoveryReconcileCounts,
@@ -46,7 +47,13 @@ interface RecoveryRpc {
     adminArmRecoveryRestore(args: {
         readonly bookmark: string;
         readonly armedAt: number;
+        readonly operationId: string;
+        readonly generation: number;
     }): Promise<{ readonly targetBookmark: string }>;
+    adminReleaseRecovery(args: {
+        readonly operationId: string;
+        readonly generation: number;
+    }): Promise<{ readonly released: true }>;
     adminCommitRecoveryRestore(args: { readonly bookmark: string }): Promise<{ readonly scheduled: true }>;
     adminRecoveryRestoreStatus(args: {
         readonly bookmark: string;
@@ -87,51 +94,71 @@ interface RecoveryRpc {
 }
 
 interface RecoveryCoordinatorRpc {
-    adminRecoveryCoordinatorState(args: { readonly digest: string }): Promise<RecoveryCoordinatorState>;
+    adminRecoveryCoordinatorState(args: { readonly operationId: string }): Promise<RecoveryCoordinatorState>;
+    adminActiveRecoveryForDigest(args: { readonly digest: string }): Promise<RecoveryCoordinatorState | null>;
     adminBeginRecoveryCommits(args: {
-        readonly digest: string;
+        readonly operationId: string;
         readonly counts: RecoveryProviderCounts;
     }): Promise<RecoveryCoordinatorState>;
     adminClaimRecoveryPreparation(args: {
+        readonly operationId: string;
         readonly digest: string;
         readonly continuationJson: string;
     }): Promise<RecoveryCoordinatorState>;
     adminSaveRecoveryPreparation(args: {
-        readonly digest: string;
+        readonly operationId: string;
         readonly continuationJson: string;
     }): Promise<RecoveryCoordinatorState>;
+    adminCancelRecoveryPreparation(args: { readonly operationId: string }): Promise<RecoveryAdmissionClock>;
     adminFinishRecoveryShardCommits(args: {
-        readonly digest: string;
+        readonly operationId: string;
         readonly continuationJson: string;
         readonly shardCount: number;
     }): Promise<RecoveryCoordinatorState>;
     adminAdvanceRecoveryShardCommit(args: {
-        readonly digest: string;
+        readonly operationId: string;
         readonly index: number;
         readonly objectId: string;
     }): Promise<RecoveryCoordinatorState>;
     adminSaveRecoveryReconcile(args: {
-        readonly digest: string;
+        readonly operationId: string;
         readonly continuationJson: string;
     }): Promise<RecoveryCoordinatorState>;
-    adminBeginRecoveryCatalogCommit(args: {
-        readonly digest: string;
+    adminBeginRecoveryReleases(args: {
+        readonly operationId: string;
         readonly counts: RecoveryReconcileCounts;
     }): Promise<RecoveryCoordinatorState>;
-    adminCompleteRecovery(args: { readonly digest: string }): Promise<RecoveryCoordinatorState>;
+    adminAdvanceRecoveryRelease(args: {
+        readonly operationId: string;
+        readonly index: number;
+    }): Promise<RecoveryCoordinatorState>;
+    adminBeginRecoveryCatalogCommit(args: {
+        readonly operationId: string;
+        readonly shardCount: number;
+    }): Promise<RecoveryCoordinatorState>;
+    adminCompleteRecovery(args: { readonly operationId: string }): Promise<RecoveryCoordinatorState>;
     adminBeginRecoveryObjectCommit(args: {
-        readonly digest: string;
+        readonly operationId: string;
         readonly objectId: string;
         readonly bookmark: string;
     }): Promise<{ readonly status: "intent" | "scheduled" }>;
     adminFinishRecoveryObjectCommit(args: {
-        readonly digest: string;
+        readonly operationId: string;
         readonly objectId: string;
         readonly bookmark: string;
     }): Promise<{ readonly status: "scheduled" }>;
 }
 
-interface CatalogRecoveryRpc extends RecoveryRpc {
+interface CatalogRecoveryRpc extends Omit<RecoveryRpc, "adminArmRecoveryRestore"> {
+    adminArmRecoveryRestore(args: {
+        readonly bookmark: string;
+        readonly armedAt: number;
+        readonly operationId: string;
+        readonly generation: number;
+        readonly schema: RecoveryPointPayload["schema"];
+        readonly routingEpoch: number;
+        readonly shardIds: readonly string[];
+    }): Promise<{ readonly targetBookmark: string }>;
     adminRecoveryInventory(args?: { readonly armedBookmark?: string }): Promise<{
         readonly schema: {
             readonly activeVersion: number;
@@ -174,12 +201,20 @@ interface RecoveryReconcileResult {
 }
 
 type RestoreTurnResult =
-    | { readonly done: true; readonly providerReset: RecoveryProviderReset }
-    | { readonly done: false; readonly state: Extract<RecoveryContinuationState, { readonly kind: "restore" }> };
+    | { readonly done: true; readonly operationId: string; readonly providerReset: RecoveryProviderReset }
+    | {
+          readonly done: false;
+          readonly operationId: string;
+          readonly state: Extract<RecoveryContinuationState, { readonly kind: "restore" }>;
+      };
 
 type ReconcileTurnResult =
-    | { readonly done: true; readonly result: RecoveryReconcileResult }
-    | { readonly done: false; readonly state: Extract<RecoveryContinuationState, { readonly kind: "reconcile" }> };
+    | { readonly done: true; readonly operationId: string; readonly result: RecoveryReconcileResult }
+    | {
+          readonly done: false;
+          readonly operationId: string;
+          readonly state: Extract<RecoveryContinuationState, { readonly kind: "reconcile" }>;
+      };
 
 export async function handleRecoveryAdminRequest(request: Request, env: ChardbEnv): Promise<Response> {
     const denied = await authorizeAdmin(request, env);
@@ -197,15 +232,27 @@ export async function handleRecoveryAdminRequest(request: Request, env: ChardbEn
         if (url.pathname === "/_chardb/backups/restore") {
             const input = parseRecoveryOperationRequest(body);
             const recoveryPoint = await parseRecoveryPoint(input.recoveryPoint);
-            const prior = await parseRecoveryContinuation(env, recoveryPoint.digest, input.continuation, "restore");
-            const restored = await restoreRecoveryPointTurn(env, recoveryPoint, prior);
+            const prior = await parseRecoveryContinuation(
+                env,
+                input.operationId,
+                recoveryPoint.digest,
+                input.continuation,
+                "restore"
+            );
+            const restored = await restoreRecoveryPointTurn(env, recoveryPoint, input.operationId, prior);
             if (!restored.done) {
                 return Response.json(
                     {
                         ok: true,
+                        operationId: restored.operationId,
                         pending: true,
                         recoveryPointDigest: recoveryPoint.digest,
-                        continuation: await signRecoveryContinuation(env, recoveryPoint.digest, restored.state),
+                        continuation: await signRecoveryContinuation(
+                            env,
+                            restored.operationId,
+                            recoveryPoint.digest,
+                            restored.state
+                        ),
                         retryAfterMs:
                             restored.state.phase === "commit"
                                 ? RECOVERY_RECONCILE_DELAY_MS
@@ -219,6 +266,7 @@ export async function handleRecoveryAdminRequest(request: Request, env: ChardbEn
             return Response.json(
                 {
                     ok: true,
+                    operationId: restored.operationId,
                     accepted: true,
                     recoveryPointDigest: recoveryPoint.digest,
                     reconcileAfterMs: RECOVERY_RECONCILE_DELAY_MS,
@@ -230,22 +278,40 @@ export async function handleRecoveryAdminRequest(request: Request, env: ChardbEn
         if (url.pathname === "/_chardb/backups/reconcile") {
             const input = parseRecoveryOperationRequest(body);
             const recoveryPoint = await parseRecoveryPoint(input.recoveryPoint);
-            const prior = await parseRecoveryContinuation(env, recoveryPoint.digest, input.continuation, "reconcile");
-            const reconciled = await reconcileRecoveryPointTurn(env, recoveryPoint, prior);
+            const prior = await parseRecoveryContinuation(
+                env,
+                input.operationId,
+                recoveryPoint.digest,
+                input.continuation,
+                "reconcile"
+            );
+            const reconciled = await reconcileRecoveryPointTurn(env, recoveryPoint, input.operationId, prior);
             if (!reconciled.done) {
                 return Response.json(
                     {
                         ok: true,
+                        operationId: reconciled.operationId,
                         pending: true,
                         recoveryPointDigest: recoveryPoint.digest,
-                        continuation: await signRecoveryContinuation(env, recoveryPoint.digest, reconciled.state),
+                        continuation: await signRecoveryContinuation(
+                            env,
+                            reconciled.operationId,
+                            recoveryPoint.digest,
+                            reconciled.state
+                        ),
                         retryAfterMs: reconciled.state.phase === "settle" ? RECOVERY_RECONCILE_DELAY_MS : 0,
                     },
                     { status: 202, headers: { "cache-control": "no-store" } }
                 );
             }
             return Response.json(
-                { ok: true, reconciled: true, recoveryPointDigest: recoveryPoint.digest, ...reconciled.result },
+                {
+                    ok: true,
+                    operationId: reconciled.operationId,
+                    reconciled: true,
+                    recoveryPointDigest: recoveryPoint.digest,
+                    ...reconciled.result,
+                },
                 { headers: { "cache-control": "no-store" } }
             );
         }
@@ -319,24 +385,48 @@ function assertRecoveryBookmark(
 async function restoreRecoveryPointTurn(
     env: ChardbEnv,
     point: ChardbRecoveryPoint,
+    requestedOperationId: string,
     prior: Extract<RecoveryContinuationState, { readonly kind: "restore" }> | undefined
 ): Promise<RestoreTurnResult> {
     const catalog = catalogRpc(env);
     const coordinator = recoveryCoordinatorRpc(env);
     let coordinated = await recoveryPhase("coordinator read", () =>
-        coordinator.adminRecoveryCoordinatorState({ digest: point.digest })
+        coordinator.adminRecoveryCoordinatorState({ operationId: requestedOperationId })
     );
+    let inventory: Awaited<ReturnType<typeof catalog.adminRecoveryInventory>> | undefined;
     if (coordinated.phase === "new") {
+        inventory = await recoveryPhase("preflight", () =>
+            catalog.adminRecoveryInventory({ armedBookmark: point.catalog.bookmark })
+        );
+        assertRecoveryTopology(inventory, point);
         coordinated = await recoveryPhase("coordinator claim", () =>
             coordinator.adminClaimRecoveryPreparation({
+                operationId: requestedOperationId,
                 digest: point.digest,
                 continuationJson: serializeRecoveryContinuationState(prior ?? restoreStartState()),
             })
         );
     }
-    if (coordinated.phase === "reconciling" || coordinated.phase === "catalog" || coordinated.phase === "complete") {
+    if (coordinated.phase !== "new" && coordinated.digest !== point.digest) {
+        throw new CdbError({
+            code: "CDB_STALE_EPOCH",
+            message: "recovery operation belongs to another recovery point",
+        });
+    }
+    if (coordinated.phase === "new") {
+        throw new CdbError({ code: "CDB_INVARIANT", message: "recovery coordinator did not claim the operation" });
+    }
+    const operationId = coordinated.operationId;
+    const generation = coordinated.generation;
+    if (
+        coordinated.phase === "reconciling" ||
+        coordinated.phase === "releasing" ||
+        coordinated.phase === "catalog" ||
+        coordinated.phase === "complete"
+    ) {
         return {
             done: true,
+            operationId: coordinated.operationId,
             providerReset: {
                 files: coordinated.files,
                 filesRetained: coordinated.filesRetained,
@@ -344,10 +434,12 @@ async function restoreRecoveryPointTurn(
             },
         };
     }
-    const inventory = await recoveryPhase("preflight", () =>
-        catalog.adminRecoveryInventory({ armedBookmark: point.catalog.bookmark })
-    );
-    assertRecoveryTopology(inventory, point);
+    if (inventory === undefined) {
+        inventory = await recoveryPhase("preflight", () =>
+            catalog.adminRecoveryInventory({ armedBookmark: point.catalog.bookmark })
+        );
+        assertRecoveryTopology(inventory, point);
+    }
     let state =
         coordinated.phase === "committing"
             ? {
@@ -365,7 +457,7 @@ async function restoreRecoveryPointTurn(
     const savePreparation = async () => {
         await recoveryPhase("coordinator preparation cursor", () =>
             coordinator.adminSaveRecoveryPreparation({
-                digest: point.digest,
+                operationId,
                 continuationJson: serializeRecoveryContinuationState(state),
             })
         );
@@ -375,21 +467,43 @@ async function restoreRecoveryPointTurn(
     if (state.phase === "arm") {
         const armedAt = Date.now();
         if (state.shardIndex === 0) {
-            await recoveryPhase("Catalog arm", () =>
-                catalog.adminArmRecoveryRestore({ bookmark: point.catalog.bookmark, armedAt })
-            );
+            try {
+                await recoveryPhase("Catalog arm", () =>
+                    catalog.adminArmRecoveryRestore({
+                        bookmark: point.catalog.bookmark,
+                        armedAt,
+                        operationId,
+                        generation,
+                        schema: point.schema,
+                        routingEpoch: point.routingEpoch,
+                        shardIds: point.shards.map(shard => shard.shardId),
+                    })
+                );
+            } catch (error) {
+                if (isCdbError(error) && error.message === "Catalog changed after recovery preflight") {
+                    await recoveryPhase("coordinator preparation cancellation", () =>
+                        coordinator.adminCancelRecoveryPreparation({ operationId })
+                    );
+                }
+                throw error;
+            }
             budget--;
         }
         while (state.shardIndex < point.shards.length && budget > 0) {
             const shard = point.shards[state.shardIndex] as (typeof point.shards)[number];
             await recoveryPhase("shard arm", () =>
-                shardRpc(env, shard.shardId).adminArmRecoveryRestore({ bookmark: shard.bookmark, armedAt })
+                shardRpc(env, shard.shardId).adminArmRecoveryRestore({
+                    bookmark: shard.bookmark,
+                    armedAt,
+                    operationId,
+                    generation,
+                })
             );
             state = { ...state, shardIndex: state.shardIndex + 1 };
             await savePreparation();
             budget--;
         }
-        if (state.shardIndex < point.shards.length) return { done: false, state };
+        if (state.shardIndex < point.shards.length) return { done: false, operationId, state };
         state = { ...state, phase: "quiescence", shardIndex: 0 };
         await savePreparation();
     }
@@ -417,9 +531,9 @@ async function restoreRecoveryPointTurn(
                     : { ...state, quiescenceTurns };
             await savePreparation();
             budget--;
-            if (settlement.pending > 0) return { done: false, state };
+            if (settlement.pending > 0) return { done: false, operationId, state };
         }
-        if (state.shardIndex < point.shards.length) return { done: false, state };
+        if (state.shardIndex < point.shards.length) return { done: false, operationId, state };
         state = { ...state, phase: "retention", shardIndex: 0 };
         await savePreparation();
     }
@@ -455,7 +569,7 @@ async function restoreRecoveryPointTurn(
             await savePreparation();
             budget--;
         }
-        if (state.shardIndex < point.shards.length) return { done: false, state };
+        if (state.shardIndex < point.shards.length) return { done: false, operationId, state };
         state = { ...state, phase: "vectors", shardIndex: 0 };
         await savePreparation();
     }
@@ -497,7 +611,7 @@ async function restoreRecoveryPointTurn(
             await savePreparation();
             budget--;
         }
-        if (state.shardIndex < point.shards.length) return { done: false, state };
+        if (state.shardIndex < point.shards.length) return { done: false, operationId, state };
         state = { ...state, phase: "files", shardIndex: 0 };
         await savePreparation();
     }
@@ -525,14 +639,14 @@ async function restoreRecoveryPointTurn(
                 break;
             }
         }
-        if (!scrubDone) return { done: false, state };
+        if (!scrubDone) return { done: false, operationId, state };
         state = { ...state, phase: "commit", shardIndex: 0 };
         await savePreparation();
     }
 
     await recoveryPhase("coordinator commit fence", () =>
         coordinator.adminBeginRecoveryCommits({
-            digest: point.digest,
+            operationId,
             counts: { files: state.files, filesRetained: state.filesRetained, vectors: state.vectors },
         })
     );
@@ -540,7 +654,7 @@ async function restoreRecoveryPointTurn(
         const shard = point.shards[state.shardIndex] as (typeof point.shards)[number];
         const restored = await commitRecoveryObject(
             coordinator,
-            point.digest,
+            operationId,
             `shard:${shard.shardId}`,
             shard.bookmark,
             shardRpc(env, shard.shardId),
@@ -548,11 +662,11 @@ async function restoreRecoveryPointTurn(
         );
         if (!restored) {
             state = { ...state, commitPolls: state.commitPolls + 1 };
-            return { done: false, state };
+            return { done: false, operationId, state };
         }
         await recoveryPhase("coordinator shard commit cursor", () =>
             coordinator.adminAdvanceRecoveryShardCommit({
-                digest: point.digest,
+                operationId,
                 index: state.shardIndex,
                 objectId: `shard:${shard.shardId}`,
             })
@@ -560,16 +674,17 @@ async function restoreRecoveryPointTurn(
         state = { ...state, shardIndex: state.shardIndex + 1 };
         budget--;
     }
-    if (state.shardIndex < point.shards.length) return { done: false, state };
+    if (state.shardIndex < point.shards.length) return { done: false, operationId, state };
     await recoveryPhase("coordinator shard completion", () =>
         coordinator.adminFinishRecoveryShardCommits({
-            digest: point.digest,
+            operationId,
             continuationJson: serializeRecoveryContinuationState(reconcileStartState()),
             shardCount: point.shards.length,
         })
     );
     return {
         done: true,
+        operationId,
         providerReset: { files: state.files, filesRetained: state.filesRetained, vectors: state.vectors },
     };
 }
@@ -596,24 +711,39 @@ function restoreStartState(): Extract<RecoveryContinuationState, { readonly kind
 async function reconcileRecoveryPointTurn(
     env: ChardbEnv,
     point: ChardbRecoveryPoint,
+    requestedOperationId: string,
     prior: Extract<RecoveryContinuationState, { readonly kind: "reconcile" }> | undefined
 ): Promise<ReconcileTurnResult> {
     const catalog = catalogRpc(env);
     const coordinator = recoveryCoordinatorRpc(env);
-    const coordinated = await recoveryPhase("reconcile coordinator read", () =>
-        coordinator.adminRecoveryCoordinatorState({ digest: point.digest })
+    let coordinated = await recoveryPhase("reconcile coordinator read", () =>
+        coordinator.adminRecoveryCoordinatorState({ operationId: requestedOperationId })
     );
+    if (coordinated.phase === "new") {
+        const active = await recoveryPhase("active recovery read", () =>
+            coordinator.adminActiveRecoveryForDigest({ digest: point.digest })
+        );
+        if (active) coordinated = active;
+    }
     if (coordinated.phase === "new" || coordinated.phase === "preparing" || coordinated.phase === "committing") {
         throw new CdbError({
             code: "CDB_STALE_EPOCH",
             message: "shard point-in-time restore has not completed",
         });
     }
+    if (coordinated.digest !== point.digest) {
+        throw new CdbError({
+            code: "CDB_STALE_EPOCH",
+            message: "recovery operation belongs to another recovery point",
+        });
+    }
+    const operationId = coordinated.operationId;
+    const generation = coordinated.generation;
     if (coordinated.phase === "catalog" || coordinated.phase === "complete") {
         if (coordinated.phase === "catalog") {
             const restored = await commitRecoveryObject(
                 coordinator,
-                point.digest,
+                operationId,
                 "catalog",
                 point.catalog.bookmark,
                 catalog,
@@ -625,23 +755,26 @@ async function reconcileRecoveryPointTurn(
                     phase: "settle" as const,
                     settleTurns: (prior?.settleTurns ?? 0) + 1,
                 };
-                return { done: false, state };
+                return { done: false, operationId, state };
             }
             const restoredInventory = await recoveryPhase("restored Catalog proof", () =>
                 catalog.adminRecoveryInventory()
             );
             assertRecoveryTopology(restoredInventory, point);
-            await recoveryPhase("coordinator completion", () =>
-                coordinator.adminCompleteRecovery({ digest: point.digest })
-            );
+            await recoveryPhase("Catalog release", () => catalog.adminReleaseRecovery({ operationId, generation }));
+            await recoveryPhase("coordinator completion", () => coordinator.adminCompleteRecovery({ operationId }));
         }
         return {
             done: true,
+            operationId,
             result: {
                 filesRehydrated: coordinated.filesRehydrated,
                 vectorsRequeued: coordinated.vectorsRequeued,
             },
         };
+    }
+    if (coordinated.phase === "releasing") {
+        return await releaseRecoveryShards(env, point, coordinator, coordinated, prior ?? reconcileStartState());
     }
     if (coordinated.phase !== "reconciling") {
         throw new CdbError({ code: "CDB_INVARIANT", message: "recovery coordinator phase is invalid" });
@@ -654,7 +787,7 @@ async function reconcileRecoveryPointTurn(
     const saveReconcile = async () => {
         await recoveryPhase("coordinator reconciliation cursor", () =>
             coordinator.adminSaveRecoveryReconcile({
-                digest: point.digest,
+                operationId,
                 continuationJson: serializeRecoveryContinuationState(state),
             })
         );
@@ -677,7 +810,7 @@ async function reconcileRecoveryPointTurn(
             await saveReconcile();
             budget--;
         }
-        if (state.shardIndex < point.shards.length) return { done: false, state };
+        if (state.shardIndex < point.shards.length) return { done: false, operationId, state };
         state = { ...state, phase: "vectors", shardIndex: 0 };
         await saveReconcile();
     }
@@ -700,7 +833,7 @@ async function reconcileRecoveryPointTurn(
             await saveReconcile();
             budget--;
         }
-        if (state.shardIndex < point.shards.length) return { done: false, state };
+        if (state.shardIndex < point.shards.length) return { done: false, operationId, state };
         state = { ...state, phase: "settle", shardIndex: 0 };
         await saveReconcile();
     }
@@ -722,31 +855,49 @@ async function reconcileRecoveryPointTurn(
                 ? { ...state, shardIndex: state.shardIndex + 1, settleTurns: 0 }
                 : { ...state, settleTurns };
         await saveReconcile();
-        if (state.shardIndex < point.shards.length) return { done: false, state };
+        if (state.shardIndex < point.shards.length) return { done: false, operationId, state };
     }
     const result = { filesRehydrated: state.filesRehydrated, vectorsRequeued: state.vectorsRequeued };
-    await recoveryPhase("coordinator Catalog fence", () =>
-        coordinator.adminBeginRecoveryCatalogCommit({ digest: point.digest, counts: result })
+    coordinated = await recoveryPhase("coordinator shard releases", () =>
+        coordinator.adminBeginRecoveryReleases({ operationId, counts: result })
     );
-    const catalogRestored = await commitRecoveryObject(
-        coordinator,
-        point.digest,
-        "catalog",
-        point.catalog.bookmark,
-        catalog,
-        "Catalog"
-    );
-    if (!catalogRestored) {
-        state = { ...state, settleTurns: state.settleTurns + 1 };
-        return { done: false, state };
+    if (coordinated.phase !== "releasing") {
+        throw new CdbError({ code: "CDB_INVARIANT", message: "recovery coordinator did not begin shard release" });
     }
-    const restoredInventory = await recoveryPhase("restored Catalog proof", () => catalog.adminRecoveryInventory());
-    assertRecoveryTopology(restoredInventory, point);
-    await recoveryPhase("coordinator completion", () => coordinator.adminCompleteRecovery({ digest: point.digest }));
-    return {
-        done: true,
-        result,
-    };
+    return await releaseRecoveryShards(env, point, coordinator, coordinated, state);
+}
+
+async function releaseRecoveryShards(
+    env: ChardbEnv,
+    point: ChardbRecoveryPoint,
+    coordinator: RecoveryCoordinatorRpc,
+    coordinated: Extract<RecoveryCoordinatorState, { readonly phase: "releasing" }>,
+    state: Extract<RecoveryContinuationState, { readonly kind: "reconcile" }>
+): Promise<ReconcileTurnResult> {
+    let index = coordinated.releaseIndex;
+    let budget = RECOVERY_TURN_BUDGET;
+    while (index < point.shards.length && budget > 0) {
+        const shard = point.shards[index] as (typeof point.shards)[number];
+        await recoveryPhase("shard release", () =>
+            shardRpc(env, shard.shardId).adminReleaseRecovery({
+                operationId: coordinated.operationId,
+                generation: coordinated.generation,
+            })
+        );
+        await recoveryPhase("coordinator shard release cursor", () =>
+            coordinator.adminAdvanceRecoveryRelease({ operationId: coordinated.operationId, index })
+        );
+        index++;
+        budget--;
+    }
+    if (index < point.shards.length) return { done: false, operationId: coordinated.operationId, state };
+    await recoveryPhase("coordinator Catalog fence", () =>
+        coordinator.adminBeginRecoveryCatalogCommit({
+            operationId: coordinated.operationId,
+            shardCount: point.shards.length,
+        })
+    );
+    return { done: false, operationId: coordinated.operationId, state };
 }
 
 function reconcileStartState(): Extract<RecoveryContinuationState, { readonly kind: "reconcile" }> {
@@ -984,14 +1135,14 @@ async function recoveryPhase<T>(phase: string, operation: () => Promise<T>): Pro
 
 async function commitRecoveryObject(
     coordinator: RecoveryCoordinatorRpc,
-    digest: string,
+    operationId: string,
     objectId: string,
     bookmark: string,
     target: RecoveryRpc,
     label: string
 ): Promise<boolean> {
     const intent = await recoveryPhase(`${label} commit intent`, () =>
-        coordinator.adminBeginRecoveryObjectCommit({ digest, objectId, bookmark })
+        coordinator.adminBeginRecoveryObjectCommit({ operationId, objectId, bookmark })
     );
     if (intent.status === "scheduled") return true;
 
@@ -1004,7 +1155,7 @@ async function commitRecoveryObject(
         if (after.state === "armed") return false;
     }
     await recoveryPhase(`${label} commit confirmation`, () =>
-        coordinator.adminFinishRecoveryObjectCommit({ digest, objectId, bookmark })
+        coordinator.adminFinishRecoveryObjectCommit({ operationId, objectId, bookmark })
     );
     return true;
 }

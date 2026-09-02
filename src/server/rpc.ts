@@ -83,6 +83,7 @@ export interface CdbSubscriptionRequest {
     readonly placement?: CdbPlacement;
     /** Catalog's physical routing generation for this vshard placement. */
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     /** Exact logical vshard covered by the subscription. */
     readonly vshard: number;
     readonly domainSchemaEpoch: number;
@@ -113,8 +114,14 @@ export type CdbSubscriptionResponse =
 
 export interface CdbSubscriptionRpc {
     subscribe(args: CdbSubscriptionRequest): Promise<CdbSubscriptionResponse>;
-    unsubscribe(subscription: LiveSubscriptionId): Promise<void>;
-    finalizeUnsubscribe(subscription: LiveSubscriptionId): Promise<void>;
+    unsubscribe(request: {
+        readonly subscription: LiveSubscriptionId;
+        readonly recoveryGeneration: number;
+    }): Promise<void>;
+    finalizeUnsubscribe(request: {
+        readonly subscription: LiveSubscriptionId;
+        readonly recoveryGeneration: number;
+    }): Promise<void>;
 }
 
 export interface GatewayInvalidation {
@@ -151,6 +158,7 @@ export interface CdbMutationRequest {
     readonly placement?: CdbPlacement;
     readonly auth: AuthCtx;
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     readonly domainSchemaEpoch: number;
 }
 
@@ -182,6 +190,7 @@ interface CdbQueryRequestBase {
     readonly args: RawJson;
     readonly auth: AuthCtx;
     readonly domainSchemaEpoch: number;
+    readonly recoveryGeneration: number;
 }
 
 /** Routed queries always carry the Catalog generation used to select their Cdb. */
@@ -212,6 +221,7 @@ export interface CdbBindingPlanRequest {
     readonly placement: CdbPlacement;
     readonly auth: AuthCtx;
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     readonly domainSchemaEpoch: number;
 }
 
@@ -233,6 +243,7 @@ export interface CdbRegisteredQueryRequest {
     readonly auth: AuthCtx;
     /** Fresh Catalog physical routing generation. */
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     /** Fresh Catalog vshard identity for the persisted partition. */
     readonly vshard: number;
     readonly domainSchemaEpoch: number;

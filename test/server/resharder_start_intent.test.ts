@@ -147,6 +147,7 @@ describe("Resharder durable start intent", () => {
             },
         });
         await resharder.adminClaimRecoveryPreparation({
+            operationId: "00000000-0000-4000-8000-000000000001",
             digest: "d".repeat(64),
             continuationJson: serializeRecoveryContinuationState({
                 kind: "restore",

@@ -43,6 +43,7 @@ function registration(
     overrides: Partial<GatewayRegistrationInstall> = {}
 ): GatewayRegistrationInstall {
     return {
+        recoveryGeneration: 0,
         registrationId,
         principalId: PrincipalId("principal-1"),
         clientId: ClientId("client-1"),
@@ -201,7 +202,7 @@ describe("Gateway durable payload budget", () => {
                 .get(current.registrationId)
         ).toEqual({
             lifecycle: "retiring",
-            organization_id: "",
+            organization_id: "org-1",
             ref: "",
             args_json: "null",
             intent_json: "null",
@@ -274,6 +275,7 @@ describe("Gateway durable payload budget", () => {
         const stage = () =>
             db.transaction(() =>
                 stageGatewaySnapshot(sql, {
+                    recoveryGeneration: 0,
                     principalId: second.principalId,
                     clientId: second.clientId,
                     subId: second.subId,
@@ -330,11 +332,12 @@ describe("Gateway durable payload budget", () => {
         expect(
             db
                 .query(
-                    `SELECT args_json, intent_json, ref, source_cdb_id, connection_id
+                    `SELECT organization_id, args_json, intent_json, ref, source_cdb_id, connection_id
                      FROM _gw_registration_generations WHERE registration_id = ?`
                 )
                 .get(legacy.registrationId)
         ).toEqual({
+            organization_id: "org-1",
             args_json: "null",
             intent_json: "null",
             ref: "",
@@ -414,6 +417,7 @@ describe("Gateway durable payload budget", () => {
         expect(
             db.transaction(() =>
                 stageGatewaySnapshot(sql, {
+                    recoveryGeneration: 0,
                     principalId: current.principalId,
                     clientId: current.clientId,
                     subId: current.subId,

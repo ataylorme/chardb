@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS migration_state (
   range_hi INTEGER NOT NULL,
   phase INTEGER NOT NULL,
   epoch_at_start INTEGER NOT NULL,
+  recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0),
   tables_json TEXT NOT NULL DEFAULT '[]',
   bulk_cursor TEXT NOT NULL DEFAULT '{}',
   tail_cursor INTEGER NOT NULL DEFAULT 0,
@@ -116,13 +117,14 @@ export interface ResharderEnv {
 
 /** Subset of `Catalog` RPC the Resharder needs. */
 interface CatalogReshardRpc {
-    topologyOperation(args: { migrationId: string }): Promise<{
+    topologyOperation(args: { migrationId: string; recoveryGeneration: number }): Promise<{
         migrationId: string;
         sourceShard: string;
         destinationShard: string;
         rangeLo: number;
         rangeHi: number;
         startEpoch: number;
+        recoveryGeneration: number;
         status: "active" | "completed" | "aborted";
     } | null>;
     topologyRoutingStatus(args: {
@@ -132,6 +134,7 @@ interface CatalogReshardRpc {
         rangeLo: number;
         rangeHi: number;
         startEpoch: number;
+        recoveryGeneration: number;
     }): Promise<{
         owner: "source" | "destination";
         schemaEpoch: number;
@@ -144,6 +147,7 @@ interface CatalogReshardRpc {
         rangeLo: number;
         rangeHi: number;
         startEpoch: number;
+        recoveryGeneration: number;
     }): Promise<{
         status: "active" | "completed" | "aborted";
         schemaVersion: number;
@@ -157,11 +161,13 @@ interface CatalogReshardRpc {
         fromShard: string;
         toShard: string;
         startEpoch: number;
+        recoveryGeneration: number;
     }): Promise<{ applied: boolean; newEpoch: number }>;
     beginOrganizationDeletionBarrier(args: {
         migId: string;
         rangeLo: number;
         rangeHi: number;
+        recoveryGeneration: number;
     }): Promise<{
         migrationId: string;
         rangeLo: number;
@@ -175,6 +181,7 @@ interface CatalogReshardRpc {
         migId: string;
         rangeLo: number;
         rangeHi: number;
+        recoveryGeneration: number;
     }): Promise<{ barrier: unknown; olderDeletionsComplete: boolean }>;
     completeTopologyOperation(args: {
         migId: string;
@@ -183,6 +190,7 @@ interface CatalogReshardRpc {
         rangeLo: number;
         rangeHi: number;
         startEpoch: number;
+        recoveryGeneration: number;
     }): Promise<{ status: "completed" }>;
     abortTopologyOperation(args: {
         migId: string;
@@ -191,6 +199,7 @@ interface CatalogReshardRpc {
         rangeLo: number;
         rangeHi: number;
         startEpoch: number;
+        recoveryGeneration: number;
     }): Promise<{ status: "aborted" }>;
 }
 
@@ -205,8 +214,10 @@ interface CdbReshardRpc {
         rangeLo: number;
         rangeHi: number;
         destinationGeneration: number;
+        recoveryGeneration: number;
     }): Promise<{ prepared: boolean; serving: boolean }>;
     provisionFreshReshardDestination(args: {
+        recoveryGeneration: number;
         migrationId: string;
         targetVersion: number;
         targetEpoch: number;
@@ -218,6 +229,7 @@ interface CdbReshardRpc {
         rangeHi: number;
         sourceGeneration: number;
         destinationGeneration: number;
+        recoveryGeneration: number;
     }): Promise<unknown>;
     activateRoutingFence(args: {
         migrationId: string;
@@ -225,6 +237,7 @@ interface CdbReshardRpc {
         rangeHi: number;
         sourceGeneration: number;
         destinationGeneration: number;
+        recoveryGeneration: number;
     }): Promise<unknown>;
     completeRoutingFenceCleanup(args: {
         migrationId: string;
@@ -232,6 +245,7 @@ interface CdbReshardRpc {
         rangeHi: number;
         sourceGeneration: number;
         destinationGeneration: number;
+        recoveryGeneration: number;
     }): Promise<unknown>;
     cancelRoutingFenceBeforeCutover?(args: {
         migrationId: string;
@@ -239,6 +253,7 @@ interface CdbReshardRpc {
         rangeHi: number;
         sourceGeneration: number;
         destinationGeneration: number;
+        recoveryGeneration: number;
     }): Promise<unknown>;
     beginReshardSource(args: {
         migId: string;
@@ -248,6 +263,7 @@ interface CdbReshardRpc {
         schemaEpoch: number;
         schemaDigest: string;
         tables: readonly TableSpec[];
+        recoveryGeneration: number;
     }): Promise<{ enabled: boolean; triggersInstalled: number }>;
     beginReshardDest(args: {
         migId: string;
@@ -258,6 +274,7 @@ interface CdbReshardRpc {
         schemaDigest: string;
         tables: readonly TableSpec[];
         destinationGeneration: number;
+        recoveryGeneration: number;
     }): Promise<{
         ready: boolean;
     }>;
@@ -423,13 +440,15 @@ interface CdbReshardRpc {
     ): Promise<{ activated: boolean }>;
     reshardTableOrder(args: {
         migId: string;
+        recoveryGeneration: number;
         role: "source" | "dest";
         range: { lo: number; hi: number };
         tables: readonly TableSpec[];
     }): Promise<{ tableNames: readonly string[] }>;
-    tailWatermark(migId: string): Promise<{ lsn: number }>;
+    tailWatermark(args: { migId: string; recoveryGeneration: number }): Promise<{ lsn: number }>;
     bulkCopyBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         table: TableSpec;
         range: { lo: number; hi: number };
         afterRowid: number;
@@ -437,50 +456,63 @@ interface CdbReshardRpc {
     }): Promise<{ rows: readonly Record<string, RawJson>[]; lastRowid: number; done: boolean }>;
     applyBulkBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         table: TableSpec;
         range: { lo: number; hi: number };
         rows: readonly Record<string, RawJson>[];
     }): Promise<{ applied: number; skipped: number }>;
     closeReshardBulkDest(args: ReshardCleanupIdentity): Promise<{ closed: boolean }>;
-    readTailBatch(args: { migId: string; afterLsn: number; limit: number }): Promise<{
+    readTailBatch(args: { migId: string; recoveryGeneration: number; afterLsn: number; limit: number }): Promise<{
         transactions: readonly TailTransaction[];
         lastLsn: number;
         done: boolean;
     }>;
-    ackTail(args: { migId: string; throughLsn: number }): Promise<{ pruned: number; ackedLsn: number }>;
+    ackTail(args: { migId: string; recoveryGeneration: number; throughLsn: number }): Promise<{
+        pruned: number;
+        ackedLsn: number;
+    }>;
     applyTailBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         tables: readonly TableSpec[];
         range: { lo: number; hi: number };
         transactions: readonly TailTransaction[];
     }): Promise<{ applied: number; lastLsn: number }>;
     stageTailBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         tables: readonly TableSpec[];
         range: { lo: number; hi: number };
         transactions: readonly TailTransaction[];
     }): Promise<{ staged: number; lastLsn: number }>;
-    readStagedTailBatch(args: { migId: string; limit: number }): Promise<{ transactions: readonly TailTransaction[] }>;
-    ackStagedTail(args: { migId: string; throughLsn: number }): Promise<{ removed: number }>;
+    readStagedTailBatch(args: { migId: string; recoveryGeneration: number; limit: number }): Promise<{
+        transactions: readonly TailTransaction[];
+    }>;
+    ackStagedTail(args: { migId: string; recoveryGeneration: number; throughLsn: number }): Promise<{
+        removed: number;
+    }>;
     closeTailStaging(args: ReshardCleanupIdentity): Promise<{ closed: boolean }>;
     stopReshardCapture(args: ReshardCleanupIdentity): Promise<{ stopped: boolean }>;
-    readSplitOpLogBatch(args: { migId: string; afterLsn: number; limit: number }): Promise<{
+    readSplitOpLogBatch(args: { migId: string; recoveryGeneration: number; afterLsn: number; limit: number }): Promise<{
         entries: readonly SplitOpLogEntry[];
         lastLsn: number;
         done: boolean;
     }>;
     ackSplitOpLog(args: {
         migId: string;
+        recoveryGeneration: number;
         throughLsn: number;
     }): Promise<{ pruned: number; prunedBytes: number; ackedLsn: number }>;
     applySplitOpLogBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         rangeLo: number;
         rangeHi: number;
         entries: readonly SplitOpLogEntry[];
     }): Promise<{ applied: number; replayed: number; lastLsn: number }>;
     dropMigratedRange(args: {
         migId: string;
+        recoveryGeneration: number;
         table: TableSpec;
         range: { lo: number; hi: number };
         batchSize: number;
@@ -504,6 +536,7 @@ interface ReshardCleanupIdentity {
     readonly schemaEpoch: number;
     readonly schemaDigest: string;
     readonly tables: readonly TableSpec[];
+    readonly recoveryGeneration: number;
 }
 
 interface MigrationState {
@@ -513,6 +546,7 @@ interface MigrationState {
     readonly lo: number;
     readonly hi: number;
     readonly epochAtStart: number;
+    readonly recoveryGeneration: number;
     readonly schemaVersion: number;
     readonly schemaEpoch: number;
     readonly schemaDigest: string;
@@ -657,42 +691,64 @@ export class Resharder extends DurableObject<ResharderEnv> {
         return null;
     }
 
-    async adminRecoveryCoordinatorState(args: { readonly digest: string }) {
-        return new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).read(args.digest);
+    async adminRecoveryAdmissionClock() {
+        return new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).admissionClock();
     }
 
-    async adminClaimRecoveryPreparation(args: { readonly digest: string; readonly continuationJson: string }) {
+    async adminRecoveryCoordinatorState(args: { readonly operationId: string }) {
+        return new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).read(args.operationId);
+    }
+
+    async adminActiveRecoveryForDigest(args: { readonly digest: string }) {
+        return new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).activeForDigest(args.digest);
+    }
+
+    async adminClaimRecoveryPreparation(args: {
+        readonly operationId: string;
+        readonly digest: string;
+        readonly continuationJson: string;
+    }) {
         return this.ctx.storage.transactionSync(() =>
             new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).claimPreparation(
+                args.operationId,
                 args.digest,
                 args.continuationJson
             )
         );
     }
 
-    async adminSaveRecoveryPreparation(args: { readonly digest: string; readonly continuationJson: string }) {
+    async adminSaveRecoveryPreparation(args: { readonly operationId: string; readonly continuationJson: string }) {
         return this.ctx.storage.transactionSync(() =>
             new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).savePreparation(
-                args.digest,
+                args.operationId,
                 args.continuationJson
             )
         );
     }
 
-    async adminBeginRecoveryCommits(args: { readonly digest: string; readonly counts: RecoveryProviderCounts }) {
+    async adminCancelRecoveryPreparation(args: { readonly operationId: string }) {
         return this.ctx.storage.transactionSync(() =>
-            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).beginCommits(args.digest, args.counts)
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).cancelPreparation(args.operationId)
+        );
+    }
+
+    async adminBeginRecoveryCommits(args: { readonly operationId: string; readonly counts: RecoveryProviderCounts }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).beginCommits(
+                args.operationId,
+                args.counts
+            )
         );
     }
 
     async adminFinishRecoveryShardCommits(args: {
-        readonly digest: string;
+        readonly operationId: string;
         readonly continuationJson: string;
         readonly shardCount: number;
     }) {
         return this.ctx.storage.transactionSync(() =>
             new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).finishShards(
-                args.digest,
+                args.operationId,
                 args.continuationJson,
                 args.shardCount
             )
@@ -700,51 +756,72 @@ export class Resharder extends DurableObject<ResharderEnv> {
     }
 
     async adminAdvanceRecoveryShardCommit(args: {
-        readonly digest: string;
+        readonly operationId: string;
         readonly index: number;
         readonly objectId: string;
     }) {
         return this.ctx.storage.transactionSync(() =>
             new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).advanceShard(
-                args.digest,
+                args.operationId,
                 args.index,
                 args.objectId
             )
         );
     }
 
-    async adminSaveRecoveryReconcile(args: { readonly digest: string; readonly continuationJson: string }) {
+    async adminSaveRecoveryReconcile(args: { readonly operationId: string; readonly continuationJson: string }) {
         return this.ctx.storage.transactionSync(() =>
             new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).saveReconcile(
-                args.digest,
+                args.operationId,
                 args.continuationJson
             )
         );
     }
 
-    async adminBeginRecoveryCatalogCommit(args: {
-        readonly digest: string;
+    async adminBeginRecoveryReleases(args: {
+        readonly operationId: string;
         readonly counts: RecoveryReconcileCounts;
     }) {
         return this.ctx.storage.transactionSync(() =>
-            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).beginCatalog(args.digest, args.counts)
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).beginReleases(
+                args.operationId,
+                args.counts
+            )
         );
     }
 
-    async adminCompleteRecovery(args: { readonly digest: string }) {
+    async adminAdvanceRecoveryRelease(args: { readonly operationId: string; readonly index: number }) {
         return this.ctx.storage.transactionSync(() =>
-            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).complete(args.digest)
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).advanceRelease(
+                args.operationId,
+                args.index
+            )
+        );
+    }
+
+    async adminBeginRecoveryCatalogCommit(args: { readonly operationId: string; readonly shardCount: number }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).beginCatalog(
+                args.operationId,
+                args.shardCount
+            )
+        );
+    }
+
+    async adminCompleteRecovery(args: { readonly operationId: string }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).complete(args.operationId)
         );
     }
 
     async adminBeginRecoveryObjectCommit(args: {
-        readonly digest: string;
+        readonly operationId: string;
         readonly objectId: string;
         readonly bookmark: string;
     }) {
         return this.ctx.storage.transactionSync(() =>
             new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).beginObject(
-                args.digest,
+                args.operationId,
                 args.objectId,
                 args.bookmark
             )
@@ -752,13 +829,13 @@ export class Resharder extends DurableObject<ResharderEnv> {
     }
 
     async adminFinishRecoveryObjectCommit(args: {
-        readonly digest: string;
+        readonly operationId: string;
         readonly objectId: string;
         readonly bookmark: string;
     }) {
         return this.ctx.storage.transactionSync(() =>
             new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).finishObject(
-                args.digest,
+                args.operationId,
                 args.objectId,
                 args.bookmark
             )
@@ -789,6 +866,19 @@ export class Resharder extends DurableObject<ResharderEnv> {
                 "ALTER TABLE migration_state ADD COLUMN legacy_cutover_recovered INTEGER NOT NULL DEFAULT 0 CHECK (legacy_cutover_recovered IN (0, 1))"
             );
         }
+        if (!migrationColumns.has("recovery_generation")) {
+            sql.exec(
+                "ALTER TABLE migration_state ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0)"
+            );
+        }
+        const startColumns = new Set(
+            sql.all<{ name: string }>("PRAGMA table_info(migration_start_intent)").map(column => column.name)
+        );
+        if (!startColumns.has("recovery_generation")) {
+            sql.exec(
+                "ALTER TABLE migration_start_intent ADD COLUMN recovery_generation INTEGER DEFAULT 0 CHECK (recovery_generation >= 0)"
+            );
+        }
         sql.exec(
             `INSERT OR IGNORE INTO migration_work_cursor (mig_id, turn, updated_at)
              SELECT mig_id, 0, updated_at FROM migration_state`
@@ -814,7 +904,14 @@ export class Resharder extends DurableObject<ResharderEnv> {
             ? { ...args, tables: canonicalRegisteredTableSpecs(schema, args.tables).tables }
             : args;
         const tablesJson = canonicalStartSplit(admittedArgs);
-        const identity = this.startIdentity(admittedArgs, tablesJson);
+        const clock = new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).admissionClock();
+        if (clock.activeOperationId !== null) {
+            throw new CdbError({
+                code: "CDB_RESHARD_PHASE_MISMATCH",
+                message: "point-in-time recovery blocks resharding",
+            });
+        }
+        const identity = this.startIdentity(admittedArgs, tablesJson, clock.generation);
         if (this.activeRecoveries.has(admittedArgs.migId) || this.activeAborts.has(admittedArgs.migId)) {
             throw new CdbError({
                 code: "CDB_RESHARD_PHASE_MISMATCH",
@@ -826,7 +923,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
             this.assertSameStartIdentity(active.identity, identity);
             return active.promise;
         }
-        const operation = Promise.resolve().then(() => this.startSplitDriver(admittedArgs, tablesJson));
+        const operation = Promise.resolve().then(() => this.startSplitDriver(admittedArgs, tablesJson, identity));
         this.activeStarts.set(admittedArgs.migId, { identity, promise: operation });
         try {
             await operation;
@@ -837,7 +934,11 @@ export class Resharder extends DurableObject<ResharderEnv> {
         }
     }
 
-    private async startSplitDriver(args: StartSplitArgs, tablesJson: string): Promise<void> {
+    private async startSplitDriver(
+        args: StartSplitArgs,
+        tablesJson: string,
+        startIdentity: ResharderStartIdentity
+    ): Promise<void> {
         const existing = this.readMigration(args.migId);
         if (
             existing &&
@@ -846,6 +947,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                 existing.lo !== args.rangeLo ||
                 existing.hi !== args.rangeHi ||
                 existing.epochAtStart !== args.epochAtStart ||
+                existing.recoveryGeneration !== startIdentity.recoveryGeneration ||
                 canonicalSplitTables(existing.tables) !== tablesJson)
         ) {
             throw new CdbError({
@@ -853,10 +955,10 @@ export class Resharder extends DurableObject<ResharderEnv> {
                 message: `migId=${args.migId} is already bound to a different split`,
             });
         }
-        const startIdentity = this.startIdentity(args, tablesJson);
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
-            if (new RecoveryCoordinatorStore(sql).hasActiveRecovery()) {
+            const clock = new RecoveryCoordinatorStore(sql).admissionClock();
+            if (clock.activeOperationId !== null || clock.generation !== startIdentity.recoveryGeneration) {
                 throw new CdbError({
                     code: "CDB_RESHARD_PHASE_MISMATCH",
                     message: "point-in-time recovery blocks resharding",
@@ -872,6 +974,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                 lo: args.rangeLo,
                 hi: args.rangeHi,
                 epochAtStart: args.epochAtStart,
+                recoveryGeneration: startIdentity.recoveryGeneration,
             })
         );
         if (topology.status === "aborted") {
@@ -928,9 +1031,10 @@ export class Resharder extends DurableObject<ResharderEnv> {
                 range_lo: number;
                 range_hi: number;
                 epoch_at_start: number;
+                recovery_generation: number;
                 tables_json: string;
             }>(
-                `SELECT src_shard, dst_shard, range_lo, range_hi, epoch_at_start, tables_json
+                `SELECT src_shard, dst_shard, range_lo, range_hi, epoch_at_start, recovery_generation, tables_json
                  FROM migration_state WHERE mig_id = ?`,
                 args.migId
             );
@@ -941,6 +1045,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                     existing.range_lo !== args.rangeLo ||
                     existing.range_hi !== args.rangeHi ||
                     existing.epoch_at_start !== args.epochAtStart ||
+                    existing.recovery_generation !== startIdentity.recoveryGeneration ||
                     canonicalSplitTables(JSON.parse(existing.tables_json) as TableSpec[]) !== tablesJson
                 ) {
                     throw new CdbError({
@@ -953,15 +1058,16 @@ export class Resharder extends DurableObject<ResharderEnv> {
             }
             sql.exec(
                 `INSERT INTO migration_state
-                 (mig_id, src_shard, dst_shard, range_lo, range_hi, phase, epoch_at_start,
+                 (mig_id, src_shard, dst_shard, range_lo, range_hi, phase, epoch_at_start, recovery_generation,
                   tables_json, bulk_cursor, tail_cursor, started_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, 0, ?, ?, '{}', 0, ?, ?)`,
+                 VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, '{}', 0, ?, ?)`,
                 args.migId,
                 args.srcShard,
                 args.dstShard,
                 args.rangeLo,
                 args.rangeHi,
                 args.epochAtStart,
+                startIdentity.recoveryGeneration,
                 tablesJson,
                 now,
                 now
@@ -1182,6 +1288,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                 rangeLo: migration.lo,
                 rangeHi: migration.hi,
                 destinationGeneration: migration.epochAtStart + 1,
+                recoveryGeneration: migration.recoveryGeneration,
             });
             if (fileCursor.enabled) {
                 await dest.activateReshardFileDest(this.splitIdentityRequest(migId, migration));
@@ -1350,6 +1457,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                 rangeLo: range.lo,
                 rangeHi: range.hi,
                 destinationGeneration: st.epochAtStart + 1,
+                recoveryGeneration: st.recoveryGeneration,
             });
             this.assertCurrentPhase(migId, st.phase as ResharderPhase);
             if (st.phase >= RESHARDER_PHASE.DUAL_WRITE_OPEN && !ownership.serving) {
@@ -1360,6 +1468,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                     fromShard: st.src,
                     toShard: st.dst,
                     startEpoch: st.epochAtStart,
+                    recoveryGeneration: st.recoveryGeneration,
                 });
                 if (cutover.newEpoch !== st.epochAtStart + 1) {
                     throw new CdbError({
@@ -1392,6 +1501,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                 schemaEpoch: st.schemaEpoch,
                 schemaDigest: st.schemaDigest,
                 tables: st.tables,
+                recoveryGeneration: st.recoveryGeneration,
             });
             if (this.fileCursors().read(migId).enabled) {
                 await source.beginReshardFileSource(this.splitIdentityRequest(migId, st));
@@ -1408,6 +1518,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                     const filePrepared = await this.runFilePreparation(migId, source, st);
                     if (!filePrepared) break;
                     await dest.provisionFreshReshardDestination({
+                        recoveryGeneration: st.recoveryGeneration,
                         migrationId: `reshard-dest:${migId}`,
                         targetVersion: st.schemaVersion,
                         targetEpoch: st.schemaEpoch,
@@ -1434,6 +1545,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                         schemaDigest: st.schemaDigest,
                         tables: st.tables,
                         destinationGeneration: st.epochAtStart + 1,
+                        recoveryGeneration: st.recoveryGeneration,
                     });
                     await source.beginReshardSource({
                         migId,
@@ -1443,6 +1555,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                         schemaEpoch: st.schemaEpoch,
                         schemaDigest: st.schemaDigest,
                         tables: st.tables,
+                        recoveryGeneration: st.recoveryGeneration,
                     });
                     this.assertCurrentPhase(migId, RESHARDER_PHASE.INIT);
                     if (fileCursor.enabled) {
@@ -1487,7 +1600,8 @@ export class Resharder extends DurableObject<ResharderEnv> {
                         source,
                         dest,
                         range,
-                        RESHARDER_PHASE.BULK_COPY_DONE
+                        RESHARDER_PHASE.BULK_COPY_DONE,
+                        st.recoveryGeneration
                     );
                     if (!oplogConverged) break;
                     await this.advance(migId, RESHARDER_PHASE.BULK_COPY_DONE);
@@ -1502,11 +1616,13 @@ export class Resharder extends DurableObject<ResharderEnv> {
                             migId,
                             rangeLo: range.lo,
                             rangeHi: range.hi,
+                            recoveryGeneration: st.recoveryGeneration,
                         });
                         const barrier = await catalog.organizationDeletionBarrierStatus({
                             migId,
                             rangeLo: range.lo,
                             rangeHi: range.hi,
+                            recoveryGeneration: st.recoveryGeneration,
                         });
                         if (!barrier.olderDeletionsComplete) break;
                     }
@@ -1521,7 +1637,8 @@ export class Resharder extends DurableObject<ResharderEnv> {
                         source,
                         dest,
                         range,
-                        RESHARDER_PHASE.TAIL_CAUGHT_UP
+                        RESHARDER_PHASE.TAIL_CAUGHT_UP,
+                        st.recoveryGeneration
                     );
                     if (!oplogConverged) break;
                     const vectorBeforeFreeze = this.vectorCursors().read(migId);
@@ -1575,6 +1692,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                         fromShard: st.src,
                         toShard: st.dst,
                         startEpoch: st.epochAtStart,
+                        recoveryGeneration: st.recoveryGeneration,
                     });
                     if (cutover.newEpoch !== fence.destinationGeneration) {
                         throw new CdbError({
@@ -1603,7 +1721,8 @@ export class Resharder extends DurableObject<ResharderEnv> {
                             source,
                             dest,
                             range,
-                            RESHARDER_PHASE.DUAL_WRITE_OPEN
+                            RESHARDER_PHASE.DUAL_WRITE_OPEN,
+                            st.recoveryGeneration
                         );
                         if (!oplogConverged) break;
                     }
@@ -1639,6 +1758,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                     }
                     const { tableNames } = await source.reshardTableOrder({
                         migId,
+                        recoveryGeneration: st.recoveryGeneration,
                         role: "source",
                         range,
                         tables: st.tables,
@@ -1690,6 +1810,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
                     const t = tablesByName.get(dropOrder[st.bulkTableIndex] as string) as TableSpec;
                     const dropped = await source.dropMigratedRange({
                         migId,
+                        recoveryGeneration: st.recoveryGeneration,
                         table: t,
                         range,
                         batchSize: DROP_BATCH,
@@ -2174,9 +2295,13 @@ export class Resharder extends DurableObject<ResharderEnv> {
         st: MigrationState
     ): Promise<boolean> {
         const cursor = { ...st.bulkCursor };
-        if (st.tailCursor > 0) await source.ackTail({ migId, throughLsn: st.tailCursor });
+        if (st.tailCursor > 0) {
+            await source.ackTail({ migId, recoveryGeneration: st.recoveryGeneration, throughLsn: st.tailCursor });
+        }
         const oplogCursor = this.readOpLogCursor(migId);
-        if (oplogCursor > 0) await source.ackSplitOpLog({ migId, throughLsn: oplogCursor });
+        if (oplogCursor > 0) {
+            await source.ackSplitOpLog({ migId, recoveryGeneration: st.recoveryGeneration, throughLsn: oplogCursor });
+        }
         if (st.workTurn === 0) {
             try {
                 await this.runTailStage(migId, source, dest, range, st);
@@ -2193,13 +2318,21 @@ export class Resharder extends DurableObject<ResharderEnv> {
             return false;
         }
         if (st.workTurn === 1) {
-            await this.runOpLogReplay(migId, source, dest, range, RESHARDER_PHASE.TAIL_CAPTURE_ENABLED);
+            await this.runOpLogReplay(
+                migId,
+                source,
+                dest,
+                range,
+                RESHARDER_PHASE.TAIL_CAPTURE_ENABLED,
+                st.recoveryGeneration
+            );
             this.persistWorkCursor(migId, RESHARDER_PHASE.TAIL_CAPTURE_ENABLED, 2);
             return false;
         }
         const tablesByName = new Map(st.tables.map(table => [table.name, table]));
         const { tableNames } = await dest.reshardTableOrder({
             migId,
+            recoveryGeneration: st.recoveryGeneration,
             role: "dest",
             range,
             tables: st.tables,
@@ -2220,15 +2353,24 @@ export class Resharder extends DurableObject<ResharderEnv> {
                 this.persistWorkCursor(migId, RESHARDER_PHASE.TAIL_CAPTURE_ENABLED, 3);
                 return false;
             }
-            const batch = await dest.readStagedTailBatch({ migId, limit: TAIL_BATCH });
+            const batch = await dest.readStagedTailBatch({
+                migId,
+                recoveryGeneration: st.recoveryGeneration,
+                limit: TAIL_BATCH,
+            });
             if (batch.transactions.length > 0) {
                 const applied = await dest.applyTailBatch({
                     migId,
+                    recoveryGeneration: st.recoveryGeneration,
                     tables: st.tables,
                     range,
                     transactions: batch.transactions,
                 });
-                await dest.ackStagedTail({ migId, throughLsn: applied.lastLsn });
+                await dest.ackStagedTail({
+                    migId,
+                    recoveryGeneration: st.recoveryGeneration,
+                    throughLsn: applied.lastLsn,
+                });
                 return false;
             }
             await dest.closeTailStaging(this.splitIdentityRequest(migId, st));
@@ -2236,8 +2378,23 @@ export class Resharder extends DurableObject<ResharderEnv> {
         }
         const table = tablesByName.get(tableNames[st.bulkTableIndex] as string) as TableSpec;
         const after = cursor[table.name] ?? 0;
-        const batch = await source.bulkCopyBatch({ migId, table, range, afterRowid: after, limit: BULK_BATCH });
-        if (batch.rows.length > 0) await dest.applyBulkBatch({ migId, table, range, rows: batch.rows });
+        const batch = await source.bulkCopyBatch({
+            migId,
+            recoveryGeneration: st.recoveryGeneration,
+            table,
+            range,
+            afterRowid: after,
+            limit: BULK_BATCH,
+        });
+        if (batch.rows.length > 0) {
+            await dest.applyBulkBatch({
+                migId,
+                recoveryGeneration: st.recoveryGeneration,
+                table,
+                range,
+                rows: batch.rows,
+            });
+        }
         cursor[table.name] = batch.lastRowid;
         this.persistBulkCursor(migId, cursor, RESHARDER_PHASE.TAIL_CAPTURE_ENABLED);
         this.persistWorkCursor(
@@ -2258,8 +2415,15 @@ export class Resharder extends DurableObject<ResharderEnv> {
     ): Promise<void> {
         const boundTableNames = new Set(st.tables.map(table => table.name));
         let cursor = st.tailCursor;
-        if (cursor > 0) await source.ackTail({ migId, throughLsn: cursor });
-        const batch = await source.readTailBatch({ migId, afterLsn: cursor, limit: TAIL_BATCH });
+        if (cursor > 0) {
+            await source.ackTail({ migId, recoveryGeneration: st.recoveryGeneration, throughLsn: cursor });
+        }
+        const batch = await source.readTailBatch({
+            migId,
+            recoveryGeneration: st.recoveryGeneration,
+            afterLsn: cursor,
+            limit: TAIL_BATCH,
+        });
         if (batch.transactions.length === 0) return;
         for (const transaction of batch.transactions) {
             for (const entry of transaction.entries) {
@@ -2273,6 +2437,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
         }
         const staged = await dest.stageTailBatch({
             migId,
+            recoveryGeneration: st.recoveryGeneration,
             tables: st.tables,
             range,
             transactions: batch.transactions,
@@ -2300,9 +2465,16 @@ export class Resharder extends DurableObject<ResharderEnv> {
     ): Promise<boolean> {
         const boundTableNames = new Set(st.tables.map(table => table.name));
         let cursor = st.tailCursor;
-        if (cursor > 0) await source.ackTail({ migId, throughLsn: cursor });
+        if (cursor > 0) {
+            await source.ackTail({ migId, recoveryGeneration: st.recoveryGeneration, throughLsn: cursor });
+        }
         for (let i = 0; i < 2; i++) {
-            const batch = await source.readTailBatch({ migId, afterLsn: cursor, limit: TAIL_BATCH });
+            const batch = await source.readTailBatch({
+                migId,
+                recoveryGeneration: st.recoveryGeneration,
+                afterLsn: cursor,
+                limit: TAIL_BATCH,
+            });
             if (batch.transactions.length === 0) {
                 continue;
             }
@@ -2318,6 +2490,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
             }
             const applied = await dest.applyTailBatch({
                 migId,
+                recoveryGeneration: st.recoveryGeneration,
                 tables: st.tables,
                 range,
                 transactions: batch.transactions,
@@ -2346,17 +2519,24 @@ export class Resharder extends DurableObject<ResharderEnv> {
         source: CdbReshardRpc,
         dest: CdbReshardRpc,
         range: { readonly lo: number; readonly hi: number },
-        expectedPhase: ResharderPhase
+        expectedPhase: ResharderPhase,
+        recoveryGeneration: number
     ): Promise<boolean> {
         let cursor = this.readOpLogCursor(migId);
-        if (cursor > 0) await source.ackSplitOpLog({ migId, throughLsn: cursor });
+        if (cursor > 0) await source.ackSplitOpLog({ migId, recoveryGeneration, throughLsn: cursor });
         for (let iteration = 0; iteration < 2; iteration++) {
-            const batch = await source.readSplitOpLogBatch({ migId, afterLsn: cursor, limit: OPLOG_BATCH });
+            const batch = await source.readSplitOpLogBatch({
+                migId,
+                recoveryGeneration,
+                afterLsn: cursor,
+                limit: OPLOG_BATCH,
+            });
             if (batch.entries.length === 0) {
                 continue;
             }
             const applied = await dest.applySplitOpLogBatch({
                 migId,
+                recoveryGeneration,
                 rangeLo: range.lo,
                 rangeHi: range.hi,
                 entries: batch.entries,
@@ -2436,12 +2616,13 @@ export class Resharder extends DurableObject<ResharderEnv> {
             work_turn: number;
             bulk_table_index: number;
             legacy_cutover_recovered: number;
+            recovery_generation: number;
         }>(
             `SELECT m.phase, m.src_shard AS src, m.dst_shard AS dst, m.range_lo AS lo, m.range_hi AS hi,
                     m.epoch_at_start, i.schema_version, i.schema_epoch, i.schema_digest,
                     m.tables_json, m.bulk_cursor, m.tail_cursor, COALESCE(w.turn, 0) AS work_turn,
                     COALESCE(w.bulk_table_index, 0) AS bulk_table_index,
-                    m.legacy_cutover_recovered
+                    m.legacy_cutover_recovered, m.recovery_generation
              FROM migration_state AS m
              LEFT JOIN migration_schema_identity AS i ON i.mig_id = m.mig_id
              LEFT JOIN migration_work_cursor AS w ON w.mig_id = m.mig_id
@@ -2469,6 +2650,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
             lo: row.lo,
             hi: row.hi,
             epochAtStart: row.epoch_at_start,
+            recoveryGeneration: row.recovery_generation,
             schemaVersion: row.schema_version,
             schemaEpoch: row.schema_epoch,
             schemaDigest: row.schema_digest,
@@ -2481,7 +2663,11 @@ export class Resharder extends DurableObject<ResharderEnv> {
         };
     }
 
-    private startIdentity(args: StartSplitArgs, tablesJson: string): ResharderStartIdentity {
+    private startIdentity(
+        args: StartSplitArgs,
+        tablesJson: string,
+        recoveryGeneration: number
+    ): ResharderStartIdentity {
         return {
             migId: args.migId,
             srcShard: args.srcShard,
@@ -2489,19 +2675,22 @@ export class Resharder extends DurableObject<ResharderEnv> {
             rangeLo: args.rangeLo,
             rangeHi: args.rangeHi,
             epochAtStart: args.epochAtStart,
+            recoveryGeneration,
             tablesJson,
         };
     }
 
     private startMigrationIdentity(
         args: StartSplitArgs
-    ): Pick<MigrationState, "src" | "dst" | "lo" | "hi" | "epochAtStart"> {
+    ): Pick<MigrationState, "src" | "dst" | "lo" | "hi" | "epochAtStart" | "recoveryGeneration"> {
         return {
             src: args.srcShard,
             dst: args.dstShard,
             lo: args.rangeLo,
             hi: args.rangeHi,
             epochAtStart: args.epochAtStart,
+            recoveryGeneration: new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).admissionClock()
+                .generation,
         };
     }
 
@@ -2515,7 +2704,10 @@ export class Resharder extends DurableObject<ResharderEnv> {
 
     private async abortPendingStart(intent: ResharderStartIntent): Promise<void> {
         if (!intent.identity) return;
-        const topology = await this.catalog().topologyOperation({ migrationId: intent.migId });
+        const topology = await this.catalog().topologyOperation({
+            migrationId: intent.migId,
+            recoveryGeneration: intent.identity.recoveryGeneration,
+        });
         if (!topology) return;
         const identity = intent.identity;
         if (
@@ -2545,6 +2737,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
             rangeLo: identity.rangeLo,
             rangeHi: identity.rangeHi,
             startEpoch: identity.epochAtStart,
+            recoveryGeneration: identity.recoveryGeneration,
         });
     }
 
@@ -2558,7 +2751,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
 
     private topologyRequest(
         migId: string,
-        migration: Pick<MigrationState, "src" | "dst" | "lo" | "hi" | "epochAtStart">
+        migration: Pick<MigrationState, "src" | "dst" | "lo" | "hi" | "epochAtStart" | "recoveryGeneration">
     ) {
         return {
             migId,
@@ -2567,16 +2760,21 @@ export class Resharder extends DurableObject<ResharderEnv> {
             rangeLo: migration.lo,
             rangeHi: migration.hi,
             startEpoch: migration.epochAtStart,
+            recoveryGeneration: migration.recoveryGeneration,
         };
     }
 
-    private routingFenceRequest(migId: string, migration: Pick<MigrationState, "lo" | "hi" | "epochAtStart">) {
+    private routingFenceRequest(
+        migId: string,
+        migration: Pick<MigrationState, "lo" | "hi" | "epochAtStart" | "recoveryGeneration">
+    ) {
         return {
             migrationId: migId,
             rangeLo: migration.lo,
             rangeHi: migration.hi,
             sourceGeneration: migration.epochAtStart,
             destinationGeneration: migration.epochAtStart + 1,
+            recoveryGeneration: migration.recoveryGeneration,
         };
     }
 
@@ -2588,6 +2786,7 @@ export class Resharder extends DurableObject<ResharderEnv> {
             schemaVersion: migration.schemaVersion,
             schemaEpoch: migration.schemaEpoch,
             schemaDigest: migration.schemaDigest,
+            recoveryGeneration: migration.recoveryGeneration,
             tables: migration.tables,
         };
     }

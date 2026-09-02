@@ -43,6 +43,7 @@ function createStore(db: Database): CdbRoutingFenceStore {
 }
 
 const first: CdbRoutingFenceIdentity = {
+    recoveryGeneration: 0,
     migrationId: "move-7-8-v1",
     rangeLo: 7,
     rangeHi: 8,
@@ -147,6 +148,7 @@ describe("Cdb routing fence store", () => {
         );
 
         const successor: CdbRoutingFenceIdentity = {
+            recoveryGeneration: 0,
             migrationId: "move-7-8-v2",
             rangeLo: 7,
             rangeHi: 8,
@@ -179,6 +181,7 @@ describe("Cdb routing fence store", () => {
             expect(() =>
                 store.prepare(
                     {
+                        recoveryGeneration: 0,
                         migrationId: `overlap-${rangeLo}-${rangeHi}`,
                         rangeLo,
                         rangeHi,
@@ -238,6 +241,7 @@ describe("Cdb routing fence store", () => {
         expect(
             store.prepare(
                 {
+                    recoveryGeneration: 0,
                     migrationId: "history-0",
                     rangeLo: 0,
                     rangeHi: 0,
@@ -250,6 +254,7 @@ describe("Cdb routing fence store", () => {
         expect(() =>
             store.prepare(
                 {
+                    recoveryGeneration: 0,
                     migrationId: "over-cap",
                     rangeLo: 0,
                     rangeHi: 0,

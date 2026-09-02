@@ -54,6 +54,7 @@ function registration(
     overrides: Partial<GatewayRegistrationInstall> = {}
 ): GatewayRegistrationInstall {
     return {
+        recoveryGeneration: 0,
         registrationId,
         principalId: PrincipalId("principal-1"),
         clientId: ClientId("client-1"),

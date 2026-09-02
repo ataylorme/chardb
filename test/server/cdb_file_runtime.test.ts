@@ -110,6 +110,7 @@ describe("Cdb file runtime", () => {
 
     function reserve(fileId = "file_a", nowMs = 100) {
         return runtime.reserve({
+            recoveryGeneration: 0,
             fileId,
             organizationId: "org-1",
             table: "messages",
@@ -127,6 +128,7 @@ describe("Cdb file runtime", () => {
         expect(() => reserve()).not.toThrow();
         expect(() =>
             runtime.reserve({
+                recoveryGeneration: 0,
                 fileId: "wrong_org",
                 organizationId: "org-2",
                 table: "messages",
@@ -140,6 +142,7 @@ describe("Cdb file runtime", () => {
         ).toThrow(expect.objectContaining({ code: "CDB_FORBIDDEN" }));
         expect(() =>
             runtime.reserve({
+                recoveryGeneration: 0,
                 fileId: "bad_mime",
                 organizationId: "org-1",
                 table: "messages",
@@ -153,6 +156,7 @@ describe("Cdb file runtime", () => {
         ).toThrow(/content type/);
         expect(() =>
             runtime.reserve({
+                recoveryGeneration: 0,
                 fileId: "too_big",
                 organizationId: "org-1",
                 table: "messages",
@@ -169,6 +173,7 @@ describe("Cdb file runtime", () => {
     test("deletes R2 before releasing quota and preserves failures for retry", async () => {
         reserve();
         runtime.markReady({
+            recoveryGeneration: 0,
             fileId: "file_a",
             organizationId: "org-1",
             sha256: FILE_SHA256,
@@ -209,6 +214,7 @@ describe("Cdb file runtime", () => {
         reserve("expired_pending", 10);
         reserve("future_ready", 1_000);
         runtime.markReady({
+            recoveryGeneration: 0,
             fileId: "future_ready",
             organizationId: "org-1",
             sha256: FILE_SHA256,
@@ -231,6 +237,7 @@ describe("Cdb file runtime", () => {
         reserve("pending", 100);
         reserve("attached", 101);
         runtime.markReady({
+            recoveryGeneration: 0,
             fileId: "attached",
             organizationId: "org-1",
             sha256: FILE_SHA256,
@@ -248,11 +255,25 @@ describe("Cdb file runtime", () => {
             103
         );
 
-        expect(runtime.deleteOrganization({ organizationId: "org-1", nowMs: 200, domainSchemaEpoch: 2 })).toEqual({
+        expect(
+            runtime.deleteOrganization({
+                recoveryGeneration: 0,
+                organizationId: "org-1",
+                nowMs: 200,
+                domainSchemaEpoch: 2,
+            })
+        ).toEqual({
             organizationId: "org-1",
             accepted: true,
         });
-        expect(runtime.deleteOrganization({ organizationId: "org-1", nowMs: 201, domainSchemaEpoch: 2 })).toEqual({
+        expect(
+            runtime.deleteOrganization({
+                recoveryGeneration: 0,
+                organizationId: "org-1",
+                nowMs: 201,
+                domainSchemaEpoch: 2,
+            })
+        ).toEqual({
             organizationId: "org-1",
             accepted: true,
         });
@@ -281,6 +302,7 @@ describe("Cdb file runtime", () => {
     test("rechecks the deletion fence after an awaited policy read", async () => {
         reserve("attached", 100);
         runtime.markReady({
+            recoveryGeneration: 0,
             fileId: "attached",
             organizationId: "org-1",
             sha256: FILE_SHA256,
@@ -300,6 +322,7 @@ describe("Cdb file runtime", () => {
         await expect(
             runtime.resolveDownload(
                 {
+                    recoveryGeneration: 0,
                     organizationId: "org-1",
                     table: "messages",
                     column: "attachment",
@@ -308,7 +331,12 @@ describe("Cdb file runtime", () => {
                     auth,
                 },
                 async () => {
-                    runtime.deleteOrganization({ organizationId: "org-1", nowMs: 200, domainSchemaEpoch: 2 });
+                    runtime.deleteOrganization({
+                        recoveryGeneration: 0,
+                        organizationId: "org-1",
+                        nowMs: 200,
+                        domainSchemaEpoch: 2,
+                    });
                     return "attached";
                 }
             )
@@ -353,6 +381,7 @@ describe("Cdb file runtime", () => {
         });
         const request = {
             fileId: "captured",
+            recoveryGeneration: 0,
             organizationId: "org-1",
             table: "messages",
             column: "attachment",
@@ -364,6 +393,7 @@ describe("Cdb file runtime", () => {
         } as const;
         guarded.reserve(request);
         guarded.markReady({
+            recoveryGeneration: 0,
             fileId: request.fileId,
             organizationId: request.organizationId,
             sha256: FILE_SHA256,

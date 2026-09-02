@@ -168,6 +168,7 @@ describe("Cdb reshard identity store", () => {
         const identities = store();
         const identity = {
             migId: "split_1",
+            recoveryGeneration: 0,
             rangeLo: 100,
             rangeHi: 199,
             role: "source" as const,
@@ -199,6 +200,7 @@ describe("Cdb reshard identity store", () => {
         const identities = store();
         const identity = {
             migId: "split_2",
+            recoveryGeneration: 0,
             rangeLo: 20,
             rangeHi: 30,
             role: "dest" as const,

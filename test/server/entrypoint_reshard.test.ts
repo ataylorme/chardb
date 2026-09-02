@@ -97,6 +97,9 @@ describe("private reshard admin endpoint", () => {
             },
         };
         const resharder = {
+            async adminRecoveryAdmissionClock() {
+                return { generation: 0, activeOperationId: null, activeDigest: null };
+            },
             migrationStatus() {
                 return current;
             },
@@ -126,7 +129,16 @@ describe("private reshard admin endpoint", () => {
             state: { phaseName: "INIT", terminal: false },
         });
         expect(calls).toEqual([
-            ["claim", { migId: "split-1", destinationShard: "ShardDO_1", rangeLo: 8, rangeHi: 15 }],
+            [
+                "claim",
+                {
+                    migId: "split-1",
+                    recoveryGeneration: 0,
+                    destinationShard: "ShardDO_1",
+                    rangeLo: 8,
+                    rangeHi: 15,
+                },
+            ],
             [
                 "start",
                 {

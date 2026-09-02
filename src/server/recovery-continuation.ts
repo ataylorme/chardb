@@ -4,6 +4,7 @@ import { exactAdminObject } from "./admin-http.ts";
 export const RECOVERY_CONTINUATION_FORMAT = "chardb-recovery-continuation/v1";
 
 const DIGEST = /^[a-f0-9]{64}$/;
+const RECOVERY_OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MAX_RECOVERY_SHARDS = 16_384;
 const MAX_CURSOR_BYTES = 256;
 const TEXT = new TextEncoder();
@@ -45,12 +46,14 @@ export type RecoveryContinuationState =
 
 interface RecoveryContinuation {
     readonly format: typeof RECOVERY_CONTINUATION_FORMAT;
+    readonly operationId: string;
     readonly recoveryPointDigest: string;
     readonly state: RecoveryContinuationState;
     readonly signature: string;
 }
 
 export function parseRecoveryOperationRequest(value: unknown): {
+    readonly operationId: string;
     readonly recoveryPoint: unknown;
     readonly continuation?: unknown;
 } {
@@ -58,18 +61,26 @@ export function parseRecoveryOperationRequest(value: unknown): {
         throw new TypeError("backup request body must be an object");
     }
     const hasContinuation = Object.hasOwn(value, "continuation");
-    const input = exactAdminObject(value, hasContinuation ? ["continuation", "recoveryPoint"] : ["recoveryPoint"]);
+    const input = exactAdminObject(
+        value,
+        hasContinuation ? ["continuation", "operationId", "recoveryPoint"] : ["operationId", "recoveryPoint"]
+    );
+    if (typeof input.operationId !== "string" || !RECOVERY_OPERATION_ID.test(input.operationId)) {
+        throw new TypeError("recovery operation id is invalid");
+    }
     return hasContinuation
-        ? { recoveryPoint: input.recoveryPoint, continuation: input.continuation }
-        : { recoveryPoint: input.recoveryPoint };
+        ? { operationId: input.operationId, recoveryPoint: input.recoveryPoint, continuation: input.continuation }
+        : { operationId: input.operationId, recoveryPoint: input.recoveryPoint };
 }
 
 export async function signRecoveryContinuation(
     env: RecoveryContinuationEnv,
+    operationId: string,
     recoveryPointDigest: string,
     state: RecoveryContinuationState
 ): Promise<RecoveryContinuation> {
-    const unsigned = { format: RECOVERY_CONTINUATION_FORMAT, recoveryPointDigest, state } as const;
+    if (!RECOVERY_OPERATION_ID.test(operationId)) throw new TypeError("recovery operation id is invalid");
+    const unsigned = { format: RECOVERY_CONTINUATION_FORMAT, operationId, recoveryPointDigest, state } as const;
     const key = await recoveryContinuationKey(env, ["sign"]);
     const signature = await crypto.subtle.sign("HMAC", key, TEXT.encode(stableJson(unsigned)));
     return { ...unsigned, signature: hex(new Uint8Array(signature)) };
@@ -77,14 +88,16 @@ export async function signRecoveryContinuation(
 
 export async function parseRecoveryContinuation<K extends RecoveryContinuationState["kind"]>(
     env: RecoveryContinuationEnv,
+    operationId: string,
     recoveryPointDigest: string,
     value: unknown,
     kind: K
 ): Promise<Extract<RecoveryContinuationState, { readonly kind: K }> | undefined> {
     if (value === undefined) return undefined;
-    const input = exactAdminObject(value, ["format", "recoveryPointDigest", "signature", "state"]);
+    const input = exactAdminObject(value, ["format", "operationId", "recoveryPointDigest", "signature", "state"]);
     if (
         input.format !== RECOVERY_CONTINUATION_FORMAT ||
+        input.operationId !== operationId ||
         input.recoveryPointDigest !== recoveryPointDigest ||
         typeof input.signature !== "string" ||
         !DIGEST.test(input.signature)
@@ -92,7 +105,7 @@ export async function parseRecoveryContinuation<K extends RecoveryContinuationSt
         throw new TypeError("recovery continuation identity is invalid");
     }
     const state = parseRecoveryContinuationState(input.state, kind);
-    const unsigned = { format: RECOVERY_CONTINUATION_FORMAT, recoveryPointDigest, state } as const;
+    const unsigned = { format: RECOVERY_CONTINUATION_FORMAT, operationId, recoveryPointDigest, state } as const;
     const key = await recoveryContinuationKey(env, ["verify"]);
     const verified = await crypto.subtle.verify(
         "HMAC",

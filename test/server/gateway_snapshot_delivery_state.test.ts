@@ -68,6 +68,7 @@ function registration(
     overrides: Partial<GatewayRegistrationInstall> = {}
 ): GatewayRegistrationInstall {
     return {
+        recoveryGeneration: 0,
         registrationId,
         principalId: PrincipalId("principal-1"),
         clientId: ClientId("client-1"),
@@ -137,6 +138,7 @@ describe("Gateway snapshot delivery state", () => {
     ): boolean {
         return db.transaction(() =>
             stageGatewaySnapshot(sql, {
+                recoveryGeneration: 0,
                 principalId: input.principalId,
                 clientId: input.clientId,
                 subId: input.subId,
@@ -569,6 +571,7 @@ describe("Gateway snapshot delivery state", () => {
             shardId: current.shardId,
             sourceCdbId: current.sourceCdbId,
             schemaEpoch: current.schemaEpoch,
+            recoveryGeneration: current.recoveryGeneration ?? 0,
             domainSchemaEpoch: current.domainSchemaEpoch,
             authEpochs: { global: 10, tenant: 11, principal: 12 },
             nowMs: 226,
@@ -583,6 +586,7 @@ describe("Gateway snapshot delivery state", () => {
             { shardId: "logical-shard-after-cutover" },
             { sourceCdbId: "physical-cdb-after-cutover" },
             { schemaEpoch: lookup.schemaEpoch + 1 },
+            { recoveryGeneration: lookup.recoveryGeneration + 1 },
             { domainSchemaEpoch: lookup.domainSchemaEpoch + 1 },
         ]) {
             expect(db.transaction(() => resolveGatewaySnapshotReplay(sql, { ...lookup, ...stale }))()).toBeNull();

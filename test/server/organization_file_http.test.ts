@@ -28,6 +28,7 @@ const session = {
 };
 
 const authority = {
+    recoveryGeneration: 0,
     principalId: "user-1",
     organizationId: "org-1",
     role: "member",
@@ -47,6 +48,7 @@ function fixture(
         readonly downloadRpcStaleOnce?: boolean;
         readonly downloadMissing?: boolean;
         readonly downloadObjectMissing?: boolean;
+        readonly changeRoleAfterProviderRead?: boolean;
         readonly uploadProviderFailure?: "retain";
     } = {}
 ) {
@@ -72,6 +74,7 @@ function fixture(
     let status: "pending" | "ready" = "pending";
     let readyFile: { readonly fileId: string; readonly size: number; readonly sha256: string } | undefined;
     let downloadCalls = 0;
+    let providerRead = false;
     let downloadProviderFailure: DownloadProviderFailure | undefined;
     const cdb: OrganizationFileUploadCdb & {
         resolveFileDownload(request: {
@@ -79,6 +82,7 @@ function fixture(
             readonly table: string;
             readonly column: string;
             readonly rowId: string;
+            readonly auth: { readonly role: string };
         }): Promise<unknown>;
     } = {
         async reserveFile(request) {
@@ -124,6 +128,9 @@ function fixture(
         async resolveFileDownload(request) {
             calls.push("cdb.download");
             downloadCalls++;
+            if (request.auth.role === "viewer") {
+                throw new CdbError({ code: "CDB_FORBIDDEN", message: "file row policy denied access" });
+            }
             if ((options.downloadStaleOnce || options.downloadRpcStaleOnce) && downloadCalls === 1) {
                 if (options.downloadRpcStaleOnce) {
                     throw new Error("CDB_STALE_EPOCH: download route moved");
@@ -156,7 +163,10 @@ function fixture(
             routeCalls++;
             const movingEveryTime = options.moveOnEveryRefresh === true;
             return {
-                authority,
+                authority:
+                    options.changeRoleAfterProviderRead && providerRead
+                        ? { ...authority, role: "viewer", roles: ["viewer"] }
+                        : authority,
                 route: {
                     shardId: (movingEveryTime
                         ? `shard-${routeCalls}`
@@ -164,6 +174,7 @@ function fixture(
                           ? "shard-b"
                           : "shard-a") as never,
                     schemaEpoch: movingEveryTime ? routeCalls : options.moveOnRefresh && routeCalls > 1 ? 2 : 1,
+                    recoveryGeneration: 0,
                     domainSchemaEpoch: 2,
                 },
             };
@@ -202,6 +213,7 @@ function fixture(
             }
             const stored = object?.key === key ? object : retained?.key === key ? retained : undefined;
             if (!stored) return null;
+            providerRead = true;
             return {
                 ...stored,
                 body: new Response(Uint8Array.from(stored.bytes)).body,
@@ -468,7 +480,48 @@ describe("private organization file HTTP upload", () => {
         expect(downloaded.headers.get("x-content-type-options")).toBe("nosniff");
         expect(downloaded.headers.get("cross-origin-resource-policy")).toBe("same-origin");
         expect(downloaded.headers.get("content-security-policy")).toBe("sandbox");
-        expect(f.calls).toEqual(["auth.session", "catalog.route", "catalog.route", "cdb.download", "r2.get"]);
+        expect(f.calls).toEqual([
+            "auth.session",
+            "catalog.route",
+            "catalog.route",
+            "cdb.download",
+            "r2.get",
+            "catalog.route",
+            "cdb.download",
+        ]);
+    });
+
+    test("reruns Cdb row policy after R2 and denies a same-route role change", async () => {
+        const f = fixture({ changeRoleAfterProviderRead: true });
+        expect(
+            (
+                await handleOrganizationFileUploadRequest({
+                    request: f.request(),
+                    env: f.env,
+                    auth: f.auth,
+                    resources: [resource],
+                    nowMs: 100,
+                })
+            ).status
+        ).toBe(200);
+        f.calls.splice(0);
+
+        const denied = await handleOrganizationFileDownloadRequest({
+            request: f.downloadRequest(),
+            env: f.env,
+            auth: f.auth,
+            resources: [resource],
+        });
+        expect(denied.status).toBe(403);
+        expect(f.calls).toEqual([
+            "auth.session",
+            "catalog.route",
+            "catalog.route",
+            "cdb.download",
+            "r2.get",
+            "catalog.route",
+            "cdb.download",
+        ]);
     });
 
     test("retries a stale download once against fresh Catalog placement", async () => {
@@ -499,6 +552,8 @@ describe("private organization file HTTP upload", () => {
             "catalog.route",
             "cdb.download",
             "r2.get",
+            "catalog.route",
+            "cdb.download",
         ]);
     });
 
@@ -519,7 +574,7 @@ describe("private organization file HTTP upload", () => {
             resources: [resource],
         });
         expect(response.status).toBe(200);
-        expect(f.calls.filter(call => call === "cdb.download")).toHaveLength(2);
+        expect(f.calls.filter(call => call === "cdb.download")).toHaveLength(3);
     });
 
     test("makes missing, denied, and cross-organization downloads indistinguishable before R2", async () => {

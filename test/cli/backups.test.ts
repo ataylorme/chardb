@@ -13,6 +13,12 @@ const RECOVERY_POINT = {
     digest: "b".repeat(64),
 };
 
+function requestOperationId(init: RequestInit | undefined): string {
+    const body = JSON.parse(String(init?.body)) as { readonly operationId?: unknown };
+    if (typeof body.operationId !== "string") throw new Error("missing recovery operation id");
+    return body.operationId;
+}
+
 function context(fetch: CliFetch): {
     readonly ctx: CliContext;
     readonly files: Map<string, string>;
@@ -92,6 +98,7 @@ describe("chardb backups CLI", () => {
             if (String(input).endsWith("/restore")) {
                 return Response.json(
                     {
+                        operationId: requestOperationId(init),
                         ok: true,
                         accepted: true,
                         recoveryPointDigest: RECOVERY_POINT.digest,
@@ -102,6 +109,7 @@ describe("chardb backups CLI", () => {
                 );
             }
             return Response.json({
+                operationId: requestOperationId(init),
                 ok: true,
                 reconciled: true,
                 recoveryPointDigest: RECOVERY_POINT.digest,
@@ -113,14 +121,16 @@ describe("chardb backups CLI", () => {
         expect(
             await runCli(state.ctx, ["backups", "restore", "--url", "https://db.example", "--from", "recovery.json"])
         ).toBe(0);
+        const operationId = (calls[0]?.body as { operationId?: unknown }).operationId;
+        expect(operationId).toBeString();
         expect(calls).toEqual([
             {
                 url: "https://db.example/_chardb/backups/restore",
-                body: { recoveryPoint: RECOVERY_POINT },
+                body: { operationId, recoveryPoint: RECOVERY_POINT },
             },
             {
                 url: "https://db.example/_chardb/backups/reconcile",
-                body: { recoveryPoint: RECOVERY_POINT },
+                body: { operationId, recoveryPoint: RECOVERY_POINT },
             },
         ]);
         expect(state.out.join("")).toContain(
@@ -131,10 +141,11 @@ describe("chardb backups CLI", () => {
 
     test("waits for every Durable Object restore before recovery reconciliation", async () => {
         let reconciles = 0;
-        const state = context(async input => {
+        const state = context(async (input, init) => {
             if (String(input).endsWith("/restore")) {
                 return Response.json(
                     {
+                        operationId: requestOperationId(init),
                         ok: true,
                         accepted: true,
                         recoveryPointDigest: RECOVERY_POINT.digest,
@@ -152,6 +163,7 @@ describe("chardb backups CLI", () => {
                 );
             }
             return Response.json({
+                operationId: requestOperationId(init),
                 ok: true,
                 reconciled: true,
                 recoveryPointDigest: RECOVERY_POINT.digest,
@@ -181,6 +193,7 @@ describe("chardb backups CLI", () => {
             if (url.endsWith("/restore") && restoreTurns++ === 0) {
                 return Response.json(
                     {
+                        operationId: requestOperationId(init),
                         ok: true,
                         pending: true,
                         recoveryPointDigest: RECOVERY_POINT.digest,
@@ -192,6 +205,7 @@ describe("chardb backups CLI", () => {
             if (url.endsWith("/restore")) {
                 return Response.json(
                     {
+                        operationId: requestOperationId(init),
                         ok: true,
                         accepted: true,
                         recoveryPointDigest: RECOVERY_POINT.digest,
@@ -204,6 +218,7 @@ describe("chardb backups CLI", () => {
             if (reconcileTurns++ === 0) {
                 return Response.json(
                     {
+                        operationId: requestOperationId(init),
                         ok: true,
                         pending: true,
                         recoveryPointDigest: RECOVERY_POINT.digest,
@@ -213,6 +228,7 @@ describe("chardb backups CLI", () => {
                 );
             }
             return Response.json({
+                operationId: requestOperationId(init),
                 ok: true,
                 reconciled: true,
                 recoveryPointDigest: RECOVERY_POINT.digest,
@@ -225,19 +241,22 @@ describe("chardb backups CLI", () => {
         expect(
             await runCli(state.ctx, ["backups", "restore", "--url", "https://db.example", "--from", "recovery.json"])
         ).toBe(0);
+        const operationId = calls[0]?.body.operationId;
+        expect(operationId).toBeString();
         expect(calls.map(call => call.body)).toEqual([
-            { recoveryPoint: RECOVERY_POINT },
-            { recoveryPoint: RECOVERY_POINT, continuation: restoreContinuation },
-            { recoveryPoint: RECOVERY_POINT },
-            { recoveryPoint: RECOVERY_POINT, continuation: reconcileContinuation },
+            { operationId, recoveryPoint: RECOVERY_POINT },
+            { operationId, recoveryPoint: RECOVERY_POINT, continuation: restoreContinuation },
+            { operationId, recoveryPoint: RECOVERY_POINT },
+            { operationId, recoveryPoint: RECOVERY_POINT, continuation: reconcileContinuation },
         ]);
         expect(state.out.join("")).toContain("retained 4 files, reset 4 file objects and 6 vector records");
     });
 
     test("rejects an unbound recovery continuation", async () => {
-        const state = context(async () =>
+        const state = context(async (_input, init) =>
             Response.json(
                 {
+                    operationId: requestOperationId(init),
                     ok: true,
                     pending: true,
                     recoveryPointDigest: "f".repeat(64),
@@ -256,10 +275,11 @@ describe("chardb backups CLI", () => {
     test("rejects a signed continuation that makes no progress", async () => {
         const continuation = { format: "restore-turn", signature: "a".repeat(64), state: { shardIndex: 1 } };
         let calls = 0;
-        const state = context(async () => {
+        const state = context(async (_input, init) => {
             calls++;
             return Response.json(
                 {
+                    operationId: requestOperationId(init),
                     ok: true,
                     pending: true,
                     recoveryPointDigest: RECOVERY_POINT.digest,
@@ -279,10 +299,11 @@ describe("chardb backups CLI", () => {
     test("allows repeated polling continuations only with a positive retry delay", async () => {
         const continuation = { format: "restore-turn", signature: "a".repeat(64), state: { shardIndex: 1 } };
         let restoreCalls = 0;
-        const state = context(async input => {
+        const state = context(async (input, init) => {
             if (String(input).endsWith("/restore") && restoreCalls++ < 3) {
                 return Response.json(
                     {
+                        operationId: requestOperationId(init),
                         ok: true,
                         pending: true,
                         recoveryPointDigest: RECOVERY_POINT.digest,
@@ -295,6 +316,7 @@ describe("chardb backups CLI", () => {
             if (String(input).endsWith("/restore")) {
                 return Response.json(
                     {
+                        operationId: requestOperationId(init),
                         ok: true,
                         accepted: true,
                         recoveryPointDigest: RECOVERY_POINT.digest,
@@ -305,6 +327,7 @@ describe("chardb backups CLI", () => {
                 );
             }
             return Response.json({
+                operationId: requestOperationId(init),
                 ok: true,
                 reconciled: true,
                 recoveryPointDigest: RECOVERY_POINT.digest,

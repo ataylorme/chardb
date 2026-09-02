@@ -22,6 +22,7 @@ const authority = {
     role: "admin,member",
     roles: ["admin", "member"],
     authEpochs: { global: 2, tenant: 3, principal: 4 },
+    recoveryGeneration: 0,
 } as const;
 
 function workingDeps(): TrustedQueryDispatchDeps {
@@ -54,7 +55,12 @@ function workingDeps(): TrustedQueryDispatchDeps {
             },
             async route(vshard) {
                 expect(vshard).toBe(Number(vshardOf(["org-1"])));
-                return { shardId: ShardId("shard-a"), schemaEpoch: 9, domainSchemaEpoch: 5 };
+                return {
+                    shardId: ShardId("shard-a"),
+                    schemaEpoch: 9,
+                    recoveryGeneration: 0,
+                    domainSchemaEpoch: 5,
+                };
             },
         },
         cdb(shardId) {
@@ -74,6 +80,7 @@ function workingDeps(): TrustedQueryDispatchDeps {
                             claims: {},
                         },
                         schemaEpoch: 9,
+                        recoveryGeneration: 0,
                         domainSchemaEpoch: 5,
                     });
                     return { ok: true, result: [{ id: "message-1" }] };
@@ -108,6 +115,7 @@ describe("trusted one-shot query dispatch", () => {
                             route: {
                                 shardId: ShardId(catalogCalls === 1 ? "source" : "destination"),
                                 schemaEpoch: catalogCalls,
+                                recoveryGeneration: 0,
                                 domainSchemaEpoch: 5,
                             },
                         };
@@ -205,7 +213,12 @@ describe("trusted one-shot query dispatch", () => {
                         });
                         return {
                             authority,
-                            route: { shardId: ShardId("shard-a"), schemaEpoch: 9, domainSchemaEpoch: 5 },
+                            route: {
+                                shardId: ShardId("shard-a"),
+                                schemaEpoch: 9,
+                                recoveryGeneration: 0,
+                                domainSchemaEpoch: 5,
+                            },
                         };
                     },
                 },
@@ -285,8 +298,14 @@ describe("trusted one-shot query dispatch", () => {
                     role: "user",
                     roles: ["user"],
                     authEpochs: { global: 2, tenant: 0, principal: 7 },
+                    recoveryGeneration: 0,
                 }),
-                route: async () => ({ shardId: ShardId("user-shard"), schemaEpoch: 3, domainSchemaEpoch: 4 }),
+                route: async () => ({
+                    shardId: ShardId("user-shard"),
+                    schemaEpoch: 3,
+                    recoveryGeneration: 0,
+                    domainSchemaEpoch: 4,
+                }),
             },
             cdb: () => ({
                 query: async input => {
@@ -350,8 +369,14 @@ describe("trusted one-shot query dispatch", () => {
                     role: "admin",
                     roles: ["admin"],
                     authEpochs: { global: 6, tenant: 0, principal: 8 },
+                    recoveryGeneration: 0,
                 }),
-                route: async () => ({ shardId: ShardId("global-shard"), schemaEpoch: 4, domainSchemaEpoch: 5 }),
+                route: async () => ({
+                    shardId: ShardId("global-shard"),
+                    schemaEpoch: 4,
+                    recoveryGeneration: 0,
+                    domainSchemaEpoch: 5,
+                }),
             },
             cdb: () => ({
                 query: async input => {
@@ -403,7 +428,12 @@ describe("trusted one-shot query dispatch", () => {
                     },
                     async route() {
                         catalogCalls++;
-                        return { shardId: ShardId("unused"), schemaEpoch: 1, domainSchemaEpoch: 1 };
+                        return {
+                            shardId: ShardId("unused"),
+                            schemaEpoch: 1,
+                            recoveryGeneration: 0,
+                            domainSchemaEpoch: 1,
+                        };
                     },
                 },
             };
@@ -502,7 +532,12 @@ describe("trusted one-shot query dispatch", () => {
                 async route() {
                     started();
                     await held;
-                    return { shardId: ShardId("shard-a"), schemaEpoch: 1, domainSchemaEpoch: 1 };
+                    return {
+                        shardId: ShardId("shard-a"),
+                        schemaEpoch: 1,
+                        recoveryGeneration: 0,
+                        domainSchemaEpoch: 1,
+                    };
                 },
             },
             cdb: () => ({

@@ -77,6 +77,7 @@ function fixture() {
     };
     const upload = (refreshAuthority: () => Promise<AuthCtx> = async () => auth) =>
         uploadOrganizationFile({
+            recoveryGeneration: 0,
             cdb,
             bucket,
             fileId: FileId("file_a"),

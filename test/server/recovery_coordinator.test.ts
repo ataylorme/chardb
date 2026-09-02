@@ -23,6 +23,12 @@ function store(db: Database): RecoveryCoordinatorStore {
     return new RecoveryCoordinatorStore(adaptSqlStorage(storage as unknown as SqlStorage));
 }
 
+const O1 = "00000000-0000-4000-8000-000000000001";
+const O2 = "00000000-0000-4000-8000-000000000002";
+const O3 = "00000000-0000-4000-8000-000000000003";
+const D1 = "a".repeat(64);
+const D2 = "b".repeat(64);
+
 const restoreCursor = serializeRecoveryContinuationState({
     kind: "restore",
     phase: "arm",
@@ -54,58 +60,99 @@ const reconcileCursor = serializeRecoveryContinuationState({
     nowMs: 1,
 });
 
-function completeRecovery(coordinator: RecoveryCoordinatorStore, digest: string): void {
-    coordinator.claimPreparation(digest, restoreCursor);
-    coordinator.beginCommits(digest, { files: 1, filesRetained: 2, vectors: 3 });
-    coordinator.beginObject(digest, "shard:only", "00000001-target");
-    coordinator.finishObject(digest, "shard:only", "00000001-target");
-    coordinator.advanceShard(digest, 0, "shard:only");
-    coordinator.finishShards(digest, reconcileCursor, 1);
-    coordinator.beginCatalog(digest, { filesRehydrated: 1, vectorsRequeued: 3 });
-    coordinator.complete(digest);
+function completeRecovery(coordinator: RecoveryCoordinatorStore, operationId: string, digest: string): void {
+    coordinator.claimPreparation(operationId, digest, restoreCursor);
+    coordinator.beginCommits(operationId, { files: 1, filesRetained: 2, vectors: 3 });
+    coordinator.beginObject(operationId, "shard:only", "00000001-target");
+    coordinator.finishObject(operationId, "shard:only", "00000001-target");
+    coordinator.advanceShard(operationId, 0, "shard:only");
+    coordinator.finishShards(operationId, reconcileCursor, 1);
+    coordinator.beginReleases(operationId, { filesRehydrated: 1, vectorsRequeued: 3 });
+    coordinator.advanceRelease(operationId, 0);
+    coordinator.beginCatalog(operationId, 1);
+    coordinator.complete(operationId);
 }
 
 describe("recovery coordinator", () => {
-    test("owns the durable cursor and excludes a different active digest", () => {
+    test("allocates one generation and excludes a different active operation", () => {
         const db = new Database(":memory:");
         const coordinator = store(db);
-        const first = "a".repeat(64);
-        const second = "b".repeat(64);
-        expect(coordinator.claimPreparation(first, restoreCursor)).toEqual({
+        expect(coordinator.claimPreparation(O1, D1, restoreCursor)).toMatchObject({
+            operationId: O1,
+            digest: D1,
+            generation: 1,
             phase: "preparing",
-            continuationJson: restoreCursor,
         });
-        expect(() => coordinator.claimPreparation(second, restoreCursor)).toThrow("another recovery operation");
-        const advanced = restoreCursor.replace('"shardIndex":0', '"shardIndex":1');
-        expect(coordinator.savePreparation(first, advanced)).toEqual({
-            phase: "preparing",
-            continuationJson: advanced,
-        });
-        expect(store(db).read(first)).toEqual({ phase: "preparing", continuationJson: advanced });
+        expect(coordinator.admissionClock()).toEqual({ generation: 1, activeOperationId: O1, activeDigest: D1 });
+        expect(coordinator.activeForDigest(D1)).toMatchObject({ operationId: O1, phase: "preparing" });
+        expect(() => coordinator.claimPreparation(O2, D2, restoreCursor)).toThrow("another recovery operation");
         db.close();
     });
 
-    test("permits sequential recovery points and retains the latest 64 terminal results", () => {
+    test("runs the same manifest again under a new operation and generation", () => {
         const db = new Database(":memory:");
         const coordinator = store(db);
-        for (let index = 0; index < 65; index++) {
-            completeRecovery(coordinator, index.toString(16).padStart(64, "0"));
-        }
-        expect(coordinator.read("0".repeat(64))).toEqual({ phase: "new" });
-        expect(coordinator.read("1".padStart(64, "0"))).toMatchObject({ phase: "complete" });
-        expect(coordinator.claimPreparation("1".padStart(64, "0"), restoreCursor)).toMatchObject({
-            phase: "complete",
+        completeRecovery(coordinator, O1, D1);
+        expect(coordinator.read(O1)).toMatchObject({ phase: "complete", operationId: O1, generation: 1 });
+        expect(coordinator.claimPreparation(O1, D1, restoreCursor)).toMatchObject({ phase: "complete" });
+        expect(coordinator.claimPreparation(O2, D1, restoreCursor)).toMatchObject({
+            phase: "preparing",
+            operationId: O2,
+            generation: 2,
         });
-        expect(coordinator.read("4".repeat(64))).toEqual({ phase: "new" });
         db.close();
+    });
+
+    test("cancels only an unarmed preparation without reusing its generation", () => {
+        const db = new Database(":memory:");
+        const coordinator = store(db);
+        coordinator.claimPreparation(O1, D1, restoreCursor);
+        expect(coordinator.cancelPreparation(O1)).toEqual({
+            generation: 1,
+            activeOperationId: null,
+            activeDigest: null,
+        });
+        expect(coordinator.read(O1)).toEqual({ phase: "new", operationId: O1 });
+        expect(coordinator.claimPreparation(O2, D1, restoreCursor)).toMatchObject({ generation: 2 });
+        expect(() => coordinator.cancelPreparation(O2)).not.toThrow();
+        db.close();
+    });
+
+    test("fails closed on active legacy recovery state and drops completed legacy history", () => {
+        const active = new Database(":memory:");
+        active.exec("CREATE TABLE _chardb_recovery_operation (phase TEXT NOT NULL)");
+        active.exec("INSERT INTO _chardb_recovery_operation (phase) VALUES ('preparing')");
+        expect(() => store(active)).toThrow("active legacy recovery operation requires manual resolution");
+        active.close();
+
+        const completed = new Database(":memory:");
+        completed.exec("CREATE TABLE _chardb_recovery_operation (phase TEXT NOT NULL)");
+        completed.exec("CREATE TABLE _chardb_recovery_commit (object_id TEXT)");
+        completed.exec("INSERT INTO _chardb_recovery_operation (phase) VALUES ('complete')");
+        expect(store(completed).admissionClock()).toEqual({
+            generation: 0,
+            activeOperationId: null,
+            activeDigest: null,
+        });
+        const names = completed
+            .query("SELECT name FROM sqlite_master WHERE name LIKE '_chardb_recovery_%'")
+            .all()
+            .map(row => (row as { name: string }).name)
+            .sort();
+        expect(names).toEqual([
+            "_chardb_recovery_clock",
+            "_chardb_recovery_commit_v2",
+            "_chardb_recovery_operation_v2",
+            "_chardb_recovery_operation_v2_digest",
+        ]);
+        completed.close();
     });
 
     test("rejects recovery while a reshard operation is active", () => {
         const db = new Database(":memory:");
         db.exec("CREATE TABLE migration_state (phase INTEGER NOT NULL)");
         db.exec("INSERT INTO migration_state (phase) VALUES (3)");
-        const coordinator = store(db);
-        expect(() => coordinator.claimPreparation("c".repeat(64), restoreCursor)).toThrow(
+        expect(() => store(db).claimPreparation(O3, D2, restoreCursor)).toThrow(
             "resharding blocks point-in-time recovery"
         );
         db.close();
@@ -114,10 +161,10 @@ describe("recovery coordinator", () => {
     test("rejects malformed and oversized internal cursors", () => {
         const db = new Database(":memory:");
         const coordinator = store(db);
-        expect(() => coordinator.claimPreparation("d".repeat(64), "{}")).toThrow("continuation state is invalid");
-        expect(() =>
-            coordinator.claimPreparation("d".repeat(64), `{"kind":"restore","x":"${"é".repeat(9_000)}"}`)
-        ).toThrow("restore cursor is invalid");
+        expect(() => coordinator.claimPreparation(O3, D2, "{}")).toThrow("continuation state is invalid");
+        expect(() => coordinator.claimPreparation(O3, D2, `{"kind":"restore","x":"${"é".repeat(9_000)}"}`)).toThrow(
+            "restore cursor is invalid"
+        );
         db.close();
     });
 });

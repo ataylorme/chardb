@@ -22,6 +22,7 @@ export interface CdbAuthInvalidationRequest {
     readonly scope: "global" | "tenant" | "principal";
     readonly scopeId: string;
     readonly epoch: number;
+    readonly recoveryGeneration: number;
 }
 
 export interface CdbAuthInvalidationResult extends CdbAuthInvalidationRequest {
@@ -53,6 +54,9 @@ function validate(request: CdbAuthInvalidationRequest): void {
         invalid("scope id is invalid");
     }
     if (!Number.isSafeInteger(request.epoch) || request.epoch < 1) invalid("epoch is invalid");
+    if (!Number.isSafeInteger(request.recoveryGeneration) || request.recoveryGeneration < 0) {
+        invalid("recovery generation is invalid");
+    }
 }
 
 export function initializeCdbAuthInvalidationStore(sql: SyncSql): void {
@@ -76,6 +80,7 @@ export class CdbAuthInvalidationStore {
                 scope: request.scope,
                 scopeId: request.scopeId,
                 epoch: existing.epoch,
+                recoveryGeneration: request.recoveryGeneration,
                 accepted: true,
                 registrations: existing.registrations,
                 changeSeq: existing.change_seq,
@@ -121,6 +126,7 @@ export class CdbAuthInvalidationStore {
             scope: request.scope,
             scopeId: request.scopeId,
             epoch: request.epoch,
+            recoveryGeneration: request.recoveryGeneration,
             accepted: true,
             ...invalidation,
         });

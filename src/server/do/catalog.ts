@@ -103,6 +103,8 @@ import {
 import type { CdbAuthInvalidationRequest, CdbAuthInvalidationResult } from "./cdb-auth-invalidation-store.ts";
 import type { CdbVectorOrganizationPurgeStatus } from "./cdb-vector-organization-deletion-store.ts";
 import { DurableAlarmScheduler } from "./gateway-alarm-store.ts";
+import { RecoveryAdmissionStore } from "./recovery-admission.ts";
+import type { RecoveryAdmissionClock } from "./recovery-coordinator.ts";
 import {
     DurableObjectRecovery,
     abortForArmedRecoveryRestore,
@@ -114,6 +116,7 @@ import { adaptSqlStorage } from "./sql_adapter.ts";
 
 export interface CatalogEnv {
     readonly CDB_SHARD?: DurableObjectNamespace;
+    readonly CDB_RESHARD?: DurableObjectNamespace;
 }
 
 const JWKS_URL_MAX_BYTES = 2_048;
@@ -166,6 +169,8 @@ export interface RouteResult {
     readonly domainSchemaEpoch: number;
     /** Physical routing generation. Changes on vshard split or cutover. */
     readonly schemaEpoch: number;
+    /** Internal recovery generation. Changes for every restore operation. */
+    readonly recoveryGeneration: number;
 }
 
 export interface OrganizationAuthorityRouteRequest extends OrganizationAuthorityRequest {
@@ -178,6 +183,7 @@ export type OrganizationAuthorityRouteResult =
 
 interface CdbSchemaMigrationRpc {
     prepareSchemaMigration(args: {
+        readonly recoveryGeneration: number;
         readonly migrationId: string;
         readonly activeVersion: number;
         readonly activeDigest: string;
@@ -185,9 +191,17 @@ interface CdbSchemaMigrationRpc {
         readonly targetEpoch: number;
         readonly targetDigest: string;
     }): Promise<unknown>;
-    applySchemaMigration(args: { readonly migrationId: string; readonly version: number }): Promise<unknown>;
-    activateSchemaMigration(args: { readonly migrationId: string }): Promise<unknown>;
+    applySchemaMigration(args: {
+        readonly migrationId: string;
+        readonly version: number;
+        readonly recoveryGeneration: number;
+    }): Promise<unknown>;
+    activateSchemaMigration(args: {
+        readonly migrationId: string;
+        readonly recoveryGeneration: number;
+    }): Promise<unknown>;
     baselineSchemaMigration(args: {
+        readonly recoveryGeneration: number;
         readonly migrationId: string;
         readonly targetVersion: number;
         readonly targetEpoch: number;
@@ -201,6 +215,7 @@ interface CdbOrganizationDeletionRpc {
         readonly organizationId: string;
         readonly nowMs: number;
         readonly domainSchemaEpoch: number;
+        readonly recoveryGeneration: number;
     }): Promise<{
         readonly organizationId: string;
         readonly accepted: true;
@@ -209,6 +224,7 @@ interface CdbOrganizationDeletionRpc {
         readonly organizationId: string;
         readonly schemaEpoch: number;
         readonly domainSchemaEpoch: number;
+        readonly recoveryGeneration: number;
     }): Promise<CdbVectorOrganizationPurgeStatus | null>;
 }
 
@@ -250,6 +266,7 @@ interface CatalogTopologyOperationRequest {
     readonly rangeLo: number;
     readonly rangeHi: number;
     readonly startEpoch: number;
+    readonly recoveryGeneration: number;
 }
 
 interface CatalogDerivedTopologyOperationRequest {
@@ -257,6 +274,7 @@ interface CatalogDerivedTopologyOperationRequest {
     readonly destinationShard: string;
     readonly rangeLo: number;
     readonly rangeHi: number;
+    readonly recoveryGeneration: number;
 }
 
 const CATALOG_TOPOLOGY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -318,6 +336,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
         initializeCatalogTopologyOperationStore(sql);
         initializeCatalogAuthInvalidationStore(sql);
         initializeRecoveryStorage(sql);
+        await this.reconcileRecoveryAdmission();
         if (schemaState.status === "active" && schemaState.activeVersion === journal.version) {
             this.ensureAuthTables();
         }
@@ -354,7 +373,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }
 
     /** Run a Better Auth model write against Catalog-owned storage. */
-    async mutateAuth(args: CatalogAuthMutationRequest): Promise<CatalogAuthMutationResult> {
+    async mutateAuth(args: CatalogAuthMutationRequest, recoveryGeneration: number): Promise<CatalogAuthMutationResult> {
         await this.bootstrap();
         this.assertRecoveryAvailable();
         this.ensureAuthTables();
@@ -362,6 +381,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
         const nowMs = Date.now();
         const mutate = () => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
+            new RecoveryAdmissionStore(sql).assertRequest(recoveryGeneration);
             const deletionStore = new CatalogOrganizationDeletionStore(sql);
             const deletionBarriers = new CatalogOrganizationDeletionBarrierStore(sql);
             if (
@@ -394,13 +414,17 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }
 
     /** Atomically apply Better Auth's guarded single-row numeric increment contract. */
-    async incrementAuth(args: CatalogAuthIncrementRequest): Promise<CatalogAuthIncrementResult> {
+    async incrementAuth(
+        args: CatalogAuthIncrementRequest,
+        recoveryGeneration: number
+    ): Promise<CatalogAuthIncrementResult> {
         await this.bootstrap();
         this.assertRecoveryAvailable();
         this.ensureAuthTables();
         const nowMs = Date.now();
         const outcome = await this.alarmScheduler.transactionWithEarlierAlarm(nowMs, () => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
+            new RecoveryAdmissionStore(sql).assertRequest(recoveryGeneration);
             const increment = incrementCatalogAuthWithEffects(sql, args);
             this.enqueueAuthInvalidations(sql, increment.authEpochChanges, nowMs);
             return increment;
@@ -409,19 +433,29 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }
 
     /** Read Better Auth rows from Catalog-owned storage. */
-    async queryAuth(args: CatalogAuthQueryRequest): Promise<readonly Record<string, RawJson>[]> {
+    async queryAuth(
+        args: CatalogAuthQueryRequest,
+        recoveryGeneration: number
+    ): Promise<readonly Record<string, RawJson>[]> {
         await this.bootstrap();
         this.assertRecoveryAvailable();
         this.ensureAuthTables();
-        return queryCatalogAuth(adaptSqlStorage(this.ctx.storage.sql), args);
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        new RecoveryAdmissionStore(sql).assertRequest(recoveryGeneration);
+        return queryCatalogAuth(sql, args);
     }
 
     /** Count Better Auth rows without materializing them across the Catalog RPC. */
-    async countAuth(args: Pick<CatalogAuthQueryRequest, "model" | "where">): Promise<number> {
+    async countAuth(
+        args: Pick<CatalogAuthQueryRequest, "model" | "where">,
+        recoveryGeneration: number
+    ): Promise<number> {
         await this.bootstrap();
         this.assertRecoveryAvailable();
         this.ensureAuthTables();
-        return countCatalogAuth(adaptSqlStorage(this.ctx.storage.sql), args);
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        new RecoveryAdmissionStore(sql).assertRequest(recoveryGeneration);
+        return countCatalogAuth(sql, args);
     }
 
     /**
@@ -433,13 +467,13 @@ export class Catalog extends DurableObject<CatalogEnv> {
         try {
             switch (request.operation) {
                 case "mutate":
-                    return { ok: true, value: await this.mutateAuth(request.args) };
+                    return { ok: true, value: await this.mutateAuth(request.args, request.recoveryGeneration) };
                 case "increment":
-                    return { ok: true, value: await this.incrementAuth(request.args) };
+                    return { ok: true, value: await this.incrementAuth(request.args, request.recoveryGeneration) };
                 case "query":
-                    return { ok: true, value: await this.queryAuth(request.args) };
+                    return { ok: true, value: await this.queryAuth(request.args, request.recoveryGeneration) };
                 case "count":
-                    return { ok: true, value: await this.countAuth(request.args) };
+                    return { ok: true, value: await this.countAuth(request.args, request.recoveryGeneration) };
                 default:
                     throw new CdbError({ code: "CDB_INVALID_ARGS", message: "unknown auth adapter operation" });
             }
@@ -470,7 +504,8 @@ export class Catalog extends DurableObject<CatalogEnv> {
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             if (new CatalogOrganizationDeletionStore(sql).isDeleted(args.organizationId)) return null;
-            return resolveOrganizationAuthorityFromCatalog(sql, args);
+            const authority = resolveOrganizationAuthorityFromCatalog(sql, args);
+            return authority ? { ...authority, recoveryGeneration: this.recoveryGeneration() } : null;
         });
     }
 
@@ -513,9 +548,14 @@ export class Catalog extends DurableObject<CatalogEnv> {
             if (new CatalogOrganizationDeletionStore(sql).isDeleted(args.organizationId)) return { authority: null };
             const authority = resolveOrganizationAuthorityFromCatalog(sql, args);
             if (!authority) return { authority: null };
+            const recoveryGeneration = this.recoveryGeneration();
             return {
-                authority,
-                route: { ...this.routingStore.route(args.vshard), domainSchemaEpoch: schemaState.activeEpoch },
+                authority: { ...authority, recoveryGeneration },
+                route: {
+                    ...this.routingStore.route(args.vshard),
+                    domainSchemaEpoch: schemaState.activeEpoch,
+                    recoveryGeneration,
+                },
             };
         });
     }
@@ -527,9 +567,10 @@ export class Catalog extends DurableObject<CatalogEnv> {
         if (!args.principalId) return null;
         if (!catalogUserAuthorityAvailable()) return null;
         this.ensureAuthTables();
-        return this.ctx.storage.transactionSync(() =>
-            resolveUserAuthorityFromCatalog(adaptSqlStorage(this.ctx.storage.sql), args)
-        );
+        return this.ctx.storage.transactionSync(() => {
+            const authority = resolveUserAuthorityFromCatalog(adaptSqlStorage(this.ctx.storage.sql), args);
+            return authority ? { ...authority, recoveryGeneration: this.recoveryGeneration() } : null;
+        });
     }
 
     async route(vshard: number): Promise<RouteResult> {
@@ -542,7 +583,11 @@ export class Catalog extends DurableObject<CatalogEnv> {
                 hint: "retry after the schema migration activates",
             });
         }
-        return { ...this.routingStore.route(vshard), domainSchemaEpoch: schemaState.activeEpoch };
+        return {
+            ...this.routingStore.route(vshard),
+            domainSchemaEpoch: schemaState.activeEpoch,
+            recoveryGeneration: this.recoveryGeneration(),
+        };
     }
 
     /** Private operational status routed through the current vshard owner. */
@@ -607,6 +652,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
 
     override async alarm(): Promise<void> {
         if (abortForArmedRecoveryRestore(this.ctx, adaptSqlStorage(this.ctx.storage.sql))) return;
+        if (new RecoveryAdmissionStore(adaptSqlStorage(this.ctx.storage.sql)).blocksBackgroundWork()) return;
         const nowMs = Date.now();
         await this.deliverAuthInvalidations(nowMs);
         if (this.hasOrganizationCleanupResources()) await this.deliverOrganizationDeletions(nowMs);
@@ -660,6 +706,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
                         organizationId: handoff.organizationId,
                         nowMs,
                         domainSchemaEpoch: route.domainSchemaEpoch,
+                        recoveryGeneration: route.recoveryGeneration,
                     });
                     this.assertOrganizationDeletionResult(result, handoff.organizationId);
                     return { handoff, error: null } as const;
@@ -716,7 +763,12 @@ export class Catalog extends DurableObject<CatalogEnv> {
         const outcomes = await Promise.all(
             targets.map(async target => {
                 try {
-                    const request = { scope: target.scope, scopeId: target.scopeId, epoch: target.epoch };
+                    const request = {
+                        scope: target.scope,
+                        scopeId: target.scopeId,
+                        epoch: target.epoch,
+                        recoveryGeneration: this.recoveryGeneration(),
+                    };
                     const result = await this.callAuthInvalidation(target.shardId, request);
                     this.assertAuthInvalidationResult(result, request);
                     return { target, error: null } as const;
@@ -752,6 +804,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
                     scope: "principal" as const,
                     scopeId: principal.scopeId,
                     epoch: principal.epoch,
+                    recoveryGeneration: this.recoveryGeneration(),
                 };
                 const principalOutcomes = await Promise.all(
                     page.map(async shardId => {
@@ -784,7 +837,12 @@ export class Catalog extends DurableObject<CatalogEnv> {
         }
         const lastShardId = page.at(-1);
         if (!lastShardId) throw new CdbError({ code: "CDB_INVARIANT", message: "global auth shard page is empty" });
-        const request = { scope: "global" as const, scopeId: "global", epoch: global.epoch };
+        const request = {
+            scope: "global" as const,
+            scopeId: "global",
+            epoch: global.epoch,
+            recoveryGeneration: this.recoveryGeneration(),
+        };
         const globalOutcomes = await Promise.all(
             page.map(async shardId => {
                 try {
@@ -836,11 +894,12 @@ export class Catalog extends DurableObject<CatalogEnv> {
             result.scopeId !== request.scopeId ||
             !Number.isSafeInteger(result.epoch) ||
             result.epoch < request.epoch ||
+            result.recoveryGeneration !== request.recoveryGeneration ||
             !Number.isSafeInteger(result.registrations) ||
             result.registrations < 0 ||
             !Number.isSafeInteger(result.changeSeq) ||
             result.changeSeq < 0 ||
-            Object.keys(result).length !== 6
+            Object.keys(result).length !== 7
         ) {
             throw new CdbError({ code: "CDB_INVARIANT", message: "Cdb auth invalidation response is invalid" });
         }
@@ -880,9 +939,9 @@ export class Catalog extends DurableObject<CatalogEnv> {
         await this.alarmScheduler.scheduleEarlier(deadline);
     }
 
-    schemaState(): CatalogSchemaState {
+    schemaState(): CatalogSchemaState & { readonly recoveryGeneration: number } {
         this.assertRecoveryAvailable();
-        return this.readSchemaState();
+        return { ...this.readSchemaState(), recoveryGeneration: this.recoveryGeneration() };
     }
 
     async adminRecoveryBookmark(args: { readonly atMs?: number }): Promise<{
@@ -892,8 +951,47 @@ export class Catalog extends DurableObject<CatalogEnv> {
         return await this.adminMigrationRpc(() => this.recovery.bookmark(args.atMs));
     }
 
-    async adminArmRecoveryRestore(args: { readonly bookmark: string; readonly armedAt: number }) {
-        return await this.adminMigrationRpc(() => this.recovery.arm(args.bookmark, args.armedAt));
+    async adminArmRecoveryRestore(args: {
+        readonly bookmark: string;
+        readonly armedAt: number;
+        readonly operationId: string;
+        readonly generation: number;
+        readonly schema: { readonly version: number; readonly epoch: number; readonly digest: string };
+        readonly routingEpoch: number;
+        readonly shardIds: readonly string[];
+    }) {
+        return await this.adminMigrationRpc(() =>
+            this.recovery.arm(
+                args.bookmark,
+                args.armedAt,
+                {
+                    operationId: args.operationId,
+                    generation: args.generation,
+                },
+                sql => {
+                    const schema = this.readSchemaState();
+                    const shardIds = [...this.routingStore.listShardIds()].sort();
+                    const unchanged =
+                        schema.status === "active" &&
+                        schema.activeVersion === args.schema.version &&
+                        schema.activeEpoch === args.schema.epoch &&
+                        schema.activeDigest === args.schema.digest &&
+                        this.routingStore.route(0).schemaEpoch === args.routingEpoch &&
+                        JSON.stringify(shardIds) === JSON.stringify([...args.shardIds].sort());
+                    if (!unchanged) {
+                        throw new CdbError({
+                            code: "CDB_STALE_EPOCH",
+                            message: "Catalog changed after recovery preflight",
+                        });
+                    }
+                    new CatalogTopologyOperationStore(sql).assertNoActive();
+                }
+            )
+        );
+    }
+
+    async adminReleaseRecovery(args: { readonly operationId: string; readonly generation: number }) {
+        return await this.adminMigrationRpc(() => this.recovery.release(args.operationId, args.generation));
     }
 
     async adminCancelRecoveryRestore(args: { readonly bookmark: string }) {
@@ -959,7 +1057,30 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }
 
     private assertRecoveryAvailable(): void {
-        assertRecoveryAvailable(adaptSqlStorage(this.ctx.storage.sql));
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        assertRecoveryAvailable(sql);
+        const admission = new RecoveryAdmissionStore(sql).read();
+        if (admission.state === "blocked") {
+            throw new CdbError({ code: "CDB_STALE_EPOCH", message: "point-in-time restore is in progress" });
+        }
+    }
+
+    private recoveryGeneration(): number {
+        this.assertRecoveryAvailable();
+        return new RecoveryAdmissionStore(adaptSqlStorage(this.ctx.storage.sql)).read().generation;
+    }
+
+    private async reconcileRecoveryAdmission(): Promise<void> {
+        if (!this.env.CDB_RESHARD) {
+            throw new CdbError({ code: "CDB_SHARD_UNAVAILABLE", message: "CDB_RESHARD binding is unavailable" });
+        }
+        const coordinator = this.env.CDB_RESHARD.get(this.env.CDB_RESHARD.idFromName("global")) as unknown as {
+            adminRecoveryAdmissionClock(): Promise<RecoveryAdmissionClock>;
+        };
+        const clock = await coordinator.adminRecoveryAdmissionClock();
+        this.ctx.storage.transactionSync(() => {
+            new RecoveryAdmissionStore(adaptSqlStorage(this.ctx.storage.sql)).reconcile(clock);
+        });
     }
 
     beginSchemaMigration(args: { readonly migrationId: string; readonly targetVersion: number }): CatalogSchemaState {
@@ -974,6 +1095,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
         args: { readonly migrationId: string; readonly targetVersion: number },
         baseline: boolean
     ): CatalogSchemaState {
+        this.assertRecoveryAvailable();
         if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(args.migrationId)) {
             throw new CdbError({ code: "CDB_INVALID_ARGS", message: "schema migration id is invalid" });
         }
@@ -1000,6 +1122,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
         readonly migrationId: string;
         readonly shardId: string;
     }): Promise<CatalogSchemaShardState> {
+        const recoveryGeneration = this.recoveryGeneration();
         const current = this.readSchemaState();
         if (
             current.status !== "migrating" ||
@@ -1024,6 +1147,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
             const baseline = catalogSchemaBaselineExists(adaptSqlStorage(this.ctx.storage.sql), args.migrationId);
             if (baseline) {
                 await cdb.baselineSchemaMigration({
+                    recoveryGeneration,
                     migrationId: args.migrationId,
                     targetVersion: current.targetVersion,
                     targetEpoch: current.targetEpoch,
@@ -1031,6 +1155,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
                 });
             } else {
                 await cdb.prepareSchemaMigration({
+                    recoveryGeneration,
                     migrationId: args.migrationId,
                     activeVersion: current.activeVersion,
                     activeDigest: current.activeDigest,
@@ -1040,9 +1165,13 @@ export class Catalog extends DurableObject<CatalogEnv> {
                 });
                 for (const migration of pendingMigrations(this.migrationJournal(), current.activeVersion)) {
                     if (migration.version > current.targetVersion) break;
-                    await cdb.applySchemaMigration({ migrationId: args.migrationId, version: migration.version });
+                    await cdb.applySchemaMigration({
+                        migrationId: args.migrationId,
+                        version: migration.version,
+                        recoveryGeneration,
+                    });
                 }
-                await cdb.activateSchemaMigration({ migrationId: args.migrationId });
+                await cdb.activateSchemaMigration({ migrationId: args.migrationId, recoveryGeneration });
             }
         } catch (error) {
             const message = (error instanceof Error ? error.message : String(error)).slice(0, 512);
@@ -1052,6 +1181,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
             throw error;
         }
         this.ctx.storage.transactionSync(() => {
+            new RecoveryAdmissionStore(adaptSqlStorage(this.ctx.storage.sql)).assertRequest(recoveryGeneration);
             activateCatalogSchemaShard(adaptSqlStorage(this.ctx.storage.sql), args);
         });
         const active = this.schemaMigrationShards({ migrationId: args.migrationId }).find(
@@ -1062,6 +1192,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }
 
     applyCatalogSchemaMigration(args: { readonly migrationId: string; readonly version: number }): CatalogSchemaState {
+        this.assertRecoveryAvailable();
         const journal = this.migrationJournal();
         if (!Number.isSafeInteger(args.version) || args.version < 1 || args.version > journal.version) {
             throw new CdbError({ code: "CDB_INVALID_ARGS", message: "Catalog schema migration version is invalid" });
@@ -1073,6 +1204,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }
 
     completeSchemaMigration(args: { readonly migrationId: string }): CatalogSchemaState {
+        this.assertRecoveryAvailable();
         this.ctx.storage.transactionSync(() => {
             completeCatalogSchemaMigration(
                 adaptSqlStorage(this.ctx.storage.sql),
@@ -1119,7 +1251,9 @@ export class Catalog extends DurableObject<CatalogEnv> {
         assertDerivedTopologyOperationRequest(args);
         let operation: CatalogTopologyOperation | null = null;
         this.ctx.storage.transactionSync(() => {
-            const store = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql));
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            new RecoveryAdmissionStore(sql).assertRequest(args.recoveryGeneration);
+            const store = new CatalogTopologyOperationStore(sql);
             const existing = store.read(args.migId);
             if (existing) {
                 const schema = this.readSchemaState();
@@ -1137,6 +1271,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
                         destinationShard: args.destinationShard,
                         rangeLo: args.rangeLo,
                         rangeHi: args.rangeHi,
+                        recoveryGeneration: args.recoveryGeneration,
                     },
                     Date.now()
                 );
@@ -1175,6 +1310,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
                     schemaVersion: schema.activeVersion,
                     schemaEpoch: schema.activeEpoch,
                     schemaDigest: schema.activeDigest,
+                    recoveryGeneration: args.recoveryGeneration,
                 },
                 Date.now()
             );
@@ -1187,7 +1323,9 @@ export class Catalog extends DurableObject<CatalogEnv> {
     beginTopologyOperation(args: CatalogTopologyOperationRequest): CatalogTopologyOperation {
         let operation: CatalogTopologyOperation | null = null;
         this.ctx.storage.transactionSync(() => {
-            const store = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql));
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            new RecoveryAdmissionStore(sql).assertRequest(args.recoveryGeneration);
+            const store = new CatalogTopologyOperationStore(sql);
             const existing = store.read(args.migId);
             if (existing) {
                 const schema = this.readSchemaState();
@@ -1232,8 +1370,13 @@ export class Catalog extends DurableObject<CatalogEnv> {
         return operation;
     }
 
-    topologyOperation(args: { readonly migrationId: string }): CatalogTopologyOperation | null {
-        return new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql)).read(args.migrationId);
+    topologyOperation(args: {
+        readonly migrationId: string;
+        readonly recoveryGeneration: number;
+    }): CatalogTopologyOperation | null {
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        new RecoveryAdmissionStore(sql).assertRequest(args.recoveryGeneration);
+        return new CatalogTopologyOperationStore(sql).read(args.migrationId);
     }
 
     topologyRoutingStatus(args: CatalogTopologyOperationRequest): {
@@ -1241,14 +1384,17 @@ export class Catalog extends DurableObject<CatalogEnv> {
         readonly schemaEpoch: number;
         readonly operationStatus: CatalogTopologyOperation["status"];
     } {
-        const operation = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql)).read(args.migId);
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        new RecoveryAdmissionStore(sql).assertRequest(args.recoveryGeneration);
+        const operation = new CatalogTopologyOperationStore(sql).read(args.migId);
         if (
             !operation ||
             operation.sourceShard !== args.sourceShard ||
             operation.destinationShard !== args.destinationShard ||
             operation.rangeLo !== args.rangeLo ||
             operation.rangeHi !== args.rangeHi ||
-            operation.startEpoch !== args.startEpoch
+            operation.startEpoch !== args.startEpoch ||
+            operation.recoveryGeneration !== args.recoveryGeneration
         ) {
             throw new CdbError({ code: "CDB_STALE_EPOCH", message: "topology recovery identity does not match" });
         }
@@ -1287,7 +1433,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
 
     /** Fence new Better Auth organization deletions before the final resource-tail convergence pass. */
     async beginOrganizationDeletionBarrier(
-        args: CatalogOrganizationDeletionBarrierRequest
+        args: CatalogOrganizationDeletionBarrierRequest & { readonly recoveryGeneration: number }
     ): Promise<CatalogOrganizationDeletionBarrier> {
         const identity = this.deletionBarrierIdentity(args);
         const nowMs = Date.now();
@@ -1295,6 +1441,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
         let ready = false;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
+            new RecoveryAdmissionStore(sql).assertRequest(args.recoveryGeneration);
             const topology = new CatalogTopologyOperationStore(sql).read(args.migId);
             if (
                 !topology ||
@@ -1317,17 +1464,19 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }
 
     organizationDeletionBarrierStatus(
-        args: CatalogOrganizationDeletionBarrierRequest
+        args: CatalogOrganizationDeletionBarrierRequest & { readonly recoveryGeneration: number }
     ): CatalogOrganizationDeletionBarrierStatus {
-        return new CatalogOrganizationDeletionBarrierStore(adaptSqlStorage(this.ctx.storage.sql)).status(
-            this.deletionBarrierIdentity(args)
-        );
+        const sql = adaptSqlStorage(this.ctx.storage.sql);
+        new RecoveryAdmissionStore(sql).assertRequest(args.recoveryGeneration);
+        return new CatalogOrganizationDeletionBarrierStore(sql).status(this.deletionBarrierIdentity(args));
     }
 
     completeTopologyOperation(args: CatalogTopologyOperationRequest): CatalogTopologyOperation {
         let operation: CatalogTopologyOperation | null = null;
         this.ctx.storage.transactionSync(() => {
-            const store = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql));
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            new RecoveryAdmissionStore(sql).assertRequest(args.recoveryGeneration);
+            const store = new CatalogTopologyOperationStore(sql);
             const stored = store.read(args.migId);
             if (!stored) {
                 throw new CdbError({ code: "CDB_STALE_EPOCH", message: "topology operation lease is missing" });
@@ -1364,7 +1513,9 @@ export class Catalog extends DurableObject<CatalogEnv> {
     abortTopologyOperation(args: CatalogTopologyOperationRequest): CatalogTopologyOperation {
         let operation: CatalogTopologyOperation | null = null;
         this.ctx.storage.transactionSync(() => {
-            const store = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql));
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            new RecoveryAdmissionStore(sql).assertRequest(args.recoveryGeneration);
+            const store = new CatalogTopologyOperationStore(sql);
             const stored = store.read(args.migId);
             if (!stored) {
                 throw new CdbError({ code: "CDB_STALE_EPOCH", message: "topology operation lease is missing" });
@@ -1409,7 +1560,10 @@ export class Catalog extends DurableObject<CatalogEnv> {
      * `epoch=N` or the post-cutover map at `epoch=N+1`, never a half-applied
      * intermediate. Mirrors the `CatalogCutover` action in `spec/Resharder.tla`.
      */
-    async cutover(args: CatalogCutoverRequest & { readonly startEpoch?: number }): Promise<CatalogCutoverResult> {
+    async cutover(
+        args: CatalogCutoverRequest & { readonly startEpoch?: number; readonly recoveryGeneration: number }
+    ): Promise<CatalogCutoverResult> {
+        new RecoveryAdmissionStore(adaptSqlStorage(this.ctx.storage.sql)).assertRequest(args.recoveryGeneration);
         const schemaState = this.readSchemaState();
         const storedTopology = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql)).read(
             args.migId
@@ -1428,7 +1582,9 @@ export class Catalog extends DurableObject<CatalogEnv> {
         }
         return this.routingStore.cutover(args, {
             before: currentEpoch => {
-                const store = new CatalogTopologyOperationStore(adaptSqlStorage(this.ctx.storage.sql));
+                const sql = adaptSqlStorage(this.ctx.storage.sql);
+                new RecoveryAdmissionStore(sql).assertRequest(args.recoveryGeneration);
+                const store = new CatalogTopologyOperationStore(sql);
                 const existing = store.read(args.migId);
                 if (!existing) {
                     throw new CdbError({
@@ -1445,6 +1601,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
                         rangeLo: args.lo,
                         rangeHi: args.hi,
                         startEpoch,
+                        recoveryGeneration: args.recoveryGeneration,
                     },
                     existing.schemaVersion,
                     existing.schemaEpoch,
@@ -1506,6 +1663,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
             schemaVersion,
             schemaEpoch,
             schemaDigest,
+            recoveryGeneration: args.recoveryGeneration,
         };
     }
 

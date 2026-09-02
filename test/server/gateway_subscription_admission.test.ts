@@ -99,6 +99,7 @@ function unsubscribe(gateway: Gateway, socket: FakeSocket, subId: number): Promi
 
 function registration(index: number): GatewayRegistrationInstall {
     return {
+        recoveryGeneration: 0,
         registrationId: `registration-${index}`,
         principalId: PrincipalId("principal-1"),
         clientId: ClientId(`client-${index}`),

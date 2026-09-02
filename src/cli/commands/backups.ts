@@ -8,6 +8,7 @@ const REQUEST_TIMEOUT_MS = 60_000;
 const RECONCILE_ATTEMPTS = 60;
 const RECONCILE_RETRY_MS = 1_000;
 const RECOVERY_OPERATION_TURNS = 6_000_000;
+const RECOVERY_OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 interface BackupCommonOptions {
     readonly baseUrl: string;
@@ -65,7 +66,8 @@ export async function runBackupRestore(
     const digest = (recoveryPoint as Record<string, unknown>).digest;
     if (typeof digest !== "string") throw new Error("recovery point file has no digest");
     const request = backupRequest(options);
-    const response = await runRecoveryOperation(request, "restore", recoveryPoint, digest);
+    const operation = { operationId: crypto.randomUUID() };
+    const response = await runRecoveryOperation(request, "restore", recoveryPoint, digest, operation);
     if (
         response.accepted !== true ||
         response.recoveryPointDigest !== digest ||
@@ -92,7 +94,7 @@ export async function runBackupRestore(
     }
     const reconcileAfterMs = response.reconcileAfterMs as number;
     if (reconcileAfterMs > 0) await new Promise(resolve => setTimeout(resolve, reconcileAfterMs));
-    const reconciled = await runRecoveryOperation(request, "reconcile", recoveryPoint, digest);
+    const reconciled = await runRecoveryOperation(request, "reconcile", recoveryPoint, digest, operation);
     if (
         reconciled.reconciled !== true ||
         reconciled.recoveryPointDigest !== digest ||
@@ -112,13 +114,24 @@ async function runRecoveryOperation(
     request: ReturnType<typeof backupRequest>,
     action: "restore" | "reconcile",
     recoveryPoint: unknown,
-    digest: string
+    digest: string,
+    operation: { operationId: string }
 ): Promise<Record<string, unknown>> {
     let continuation: unknown;
     let continuationIdentity: string | undefined;
     for (let turn = 0; turn < RECOVERY_OPERATION_TURNS; turn++) {
-        const body = continuation === undefined ? { recoveryPoint } : { recoveryPoint, continuation };
+        const body =
+            continuation === undefined
+                ? { operationId: operation.operationId, recoveryPoint }
+                : { operationId: operation.operationId, recoveryPoint, continuation };
         const response = await request(action, { method: "POST", body: JSON.stringify(body) });
+        if (typeof response.operationId !== "string" || !RECOVERY_OPERATION_ID.test(response.operationId)) {
+            throw new Error(`backup endpoint returned an invalid ${action} operation id`);
+        }
+        if (response.operationId !== operation.operationId) {
+            if (continuation !== undefined) throw new Error(`backup endpoint changed the ${action} operation id`);
+            operation.operationId = response.operationId;
+        }
         if (response.pending !== true) return response;
         if (
             response.recoveryPointDigest !== digest ||

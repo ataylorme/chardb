@@ -135,12 +135,14 @@ describe("Gateway public durable registration", () => {
                     role: "member",
                     roles: ["member"],
                     authEpochs: { global: 10, tenant: 11, principal: 12 },
+                    recoveryGeneration: 0,
                 };
             },
             async route() {
                 return {
                     shardId: ShardId("logical-shard-1"),
                     schemaEpoch: 4,
+                    recoveryGeneration: 0,
                     domainSchemaEpoch: 1,
                 };
             },
@@ -153,11 +155,19 @@ describe("Gateway public durable registration", () => {
                 subscribeCalls.push(request);
                 return await subscribeBehavior(request);
             },
-            async unsubscribe(subscription: LiveSubscriptionId) {
-                unsubscribeCalls.push(subscription);
+            async unsubscribe(
+                request:
+                    | LiveSubscriptionId
+                    | { readonly subscription: LiveSubscriptionId; readonly recoveryGeneration: number }
+            ) {
+                unsubscribeCalls.push("subscription" in request ? request.subscription : request);
             },
-            async finalizeUnsubscribe(subscription: LiveSubscriptionId) {
-                finalizeCalls.push(subscription);
+            async finalizeUnsubscribe(
+                request:
+                    | LiveSubscriptionId
+                    | { readonly subscription: LiveSubscriptionId; readonly recoveryGeneration: number }
+            ) {
+                finalizeCalls.push("subscription" in request ? request.subscription : request);
             },
             async queryRegistered(request: unknown) {
                 registeredQueryCalls.push(request);

@@ -33,6 +33,7 @@ export async function uploadOrganizationFile(input: {
     readonly nowMs: number;
     readonly domainSchemaEpoch: number;
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     readonly auth: AuthCtx;
     readonly refreshAuthority: () => Promise<AuthCtx>;
 }): Promise<OrganizationFileUploadResult> {
@@ -51,6 +52,7 @@ export async function uploadOrganizationFile(input: {
             nowMs: input.nowMs,
             domainSchemaEpoch: input.domainSchemaEpoch,
             schemaEpoch: input.schemaEpoch,
+            recoveryGeneration: input.recoveryGeneration,
             auth: input.auth,
         });
     } catch (error) {
@@ -79,6 +81,7 @@ export async function uploadOrganizationFile(input: {
             nowMs: input.nowMs,
             domainSchemaEpoch: input.domainSchemaEpoch,
             schemaEpoch: input.schemaEpoch,
+            recoveryGeneration: input.recoveryGeneration,
             auth: refreshedAuth,
         });
     } catch (error) {

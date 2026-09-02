@@ -314,10 +314,16 @@ describe("server-owned native binding select plans", () => {
                             role: "user",
                             roles: ["user"],
                             authEpochs: { global: 7, tenant: 0, principal: 9 },
+                            recoveryGeneration: 0,
                         };
                     },
                     async route() {
-                        return { shardId: ShardId("shard-a"), schemaEpoch: 4, domainSchemaEpoch: 6 };
+                        return {
+                            shardId: ShardId("shard-a"),
+                            schemaEpoch: 4,
+                            recoveryGeneration: 0,
+                            domainSchemaEpoch: 6,
+                        };
                     },
                 },
                 cdb: shardId => ({
@@ -374,8 +380,14 @@ describe("server-owned native binding select plans", () => {
                                 role: "member",
                                 roles: ["member"],
                                 authEpochs: { global: 2, tenant: 3, principal: 4 },
+                                recoveryGeneration: 0,
                             },
-                            route: { shardId: ShardId("shard-a"), schemaEpoch: 5, domainSchemaEpoch: 6 },
+                            route: {
+                                shardId: ShardId("shard-a"),
+                                schemaEpoch: 5,
+                                recoveryGeneration: 0,
+                                domainSchemaEpoch: 6,
+                            },
                         };
                     },
                 },
@@ -420,10 +432,16 @@ describe("server-owned native binding select plans", () => {
                         role: "user",
                         roles: ["user"],
                         authEpochs: { global: 1, tenant: 0 as const, principal: 1 },
+                        recoveryGeneration: 0,
                     };
                 },
                 async route() {
-                    return { shardId: ShardId("shard-a"), schemaEpoch: 1, domainSchemaEpoch: 1 };
+                    return {
+                        shardId: ShardId("shard-a"),
+                        schemaEpoch: 1,
+                        recoveryGeneration: 0,
+                        domainSchemaEpoch: 1,
+                    };
                 },
             },
             cdb: () => ({
@@ -459,6 +477,7 @@ describe("server-owned native binding select plans", () => {
                             role: "user",
                             roles: ["user"],
                             authEpochs: { global: catalogCalls + 1, tenant: 0, principal: catalogCalls + 1 },
+                            recoveryGeneration: 0,
                         };
                     },
                     async route() {
@@ -466,6 +485,7 @@ describe("server-owned native binding select plans", () => {
                         return {
                             shardId: ShardId(catalogCalls === 1 ? "source" : "destination"),
                             schemaEpoch: catalogCalls,
+                            recoveryGeneration: 0,
                             domainSchemaEpoch: 1,
                         };
                     },
@@ -519,10 +539,16 @@ describe("server-owned native binding select plans", () => {
                                 role: "user",
                                 roles: ["user"],
                                 authEpochs: { global: 1, tenant: 0, principal: 1 },
+                                recoveryGeneration: 0,
                             };
                         },
                         async route() {
-                            return { shardId: ShardId("shard-a"), schemaEpoch: 1, domainSchemaEpoch: 1 };
+                            return {
+                                shardId: ShardId("shard-a"),
+                                schemaEpoch: 1,
+                                recoveryGeneration: 0,
+                                domainSchemaEpoch: 1,
+                            };
                         },
                     },
                     cdb: () => ({

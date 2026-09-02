@@ -10,7 +10,7 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { CdbError, docsUrlFor, isCdbErrorCode, isRetryable } from "../../errors.ts";
+import { CdbError, docsUrlFor, isCdbErrorCode, isRetryable, rehydrateCdbRpcError } from "../../errors.ts";
 import {
     type ChardbRef,
     ClientId,
@@ -249,6 +249,7 @@ export function cdbSubscriptionRequest(input: {
     readonly organizationId: TenantId;
     readonly authority?: MutationAuthority;
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     readonly vshard: number;
     readonly domainSchemaEpoch: number;
     readonly ref: ChardbRef;
@@ -270,6 +271,7 @@ export function cdbSubscriptionRequest(input: {
             ? {}
             : { placement: { authority: input.authority, partitionKey: input.organizationId } }),
         schemaEpoch: input.schemaEpoch,
+        recoveryGeneration: input.recoveryGeneration,
         vshard: input.vshard,
         domainSchemaEpoch: input.domainSchemaEpoch,
         ref: input.ref,
@@ -696,7 +698,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
     private dueGatewayCleanupRows(nowMs: number): readonly StoredGatewayCleanupRow[] {
         return adaptSqlStorage(this.ctx.storage.sql).all<StoredGatewayCleanupRow>(
             `SELECT g.principal_id, g.client_id, g.sub_id, g.registration_id,
-                    g.connection_id, g.source_cdb_id, g.retry_count
+                    g.connection_id, g.source_cdb_id, g.organization_id, g.recovery_generation, g.retry_count
              FROM _gw_registration_generations g
              WHERE g.lifecycle = 'retiring' AND g.cdb_state = 'retiring'
                AND g.retry_at IS NOT NULL AND g.retry_at <= ?
@@ -822,9 +824,25 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 clientId: ClientId(row.client_id),
                 subId: SubId(row.sub_id),
             };
-            const outcome: unknown = await cdb.unsubscribe(subscription);
+            let recoveryGeneration = row.recovery_generation;
+            let outcome: unknown;
+            try {
+                outcome = await cdb.unsubscribe({ subscription, recoveryGeneration });
+            } catch (error) {
+                const normalized = rehydrateCdbRpcError(error);
+                if (!(normalized instanceof CdbError) || normalized.code !== "CDB_STALE_EPOCH") throw normalized;
+                if (!row.organization_id) {
+                    throw gatewayInvalidationInvariant("retired Gateway generation omitted its recovery owner");
+                }
+                const route = await this.catalog().route(Number(vshardOf([row.organization_id])));
+                recoveryGeneration = route.recoveryGeneration;
+                outcome = await cdb.unsubscribe({ subscription, recoveryGeneration });
+            }
             if (outcome !== undefined) throw new Error("Cdb returned a malformed unsubscribe outcome");
-            const finalized: unknown = await cdb.finalizeUnsubscribe(subscription);
+            const finalized: unknown = await cdb.finalizeUnsubscribe({
+                subscription,
+                recoveryGeneration,
+            });
             if (finalized !== undefined) throw new Error("Cdb returned a malformed unsubscribe finalization outcome");
             this.completeGatewayCleanup(row);
         } catch (error) {
@@ -1783,6 +1801,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         }
 
         const { shardId, schemaEpoch, domainSchemaEpoch } = projected.route;
+        const recoveryGeneration = projected.route.recoveryGeneration;
         if (pending.cancelled) return;
         const currentBeforeInstall = ws.deserializeAttachment() as GwAttachment | null;
         const operationKey = `${att.connectionId}:${msg.subId}`;
@@ -1828,6 +1847,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                           shardId,
                           sourceCdbId,
                           schemaEpoch,
+                          recoveryGeneration,
                           domainSchemaEpoch,
                           authEpochs,
                           nowMs: replayAt,
@@ -1901,6 +1921,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                     shardId,
                     sourceCdbId,
                     schemaEpoch,
+                    recoveryGeneration,
                     domainSchemaEpoch,
                     authEpochs,
                     ...(att.lastCookie === undefined ? {} : { lastCookie: att.lastCookie }),
@@ -1959,6 +1980,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             organizationId: TenantId(organizationId),
             authority: routed.authority,
             schemaEpoch,
+            recoveryGeneration,
             vshard,
             domainSchemaEpoch,
             ref: msg.ref,

@@ -41,6 +41,17 @@ function sqlStorage(db: Database, statements: string[] = []) {
     };
 }
 
+const recoveryNamespace = {
+    idFromName: () => "global",
+    get: () => ({
+        adminRecoveryAdmissionClock: async () => ({ generation: 0, activeOperationId: null, activeDigest: null }),
+    }),
+} as unknown as DurableObjectNamespace;
+
+function withRecoveryEnv(env: Record<string, unknown>): Record<string, unknown> {
+    return { CDB_RESHARD: recoveryNamespace, ...env };
+}
+
 class CatalogHarness {
     readonly db: Database;
     readonly sqlStatements: string[] = [];
@@ -59,7 +70,7 @@ class CatalogHarness {
         this.db = new Database(":memory:");
         prepare?.(this.db);
         this.CatalogClass = CatalogClass;
-        this.env = env;
+        this.env = withRecoveryEnv(env);
         this.state = {
             storage: {
                 sql: sqlStorage(this.db, this.sqlStatements),
@@ -89,7 +100,7 @@ class CatalogHarness {
                 this.bootstrap = callback();
             },
         } as unknown as DurableObjectState;
-        this.catalog = new CatalogClass(this.state, env);
+        this.catalog = new CatalogClass(this.state, this.env);
     }
 
     async ready(): Promise<void> {
@@ -103,8 +114,8 @@ class CatalogHarness {
 
     async reconfigure(CatalogClass: typeof Catalog, env: Record<string, unknown> = {}): Promise<void> {
         this.CatalogClass = CatalogClass;
-        this.env = env;
-        this.catalog = new CatalogClass(this.state as never, env);
+        this.env = withRecoveryEnv(env);
+        this.catalog = new CatalogClass(this.state as never, this.env);
         await this.ready();
     }
 
@@ -172,7 +183,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("creates and looks up core and membership rows by non-owner fields", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
 
         await adapter.create({
@@ -268,7 +281,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("counts filtered rows with scalar SQL and no row materialization", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
         for (const [id, name] of [
             ["count-user-1", "Counted"],
@@ -296,7 +311,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("honors findMany sort and offset across stable pages", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
         for (const [id, name] of [
             ["sorted-user-d", "Delta"],
@@ -357,7 +374,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("uses id as a stable tie-breaker across sorted pages", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
         for (const id of ["tied-user-d", "tied-user-a", "tied-user-c", "tied-user-b"] as const) {
             await adapter.create({
@@ -405,19 +424,48 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             idFromName: () => "global",
             get: () => catalog,
         } as unknown as DurableObjectNamespace;
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespace } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespace } })(auth.options);
 
         await expect(adapter.count({ model: "user", where: eq("name", "Counted") })).resolves.toBe(7);
         expect(requests).toEqual([
             {
                 operation: "count",
+                recoveryGeneration: 0,
                 args: { model: "user", where: [{ field: "name", operator: "eq", value: "Counted" }] },
             },
         ]);
     });
 
+    test("resolves the current recovery generation only when an adapter operation reaches Catalog", async () => {
+        const requests: unknown[] = [];
+        const namespace = {
+            idFromName: () => "global",
+            get: () => ({
+                authAdapterRpc: async (request: unknown) => {
+                    requests.push(structuredClone(request));
+                    return { ok: true, value: 1 };
+                },
+            }),
+        } as unknown as DurableObjectNamespace;
+        let generation = 3;
+        const adapter = chardbAuthAdapter({
+            env: { CDB_CATALOG: namespace },
+            recoveryGeneration: async () => generation++,
+        })(auth.options);
+
+        expect(requests).toEqual([]);
+        await adapter.count({ model: "user", where: [] });
+        await adapter.count({ model: "user", where: [] });
+        expect(requests).toEqual([
+            { operation: "count", recoveryGeneration: 3, args: { model: "user", where: [] } },
+            { operation: "count", recoveryGeneration: 4, args: { model: "user", where: [] } },
+        ]);
+    });
+
     test("routes bounded in filters through Catalog reads", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-24T00:00:00Z");
         for (const id of ["in-user-a", "in-user-b", "in-user-c"]) {
             await adapter.create({
@@ -462,7 +510,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("honors Better Auth organization list filter operators", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-24T00:00:00Z");
         for (const [id, name] of [
             ["filter-a", "Ada Lovelace"],
@@ -518,7 +568,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("rejects hostile Better Auth filter operators and modes before Catalog SQL", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const find = (where: Record<string, unknown>) => adapter.findMany({ model: "user", where: [where as never] });
 
         await expect(find({ field: "name", operator: "between", value: "Ada" })).rejects.toMatchObject({
@@ -554,7 +606,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             idFromName: () => "global",
             get: () => catalog,
         } as unknown as DurableObjectNamespace;
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespace } })(renamedRateLimitAuth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespace } })(
+            renamedRateLimitAuth.options
+        );
 
         await expect(
             adapter.incrementOne<Record<string, unknown>>({
@@ -571,6 +625,7 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(requests).toEqual([
             {
                 operation: "increment",
+                recoveryGeneration: 0,
                 args: {
                     model: "rateLimit",
                     where: [
@@ -597,12 +652,15 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         });
         harness = new CatalogHarness();
         await harness.ready();
-        await harness.catalog.mutateAuth({
-            model: "rateLimit",
-            op: "create",
-            payload: { id: "rate-swapped", key: "swapped", count: 1, lastRequest: 100 },
-        });
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(
+        await harness.catalog.mutateAuth(
+            {
+                model: "rateLimit",
+                op: "create",
+                payload: { id: "rate-swapped", key: "swapped", count: 1, lastRequest: 100 },
+            },
+            0
+        );
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
             swappedRateLimitAuth.options
         );
 
@@ -619,11 +677,14 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             })
         ).resolves.toMatchObject({ id: "rate-swapped", key: "swapped", count: 2, lastRequest: 200 });
         await expect(
-            harness.catalog.queryAuth({
-                model: "rateLimit",
-                where: [{ field: "id", operator: "eq", value: "rate-swapped" }],
-                limit: 1,
-            })
+            harness.catalog.queryAuth(
+                {
+                    model: "rateLimit",
+                    where: [{ field: "id", operator: "eq", value: "rate-swapped" }],
+                    limit: 1,
+                },
+                0
+            )
         ).resolves.toEqual([
             expect.objectContaining({ id: "rate-swapped", key: "swapped", count: 2, lastRequest: 200 }),
         ]);
@@ -631,7 +692,7 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
 
     test("rejects duplicate physical incrementOne mappings at adapter construction", () => {
         expect(() =>
-            chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })({
+            chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })({
                 rateLimit: {
                     storage: "database",
                     fields: { key: "duplicate", count: "duplicate" },
@@ -649,7 +710,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         });
         harness = new CatalogHarness();
         await harness.ready();
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(rateLimitAuth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            rateLimitAuth.options
+        );
 
         await adapter.create({
             model: "rateLimit",
@@ -764,7 +827,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         });
         harness = new CatalogHarness();
         await harness.ready();
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(rateLimitAuth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            rateLimitAuth.options
+        );
         await adapter.create({
             model: "rateLimit",
             forceAllowId: true,
@@ -787,33 +852,44 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             })
         ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
         await expect(
-            harness.catalog.incrementAuth({
-                model: "rateLimit",
-                where: [{ field: "missing", operator: "eq", value: "invalid" }],
-                increment: { count: 1 },
-            })
+            harness.catalog.incrementAuth(
+                {
+                    model: "rateLimit",
+                    where: [{ field: "missing", operator: "eq", value: "invalid" }],
+                    increment: { count: 1 },
+                },
+                0
+            )
         ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
         await expect(
-            harness.catalog.incrementAuth({
-                model: "rateLimit",
-                where: [{ field: "key", operator: "eq", value: "invalid" }],
-                increment: { key: 1 },
-            })
+            harness.catalog.incrementAuth(
+                {
+                    model: "rateLimit",
+                    where: [{ field: "key", operator: "eq", value: "invalid" }],
+                    increment: { key: 1 },
+                },
+                0
+            )
         ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS", retryable: false });
         await expect(
-            harness.catalog.incrementAuth({
-                model: "rateLimit",
-                where: [{ field: "key", operator: "eq", value: "invalid" }],
-                increment: {},
-                set: { key: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES + 1) },
-            })
+            harness.catalog.incrementAuth(
+                {
+                    model: "rateLimit",
+                    where: [{ field: "key", operator: "eq", value: "invalid" }],
+                    increment: {},
+                    set: { key: "x".repeat(AUTH_BULK_REPLACEMENT_MAX_BYTES + 1) },
+                },
+                0
+            )
         ).rejects.toMatchObject({ code: "CDB_RATE_LIMITED", retryable: true });
         expect(harness.sqlStatements.some(statement => statement.startsWith('UPDATE "rateLimit"'))).toBe(false);
         expect(harness.sqlStatements.some(statement => statement.startsWith("UPDATE catalog_epoch"))).toBe(false);
     });
 
     test("updates and deletes through non-owner lookups while preserving epoch bumps", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
 
         await adapter.create({
@@ -853,7 +929,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("keeps empty single-row mutations as no-ops while bulk mutations remain explicit", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
         for (const id of ["empty-single-a", "empty-single-b"] as const) {
             await adapter.create({
@@ -885,7 +963,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("keeps legacy direct Catalog mutations bulk by default", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
         for (const id of ["legacy-bulk-a", "legacy-bulk-b"] as const) {
             await adapter.create({
@@ -903,21 +983,26 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         }
 
         await expect(
-            harness.catalog.mutateAuth({
-                model: "user",
-                op: "update",
-                where: { name: "Legacy" },
-                payload: { name: "Legacy changed" },
-                returnRow: false,
-            })
+            harness.catalog.mutateAuth(
+                {
+                    model: "user",
+                    op: "update",
+                    where: { name: "Legacy" },
+                    payload: { name: "Legacy changed" },
+                    returnRow: false,
+                },
+                0
+            )
         ).resolves.toMatchObject({ affected: 2 });
         await expect(
-            harness.catalog.mutateAuth({ model: "user", op: "delete", where: { name: "Legacy changed" } })
+            harness.catalog.mutateAuth({ model: "user", op: "delete", where: { name: "Legacy changed" } }, 0)
         ).resolves.toMatchObject({ affected: 2 });
     });
 
     test("single-row update and delete choose the lowest matching id without touching siblings", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
         for (const id of ["single-c", "single-a", "single-b"] as const) {
             await adapter.create({
@@ -958,7 +1043,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("rolls back an auth row when its atomic epoch bump fails", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         harness.db.run(`CREATE TRIGGER fail_auth_epoch
             BEFORE UPDATE ON catalog_epoch
             WHEN NEW.scope = 'auth_principal'
@@ -984,7 +1071,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("updateMany bumps every affected principal before returning", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
         for (const id of ["batch-user-1", "batch-user-2"]) {
             await adapter.create({
@@ -1011,7 +1100,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("rejects a 4097-row auth update before the row or epoch write", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const insert = harness.db.prepare(
             'INSERT INTO "user" ("id", "name", "email", "emailVerified", "createdAt", "updatedAt") VALUES (?, ?, ?, ?, ?, ?)'
         );
@@ -1060,7 +1151,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("rejects excess stored and replacement scope bytes before auth writes", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const oversizedId = "s".repeat(AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES + 1);
         harness.db
             .prepare(
@@ -1089,13 +1182,16 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             retryable: true,
         });
         await expect(
-            harness.catalog.mutateAuth({
-                model: "user",
-                op: "update",
-                where: { id: "replacement-byte-user" },
-                payload: { id: "n".repeat(AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES) },
-                returnRow: false,
-            })
+            harness.catalog.mutateAuth(
+                {
+                    model: "user",
+                    op: "update",
+                    where: { id: "replacement-byte-user" },
+                    payload: { id: "n".repeat(AUTH_BULK_PRELOAD_MAX_SCOPE_BYTES) },
+                    returnRow: false,
+                },
+                0
+            )
         ).rejects.toMatchObject({ code: "CDB_RATE_LIMITED", retryable: true });
         expect(harness.db.query('SELECT "name" FROM "user" WHERE "id" = ?').get(oversizedId)).toEqual({
             name: "Bulk byte cap",
@@ -1110,7 +1206,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("updateMany preloads only narrow scope columns and skips a full-row reread", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         await adapter.create({
             model: "user",
             forceAllowId: true,
@@ -1143,7 +1241,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("rejects expanded non-scope replacements before base or epoch writes", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         await adapter.create({
             model: "user",
             forceAllowId: true,
@@ -1176,7 +1276,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("updateMany bumps every tenant and principal touched by membership rows", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
         for (const suffix of ["1", "2"]) {
             const userId = `batch-member-user-${suffix}`;
@@ -1235,7 +1337,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("moving a membership bumps every old and new tenant and principal scope", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
         for (const id of ["move-user-1", "move-user-2"]) {
             await adapter.create({
@@ -1301,7 +1405,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     });
 
     test("a restarted Catalog instance reads rows from the same durable storage", async () => {
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
         await adapter.create({
             model: "user",
@@ -1317,7 +1423,10 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         });
 
         await harness.restart();
-        const restartedAdapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const restartedAdapter = chardbAuthAdapter({
+            recoveryGeneration: 0,
+            env: { CDB_CATALOG: namespaceFor(harness) },
+        })(auth.options);
 
         expect(
             await restartedAdapter.findOne({ model: "user", where: eq("email", "restart@example.com") })
@@ -1336,7 +1445,9 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         harness = new CatalogHarness();
         await harness.ready();
 
-        const adapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const adapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
+            auth.options
+        );
         const now = new Date("2026-08-23T00:00:00Z");
         await adapter.create({
             model: "user",
@@ -1364,7 +1475,10 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         });
 
         await harness.restart();
-        const restartedAdapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(auth.options);
+        const restartedAdapter = chardbAuthAdapter({
+            recoveryGeneration: 0,
+            env: { CDB_CATALOG: namespaceFor(harness) },
+        })(auth.options);
         expect(
             await restartedAdapter.findOne({ model: "session", where: eq("token", "first-request-token") })
         ).toMatchObject({ id: "first-session", userId: "first-user" });
@@ -1384,18 +1498,21 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
 
     test("applies a versioned auth migration, preserves rows, and fences auth traffic until activation", async () => {
         const now = Date.parse("2026-08-23T00:00:00Z");
-        await harness.catalog.mutateAuth({
-            model: "user",
-            op: "create",
-            payload: {
-                id: "migrated-user",
-                name: "Before migration",
-                email: "migration@example.com",
-                emailVerified: true,
-                createdAt: now,
-                updatedAt: now,
+        await harness.catalog.mutateAuth(
+            {
+                model: "user",
+                op: "create",
+                payload: {
+                    id: "migrated-user",
+                    name: "Before migration",
+                    email: "migration@example.com",
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                },
             },
-        });
+            0
+        );
         const journal = defineMigrations([
             {
                 version: 1,
@@ -1428,14 +1545,18 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             } as unknown as DurableObjectNamespace,
         });
         await expect(
-            harness.catalog.queryAuth({
-                model: "user",
-                where: [{ field: "id", operator: "eq", value: "migrated-user" }],
-            })
+            harness.catalog.queryAuth(
+                {
+                    model: "user",
+                    where: [{ field: "id", operator: "eq", value: "migrated-user" }],
+                },
+                0
+            )
         ).rejects.toMatchObject({ code: "CDB_STALE_EPOCH" });
         await expect(
             harness.catalog.authAdapterRpc({
                 operation: "query",
+                recoveryGeneration: 0,
                 args: { model: "user", where: [{ field: "id", operator: "eq", value: "migrated-user" }] },
             })
         ).resolves.toEqual({
@@ -1446,7 +1567,7 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
                 hint: "retry after the schema migration activates",
             },
         });
-        const fencedAdapter = chardbAuthAdapter({ env: { CDB_CATALOG: namespaceFor(harness) } })(
+        const fencedAdapter = chardbAuthAdapter({ recoveryGeneration: 0, env: { CDB_CATALOG: namespaceFor(harness) } })(
             authWithNickname.options
         );
         await expect(fencedAdapter.findOne({ model: "user", where: eq("id", "migrated-user") })).rejects.toMatchObject({
@@ -1476,12 +1597,15 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
 
         await harness.restart();
         await expect(
-            harness.catalog.mutateAuth({
-                model: "user",
-                op: "update",
-                where: { id: "migrated-user" },
-                payload: { nickname: "after" },
-            })
+            harness.catalog.mutateAuth(
+                {
+                    model: "user",
+                    op: "update",
+                    where: { id: "migrated-user" },
+                    payload: { nickname: "after" },
+                },
+                0
+            )
         ).resolves.toMatchObject({ row: expect.objectContaining({ id: "migrated-user", nickname: "after" }) });
         expect(harness.db.query('SELECT id, nickname FROM "user"').all()).toEqual([
             { id: "migrated-user", nickname: "after" },
@@ -1518,7 +1642,7 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         await harness.ready();
         expect(harness.catalog.schemaState()).toMatchObject({ activeVersion: 0, activeEpoch: 1, status: "active" });
         expect(harness.db.query("SELECT name FROM sqlite_master WHERE name = 'user'").get()).toBeNull();
-        await expect(harness.catalog.queryAuth({ model: "user", where: [] })).rejects.toMatchObject({
+        await expect(harness.catalog.queryAuth({ model: "user", where: [] }, 0)).rejects.toMatchObject({
             code: "CDB_STALE_EPOCH",
         });
 
@@ -1531,19 +1655,22 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             status: "active",
         });
         await expect(
-            harness.catalog.mutateAuth({
-                model: "user",
-                op: "create",
-                payload: {
-                    id: "fresh-user",
-                    name: "Fresh",
-                    email: "fresh@example.com",
-                    emailVerified: true,
-                    createdAt: 1,
-                    updatedAt: 1,
-                    nickname: "new",
+            harness.catalog.mutateAuth(
+                {
+                    model: "user",
+                    op: "create",
+                    payload: {
+                        id: "fresh-user",
+                        name: "Fresh",
+                        email: "fresh@example.com",
+                        emailVerified: true,
+                        createdAt: 1,
+                        updatedAt: 1,
+                        nickname: "new",
+                    },
                 },
-            })
+                0
+            )
         ).resolves.toMatchObject({ row: expect.objectContaining({ id: "fresh-user", nickname: "new" }) });
         expect(harness.db.query("SELECT COUNT(*) AS count FROM catalog_schema_steps").get()).toEqual({ count: 1 });
     });
@@ -1571,36 +1698,46 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
 
     test("derives canonical organization roles and current epochs from Catalog rows", async () => {
         const nowMs = Date.parse("2026-08-23T00:00:00Z");
-        await harness.catalog.mutateAuth({
-            model: "user",
-            op: "create",
-            payload: {
-                id: "authority-user",
-                name: "Authority User",
-                email: "authority@example.com",
-                emailVerified: true,
-                createdAt: nowMs,
-                updatedAt: nowMs,
+        await harness.catalog.mutateAuth(
+            {
+                model: "user",
+                op: "create",
+                payload: {
+                    id: "authority-user",
+                    name: "Authority User",
+                    email: "authority@example.com",
+                    emailVerified: true,
+                    createdAt: nowMs,
+                    updatedAt: nowMs,
+                },
             },
-        });
-        await harness.catalog.mutateAuth({
-            model: "organization",
-            op: "create",
-            payload: { id: "authority-org", name: "Authority Org", slug: "authority", createdAt: nowMs },
-        });
-        await harness.catalog.mutateAuth({
-            model: "member",
-            op: "create",
-            payload: {
-                id: "authority-member",
-                organizationId: "authority-org",
-                userId: "authority-user",
-                role: " member,admin, member ,owner ",
-                createdAt: nowMs,
+            0
+        );
+        await harness.catalog.mutateAuth(
+            {
+                model: "organization",
+                op: "create",
+                payload: { id: "authority-org", name: "Authority Org", slug: "authority", createdAt: nowMs },
             },
-        });
+            0
+        );
+        await harness.catalog.mutateAuth(
+            {
+                model: "member",
+                op: "create",
+                payload: {
+                    id: "authority-member",
+                    organizationId: "authority-org",
+                    userId: "authority-user",
+                    role: " member,admin, member ,owner ",
+                    createdAt: nowMs,
+                },
+            },
+            0
+        );
 
         const expectedAuthority = {
+            recoveryGeneration: 0,
             principalId: PrincipalId("authority-user"),
             organizationId: TenantId("authority-org"),
             role: "admin,member,owner",
@@ -1615,29 +1752,33 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(await harness.catalog.resolveOrganizationAuthority(authorityRequest)).toEqual(expectedAuthority);
         expect(await harness.catalog.resolveOrganizationAuthorityRoute({ ...authorityRequest, vshard: 73 })).toEqual({
             authority: expectedAuthority,
-            route: { shardId: ShardId("ShardDO_0"), schemaEpoch: 1, domainSchemaEpoch: 1 },
+            route: { shardId: ShardId("ShardDO_0"), schemaEpoch: 1, recoveryGeneration: 0, domainSchemaEpoch: 1 },
         });
     });
 
     test("derives user authority from the current Catalog user row", async () => {
         const nowMs = Date.parse("2026-08-23T00:00:00Z");
-        await harness.catalog.mutateAuth({
-            model: "user",
-            op: "create",
-            payload: {
-                id: "user-authority-subject",
-                name: "User Authority",
-                email: "user-authority@example.com",
-                emailVerified: true,
-                role: " user,admin,user ",
-                createdAt: nowMs,
-                updatedAt: nowMs,
+        await harness.catalog.mutateAuth(
+            {
+                model: "user",
+                op: "create",
+                payload: {
+                    id: "user-authority-subject",
+                    name: "User Authority",
+                    email: "user-authority@example.com",
+                    emailVerified: true,
+                    role: " user,admin,user ",
+                    createdAt: nowMs,
+                    updatedAt: nowMs,
+                },
             },
-        });
+            0
+        );
 
         expect(
             await harness.catalog.resolveUserAuthority({ principalId: PrincipalId("user-authority-subject") })
         ).toEqual({
+            recoveryGeneration: 0,
             principalId: PrincipalId("user-authority-subject"),
             role: "admin,user",
             roles: ["admin", "user"],
@@ -1646,18 +1787,21 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
         expect(
             await harness.catalog.resolveUserAuthority({ principalId: PrincipalId("missing-user-authority") })
         ).toBeNull();
-        await harness.catalog.mutateAuth({
-            model: "user",
-            op: "create",
-            payload: {
-                id: "default-role-user",
-                name: "Default Role User",
-                email: "default-role@example.com",
-                emailVerified: true,
-                createdAt: nowMs,
-                updatedAt: nowMs,
+        await harness.catalog.mutateAuth(
+            {
+                model: "user",
+                op: "create",
+                payload: {
+                    id: "default-role-user",
+                    name: "Default Role User",
+                    email: "default-role@example.com",
+                    emailVerified: true,
+                    createdAt: nowMs,
+                    updatedAt: nowMs,
+                },
             },
-        });
+            0
+        );
         expect(
             await harness.catalog.resolveUserAuthority({ principalId: PrincipalId("default-role-user") })
         ).toMatchObject({
@@ -1666,11 +1810,14 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
             authEpochs: { tenant: 0 },
         });
 
-        await harness.catalog.mutateAuth({
-            model: "user",
-            op: "delete",
-            where: { id: "user-authority-subject" },
-        });
+        await harness.catalog.mutateAuth(
+            {
+                model: "user",
+                op: "delete",
+                where: { id: "user-authority-subject" },
+            },
+            0
+        );
         expect(
             await harness.catalog.resolveUserAuthority({ principalId: PrincipalId("user-authority-subject") })
         ).toBeNull();
@@ -1679,91 +1826,115 @@ describe("chardbAuthAdapter — Catalog-owned auth storage", () => {
     test("isolates organizations and returns null for missing or revoked membership", async () => {
         const nowMs = Date.parse("2026-08-23T00:00:00Z");
         for (const organizationId of ["isolation-org-a", "isolation-org-b"]) {
-            await harness.catalog.mutateAuth({
-                model: "organization",
-                op: "create",
-                payload: { id: organizationId, name: organizationId, slug: organizationId, createdAt: nowMs },
-            });
+            await harness.catalog.mutateAuth(
+                {
+                    model: "organization",
+                    op: "create",
+                    payload: { id: organizationId, name: organizationId, slug: organizationId, createdAt: nowMs },
+                },
+                0
+            );
         }
-        await harness.catalog.mutateAuth({
-            model: "user",
-            op: "create",
-            payload: {
-                id: "isolation-user",
-                name: "Isolation User",
-                email: "isolation@example.com",
-                emailVerified: true,
-                createdAt: nowMs,
-                updatedAt: nowMs,
+        await harness.catalog.mutateAuth(
+            {
+                model: "user",
+                op: "create",
+                payload: {
+                    id: "isolation-user",
+                    name: "Isolation User",
+                    email: "isolation@example.com",
+                    emailVerified: true,
+                    createdAt: nowMs,
+                    updatedAt: nowMs,
+                },
             },
-        });
+            0
+        );
 
         const request = {
             principalId: PrincipalId("isolation-user"),
             organizationId: TenantId("isolation-org-a"),
         };
         expect(await harness.catalog.resolveOrganizationAuthority(request)).toBeNull();
-        await harness.catalog.mutateAuth({
-            model: "member",
-            op: "create",
-            payload: {
-                id: "isolation-member",
-                organizationId: "isolation-org-a",
-                userId: "isolation-user",
-                role: "member",
-                createdAt: nowMs,
+        await harness.catalog.mutateAuth(
+            {
+                model: "member",
+                op: "create",
+                payload: {
+                    id: "isolation-member",
+                    organizationId: "isolation-org-a",
+                    userId: "isolation-user",
+                    role: "member",
+                    createdAt: nowMs,
+                },
             },
-        });
+            0
+        );
         expect(
             await harness.catalog.resolveOrganizationAuthority({
                 ...request,
                 organizationId: TenantId("isolation-org-b"),
             })
         ).toBeNull();
-        await harness.catalog.mutateAuth({
-            model: "member",
-            op: "delete",
-            where: { id: "isolation-member" },
-        });
+        await harness.catalog.mutateAuth(
+            {
+                model: "member",
+                op: "delete",
+                where: { id: "isolation-member" },
+            },
+            0
+        );
         expect(await harness.catalog.resolveOrganizationAuthority(request)).toBeNull();
     });
 
     test("reflects membership role changes and their tenant/principal epoch bumps", async () => {
         const nowMs = Date.parse("2026-08-23T00:00:00Z");
-        await harness.catalog.mutateAuth({
-            model: "user",
-            op: "create",
-            payload: {
-                id: "role-user",
-                name: "Role User",
-                email: "role@example.com",
-                emailVerified: true,
-                createdAt: nowMs,
-                updatedAt: nowMs,
+        await harness.catalog.mutateAuth(
+            {
+                model: "user",
+                op: "create",
+                payload: {
+                    id: "role-user",
+                    name: "Role User",
+                    email: "role@example.com",
+                    emailVerified: true,
+                    createdAt: nowMs,
+                    updatedAt: nowMs,
+                },
             },
-        });
-        await harness.catalog.mutateAuth({
-            model: "organization",
-            op: "create",
-            payload: { id: "role-org", name: "Role Org", slug: "role-org", createdAt: nowMs },
-        });
-        await harness.catalog.mutateAuth({
-            model: "member",
-            op: "create",
-            payload: {
-                id: "role-member",
-                organizationId: "role-org",
-                userId: "role-user",
-                role: "member",
-                createdAt: nowMs,
+            0
+        );
+        await harness.catalog.mutateAuth(
+            {
+                model: "organization",
+                op: "create",
+                payload: { id: "role-org", name: "Role Org", slug: "role-org", createdAt: nowMs },
             },
-        });
-        await harness.catalog.mutateAuth({
-            model: "member",
-            op: "update",
-            where: { id: "role-member" },
-            payload: { role: "owner, admin" },
-        });
+            0
+        );
+        await harness.catalog.mutateAuth(
+            {
+                model: "member",
+                op: "create",
+                payload: {
+                    id: "role-member",
+                    organizationId: "role-org",
+                    userId: "role-user",
+                    role: "member",
+                    createdAt: nowMs,
+                },
+            },
+            0
+        );
+        await harness.catalog.mutateAuth(
+            {
+                model: "member",
+                op: "update",
+                where: { id: "role-member" },
+                payload: { role: "owner, admin" },
+            },
+            0
+        );
 
         expect(
             await harness.catalog.resolveOrganizationAuthority({

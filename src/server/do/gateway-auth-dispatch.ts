@@ -196,7 +196,9 @@ type OrganizationAuthFailure = {
     readonly message: string;
 };
 
-type OrganizationAuthProjection = { readonly ok: true; readonly auth: AuthCtx } | OrganizationAuthFailure;
+type OrganizationAuthProjection =
+    | { readonly ok: true; readonly auth: AuthCtx; readonly recoveryGeneration: number }
+    | OrganizationAuthFailure;
 
 type UserAuthProjection = OrganizationAuthProjection;
 
@@ -205,6 +207,11 @@ function catalogBoundaryFailure(error: unknown, message: string): OrganizationAu
         return { ok: false, code: error.code, message: error.message };
     }
     return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message };
+}
+
+function ownEnumerableData(value: object, key: string): unknown {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor?.enumerable === true && "value" in descriptor ? descriptor.value : undefined;
 }
 
 /** Validate the Catalog user envelope before it becomes runtime auth. */
@@ -221,9 +228,12 @@ export function projectUserMutationAuth(
     const authority = value as Record<string, unknown>;
     const roles = authority.roles;
     const epochs = authority.authEpochs;
+    const recoveryGeneration = ownEnumerableData(authority, "recoveryGeneration");
     if (
         typeof authority.principalId !== "string" ||
         typeof authority.role !== "string" ||
+        !Number.isSafeInteger(recoveryGeneration) ||
+        (recoveryGeneration as number) < 0 ||
         !Array.isArray(roles) ||
         !roles.every(role => typeof role === "string") ||
         typeof epochs !== "object" ||
@@ -249,6 +259,7 @@ export function projectUserMutationAuth(
     }
     return {
         ok: true,
+        recoveryGeneration: recoveryGeneration as number,
         auth: {
             userId: authority.principalId,
             role: authority.role,
@@ -278,10 +289,13 @@ export function projectOrganizationMutationAuth(
     const roles = authority.roles;
     const userRole = authority.userRole;
     const epochs = authority.authEpochs;
+    const recoveryGeneration = ownEnumerableData(authority, "recoveryGeneration");
     if (
         typeof authority.principalId !== "string" ||
         typeof authority.organizationId !== "string" ||
         typeof authority.role !== "string" ||
+        !Number.isSafeInteger(recoveryGeneration) ||
+        (recoveryGeneration as number) < 0 ||
         !Array.isArray(roles) ||
         !roles.every(role => typeof role === "string") ||
         (userRole !== undefined && (typeof userRole !== "string" || userRole.length === 0)) ||
@@ -312,6 +326,7 @@ export function projectOrganizationMutationAuth(
     }
     return {
         ok: true,
+        recoveryGeneration: recoveryGeneration as number,
         auth: {
             userId: authority.principalId,
             tenantId: authority.organizationId,
@@ -372,16 +387,19 @@ type PartitionAuthRouteProjection =
       }
     | Extract<OrganizationAuthProjection, { readonly ok: false }>;
 
-function validCatalogRoute(value: unknown): value is Awaited<ReturnType<CatalogMutationRpc["route"]>> {
+export function isCatalogRouteResult(value: unknown): value is Awaited<ReturnType<CatalogMutationRpc["route"]>> {
     if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
     const route = value as Record<string, unknown>;
+    const recoveryGeneration = ownEnumerableData(route, "recoveryGeneration");
     return (
         typeof route.shardId === "string" &&
         route.shardId.length > 0 &&
         Number.isSafeInteger(route.schemaEpoch) &&
         (route.schemaEpoch as number) >= 0 &&
         Number.isSafeInteger(route.domainSchemaEpoch) &&
-        (route.domainSchemaEpoch as number) >= 1
+        (route.domainSchemaEpoch as number) >= 1 &&
+        Number.isSafeInteger(recoveryGeneration) &&
+        (recoveryGeneration as number) >= 0
     );
 }
 
@@ -407,16 +425,23 @@ export async function resolvePartitionAuthRoute(
             return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog returned malformed authority" };
         }
         const record = resolved as Record<string, unknown>;
-        const projected = projectOrganizationMutationAuth(record.authority, { principalId, organizationId });
+        const projected = projectOrganizationMutationAuth(ownEnumerableData(record, "authority"), {
+            principalId,
+            organizationId,
+        });
         if (!projected.ok) return projected;
-        if (!validCatalogRoute(record.route)) {
+        const route = ownEnumerableData(record, "route");
+        if (!isCatalogRouteResult(route)) {
             return {
                 ok: false,
                 code: "CDB_CATALOG_UNAVAILABLE",
                 message: "Catalog returned a malformed shard route",
             };
         }
-        return { ok: true, auth: projected.auth, route: record.route };
+        if (projected.recoveryGeneration !== route.recoveryGeneration) {
+            return { ok: false, code: "CDB_STALE_EPOCH", message: "Catalog authority and route generations differ" };
+        }
+        return { ok: true, auth: projected.auth, route };
     }
 
     const projected = await resolvePartitionAuth(catalog, authority, principalId, partitionKey);
@@ -427,12 +452,15 @@ export async function resolvePartitionAuthRoute(
     } catch (error) {
         return catalogBoundaryFailure(error, "Catalog routing RPC failed");
     }
-    if (!validCatalogRoute(route)) {
+    if (!isCatalogRouteResult(route)) {
         return {
             ok: false,
             code: "CDB_CATALOG_UNAVAILABLE",
             message: "Catalog returned a malformed shard route",
         };
+    }
+    if (projected.recoveryGeneration !== route.recoveryGeneration) {
+        return { ok: false, code: "CDB_STALE_EPOCH", message: "Catalog authority and route generations differ" };
     }
     return { ok: true, auth: projected.auth, route };
 }
@@ -567,6 +595,7 @@ export async function dispatchTrustedMutation(
                     placement: { authority: routeAuthority, partitionKey },
                     auth: projected.auth,
                     schemaEpoch: location.schemaEpoch,
+                    recoveryGeneration: location.recoveryGeneration,
                     domainSchemaEpoch: location.domainSchemaEpoch,
                 })
             );
@@ -655,6 +684,7 @@ export async function dispatchTrustedQuery(
                     placement: { authority: routed.authority, partitionKey },
                     auth: projected.auth,
                     schemaEpoch: location.schemaEpoch,
+                    recoveryGeneration: location.recoveryGeneration,
                     domainSchemaEpoch: location.domainSchemaEpoch,
                 })
             );

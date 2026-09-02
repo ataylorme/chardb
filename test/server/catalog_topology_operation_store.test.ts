@@ -33,6 +33,7 @@ function sqlStorage(db: Database) {
 
 const digest = "a".repeat(64);
 const identity = (overrides: Partial<CatalogTopologyOperationIdentity> = {}): CatalogTopologyOperationIdentity => ({
+    recoveryGeneration: 0,
     migrationId: "split-1",
     sourceShard: "ShardDO_0",
     destinationShard: "ShardDO_1",

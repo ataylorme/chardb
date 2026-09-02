@@ -12,6 +12,7 @@ import { renderVectorReshardTriggers } from "../../src/server/vector-reshard-tri
 import { stableJson } from "../../src/util/canonical.ts";
 import { vector } from "../../src/vector.ts";
 import { forOrg } from "../helpers/cdb-table.ts";
+import { withRecoveryEnv } from "../helpers/recovery.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -49,7 +50,7 @@ function construct(CdbClass: typeof Cdb, db: Database): { readonly cdb: Cdb; rea
             ready = callback();
         },
     } as unknown as DurableObjectState;
-    return { cdb: new CdbClass(state, {}), ready };
+    return { cdb: new CdbClass(state, withRecoveryEnv({})), ready };
 }
 
 const organization = sqliteTable("organization", { id: text("id").primaryKey() });
@@ -75,6 +76,7 @@ const TABLES: readonly TableSpec[] = Object.freeze([
 ]);
 const IDENTITY = Object.freeze({
     migId: "vector-source-move",
+    recoveryGeneration: 0,
     rangeLo: 0,
     rangeHi: 16_383,
     schemaVersion: 0,
@@ -90,10 +92,11 @@ const ConfiguredCdb = configureCdbRuntime({
 function bindSource(db: Database): void {
     db.run(
         `INSERT INTO _chardb_split_identity
-           (mig_id, range_lo, range_hi, role, schema_version, schema_epoch, schema_digest, tables_json, created_at)
-         VALUES (?, ?, ?, 'source', ?, ?, ?, ?, 0)`,
+           (mig_id, recovery_generation, range_lo, range_hi, role, schema_version, schema_epoch, schema_digest, tables_json, created_at)
+         VALUES (?, ?, ?, ?, 'source', ?, ?, ?, ?, 0)`,
         [
             IDENTITY.migId,
+            IDENTITY.recoveryGeneration,
             IDENTITY.rangeLo,
             IDENTITY.rangeHi,
             IDENTITY.schemaVersion,
@@ -158,25 +161,31 @@ describe("Cdb vector reshard source lifecycle", () => {
                 .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
                 .get("_chardb_vector_snapshot_sessions")
         ).toBeNull();
-        expect(plainTarget.cdb.beginReshardVectorSource({} as never)).toEqual({
+        expect(plainTarget.cdb.beginReshardVectorSource({ recoveryGeneration: 0 } as never)).toEqual({
             enabled: false,
             triggersInstalled: 0,
             snapshot: null,
         });
-        expect(plainTarget.cdb.inspectReshardVectorSnapshot({} as never)).toEqual({ enabled: false, snapshot: null });
-        expect(plainTarget.cdb.readReshardVectorSnapshot({} as never)).toEqual({ enabled: false, page: null });
-        expect(plainTarget.cdb.stopReshardVectorSource({} as never)).toEqual({
+        expect(plainTarget.cdb.inspectReshardVectorSnapshot({ recoveryGeneration: 0 } as never)).toEqual({
+            enabled: false,
+            snapshot: null,
+        });
+        expect(plainTarget.cdb.readReshardVectorSnapshot({ recoveryGeneration: 0 } as never)).toEqual({
+            enabled: false,
+            page: null,
+        });
+        expect(plainTarget.cdb.stopReshardVectorSource({ recoveryGeneration: 0 } as never)).toEqual({
             enabled: false,
             stopped: false,
             triggersUninstalled: 0,
         });
-        expect(plainTarget.cdb.abortReshardVectors({} as never)).toEqual({
+        expect(plainTarget.cdb.abortReshardVectors({ recoveryGeneration: 0 } as never)).toEqual({
             enabled: false,
             cleaned: false,
             done: true,
             triggersUninstalled: 0,
         });
-        expect(plainTarget.cdb.finishReshardVectors({} as never)).toEqual({
+        expect(plainTarget.cdb.finishReshardVectors({ recoveryGeneration: 0 } as never)).toEqual({
             enabled: false,
             cleaned: false,
             done: true,
@@ -192,7 +201,10 @@ describe("Cdb vector reshard source lifecycle", () => {
         const begun = target.cdb.beginReshardVectorSource(IDENTITY);
         expect(begun).toMatchObject({ enabled: true, triggersInstalled: 9 });
         if (!begun.enabled) throw new Error("vector source fixture is disabled");
-        const first = target.cdb.readReshardVectorSnapshot({ ...IDENTITY, ...begun.snapshot.next });
+        const first = target.cdb.readReshardVectorSnapshot({
+            ...IDENTITY,
+            ...begun.snapshot.next,
+        });
         if (!first.enabled) throw new Error("vector source fixture is disabled");
         target.db.run(
             `INSERT INTO _chardb_split_log
@@ -205,7 +217,10 @@ describe("Cdb vector reshard source lifecycle", () => {
         await cold.ready;
         const reentered = cold.cdb.beginReshardVectorSource(IDENTITY);
         expect(reentered).toMatchObject({ enabled: true, triggersInstalled: 9 });
-        const replay = cold.cdb.readReshardVectorSnapshot({ ...IDENTITY, ...begun.snapshot.next });
+        const replay = cold.cdb.readReshardVectorSnapshot({
+            ...IDENTITY,
+            ...begun.snapshot.next,
+        });
         expect(replay).toEqual(first);
         if (!replay.enabled) throw new Error("vector source fixture is disabled");
         expect(replay.page.throughLsn).toBe(0);
@@ -304,7 +319,10 @@ describe("Cdb vector reshard source lifecycle", () => {
         stage(target.db, "vec-abort");
         const begun = target.cdb.beginReshardVectorSource(IDENTITY);
         if (!begun.enabled) throw new Error("vector source fixture is disabled");
-        const page = target.cdb.readReshardVectorSnapshot({ ...IDENTITY, ...begun.snapshot.next });
+        const page = target.cdb.readReshardVectorSnapshot({
+            ...IDENTITY,
+            ...begun.snapshot.next,
+        });
         if (!page.enabled) throw new Error("vector source fixture is disabled");
         expect(decodeCdbVectorReshardPage(page.page.encodedPage).done).toBeFalse();
         target.db.run("UPDATE _chardb_split_state SET capture = 0, drained = 1 WHERE mig_id = ?", [IDENTITY.migId]);

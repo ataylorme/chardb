@@ -1,5 +1,6 @@
 import { CdbError } from "../../errors.ts";
 import type { SyncSql } from "../../oplog/wrapper.ts";
+import { RecoveryAdmissionStore, initializeRecoveryAdmissionStore } from "./recovery-admission.ts";
 
 const RECOVERY_RESTORE_DDL = `
 CREATE TABLE IF NOT EXISTS _chardb_recovery_restore (
@@ -52,6 +53,7 @@ export function initializeRecoveryStorage(sql: SyncSql): void {
              ADD COLUMN native_scheduled INTEGER NOT NULL DEFAULT 0 CHECK (native_scheduled IN (0, 1))`
         );
     }
+    initializeRecoveryAdmissionStore(sql);
 }
 
 export function readArmedRecoveryRestore(sql: SyncSql): ArmedRecoveryRestore | null {
@@ -118,7 +120,12 @@ export class DurableObjectRecovery {
         };
     }
 
-    async arm(targetBookmark: string, armedAt = Date.now()): Promise<ArmedRecoveryRestore> {
+    async arm(
+        targetBookmark: string,
+        armedAt = Date.now(),
+        admission?: { readonly operationId: string; readonly generation: number },
+        beforeArm?: (sql: SyncSql) => void
+    ): Promise<ArmedRecoveryRestore> {
         const target = assertBookmark(targetBookmark);
         if (!Number.isSafeInteger(armedAt) || armedAt < 0) {
             throw new CdbError({ code: "CDB_INVALID_ARGS", message: "recovery arm time is invalid" });
@@ -131,6 +138,13 @@ export class DurableObjectRecovery {
                     message: "a different point-in-time restore is already armed",
                 });
             }
+            if (admission) {
+                this.storage.transactionSync(() => {
+                    const sql = this.sql();
+                    beforeArm?.(sql);
+                    new RecoveryAdmissionStore(sql).arm(admission.operationId, admission.generation);
+                });
+            }
             return existing;
         }
 
@@ -140,6 +154,8 @@ export class DurableObjectRecovery {
         // recovery coordinator finishes provider cleanup.
         this.storage.transactionSync(() => {
             const sql = this.sql();
+            beforeArm?.(sql);
+            if (admission) new RecoveryAdmissionStore(sql).arm(admission.operationId, admission.generation);
             if (readArmedRecoveryRestore(sql)) {
                 throw new CdbError({
                     code: "CDB_STALE_EPOCH",
@@ -155,6 +171,19 @@ export class DurableObjectRecovery {
             );
         });
         return { targetBookmark: target, undoBookmark: current, armedAt, commitAt: null, nativeScheduled: false };
+    }
+
+    release(
+        operationId: string,
+        generation: number,
+        beforeRelease?: (sql: SyncSql) => void
+    ): { readonly released: true } {
+        this.storage.transactionSync(() => {
+            const sql = this.sql();
+            beforeRelease?.(sql);
+            new RecoveryAdmissionStore(sql).release(operationId, generation);
+        });
+        return { released: true };
     }
 
     async cancel(targetBookmark: string): Promise<{ readonly cancelled: boolean }> {

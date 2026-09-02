@@ -94,7 +94,25 @@ function sameFileRoute(left: RouteResult, right: RouteResult | undefined): boole
         right !== undefined &&
         left.shardId === right.shardId &&
         left.schemaEpoch === right.schemaEpoch &&
+        left.recoveryGeneration === right.recoveryGeneration &&
         left.domainSchemaEpoch === right.domainSchemaEpoch
+    );
+}
+
+function sameStoredFile(left: StoredFile, right: StoredFile): boolean {
+    return (
+        left.fileId === right.fileId &&
+        left.organizationId === right.organizationId &&
+        left.table === right.table &&
+        left.column === right.column &&
+        left.objectKey === right.objectKey &&
+        left.contentType === right.contentType &&
+        left.size === right.size &&
+        left.sha256 === right.sha256 &&
+        left.status === right.status &&
+        left.rowId === right.rowId &&
+        left.createdAt === right.createdAt &&
+        left.updatedAt === right.updatedAt
     );
 }
 
@@ -180,6 +198,7 @@ export async function handleOrganizationFileUploadRequest(input: {
                         nowMs,
                         domainSchemaEpoch: route.domainSchemaEpoch,
                         schemaEpoch: route.schemaEpoch,
+                        recoveryGeneration: route.recoveryGeneration,
                         auth,
                         refreshAuthority: async () => {
                             const refreshed = await context.refreshAuthorityRoute();
@@ -256,6 +275,7 @@ export async function handleOrganizationFileDownloadRequest(input: {
                             rowId,
                             domainSchemaEpoch: route.domainSchemaEpoch,
                             schemaEpoch: route.schemaEpoch,
+                            recoveryGeneration: route.recoveryGeneration,
                             auth,
                         });
                     } catch (error) {
@@ -267,8 +287,9 @@ export async function handleOrganizationFileDownloadRequest(input: {
                     throw new CdbError({ code: "CDB_CATALOG_UNAVAILABLE", message: "file placement is unavailable" });
                 }
                 let stored: StoredFile | null;
+                let resolvedRoute = current.route;
                 try {
-                    stored = await resolve(current.route, current.auth);
+                    stored = await resolve(resolvedRoute, current.auth);
                 } catch (error) {
                     if (!isCdbError(error) || error.code !== "CDB_STALE_EPOCH") throw error;
                     const refreshed = await context.refreshAuthorityRoute();
@@ -278,11 +299,27 @@ export async function handleOrganizationFileDownloadRequest(input: {
                             message: "file placement is unavailable after a stale route",
                         });
                     }
-                    stored = await resolve(refreshed.route, refreshed.auth);
+                    resolvedRoute = refreshed.route;
+                    stored = await resolve(resolvedRoute, refreshed.auth);
                 }
                 if (!stored) return null;
                 const object = await fileProviderCall(() => readRecoverableFile(context.bucket, stored));
-                return { object, stored };
+                const finalAuthority = await context.refreshAuthorityRoute();
+                if (!sameFileRoute(resolvedRoute, finalAuthority.route)) {
+                    throw new CdbError({
+                        code: "CDB_STALE_EPOCH",
+                        message: "file placement changed while reading retained content",
+                    });
+                }
+                const finalStored = await resolve(resolvedRoute, finalAuthority.auth);
+                if (!finalStored) return null;
+                if (!sameStoredFile(stored, finalStored)) {
+                    throw new CdbError({
+                        code: "CDB_STALE_EPOCH",
+                        message: "file attachment changed while reading retained content",
+                    });
+                }
+                return { object, stored: finalStored };
             },
         });
         if (!dispatched.ok) return dispatchFailure(dispatched);
