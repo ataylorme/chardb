@@ -248,6 +248,7 @@ export default {
                 ref: input.ref,
                 args: input.args,
                 auth: input.auth,
+                recoveryGeneration: 0,
                 schemaEpoch: 1,
                 domainSchemaEpoch: 1,
             })

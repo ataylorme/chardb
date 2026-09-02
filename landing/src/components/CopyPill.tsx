@@ -33,14 +33,14 @@ export function CopyPill({ text = INSTALL_CMD }: Props) {
     };
 
     return (
-        <div className="relative inline-flex items-center gap-2 rounded-full border border-line2 bg-ink-850 pl-4 pr-1.5 py-1.5 font-mono text-sm w-fit max-w-full">
+        <div className="relative flex w-full max-w-full items-center gap-2 rounded-full border border-line2 bg-ink-850 py-1.5 pl-4 pr-1.5 font-mono text-xs sm:w-fit sm:text-sm">
             <span className="text-fg-dim select-none">$</span>
-            <code className="text-fg whitespace-nowrap">{text}</code>
+            <code className="min-w-0 flex-1 truncate whitespace-nowrap text-fg">{text}</code>
             <button
                 type="button"
                 onClick={onCopy}
                 aria-label={copied ? "Copied" : `Copy ${text} to clipboard`}
-                className="ml-1 inline-flex items-center justify-center h-8 w-8 rounded-full bg-accent text-ink-950 hover:brightness-110 transition"
+                className="ml-1 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-ink-950 transition hover:brightness-110"
             >
                 {copied ? (
                     <svg

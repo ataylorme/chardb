@@ -273,7 +273,7 @@ function profileAccountPreflightCommands(profile) {
 
 export function planCloudflareVectorizeCommands(input) {
     const names = deriveDisposableVectorizeResourceNames(input.candidateSha256, input.nonce);
-    const description = `Chardb disposable proof ${input.candidateSha256.slice(0, 12)}`;
+    const description = `CharDB disposable proof ${input.candidateSha256.slice(0, 12)}`;
     const plan = {
         schema: CLOUDFLARE_VECTORIZE_PROOF_PLAN_SCHEMA,
         mutatingCommandsExecuted: false,

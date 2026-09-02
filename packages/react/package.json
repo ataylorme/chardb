@@ -1,18 +1,13 @@
 {
     "name": "@chardb/react",
     "version": "0.1.0",
-    "description": "React hooks for Chardb and Better Auth",
+    "description": "React hooks for CharDB and Better Auth",
     "type": "module",
     "license": "MIT",
     "publishConfig": {
         "access": "public"
     },
     "homepage": "https://chardb.dev",
-    "repository": {
-        "type": "git",
-        "url": "git+https://github.com/zpg6/chardb.git",
-        "directory": "packages/react"
-    },
     "files": ["dist", "README.md"],
     "scripts": {
         "build": "unbuild",

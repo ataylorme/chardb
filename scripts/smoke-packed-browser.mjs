@@ -12,8 +12,7 @@ if (await isolateProcessTree(import.meta.url, { label: "packed browser smoke", t
     process.exit(0);
 }
 
-const ADMIN_TOKEN = "packed-browser-migration-secret";
-const AUTH_SECRET = "packed-browser-auth-secret-at-least-32-characters";
+const ADMIN_TOKEN = "local-chardb-admin";
 const tarballArgument = process.argv[2];
 const reactArgumentIndex = process.argv.indexOf("--react");
 const reactTarballArgument = reactArgumentIndex < 0 ? undefined : process.argv[reactArgumentIndex + 1];
@@ -393,7 +392,7 @@ try {
 
     const deletionErrors = browserErrors.splice(deletionErrorCursor);
     browserErrors.push(
-        ...deletionErrors.filter(error => !/^Chardb WebSocket error CDB_FORBIDDEN for sub \d+$/.test(error))
+        ...deletionErrors.filter(error => !/^CharDB WebSocket error CDB_FORBIDDEN for sub \d+$/.test(error))
     );
 
     assertBetterAuthRoutes(authRoutes);
@@ -595,10 +594,8 @@ async function startGeneratedApp(cwd, workerPort, webPort) {
         env: {
             ...process.env,
             ...environment,
-            CHARDB_ADMIN_TOKEN: ADMIN_TOKEN,
-            BETTER_AUTH_SECRET: AUTH_SECRET,
-            CHARDB_URL: workerOrigin.origin,
-            CHARDB_WEB_URL: webOrigin.origin,
+            CHARDB_DEV_URL: workerOrigin.origin,
+            CHARDB_DEV_WEB_URL: webOrigin.origin,
         },
         stdout: "pipe",
         stderr: "pipe",
@@ -696,7 +693,7 @@ function collectBrowserErrors(page, errors) {
             try {
                 const message = JSON.parse(event.payload);
                 if (message?.t === "error") {
-                    errors.push(`Chardb WebSocket error ${String(message.code)} for sub ${String(message.subId)}`);
+                    errors.push(`CharDB WebSocket error ${String(message.code)} for sub ${String(message.subId)}`);
                 }
             } catch {
                 // Non-JSON frames are rejected by the client itself; they are not useful diagnostics here.
@@ -844,7 +841,7 @@ async function sendMessage(page, body, attachment) {
     if (uploadResponsePromise) {
         const response = await uploadResponsePromise;
         if (!response.ok()) {
-            throw new Error(`Chardb file upload failed with status ${response.status()}: ${await response.text()}`);
+            throw new Error(`CharDB file upload failed with status ${response.status()}: ${await response.text()}`);
         }
     }
     await waitForMessage(page, body);

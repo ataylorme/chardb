@@ -194,6 +194,8 @@ export class Cdb extends app.Cdb {
     }
 }
 
+export class Resharder extends app.Resharder {}
+
 interface Env {
     readonly CDB_CATALOG: DurableObjectNamespace;
     readonly CDB_GATEWAY: DurableObjectNamespace;
@@ -212,48 +214,60 @@ export default {
             const catalogId = env.CDB_CATALOG.idFromName("global");
             const catalog = env.CDB_CATALOG.get(catalogId) as unknown as {
                 seedJwkForTest(jwksUrl: string, kid: string, jwkJson: string, ttlMs: number): Promise<void>;
-                mutateAuth(args: {
-                    readonly model: string;
-                    readonly op: "create";
-                    readonly payload: Record<string, unknown>;
-                }): Promise<unknown>;
+                mutateAuth(
+                    args: {
+                        readonly model: string;
+                        readonly op: "create";
+                        readonly payload: Record<string, unknown>;
+                    },
+                    _recoveryGeneration: number
+                ): Promise<unknown>;
                 route(vshard: number): Promise<{ readonly shardId: string }>;
             };
             await catalog.seedJwkForTest(JWKS_URL, body.kid, JSON.stringify(body.jwk), 60_000);
             const now = Date.parse("2026-08-25T00:00:00Z");
-            await catalog.mutateAuth({
-                model: "user",
-                op: "create",
-                payload: {
-                    id: USER_ID,
-                    name: "Planned Query User",
-                    email: "planned-query@example.com",
-                    emailVerified: true,
-                    createdAt: now,
-                    updatedAt: now,
+            await catalog.mutateAuth(
+                {
+                    model: "user",
+                    op: "create",
+                    payload: {
+                        id: USER_ID,
+                        name: "Planned Query User",
+                        email: "planned-query@example.com",
+                        emailVerified: true,
+                        createdAt: now,
+                        updatedAt: now,
+                    },
                 },
-            });
+                0
+            );
             for (const [id, slug] of [
                 [ORGANIZATION_ID, "planned-query-org"],
                 [OTHER_ORGANIZATION_ID, "planned-query-org-other"],
             ] as const) {
-                await catalog.mutateAuth({
-                    model: "organization",
-                    op: "create",
-                    payload: { id, name: id, slug, createdAt: now },
-                });
+                await catalog.mutateAuth(
+                    {
+                        model: "organization",
+                        op: "create",
+                        payload: { id, name: id, slug, createdAt: now },
+                    },
+                    0
+                );
             }
-            await catalog.mutateAuth({
-                model: "member",
-                op: "create",
-                payload: {
-                    id: "planned-query-member",
-                    organizationId: ORGANIZATION_ID,
-                    userId: USER_ID,
-                    role: "member",
-                    createdAt: now,
+            await catalog.mutateAuth(
+                {
+                    model: "member",
+                    op: "create",
+                    payload: {
+                        id: "planned-query-member",
+                        organizationId: ORGANIZATION_ID,
+                        userId: USER_ID,
+                        role: "member",
+                        createdAt: now,
+                    },
                 },
-            });
+                0
+            );
             const route = await catalog.route(Number(vshardOf([ORGANIZATION_ID])));
             const cdbId = env.CDB_SHARD.idFromName(route.shardId);
             const cdb = env.CDB_SHARD.get(cdbId) as unknown as { fixtureSeedRows(): Promise<void> };
@@ -293,37 +307,46 @@ export default {
         if (url.pathname === "/authorize-benchmark-other-organization") {
             const catalogId = env.CDB_CATALOG.idFromName("global");
             const catalog = env.CDB_CATALOG.get(catalogId) as unknown as {
-                mutateAuth(args: {
-                    readonly model: string;
-                    readonly op: "create";
-                    readonly payload: Record<string, unknown>;
-                }): Promise<unknown>;
+                mutateAuth(
+                    args: {
+                        readonly model: string;
+                        readonly op: "create";
+                        readonly payload: Record<string, unknown>;
+                    },
+                    _recoveryGeneration: number
+                ): Promise<unknown>;
                 route(vshard: number): Promise<{ readonly shardId: string }>;
             };
             const now = Date.parse("2026-08-25T00:00:00Z");
-            await catalog.mutateAuth({
-                model: "user",
-                op: "create",
-                payload: {
-                    id: OTHER_USER_ID,
-                    name: "Other Planned Query User",
-                    email: "planned-query-other@example.com",
-                    emailVerified: true,
-                    createdAt: now,
-                    updatedAt: now,
+            await catalog.mutateAuth(
+                {
+                    model: "user",
+                    op: "create",
+                    payload: {
+                        id: OTHER_USER_ID,
+                        name: "Other Planned Query User",
+                        email: "planned-query-other@example.com",
+                        emailVerified: true,
+                        createdAt: now,
+                        updatedAt: now,
+                    },
                 },
-            });
-            await catalog.mutateAuth({
-                model: "member",
-                op: "create",
-                payload: {
-                    id: "planned-query-member-other",
-                    organizationId: OTHER_ORGANIZATION_ID,
-                    userId: OTHER_USER_ID,
-                    role: "member",
-                    createdAt: now,
+                0
+            );
+            await catalog.mutateAuth(
+                {
+                    model: "member",
+                    op: "create",
+                    payload: {
+                        id: "planned-query-member-other",
+                        organizationId: OTHER_ORGANIZATION_ID,
+                        userId: OTHER_USER_ID,
+                        role: "member",
+                        createdAt: now,
+                    },
                 },
-            });
+                0
+            );
             return Response.json(await catalog.route(Number(vshardOf([OTHER_ORGANIZATION_ID]))));
         }
         if (url.pathname === "/binding-select") {

@@ -178,11 +178,48 @@ describe("generated tutorial flow", () => {
         expect(versionOne).toContain('"digest": "0fd0fcf9a9449e01fdeeb9834234b794a8d6b20b8031319aa0734b2ea03481f7"');
         expect(versionOne).toContain(".initialMigration");
         expect(JSON.parse(snapshotOne)).toEqual(SCAFFOLD_INITIAL_SNAPSHOT);
-        expect(readme).toContain(
-            "run `bunx @chardb/core migrations generate --name <name>` to append the next sequential version"
-        );
-        expect(readme).toContain("verifies the full JSON digest chain, every generated TypeScript file");
+        expect(readme).toContain("bunx @chardb/core migrations generate --name add_messages");
         expect(readme).not.toContain("shards split");
         expect(readme).not.toContain("virtual-shard range");
+    });
+
+    test("keeps local development isolated from deployed origins and secrets", async () => {
+        const { ctx, files } = generatedProject();
+        await runInit(ctx, { name: "local-boundary" });
+
+        const dev = files.get("/tmp/generated/scripts/dev.mjs") ?? "";
+        const vite = files.get("/tmp/generated/vite.config.ts") ?? "";
+        const worker = files.get("/tmp/generated/src/worker.ts") ?? "";
+        const workerIdentity = worker.match(/deploymentId: "(chardb\.app\.v1\/[^"]+)"/)?.[1];
+        expect(workerIdentity).toMatch(
+            /^chardb\.app\.v1\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+        );
+
+        expect(dev).toContain('process.env.CHARDB_DEV_URL, "http://127.0.0.1:8787"');
+        expect(dev).toContain('process.env.CHARDB_DEV_WEB_URL, "http://127.0.0.1:5173"');
+        expect(dev).toContain("process.env.CHARDB_DEV_PERSIST_TO");
+        expect(vite).toContain('process.env.CHARDB_DEV_URL, "http://127.0.0.1:8787"');
+        expect(vite).toContain('throw new Error(name + " must be a loopback HTTP origin")');
+        expect(dev).toContain('throw new Error(name + " must be a loopback HTTP origin")');
+
+        for (const productionVariable of ["CHARDB_URL", "CHARDB_WEB_URL", "CHARDB_ADMIN_TOKEN", "BETTER_AUTH_SECRET"]) {
+            expect(dev).not.toContain(`process.env.${productionVariable}`);
+            expect(dev).toContain(`delete env.${productionVariable}`);
+        }
+        expect(vite).not.toContain("process.env.CHARDB_URL");
+        expect(dev).not.toContain("production-admin-token");
+        expect(dev).not.toContain("production-better-auth-secret");
+        expect(dev).toContain(`const deploymentId = "${workerIdentity}"`);
+        expect(worker).toContain(`deploymentId: "${workerIdentity}"`);
+        expect(files.get("/tmp/generated/test/worker.test.ts")).toContain(`deploymentId: "${workerIdentity}"`);
+        expect(files.get("/tmp/generated/scripts/setup-cloudflare.mjs")).toContain(
+            `const deploymentId = "${workerIdentity}"`
+        );
+        expect(files.get("/tmp/generated/scripts/deploy.mjs")).toContain(`const deploymentId = "${workerIdentity}"`);
+
+        const packageJson = JSON.parse(files.get("/tmp/generated/package.json") ?? "null");
+        expect(packageJson.engines).toEqual({ node: ">=22", bun: ">=1.2.22" });
+        expect(packageJson.devDependencies.wrangler).toBe("4.125.0");
+        expect(files.get("/tmp/generated/scripts/deploy.mjs")).toContain('const pinnedWranglerVersion = "4.125.0"');
     });
 });

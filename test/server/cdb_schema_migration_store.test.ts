@@ -61,6 +61,7 @@ describe("Cdb schema migration store", () => {
 
         const active = store.provisionFresh(
             {
+                recoveryGeneration: 0,
                 migrationId: "reshard-dest:empty-v0",
                 targetVersion: 0,
                 targetEpoch: 1,
@@ -114,6 +115,7 @@ describe("Cdb schema migration store", () => {
 
         const active = store.provisionFresh(
             {
+                recoveryGeneration: 0,
                 migrationId: "reshard-dest-v2",
                 targetVersion: 2,
                 targetEpoch: 7,
@@ -157,6 +159,7 @@ describe("Cdb schema migration store", () => {
         expect(
             store.provisionFresh(
                 {
+                    recoveryGeneration: 0,
                     migrationId: "reshard-dest-v2",
                     targetVersion: 2,
                     targetEpoch: 7,
@@ -174,6 +177,7 @@ describe("Cdb schema migration store", () => {
         expect(() =>
             store.provisionFresh(
                 {
+                    recoveryGeneration: 0,
                     migrationId: "schema-migration-id-collision",
                     targetVersion: 2,
                     targetEpoch: 7,
@@ -204,6 +208,7 @@ describe("Cdb schema migration store", () => {
             expect(() =>
                 store.provisionFresh(
                     {
+                        recoveryGeneration: 0,
                         migrationId: `reshard-${failure}`,
                         targetVersion: 1,
                         targetEpoch: 9,
@@ -245,6 +250,7 @@ describe("Cdb schema migration store", () => {
         expect(() =>
             store.provisionFresh(
                 {
+                    recoveryGeneration: 0,
                     migrationId: "reshard-fresh-reject",
                     targetVersion: 1,
                     targetEpoch: 2,
@@ -280,6 +286,7 @@ describe("Cdb schema migration store", () => {
 
         const prepared = store.prepare(
             {
+                recoveryGeneration: 0,
                 migrationId: "store-v1",
                 activeVersion: 0,
                 activeDigest: migrationDigestAt(journal, 0),
@@ -290,10 +297,10 @@ describe("Cdb schema migration store", () => {
             journal
         );
         expect(prepared).toMatchObject({ status: "migrating", migrationId: "store-v1", targetEpoch: 2 });
-        expect(store.apply({ migrationId: "store-v1", version: 1 }, journal)).toMatchObject({
+        expect(store.apply({ recoveryGeneration: 0, migrationId: "store-v1", version: 1 }, journal)).toMatchObject({
             status: "migrating",
         });
-        expect(store.apply({ migrationId: "store-v1", version: 1 }, journal)).toMatchObject({
+        expect(store.apply({ recoveryGeneration: 0, migrationId: "store-v1", version: 1 }, journal)).toMatchObject({
             status: "migrating",
         });
         expect(db.query('SELECT id, value FROM "store_probe"').all()).toEqual([{ id: "probe", value: "applied" }]);
@@ -301,7 +308,7 @@ describe("Cdb schema migration store", () => {
 
         let reconciliations = 0;
         const active = store.activate(
-            { migrationId: "store-v1" },
+            { recoveryGeneration: 0, migrationId: "store-v1" },
             () => journal,
             () => {
                 reconciliations += 1;
@@ -310,7 +317,7 @@ describe("Cdb schema migration store", () => {
         expect(active).toMatchObject({ activeVersion: 1, activeEpoch: 2, status: "active" });
         expect(
             store.activate(
-                { migrationId: "store-v1" },
+                { recoveryGeneration: 0, migrationId: "store-v1" },
                 () => journal,
                 () => void 0
             )
@@ -339,6 +346,7 @@ describe("Cdb schema migration store", () => {
         store.initialize(journal);
         store.prepare(
             {
+                recoveryGeneration: 0,
                 migrationId: "broken-v1",
                 activeVersion: 0,
                 activeDigest: migrationDigestAt(journal, 0),
@@ -349,7 +357,7 @@ describe("Cdb schema migration store", () => {
             journal
         );
 
-        expect(() => store.apply({ migrationId: "broken-v1", version: 1 }, journal)).toThrow();
+        expect(() => store.apply({ recoveryGeneration: 0, migrationId: "broken-v1", version: 1 }, journal)).toThrow();
         expect(db.query("SELECT sql FROM sqlite_master WHERE name = 'rolled_back_probe'").get()).toBeNull();
         expect(db.query("SELECT COUNT(*) AS count FROM _chardb_schema_steps").get()).toEqual({ count: 0 });
         expect(store.state()).toMatchObject({ status: "migrating", migrationId: "broken-v1" });
@@ -370,6 +378,7 @@ describe("Cdb schema migration store", () => {
         store.initialize(journal);
         store.prepare(
             {
+                recoveryGeneration: 0,
                 migrationId: "activation-v1",
                 activeVersion: 0,
                 activeDigest: migrationDigestAt(journal, 0),
@@ -379,11 +388,11 @@ describe("Cdb schema migration store", () => {
             },
             journal
         );
-        store.apply({ migrationId: "activation-v1", version: 1 }, journal);
+        store.apply({ recoveryGeneration: 0, migrationId: "activation-v1", version: 1 }, journal);
 
         expect(() =>
             store.activate(
-                { migrationId: "activation-v1" },
+                { recoveryGeneration: 0, migrationId: "activation-v1" },
                 () => journal,
                 sql => {
                     sql.exec('INSERT INTO "domain_reconciliation" ("id") VALUES (?)', "rolled-back");

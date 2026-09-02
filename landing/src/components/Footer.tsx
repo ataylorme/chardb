@@ -1,5 +1,3 @@
-import { GITHUB_URL } from "../lib/constants";
-
 export function Footer() {
     return (
         <footer className="border-t border-line">
@@ -8,11 +6,7 @@ export function Footer() {
                 <span aria-hidden="true">·</span>
                 <span>MIT</span>
                 <span aria-hidden="true">·</span>
-                <a href={GITHUB_URL} rel="noopener" className="hover:text-fg transition-colors">
-                    GitHub
-                </a>
-                <span aria-hidden="true">·</span>
-                <span>infrastructure billed by Cloudflare · no Chardb service fee</span>
+                <span>infrastructure billed by Cloudflare · no CharDB service fee</span>
             </div>
         </footer>
     );

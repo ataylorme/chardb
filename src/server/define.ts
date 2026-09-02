@@ -250,7 +250,7 @@ export function defineMutation<TDb, TArgs extends Record<string, unknown>, TResu
         const wrappedCtx = wrapCtxDb(ctx) as MutationCtx<TDb>;
         return handler(wrappedCtx, args);
     };
-    // Chardb's pragmatic defaults for the config-object form (Phase 1 of
+    // CharDB's pragmatic defaults for the config-object form (Phase 1 of
     // the "just makes sense" cluster):
     //   - declaring `partitionKey` implies `singlePartition: true` —
     //     extracting a key only makes sense when the mutation lives in
@@ -338,7 +338,7 @@ export interface PlannedQueryConfig<TDb, TArgs extends Record<string, unknown>, 
     /** Stable across Wrangler, Vite, browser, Gateway, and Cdb builds. */
     readonly ref: string;
     readonly args?: StandardSchemaV1<unknown, TArgs>;
-    /** Pure synchronous builder. Chardb compiles it before Catalog and executes it inside Cdb. */
+    /** Pure synchronous builder. CharDB compiles it before Catalog and executes it inside Cdb. */
     readonly query: (db: TDb, args: TArgs) => TBuilder;
 }
 
@@ -349,7 +349,7 @@ export interface PlannedQueryBuilder {
 type PlannedQueryResult<TBuilder extends PlannedQueryBuilder> = TBuilder["_"]["result"];
 
 /**
- * Define a planned read. Chardb compiles the Drizzle builder before routing
+ * Define a planned read. CharDB compiles the Drizzle builder before routing
  * and executes the canonical plan inside the target Cdb shard.
  */
 export function defineQuery<TDb, TArgs extends Record<string, unknown>, TBuilder extends PlannedQueryBuilder>(

@@ -208,6 +208,7 @@ export class GatewaySnapshotMaterializer {
                     placement: { authority: rerouted.authority, partitionKey: run.organizationId },
                     auth: projected.auth,
                     schemaEpoch: route.schemaEpoch,
+                    recoveryGeneration: route.recoveryGeneration,
                     vshard,
                     domainSchemaEpoch: route.domainSchemaEpoch,
                 })
@@ -224,6 +225,7 @@ export class GatewaySnapshotMaterializer {
                         shardId: route.shardId,
                         sourceCdbId: run.sourceCdbId,
                         schemaEpoch: route.schemaEpoch,
+                        recoveryGeneration: route.recoveryGeneration,
                         domainSchemaEpoch: route.domainSchemaEpoch,
                         authEpochs: projected.auth.authEpochs ?? { global: 0, tenant: 0, principal: 0 },
                     });
@@ -266,6 +268,7 @@ export class GatewaySnapshotMaterializer {
                 shardId: route.shardId,
                 sourceCdbId: run.sourceCdbId,
                 schemaEpoch: route.schemaEpoch,
+                recoveryGeneration: route.recoveryGeneration,
                 domainSchemaEpoch: route.domainSchemaEpoch,
                 authEpochs: projected.auth.authEpochs ?? { global: 0, tenant: 0, principal: 0 },
             });
@@ -323,6 +326,7 @@ export class GatewaySnapshotMaterializer {
                 targetVersion: run.targetVersion,
                 cookie: Cookie(`${identity.clientId}:${run.targetVersion}:${crypto.randomUUID()}`),
                 rows: response.result,
+                recoveryGeneration: route.recoveryGeneration,
                 authEpochs,
                 nowMs: settledAt,
             });

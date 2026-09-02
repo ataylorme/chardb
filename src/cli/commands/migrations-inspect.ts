@@ -24,7 +24,7 @@ export async function runMigrationsInspect(
     const schemaModule = (await import(pathToFileURL(`${ctx.cwd}/src/schema.ts`).href)) as Record<string, unknown>;
     const auth = authModule.auth;
     if (typeof auth !== "object" || auth === null || !("options" in auth)) {
-        throw new Error('src/auth.ts must export the named Chardb auth value "auth"');
+        throw new Error('src/auth.ts must export the named CharDB auth value "auth"');
     }
     const authOptions = (auth as { readonly options?: unknown }).options;
     if (typeof authOptions !== "object" || authOptions === null) {

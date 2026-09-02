@@ -50,9 +50,9 @@ function addSubscription(
     db.prepare(
         `INSERT INTO _chardb_live_subscriptions
           (gateway_id, registration_id, connection_id, client_id, sub_id, state,
-           payload_hash, principal_id, organization_id, authority, schema_epoch, vshard,
+           payload_hash, principal_id, organization_id, authority, schema_epoch, recovery_generation, vshard,
            domain_schema_epoch, ref, args_json, policy_digest, query_hash, tables_json, intervals_json)
-         VALUES (?, ?, ?, ?, 1, 'active', 'payload', ?, ?, 'organization', 1, 0, 1,
+         VALUES (?, ?, ?, ?, 1, 'active', 'payload', ?, ?, 'organization', 1, 0, 0, 1,
                  'messages.list', '{}', 'policy', 'query', '[]', '{}')`
     ).run(
         gatewayId,
@@ -84,14 +84,14 @@ describe("Cdb auth invalidation store", () => {
     afterEach(() => db.close());
 
     test("dirties only active registrations matching an exact tenant or principal scope", () => {
-        const tenant = store.apply({ scope: "tenant", scopeId: "org-a", epoch: 2 }, 100);
+        const tenant = store.apply({ recoveryGeneration: 0, scope: "tenant", scopeId: "org-a", epoch: 2 }, 100);
         expect(tenant).toMatchObject({ registrations: 2, changeSeq: 1 });
         expect(
             db.query("SELECT registration_id FROM _chardb_invalidation_outbox ORDER BY registration_id").all()
         ).toEqual([{ registration_id: "org-a-user-a" }, { registration_id: "org-a-user-b" }]);
 
         db.run("DELETE FROM _chardb_invalidation_outbox");
-        const principal = store.apply({ scope: "principal", scopeId: "user-a", epoch: 3 }, 200);
+        const principal = store.apply({ recoveryGeneration: 0, scope: "principal", scopeId: "user-a", epoch: 3 }, 200);
         expect(principal).toMatchObject({ registrations: 2, changeSeq: 2 });
         expect(
             db.query("SELECT registration_id FROM _chardb_invalidation_outbox ORDER BY registration_id").all()
@@ -99,16 +99,20 @@ describe("Cdb auth invalidation store", () => {
     });
 
     test("global scope reaches every active registration without broadening scoped work", () => {
-        expect(store.apply({ scope: "global", scopeId: "global", epoch: 4 }, 100)).toMatchObject({
-            registrations: 4,
-            changeSeq: 1,
-        });
+        expect(store.apply({ recoveryGeneration: 0, scope: "global", scopeId: "global", epoch: 4 }, 100)).toMatchObject(
+            {
+                registrations: 4,
+                changeSeq: 1,
+            }
+        );
         expect(db.query("SELECT COUNT(*) AS count FROM _chardb_invalidation_outbox").get()).toEqual({ count: 4 });
     });
 
     test("a fresh destination records a zero-impact epoch without advancing its change clock", () => {
         db.run("DELETE FROM _chardb_live_subscriptions");
-        expect(store.apply({ scope: "principal", scopeId: "user-before-provision", epoch: 2 }, 100)).toMatchObject({
+        expect(
+            store.apply({ recoveryGeneration: 0, scope: "principal", scopeId: "user-before-provision", epoch: 2 }, 100)
+        ).toMatchObject({
             registrations: 0,
             changeSeq: 0,
         });
@@ -118,7 +122,7 @@ describe("Cdb auth invalidation store", () => {
     });
 
     test("reconstructs exact results after eviction and rejects delayed older epochs", () => {
-        const request = { scope: "tenant" as const, scopeId: "org-a", epoch: 5 };
+        const request = { recoveryGeneration: 0, scope: "tenant" as const, scopeId: "org-a", epoch: 5 };
         const first = store.apply(request, 100);
         const retry = new CdbAuthInvalidationStore(store.sql).apply(request, 200);
         const delayed = new CdbAuthInvalidationStore(store.sql).apply({ ...request, epoch: 4 }, 300);
@@ -131,6 +135,7 @@ describe("Cdb auth invalidation store", () => {
 
     test("never reflects extra transport fields into its response contract", () => {
         const request = {
+            recoveryGeneration: 0,
             scope: "tenant" as const,
             scopeId: "org-a",
             epoch: 2,
@@ -143,6 +148,7 @@ describe("Cdb auth invalidation store", () => {
             "accepted",
             "changeSeq",
             "epoch",
+            "recoveryGeneration",
             "registrations",
             "scope",
             "scopeId",
@@ -151,6 +157,7 @@ describe("Cdb auth invalidation store", () => {
             scope: "tenant",
             scopeId: "org-a",
             epoch: 2,
+            recoveryGeneration: 0,
             accepted: true,
             registrations: 2,
             changeSeq: 1,
@@ -160,7 +167,7 @@ describe("Cdb auth invalidation store", () => {
     test("rolls the watermark and existing outbox back with the surrounding transaction", () => {
         expect(() =>
             db.transaction(() => {
-                store.apply({ scope: "tenant", scopeId: "org-a", epoch: 2 }, 100);
+                store.apply({ recoveryGeneration: 0, scope: "tenant", scopeId: "org-a", epoch: 2 }, 100);
                 throw new Error("lost transaction");
             })()
         ).toThrow("lost transaction");
@@ -182,7 +189,9 @@ describe("Cdb auth invalidation store", () => {
             for (let index = 0; index < CDB_AUTH_INVALIDATION_SCOPE_LIMIT; index++) insert.run(`full-${index}`);
         })();
         addSubscription(db, "overflow", "user-overflow", "org-overflow");
-        expect(() => store.apply({ scope: "tenant", scopeId: "org-overflow", epoch: 2 }, 100)).not.toThrow();
+        expect(() =>
+            store.apply({ recoveryGeneration: 0, scope: "tenant", scopeId: "org-overflow", epoch: 2 }, 100)
+        ).not.toThrow();
         expect(db.query("SELECT COUNT(*) AS count FROM _chardb_auth_invalidation_epochs").get()).toEqual({ count: 1 });
 
         db.run("UPDATE _chardb_live_subscriptions SET organization_id = 'org-second'");
@@ -191,6 +200,8 @@ describe("Cdb auth invalidation store", () => {
             for (let index = 0; index < CDB_AUTH_INVALIDATION_SCOPE_LIMIT; index++) insert.run(`full-${index}`);
         })();
         db.run("UPDATE _chardb_live_subscriptions SET organization_id = 'full-0'");
-        expect(() => store.apply({ scope: "tenant", scopeId: "full-0", epoch: 2 }, 200)).not.toThrow();
+        expect(() =>
+            store.apply({ recoveryGeneration: 0, scope: "tenant", scopeId: "full-0", epoch: 2 }, 200)
+        ).not.toThrow();
     });
 });

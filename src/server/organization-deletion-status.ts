@@ -7,6 +7,7 @@ export interface OrganizationDeletionStatusCdbRpc {
         readonly organizationId: string;
         readonly schemaEpoch: number;
         readonly domainSchemaEpoch: number;
+        readonly recoveryGeneration: number;
     }): Promise<CdbVectorOrganizationPurgeStatus | null>;
 }
 
@@ -26,6 +27,7 @@ function sameRoute(left: RouteResult, right: RouteResult): boolean {
     return (
         left.shardId === right.shardId &&
         left.schemaEpoch === right.schemaEpoch &&
+        left.recoveryGeneration === right.recoveryGeneration &&
         left.domainSchemaEpoch === right.domainSchemaEpoch
     );
 }
@@ -107,6 +109,7 @@ export async function readCurrentOwnerVectorPurgeStatus(input: {
                 organizationId: input.organizationId,
                 schemaEpoch: before.schemaEpoch,
                 domainSchemaEpoch: before.domainSchemaEpoch,
+                recoveryGeneration: before.recoveryGeneration,
             });
         } catch (error) {
             const afterFailure = await input.deps.route(input.vshard);

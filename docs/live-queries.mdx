@@ -33,11 +33,11 @@ export const listMessages = api.query({
 
 Keep `ref` stable after release. It identifies the query across the browser bundle, Worker, reconnects, and pending subscriptions.
 
-The organization predicate is required even though Chardb also applies the ownership policy. It tells the router which partition can answer the query.
+The organization predicate is required even though CharDB also applies the ownership policy. It tells the router which partition can answer the query.
 
 ## Subscribe in React
 
-Configure one client with the public Worker URL and the same Better Auth client. Chardb derives `/ws` from this URL.
+Configure one client with the public Worker URL and the same Better Auth client. CharDB derives `/ws` from this URL.
 
 ```tsx src/web/App.tsx
 const workerUrl = window.location.origin;
@@ -69,7 +69,7 @@ export function MessageList() {
 }
 ```
 
-`pending` means the first snapshot has not arrived. `live` means the subscription is current. `refetching` means Chardb could not safely resume an earlier snapshot and is replacing it.
+`pending` means the first snapshot has not arrived. `live` means the subscription is current. `refetching` means CharDB could not safely resume an earlier snapshot and is replacing it.
 
 ## Write through a mutation
 

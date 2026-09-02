@@ -34,7 +34,7 @@ describe("native loopback binding resolution", () => {
         expect(resolved.DB).toBe(explicit);
     });
 
-    test("maps exported class names onto Chardb's internal environment", () => {
+    test("maps exported class names onto CharDB's internal environment", () => {
         const rawEnv = { APP_SETTING: "kept" };
         const catalog = namespace("catalog");
         const cdb = namespace("cdb");

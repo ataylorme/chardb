@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { CDB_ERROR_CODES, CdbError } from "../../src/errors.ts";
 import { cdbHttpErrorResponse, httpStatusForCdbError } from "../../src/server/http-errors.ts";
 
-describe("Chardb HTTP errors", () => {
+describe("CharDB HTTP errors", () => {
     test("maps the stable error-code surface to valid failure statuses", () => {
         for (const code of CDB_ERROR_CODES) {
             const status = httpStatusForCdbError(code);

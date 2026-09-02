@@ -98,8 +98,8 @@ describe("Cdb file store on real Durable Object SQLite", () => {
             readonly object: { readonly customMetadata: Record<string, string> };
         };
         expect(uploaded.object.customMetadata).toEqual({
-            chardbFileId: firstUpload.file.fileId,
-            chardbSha256: firstUpload.file.sha256,
+            chardbRetainedSha256: firstUpload.file.sha256,
+            chardbRetainedSize: "12",
         });
         const seeded = (await (await mf.dispatchFetch("http://example.com/seed")).json()) as Record<string, unknown>;
         expect(seeded).toMatchObject({

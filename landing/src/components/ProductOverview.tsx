@@ -1,51 +1,117 @@
 import { useState } from "react";
-import { GITHUB_URL } from "../lib/constants";
+
+type CodeLanguage = "rust" | "typescript";
+
+const CODE_TOKEN =
+    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b/g;
+const TYPESCRIPT_KEYWORDS = new Set([
+    "as",
+    "async",
+    "await",
+    "const",
+    "export",
+    "from",
+    "function",
+    "if",
+    "import",
+    "new",
+    "return",
+    "true",
+]);
+const RUST_KEYWORDS = new Set([
+    "as",
+    "async",
+    "await",
+    "break",
+    "const",
+    "derive",
+    "if",
+    "let",
+    "loop",
+    "mut",
+    "struct",
+    "use",
+]);
+
+function syntaxClass(source: string, token: string, index: number, language: CodeLanguage): string {
+    if (token.startsWith("//") || token.startsWith("/*")) return "syntax-comment";
+    if (token.startsWith('"') || token.startsWith("'")) return "syntax-string";
+    if (/^\d/.test(token)) return "syntax-number";
+    if ((language === "rust" ? RUST_KEYWORDS : TYPESCRIPT_KEYWORDS).has(token)) return "syntax-keyword";
+    if (/^[A-Z]/.test(token)) return "syntax-type";
+
+    const before = source.slice(0, index).trimEnd().at(-1);
+    const after = source
+        .slice(index + token.length)
+        .trimStart()
+        .at(0);
+    if (before === ".") return "syntax-property";
+    if (after === "(" || after === "!") return "syntax-function";
+    return "syntax-variable";
+}
+
+function highlightCode(source: string, language: CodeLanguage) {
+    const nodes: Array<string | React.JSX.Element> = [];
+    let cursor = 0;
+
+    for (const match of source.matchAll(CODE_TOKEN)) {
+        const index = match.index ?? 0;
+        if (index > cursor) nodes.push(source.slice(cursor, index));
+        nodes.push(
+            <span className={syntaxClass(source, match[0], index, language)} key={`${index}-${match[0]}`}>
+                {match[0]}
+            </span>
+        );
+        cursor = index + match[0].length;
+    }
+    if (cursor < source.length) nodes.push(source.slice(cursor));
+    return nodes;
+}
 
 function DatabaseSnippet() {
     return (
         <code>
-            <span className="syntax-comment">{"// Better Auth config"}</span>
-            {"\n"}
-            <span className="syntax-keyword">export const</span> <span className="syntax-variable">auth</span> {"= "}
-            <span className="syntax-function">defineAuth</span>
-            <span className="syntax-punctuation">({"{"}</span>
-            {"\n  "}
-            <span className="syntax-property">plugins</span>: [<span className="syntax-function">anonymous</span>(),{" "}
-            <span className="syntax-function">organization</span>(), <span className="syntax-function">jwt</span>()],
-            {"\n"}
-            <span className="syntax-punctuation">{"});"}</span>
-            {"\n\n"}
-            <span className="syntax-comment">{"// Drizzle + Better Auth ownership"}</span>
-            {"\n"}
-            <span className="syntax-keyword">const</span> {"{ "}
-            <span className="syntax-variable">cdbTable</span>
-            {" } = "}
-            <span className="syntax-function">forOrg</span>
-            <span className="syntax-punctuation">(auth);</span>
-            {"\n\n"}
-            <span className="syntax-keyword">export const</span> <span className="syntax-variable">messages</span>{" "}
-            {"= "}
-            <span className="syntax-function">cdbTable</span>
-            <span className="syntax-punctuation">(</span>
-            <span className="syntax-string">"messages"</span>
-            <span className="syntax-punctuation">, {"{"}</span>
-            {"\n  "}
-            <span className="syntax-property">id</span>: <span className="syntax-function">text</span>(
-            <span className="syntax-string">"id"</span>).<span className="syntax-function">primaryKey</span>(),
-            {"\n  "}
-            <span className="syntax-property">body</span>: <span className="syntax-function">text</span>(
-            <span className="syntax-string">"body"</span>).<span className="syntax-function">notNull</span>(),
-            {"\n"}
-            <span className="syntax-punctuation">{"});"}</span>
-            {"\n\n"}
-            <span className="syntax-keyword">export default</span> <span className="syntax-function">chardb</span>
-            <span className="syntax-punctuation">({"{"}</span>
-            {"\n  "}
-            <span className="syntax-property">auth</span>, <span className="syntax-property">schema</span>: {"{ "}
-            <span className="syntax-variable">messages</span>
-            {" },"}
-            {"\n"}
-            <span className="syntax-punctuation">{"});"}</span>
+            {highlightCode(
+                `// src/auth.ts
+import { defineAuth } from "@chardb/core/server";
+import { anonymous } from "better-auth/plugins/anonymous";
+import { jwt } from "better-auth/plugins/jwt";
+import { organization } from "better-auth/plugins/organization";
+
+export const auth = defineAuth({
+  plugins: [anonymous(), organization(), jwt()],
+});
+
+// src/schema.ts
+import { forOrg } from "@chardb/core/server";
+import { text } from "drizzle-orm/sqlite-core";
+import { auth } from "./auth.ts";
+
+const { cdbTable } = forOrg(auth);
+export const messages = cdbTable("messages", {
+  id: text("id").primaryKey(),
+  body: text("body").notNull(),
+});
+
+// src/worker.ts
+import { chardb } from "@chardb/core/server";
+import { auth } from "./auth.ts";
+import * as api from "./messages.ts";
+import { migrations } from "./migrations.ts";
+import * as schema from "./schema.ts";
+
+const app = chardb({
+  ownership: "organization",
+  auth,
+  schema,
+  api,
+  migrations,
+});
+
+export default app;
+export const { DB, Catalog, Cdb, Gateway, Resharder } = app;`,
+                "typescript"
+            )}
         </code>
     );
 }
@@ -53,79 +119,56 @@ function DatabaseSnippet() {
 function ReactClientSnippet() {
     return (
         <code>
-            <span className="syntax-keyword">import</span> {"{ "}
-            <span className="syntax-function">createChardbReactClient</span>
-            {" } "}
-            <span className="syntax-keyword">from</span> <span className="syntax-string">"@chardb/react"</span>
-            <span className="syntax-punctuation">;</span>
-            {"\n\n"}
-            <span className="syntax-keyword">const</span> <span className="syntax-variable">url</span> {"= "}
-            <span className="syntax-variable">import</span>.<span className="syntax-property">meta</span>.
-            <span className="syntax-property">env</span>.<span className="syntax-property">VITE_CHARD_DB_URL</span>
-            {" ?? "}
-            <span className="syntax-variable">window</span>.<span className="syntax-property">location</span>.
-            <span className="syntax-property">origin</span>
-            <span className="syntax-punctuation">;</span>
-            {"\n\n"}
-            <span className="syntax-keyword">export const</span> <span className="syntax-variable">db</span> {"= "}
-            <span className="syntax-function">createChardbReactClient</span>
-            <span className="syntax-punctuation">({"{"}</span>
-            {"\n  "}
-            <span className="syntax-property">url</span>,{"\n  "}
-            <span className="syntax-property">ownership</span>: <span className="syntax-string">"organization"</span>,
-            {"\n  "}
-            <span className="syntax-property">auth</span>: ({"{ "}
-            <span className="syntax-property">baseURL</span> {"}"}) ={">"}{" "}
-            <span className="syntax-function">createAuthClient</span>({"{"}
-            {"\n    "}
-            <span className="syntax-property">baseURL</span>, <span className="syntax-property">plugins</span>: [
-            <span className="syntax-function">anonymousClient</span>(),{" "}
-            <span className="syntax-function">organizationClient</span>(),{" "}
-            <span className="syntax-function">jwtClient</span>()],
-            {"\n  "}
-            {"}"}),{"\n"}
-            <span className="syntax-punctuation">{"});"}</span>
-            {"\n\n"}
-            <span className="syntax-keyword">const</span> <span className="syntax-variable">signIn</span> {"= () => "}
-            <span className="syntax-variable">db</span>.<span className="syntax-property">auth</span>.
-            <span className="syntax-property">signIn</span>.<span className="syntax-function">anonymous</span>();
-            {"\n\n"}
-            <span className="syntax-keyword">export function</span> <span className="syntax-function">App</span>() {"{"}
-            {"\n  "}
-            <span className="syntax-keyword">const</span> <span className="syntax-variable">session</span> {"= "}
-            <span className="syntax-variable">db</span>.<span className="syntax-property">auth</span>.
-            <span className="syntax-function">useSession</span>();
-            {"\n  "}
-            <span className="syntax-keyword">if</span> (!<span className="syntax-variable">session</span>.
-            <span className="syntax-property">data</span>) {"return <button onClick={signIn}>Sign in</button>;"}
-            {"\n  "}
-            <span className="syntax-keyword">return</span> {"<db.Provider><Workspace />"}
-            {"\n    <button onClick={() => db.auth.signOut()}>Sign out</button>"}
-            {"\n  </db.Provider>;"}
-            {"\n"}
-            {"}"}
-            {"\n\n"}
-            <span className="syntax-keyword">function</span> <span className="syntax-function">Workspace</span>() {"{"}
-            {"\n  "}
-            <span className="syntax-keyword">const</span> <span className="syntax-variable">identity</span> {"= "}
-            <span className="syntax-variable">db</span>.<span className="syntax-function">useIdentity</span>();
-            {"\n  "}
-            <span className="syntax-keyword">const</span> {"{ "}
-            <span className="syntax-variable">data</span>
-            {" } = "}
-            <span className="syntax-variable">db</span>.<span className="syntax-function">useQuery</span>(
-            <span className="syntax-variable">listMessages</span>, {"{"}
-            {"\n    "}
-            <span className="syntax-property">limit</span>: <span className="syntax-number">50</span>,{"\n  "}
-            {"});"}
-            {"\n  "}
-            <span className="syntax-keyword">if</span> (<span className="syntax-variable">identity</span>.
-            <span className="syntax-property">status</span> !== <span className="syntax-string">"ready"</span>){" "}
-            {"return <ChooseOrganization />;"}
-            {"\n  "}
-            <span className="syntax-keyword">return</span> {"<MessageList user={identity.user} data={data} />;"}
-            {"\n"}
-            {"}"}
+            {highlightCode(
+                `import { createChardbReactClient } from "@chardb/react";
+import { anonymousClient, jwtClient, organizationClient } from "better-auth/client/plugins";
+import { createAuthClient } from "better-auth/react";
+import { listMessages } from "./messages.ts";
+
+export const db = createChardbReactClient({
+  url: window.location.origin,
+  ownership: "organization",
+  auth: ({ baseURL }) => createAuthClient({
+    baseURL,
+    plugins: [anonymousClient(), organizationClient(), jwtClient()],
+  }),
+});
+
+async function createOrganization() {
+  const suffix = crypto.randomUUID().slice(0, 8);
+  const created = await db.auth.organization.create({
+    name: "My organization",
+    slug: "my-organization-" + suffix,
+    keepCurrentActiveOrganization: true,
+  });
+  if (created.data) {
+    await db.auth.organization.setActive({ organizationId: created.data.id });
+  }
+}
+
+function Messages() {
+  const identity = db.useIdentity();
+  const messages = db.useQuery(listMessages, { limit: 50 });
+  if (identity.status === "select-organization") {
+    return <button onClick={createOrganization}>Create organization</button>;
+  }
+  return <p>{messages.data?.length ?? 0} messages</p>;
+}
+
+export function App() {
+  const session = db.auth.useSession();
+  if (!session.data) {
+    return <button onClick={() => db.auth.signIn.anonymous()}>Sign in</button>;
+  }
+  return (
+    <db.Provider>
+      <Messages />
+      <button onClick={() => db.auth.signOut()}>Sign out</button>
+    </db.Provider>
+  );
+}`,
+                "typescript"
+            )}
         </code>
     );
 }
@@ -133,43 +176,40 @@ function ReactClientSnippet() {
 function RustClientSnippet() {
     return (
         <code>
-            <span className="syntax-keyword">use</span> <span className="syntax-variable">crate</span>::
-            <span className="syntax-variable">operations</span>::{"{"}
-            <span className="syntax-type">ListMessagesArgs</span>,{" "}
-            <span className="syntax-variable">LIST_MESSAGES</span>
-            {"};\n"}
-            <span className="syntax-keyword">use</span> <span className="syntax-variable">chardb_client</span>::{"{"}
-            <span className="syntax-type">AsyncClient</span>, <span className="syntax-type">ClientConfig</span>,{" "}
-            <span className="syntax-type">SubscriptionEvent</span>
-            {"};\n\n"}
-            <span className="syntax-keyword">let</span> <span className="syntax-variable">client</span> {"= "}
-            <span className="syntax-type">AsyncClient</span>::<span className="syntax-function">connect</span>(
-            <span className="syntax-type">ClientConfig</span>::<span className="syntax-function">with_token</span>(
-            <span className="syntax-variable">endpoint</span>, <span className="syntax-variable">jwt</span>))
-            {"\n  ."}
-            <span className="syntax-keyword">await</span>?;
-            {"\n\n"}
-            <span className="syntax-keyword">let mut</span> <span className="syntax-variable">messages</span> {"= "}
-            <span className="syntax-variable">client</span>.<span className="syntax-function">subscribe</span>({"\n  "}
-            <span className="syntax-variable">LIST_MESSAGES</span>,{"\n  &"}
-            <span className="syntax-type">ListMessagesArgs</span> {"{"}
-            <span className="syntax-property"> organization_id</span>, <span className="syntax-property">limit</span>:{" "}
-            <span className="syntax-number">50</span> {"}"},{"\n"}
-            )?;
-            {"\n\n"}
-            <span className="syntax-keyword">loop</span> {"{"}
-            {"\n  "}
-            <span className="syntax-keyword">let</span> <span className="syntax-variable">event</span> {"= "}
-            <span className="syntax-variable">messages</span>.<span className="syntax-function">recv</span>().
-            <span className="syntax-keyword">await</span>?;
-            {"\n  "}
-            <span className="syntax-keyword">if</span> <span className="syntax-function">matches!</span>(
-            <span className="syntax-variable">event</span>, <span className="syntax-type">SubscriptionEvent</span>::
-            <span className="syntax-property">Closed</span>) {"{ break; }"}
-            {"\n  "}
-            <span className="syntax-function">render</span>(<span className="syntax-variable">event</span>);
-            {"\n"}
-            {"}"}
+            {highlightCode(
+                `// Application-authored types and operation handle.
+use chardb_client::{AsyncClient, ClientConfig, Query, SubscriptionEvent};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize)]
+struct ListMessagesArgs {
+  #[serde(rename = "organizationId")]
+  organization_id: String,
+  limit: u32,
+}
+
+#[derive(Deserialize)]
+struct Message { id: String, body: String }
+
+const LIST_MESSAGES: Query<ListMessagesArgs, Message> =
+  Query::new("messages#list");
+
+let client = AsyncClient::connect(
+  ClientConfig::with_token(endpoint, jwt)
+).await?;
+
+let mut messages = client.subscribe(
+  LIST_MESSAGES,
+  &ListMessagesArgs { organization_id, limit: 50 },
+)?;
+
+loop {
+  let event = messages.recv().await?;
+  if matches!(&event, SubscriptionEvent::Closed) { break; }
+  render(event);
+}`,
+                "rust"
+            )}
         </code>
     );
 }
@@ -177,12 +217,12 @@ function RustClientSnippet() {
 const clientSdks = [
     { name: "React", icon: "/brands/react.svg", fileIcon: "/brands/file-react-ts.svg", available: true },
     { name: "Rust", icon: "/brands/rust.svg", fileIcon: "/brands/file-rust.svg", available: true },
-    { name: "Python", icon: "/brands/python.svg", fileIcon: "/brands/python.svg", available: false },
-    { name: "Swift", icon: "/brands/swift.svg", fileIcon: "/brands/swift.svg", available: false },
-    { name: "Flutter", icon: "/brands/flutter.svg", fileIcon: "/brands/flutter.svg", available: false },
-    { name: "Expo", icon: "/brands/expo.svg", fileIcon: "/brands/expo.svg", available: false },
+    { name: "Python", icon: "/brands/python.svg", fileIcon: "/brands/file-typescript.svg", available: false },
+    { name: "Swift", icon: "/brands/swift.svg", fileIcon: "/brands/file-typescript.svg", available: false },
+    { name: "Flutter", icon: "/brands/flutter.svg", fileIcon: "/brands/file-typescript.svg", available: false },
+    { name: "Expo", icon: "/brands/expo.svg", fileIcon: "/brands/file-typescript.svg", available: false },
 ] as const;
-type ClientSdk = (typeof clientSdks)[number]["name"];
+type ClientSdk = "React" | "Rust";
 
 const moments = [
     {
@@ -208,7 +248,7 @@ export function ProductOverview() {
 
     return (
         <>
-            <section id="files" className="border-y border-line bg-ink-900/50">
+            <section id="worker-client" className="border-y border-line bg-ink-900/50">
                 <div className="mx-auto max-w-page px-5 py-20 sm:px-8 sm:py-28">
                     <div className="max-w-2xl">
                         <p className="eyebrow">Worker → client</p>
@@ -216,7 +256,7 @@ export function ProductOverview() {
                             Set up your Worker. Use it like an app SDK.
                         </h2>
                         <p className="mt-5 text-base leading-7 text-fg-muted">
-                            Pick organization or user ownership once. Chardb carries the successful Better Auth identity
+                            Pick organization or user ownership once. CharDB carries the successful Better Auth identity
                             through routing, policy, typed handles, and every client query.
                         </p>
                     </div>
@@ -234,7 +274,7 @@ export function ProductOverview() {
                                     width="18"
                                     height="18"
                                 />
-                                <code>src/database.ts</code>
+                                <code>Worker setup</code>
                                 <span className="code-surface">Worker</span>
                             </header>
                             <pre>
@@ -274,7 +314,7 @@ export function ProductOverview() {
                                             role="tab"
                                             aria-selected={clientSdk === sdk.name}
                                             disabled={!sdk.available}
-                                            onClick={() => setClientSdk(sdk.name)}
+                                            onClick={() => sdk.available && setClientSdk(sdk.name)}
                                             key={sdk.name}
                                         >
                                             <img
@@ -313,13 +353,7 @@ export function ProductOverview() {
                     </p>
                     <div className="flex items-center gap-5 text-sm">
                         <a href="/why/" className="text-fg hover:text-accent transition-colors">
-                            Why Chardb
-                        </a>
-                        <a href={GITHUB_URL} rel="noopener" className="text-fg hover:text-accent transition-colors">
-                            GitHub
-                        </a>
-                        <a href="/docs" className="text-fg-dim hover:text-fg transition-colors">
-                            Docs
+                            Why CharDB
                         </a>
                     </div>
                 </div>

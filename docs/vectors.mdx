@@ -3,7 +3,7 @@ title: "Vectors"
 description: "Write and search organization vectors through Vectorize."
 ---
 
-Vector columns are an opt-in organization feature. Chardb stores an opaque logical handle in SQLite and delivers the vector to Cloudflare Vectorize after the transaction commits.
+Vector columns are an opt-in organization feature. CharDB stores an opaque logical handle in SQLite and delivers the vector to Cloudflare Vectorize after the transaction commits.
 
 ## Declare the vector
 
@@ -22,12 +22,13 @@ export const messages = cdbTable("messages", {
 });
 ```
 
-Add the matching native binding to `wrangler.toml`, create the index, then prepare Chardb's required metadata index.
+Add the matching native binding to `wrangler.toml`, create the index, then prepare CharDB's required metadata index.
 
 ```toml wrangler.toml
 [[vectorize]]
 binding = "VECTORS"
 index_name = "my-app-vectors"
+remote = true
 ```
 
 ```bash
@@ -35,13 +36,15 @@ bunx wrangler vectorize create my-app-vectors --dimensions 768 --metric cosine
 bunx @chardb/core vectorize prepare
 ```
 
+Vectorize has no local emulator. `remote = true` makes local Wrangler development use the Cloudflare index.
+
 ## Write and delete
 
 Your application computes the embedding values. This release does not call an embedding model for you.
 
 ```ts src/api.ts
 export const putMessage = api.mutation({
-  ref: "src/api.ts#putMessage",
+  ref: "messages#put",
   authority: "organization",
   partitionKey: "organizationId",
   args: z.object({
@@ -67,7 +70,7 @@ Keep `ctx.vector.delete()` and the row deletion in the same mutation.
 
 ```ts src/queries.ts
 export const searchMessages = api.query({
-  ref: "src/queries.ts#searchMessages",
+  ref: "messages#search",
   args: z.object({
     organizationId: z.string(),
     values: z.array(z.number()).length(768),
@@ -77,4 +80,4 @@ export const searchMessages = api.query({
 });
 ```
 
-Search returns `{ rowPk, score }`. Chardb rejects stale, cross-organization, and policy-hidden Vectorize results against SQLite. Delivery and deletion are eventually consistent. A settled vector change invalidates the matching live search query and causes it to refetch.
+Search returns `{ rowPk, score }`. CharDB rejects stale, cross-organization, and policy-hidden Vectorize results against SQLite. Delivery and deletion are eventually consistent. A settled vector change invalidates the matching live search query and causes it to refetch.

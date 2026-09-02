@@ -5,7 +5,7 @@ export interface CloudflareVectorizeProofCandidate {
 }
 
 export interface CloudflareVectorizeProofValidation {
-    readonly schema: "chardb.cloudflare-vectorize-proof.validation.v2";
+    readonly schema: "chardb.cloudflare-vectorize-proof.validation.v3";
     readonly ok: true;
     readonly candidate: CloudflareVectorizeProofCandidate;
     readonly reportSha256: string;
@@ -81,8 +81,8 @@ export interface CloudflareVectorizeBenchmarkWorkload {
     readonly requestsPerSample: 1;
 }
 
-export const CLOUDFLARE_VECTORIZE_PROOF_REPORT_SCHEMA: "chardb.cloudflare-vectorize-proof.report.v2";
-export const CLOUDFLARE_VECTORIZE_PROOF_VALIDATION_SCHEMA: "chardb.cloudflare-vectorize-proof.validation.v2";
+export const CLOUDFLARE_VECTORIZE_PROOF_REPORT_SCHEMA: "chardb.cloudflare-vectorize-proof.report.v3";
+export const CLOUDFLARE_VECTORIZE_PROOF_VALIDATION_SCHEMA: "chardb.cloudflare-vectorize-proof.validation.v3";
 
 export function assertCloudflareVectorizeProofReport<T>(
     report: T,

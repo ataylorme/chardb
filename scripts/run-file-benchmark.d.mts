@@ -34,6 +34,10 @@ export declare function runFileBenchmarkUploadHook(
     targetKind: "local" | "cloudflare",
     upload: { readonly organizationId: string; readonly fileId: string }
 ): Promise<void>;
+export declare function runRetryableFileUpload<T extends { readonly response: Response }>(
+    operation: () => Promise<T>,
+    pause?: (milliseconds: number) => Promise<unknown>
+): Promise<{ readonly value: T; readonly attempts: number }>;
 export declare function validateFileBenchmarkEvidence(
     directory: string,
     expectedCandidateSha256?: string

@@ -373,6 +373,7 @@ export class CdbReshardRuntime {
      */
     async beginReshardSource(args: {
         migId: string;
+        recoveryGeneration: number;
         rangeLo: number;
         rangeHi: number;
         schemaVersion: number;
@@ -577,6 +578,7 @@ export class CdbReshardRuntime {
     /** Destination-shard counterpart; tracks the migration so duplicate applies are rejected. */
     async beginReshardDest(args: {
         migId: string;
+        recoveryGeneration: number;
         rangeLo: number;
         rangeHi: number;
         schemaVersion: number;

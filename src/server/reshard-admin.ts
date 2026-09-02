@@ -17,6 +17,7 @@ interface CatalogReshardAdminRpc {
         readonly destinationShard: string;
         readonly rangeLo: number;
         readonly rangeHi: number;
+        readonly recoveryGeneration: number;
     }): Promise<CatalogTopologyOperation>;
     topologyOperation(args: { readonly migrationId: string }): Promise<CatalogTopologyOperation | null>;
     abortTopologyOperation(args: {
@@ -39,6 +40,10 @@ interface ResharderAdminStatus {
 }
 
 interface ResharderAdminRpc {
+    adminRecoveryAdmissionClock(): Promise<{
+        readonly generation: number;
+        readonly activeOperationId: string | null;
+    }>;
     migrationStatus(migId: string): Promise<ResharderAdminStatus | null>;
     startSplit(args: {
         readonly migId: string;
@@ -179,11 +184,19 @@ export async function handleReshardAdminRequest(
                 return Response.json({ ok: true, started: false, state: projectReshardStatus(existing) });
             }
             const tables = packagedReshardTableSpecs(schema);
+            const recoveryClock = await resharder.adminRecoveryAdmissionClock();
+            if (recoveryClock.activeOperationId !== null) {
+                throw new CdbError({
+                    code: "CDB_RESHARD_PHASE_MISMATCH",
+                    message: "point-in-time recovery blocks resharding",
+                });
+            }
             const topology = await catalog.beginDerivedTopologyOperation({
                 migId: input.migrationId,
                 destinationShard: input.destinationShard,
                 rangeLo: input.rangeLo,
                 rangeHi: input.rangeHi,
+                recoveryGeneration: recoveryClock.generation,
             });
             if (topology.status !== "active") {
                 throw new CdbError({

@@ -261,6 +261,7 @@ test("CLI upgrades persisted Catalog and Cdb state and fences stale epochs", asy
             pathname: "/fixture/mutate",
             body: {
                 mutId: "blocked-before-migration",
+                recoveryGeneration: 0,
                 domainSchemaEpoch: 1,
                 id: "blocked-before-migration",
                 value: "blocked",
@@ -343,13 +344,27 @@ test("CLI upgrades persisted Catalog and Cdb state and fences stale epochs", asy
             name: "wrongEpoch1",
             type: "call",
             pathname: "/fixture/mutate",
-            body: { mutId: "wrong-epoch-1", domainSchemaEpoch: 1, id: "wrong-epoch-1", value: "blocked", note: null },
+            body: {
+                mutId: "wrong-epoch-1",
+                recoveryGeneration: 0,
+                domainSchemaEpoch: 1,
+                id: "wrong-epoch-1",
+                value: "blocked",
+                note: null,
+            },
         },
         {
             name: "wrongEpoch3",
             type: "call",
             pathname: "/fixture/mutate",
-            body: { mutId: "wrong-epoch-3", domainSchemaEpoch: 3, id: "wrong-epoch-3", value: "blocked", note: null },
+            body: {
+                mutId: "wrong-epoch-3",
+                recoveryGeneration: 0,
+                domainSchemaEpoch: 3,
+                id: "wrong-epoch-3",
+                value: "blocked",
+                note: null,
+            },
         },
         {
             name: "fresh",
@@ -357,6 +372,7 @@ test("CLI upgrades persisted Catalog and Cdb state and fences stale epochs", asy
             pathname: "/fixture/mutate",
             body: {
                 mutId: "fresh-after-migration",
+                recoveryGeneration: 0,
                 domainSchemaEpoch: 2,
                 id: "row-after-upgrade",
                 value: "after",
@@ -368,7 +384,13 @@ test("CLI upgrades persisted Catalog and Cdb state and fences stale epochs", asy
             name: "replay",
             type: "call",
             pathname: "/fixture/mutate",
-            body: { mutId: "seed-mutation", domainSchemaEpoch: 2, id: "row-before-upgrade", value: "before" },
+            body: {
+                mutId: "seed-mutation",
+                recoveryGeneration: 0,
+                domainSchemaEpoch: 2,
+                id: "row-before-upgrade",
+                value: "before",
+            },
         },
         { name: "afterReplay", type: "call", pathname: "/fixture/state" },
     ]);
@@ -592,6 +614,7 @@ test("CLI upgrades persisted Catalog and Cdb state and fences stale epochs", asy
             pathname: "/fixture/mutate",
             body: {
                 mutId: "obsolete-v1-write",
+                recoveryGeneration: 0,
                 domainSchemaEpoch: 1,
                 id: "obsolete-v1-write",
                 value: "must-not-commit",
@@ -706,6 +729,7 @@ test("resumes a partial multi-shard v0 to v3 journal and rejects out-of-order Ca
         err: "",
     });
     expect(value<{ readonly route: { readonly domainSchemaEpoch: number } }>(resumed, "seed").route).toMatchObject({
+        recoveryGeneration: 0,
         domainSchemaEpoch: 2,
     });
     expect(value<FixtureState>(resumed, "state")).toMatchObject({

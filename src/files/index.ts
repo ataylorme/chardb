@@ -22,7 +22,7 @@ export function FileId(value: string): FileId {
         value.length > CDB_FILE_ID_MAX_LENGTH ||
         !FILE_ID.test(value)
     ) {
-        throw new TypeError("invalid Chardb FileId");
+        throw new TypeError("invalid CharDB FileId");
     }
     return value as FileId;
 }
@@ -121,7 +121,7 @@ export interface ChardbFileClient {
 
 export interface FileClientOptions {
     /**
-     * Public Chardb Worker origin. Relative file routes are used when omitted.
+     * Public CharDB Worker origin. Relative file routes are used when omitted.
      * Browser file requests must remain same-origin with the Worker.
      */
     readonly baseUrl?: string;
@@ -202,7 +202,7 @@ async function fileRequestError(response: Response): Promise<Error> {
 }
 
 /**
- * Bind one schema file column to Chardb's same-origin upload and download routes.
+ * Bind one schema file column to CharDB's same-origin upload and download routes.
  * Better Auth's session cookie is sent by the browser automatically.
  */
 export function createFileClient(column: Column | FileRef, options: FileClientOptions = {}): ChardbFileClient {

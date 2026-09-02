@@ -63,6 +63,7 @@ function identity(registrationId: string, subId: number): LiveSubscriptionId {
 
 function subscription(registrationId: string, subId: number): CdbSubscriptionRequest {
     return {
+        recoveryGeneration: 0,
         subscription: identity(registrationId, subId),
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-1"),

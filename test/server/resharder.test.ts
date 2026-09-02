@@ -497,6 +497,7 @@ describe("Resharder safety", () => {
         });
         const boundIdentity = {
             migId: split.migId,
+            recoveryGeneration: 0,
             rangeLo: split.rangeLo,
             rangeHi: split.rangeHi,
             ...topologySchema,
@@ -507,6 +508,7 @@ describe("Resharder safety", () => {
                 op: "provision",
                 input: {
                     migrationId: `reshard-dest:${split.migId}`,
+                    recoveryGeneration: 0,
                     targetVersion: topologySchema.schemaVersion,
                     targetEpoch: topologySchema.schemaEpoch,
                     targetDigest: topologySchema.schemaDigest,
@@ -531,6 +533,7 @@ describe("Resharder safety", () => {
                 op: "begin",
                 input: {
                     migId: split.migId,
+                    recoveryGeneration: 0,
                     sourceShard: split.srcShard,
                     destinationShard: split.dstShard,
                     rangeLo: split.rangeLo,
@@ -542,6 +545,7 @@ describe("Resharder safety", () => {
                 op: "cutover",
                 input: {
                     migId: split.migId,
+                    recoveryGeneration: 0,
                     lo: split.rangeLo,
                     hi: split.rangeHi,
                     fromShard: split.srcShard,
@@ -553,6 +557,7 @@ describe("Resharder safety", () => {
                 op: "complete",
                 input: {
                     migId: split.migId,
+                    recoveryGeneration: 0,
                     sourceShard: split.srcShard,
                     destinationShard: split.dstShard,
                     rangeLo: split.rangeLo,
@@ -563,6 +568,7 @@ describe("Resharder safety", () => {
         ]);
         const fenceIdentity = {
             migrationId: split.migId,
+            recoveryGeneration: 0,
             rangeLo: split.rangeLo,
             rangeHi: split.rangeHi,
             sourceGeneration: split.epochAtStart,
@@ -720,6 +726,7 @@ describe("Resharder safety", () => {
             new Set([
                 stableJson({
                     migrationId: split.migId,
+                    recoveryGeneration: 0,
                     rangeLo: split.rangeLo,
                     rangeHi: split.rangeHi,
                     sourceGeneration: split.epochAtStart,
@@ -1339,6 +1346,7 @@ describe("Resharder safety", () => {
         ]);
         const expectedIdentity = stableJson({
             migId: split.migId,
+            recoveryGeneration: 0,
             rangeLo: split.rangeLo,
             rangeHi: split.rangeHi,
             ...topologySchema,

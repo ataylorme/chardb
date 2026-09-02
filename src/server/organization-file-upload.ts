@@ -1,9 +1,9 @@
-import { CdbError, isCdbError, rehydrateCdbRpcError } from "../errors.ts";
+import { CdbError, rehydrateCdbRpcError } from "../errors.ts";
 import { FileId, type FileId as FileIdType } from "../files/index.ts";
 import type { AuthCtx } from "./define.ts";
 import type { CdbFileReadyRequest, CdbFileReserveRequest } from "./do/cdb-file-runtime.ts";
 import type { StoredFile } from "./do/cdb-file-store.ts";
-import { retainUploadedFile } from "./file-retention.ts";
+import { fileProviderCall, retainUploadedFile } from "./file-retention.ts";
 
 export interface OrganizationFileUploadCdb {
     reserveFile(request: CdbFileReserveRequest & { readonly schemaEpoch: number }): Promise<StoredFile>;
@@ -33,6 +33,7 @@ export async function uploadOrganizationFile(input: {
     readonly nowMs: number;
     readonly domainSchemaEpoch: number;
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     readonly auth: AuthCtx;
     readonly refreshAuthority: () => Promise<AuthCtx>;
 }): Promise<OrganizationFileUploadResult> {
@@ -51,34 +52,23 @@ export async function uploadOrganizationFile(input: {
             nowMs: input.nowMs,
             domainSchemaEpoch: input.domainSchemaEpoch,
             schemaEpoch: input.schemaEpoch,
+            recoveryGeneration: input.recoveryGeneration,
             auth: input.auth,
         });
     } catch (error) {
         throw rehydrateCdbRpcError(error);
     }
-    const metadata = { chardbFileId: fileId, chardbSha256: sha256 };
-    const written = await input.bucket.put(reserved.objectKey, ownedBytes, {
-        onlyIf: { etagDoesNotMatch: "*" },
-        httpMetadata: { contentType: reserved.contentType },
-        customMetadata: metadata,
-    });
-    if (written === null) {
-        const existing = await input.bucket.head(reserved.objectKey);
-        if (
-            existing === null ||
-            existing.size !== ownedBytes.byteLength ||
-            existing.customMetadata?.chardbFileId !== fileId ||
-            existing.customMetadata?.chardbSha256 !== sha256
-        ) {
-            throw new CdbError({ code: "CDB_INVARIANT", message: "immutable file object does not match its retry" });
-        }
-    }
-    await retainUploadedFile(input.bucket, {
-        sha256,
-        size: ownedBytes.byteLength,
-        contentType: reserved.contentType,
-        bytes: ownedBytes,
-    });
+    // Ordinary uploads write only the content-addressed retained object. The
+    // SQLite ready transition makes it visible; recovery alone materializes a
+    // live v1 key. A late upload can therefore leave only an invisible orphan.
+    await fileProviderCall(() =>
+        retainUploadedFile(input.bucket, {
+            sha256,
+            size: ownedBytes.byteLength,
+            contentType: reserved.contentType,
+            bytes: ownedBytes,
+        })
+    );
 
     let ready: StoredFile;
     try {
@@ -91,17 +81,14 @@ export async function uploadOrganizationFile(input: {
             nowMs: input.nowMs,
             domainSchemaEpoch: input.domainSchemaEpoch,
             schemaEpoch: input.schemaEpoch,
+            recoveryGeneration: input.recoveryGeneration,
             auth: refreshedAuth,
         });
     } catch (error) {
         const normalized = rehydrateCdbRpcError(error);
-        if (isCdbError(normalized) && normalized.code === "CDB_FORBIDDEN") {
-            try {
-                await input.bucket.delete(reserved.objectKey);
-            } catch {
-                // The retained pending lease lets the shard alarm retry this exact key.
-            }
-        }
+        // Retained objects are immutable and content-addressed. Failed
+        // readiness leaves an invisible orphan that another identical upload
+        // can reuse safely.
         throw normalized;
     }
     if (ready.status !== "ready" && ready.status !== "attached") {

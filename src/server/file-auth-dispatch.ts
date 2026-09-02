@@ -4,7 +4,7 @@ import { PrincipalId as PrincipalIdValue, TenantId as TenantIdValue } from "../t
 import { vshardOf } from "../vshard.ts";
 import type { AuthCtx } from "./define.ts";
 import type { RouteResult } from "./do/catalog.ts";
-import { projectOrganizationMutationAuth } from "./do/gateway-auth-dispatch.ts";
+import { isCatalogRouteResult, projectOrganizationMutationAuth } from "./do/gateway-auth-dispatch.ts";
 import type { ChardbFileResourceDescriptor } from "./resource-descriptors.ts";
 import type { CatalogOrganizationAuthorityRouteRpc, CatalogOrganizationAuthorityRpc } from "./rpc.ts";
 
@@ -36,6 +36,11 @@ export interface OrganizationFileDispatchContext {
     readonly refreshAuthority: () => Promise<AuthCtx>;
     /** Resolve current authority and placement so a stale file RPC can retry once on the new owner. */
     readonly refreshAuthorityRoute: () => Promise<{ readonly auth: AuthCtx; readonly route?: RouteResult }>;
+}
+
+function ownEnumerableData(value: object, key: string): unknown {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor?.enumerable === true && "value" in descriptor ? descriptor.value : undefined;
 }
 
 function projectSession(value: unknown): OrganizationFileSession | undefined {
@@ -106,15 +111,23 @@ export async function dispatchOrganizationFileOperation<TResult>(input: {
                     organizationId: session.activeOrganizationId,
                     vshard: Number(vshardOf([session.activeOrganizationId])),
                 });
-                const projected = projectOrganizationMutationAuth(resolved.authority, {
+                const projected = projectOrganizationMutationAuth(ownEnumerableData(resolved, "authority"), {
                     principalId: session.principalId,
                     organizationId: session.activeOrganizationId,
                 });
                 if (!projected.ok) return projected;
-                if (!("route" in resolved)) {
+                const route = ownEnumerableData(resolved, "route");
+                if (!isCatalogRouteResult(route)) {
                     return { ok: false, code: "CDB_CATALOG_UNAVAILABLE", message: "Catalog route is unavailable" };
                 }
-                return { ok: true, auth: projected.auth, route: resolved.route };
+                if (projected.recoveryGeneration !== route.recoveryGeneration) {
+                    return {
+                        ok: false,
+                        code: "CDB_STALE_EPOCH",
+                        message: "Catalog authority and route generations differ",
+                    };
+                }
+                return { ok: true, auth: projected.auth, route };
             }
             return projectOrganizationMutationAuth(
                 await input.catalog.resolveOrganizationAuthority({
@@ -158,6 +171,7 @@ export async function dispatchOrganizationFileOperation<TResult>(input: {
                     (!refreshed.route ||
                         refreshed.route.shardId !== projected.route.shardId ||
                         refreshed.route.schemaEpoch !== projected.route.schemaEpoch ||
+                        refreshed.route.recoveryGeneration !== projected.route.recoveryGeneration ||
                         refreshed.route.domainSchemaEpoch !== projected.route.domainSchemaEpoch)
                 ) {
                     throw new CdbError({

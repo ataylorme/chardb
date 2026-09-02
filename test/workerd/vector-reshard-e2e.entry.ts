@@ -180,7 +180,7 @@ interface CatalogRpc {
     migrateSchemaShard(args: { migrationId: string; shardId: string }): Promise<unknown>;
     applyCatalogSchemaMigration(args: { migrationId: string; version: number }): Promise<unknown>;
     completeSchemaMigration(args: { migrationId: string }): Promise<unknown>;
-    mutateAuth(args: Record<string, unknown>): Promise<unknown>;
+    mutateAuth(args: Record<string, unknown>, _recoveryGeneration: number): Promise<unknown>;
     route(vshard: number): Promise<Route>;
     seedJwkForTest(jwksUrl: string, kid: string, jwkJson: string, ttlMs: number): Promise<void>;
 }
@@ -495,6 +495,7 @@ export class Cdb extends app.Cdb {
         return this.deleteOrganizationFiles({
             organizationId: input.organizationId,
             nowMs: Date.now(),
+            recoveryGeneration: 0,
             domainSchemaEpoch: input.domainSchemaEpoch,
         });
     }
@@ -716,39 +717,48 @@ async function setupPublicVector(
     const now = Date.now();
     const userId = "vector-e2e-public-user";
     await cat.seedJwkForTest(JWKS_URL, input.kid, JSON.stringify(input.jwk), 60_000);
-    await cat.mutateAuth({
-        model: "user",
-        op: "create",
-        payload: {
-            id: userId,
-            name: "Vector E2E Public User",
-            email: "vector-public@example.com",
-            emailVerified: true,
-            createdAt: now,
-            updatedAt: now,
+    await cat.mutateAuth(
+        {
+            model: "user",
+            op: "create",
+            payload: {
+                id: userId,
+                name: "Vector E2E Public User",
+                email: "vector-public@example.com",
+                emailVerified: true,
+                createdAt: now,
+                updatedAt: now,
+            },
         },
-    });
-    await cat.mutateAuth({
-        model: "organization",
-        op: "create",
-        payload: {
-            id: input.organizationId,
-            name: input.organizationId,
-            slug: input.organizationId,
-            createdAt: now,
+        0
+    );
+    await cat.mutateAuth(
+        {
+            model: "organization",
+            op: "create",
+            payload: {
+                id: input.organizationId,
+                name: input.organizationId,
+                slug: input.organizationId,
+                createdAt: now,
+            },
         },
-    });
-    await cat.mutateAuth({
-        model: "member",
-        op: "create",
-        payload: {
-            id: `member-${input.organizationId}`,
-            organizationId: input.organizationId,
-            userId,
-            role: "member",
-            createdAt: now,
+        0
+    );
+    await cat.mutateAuth(
+        {
+            model: "member",
+            op: "create",
+            payload: {
+                id: `member-${input.organizationId}`,
+                organizationId: input.organizationId,
+                userId,
+                role: "member",
+                createdAt: now,
+            },
         },
-    });
+        0
+    );
     const vshard = placement(input.organizationId);
     return {
         userId,
@@ -790,16 +800,19 @@ async function setup(
     const vshard = placement(input.organizationId);
     const route = await cat.route(vshard);
     if (route.shardId !== SOURCE) throw new Error(`fixture range is owned by ${route.shardId}`);
-    await cat.mutateAuth({
-        model: "organization",
-        op: "create",
-        payload: {
-            id: input.organizationId,
-            name: input.organizationId,
-            slug: input.organizationId,
-            createdAt: Date.now(),
+    await cat.mutateAuth(
+        {
+            model: "organization",
+            op: "create",
+            payload: {
+                id: input.organizationId,
+                name: input.organizationId,
+                slug: input.organizationId,
+                createdAt: Date.now(),
+            },
         },
-    });
+        0
+    );
     const seeded = await cdb(env, SOURCE).fixtureSeed({ organizationId: input.organizationId, count: input.count });
     await resharder(env).startSplit({
         migId: input.migId,
@@ -830,6 +843,7 @@ async function mutate(
         },
         placement: { authority: "organization", partitionKey: input.organizationId },
         auth: vectorAuth(input.organizationId),
+        recoveryGeneration: 0,
         schemaEpoch: route.schemaEpoch,
         domainSchemaEpoch: route.domainSchemaEpoch,
     });

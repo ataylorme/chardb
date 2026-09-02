@@ -17,6 +17,7 @@ export interface CatalogTopologyOperationIdentity {
     readonly schemaVersion: number;
     readonly schemaEpoch: number;
     readonly schemaDigest: string;
+    readonly recoveryGeneration: number;
 }
 
 export interface CatalogTopologyOperation extends CatalogTopologyOperationIdentity {
@@ -36,6 +37,7 @@ interface StoredTopologyOperation {
     readonly schema_version: number;
     readonly schema_epoch: number;
     readonly schema_digest: string;
+    readonly recovery_generation: number;
     readonly status: CatalogTopologyOperationStatus;
     readonly completed_epoch: number | null;
     readonly created_at: number;
@@ -53,6 +55,7 @@ CREATE TABLE IF NOT EXISTS catalog_topology_operations (
   schema_version INTEGER NOT NULL CHECK (schema_version >= 0),
   schema_epoch INTEGER NOT NULL CHECK (schema_epoch > 0),
   schema_digest TEXT NOT NULL,
+  recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0),
   status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'aborted')),
   completed_epoch INTEGER,
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
@@ -101,6 +104,9 @@ function assertIdentity(identity: CatalogTopologyOperationIdentity): void {
         invalid("topology schema epoch is invalid");
     }
     if (!SCHEMA_DIGEST.test(identity.schemaDigest)) invalid("topology schema digest is invalid");
+    if (!Number.isSafeInteger(identity.recoveryGeneration) || identity.recoveryGeneration < 0) {
+        invalid("topology recovery generation is invalid");
+    }
 }
 
 function fromStored(row: StoredTopologyOperation): CatalogTopologyOperation {
@@ -114,6 +120,7 @@ function fromStored(row: StoredTopologyOperation): CatalogTopologyOperation {
         schemaVersion: row.schema_version,
         schemaEpoch: row.schema_epoch,
         schemaDigest: row.schema_digest,
+        recoveryGeneration: row.recovery_generation,
         status: row.status,
         completedEpoch: row.completed_epoch,
         createdAt: row.created_at,
@@ -131,7 +138,8 @@ function sameIdentity(stored: CatalogTopologyOperation, requested: CatalogTopolo
         stored.startEpoch === requested.startEpoch &&
         stored.schemaVersion === requested.schemaVersion &&
         stored.schemaEpoch === requested.schemaEpoch &&
-        stored.schemaDigest === requested.schemaDigest
+        stored.schemaDigest === requested.schemaDigest &&
+        stored.recoveryGeneration === requested.recoveryGeneration
     );
 }
 
@@ -145,6 +153,11 @@ export function initializeCatalogTopologyOperationStore(sql: CatalogSql): void {
     if (!columns.some(column => column.name === "schema_epoch")) {
         sql.exec("ALTER TABLE catalog_topology_operations ADD COLUMN schema_epoch INTEGER CHECK (schema_epoch > 0)");
     }
+    if (!columns.some(column => column.name === "recovery_generation")) {
+        sql.exec(
+            "ALTER TABLE catalog_topology_operations ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0)"
+        );
+    }
 }
 
 /** Owns the one-at-a-time Catalog lease for a durable topology change. */
@@ -154,7 +167,7 @@ export class CatalogTopologyOperationStore {
     read(migrationId: string): CatalogTopologyOperation | null {
         const row = this.sql.one<StoredTopologyOperation>(
             `SELECT migration_id, source_shard, destination_shard, range_lo, range_hi,
-                    start_epoch, schema_version, schema_epoch, schema_digest, status, completed_epoch,
+                    start_epoch, schema_version, schema_epoch, schema_digest, recovery_generation, status, completed_epoch,
                     created_at, updated_at
              FROM catalog_topology_operations WHERE migration_id = ?`,
             migrationId
@@ -165,7 +178,7 @@ export class CatalogTopologyOperationStore {
     active(): CatalogTopologyOperation | null {
         const row = this.sql.one<StoredTopologyOperation>(
             `SELECT migration_id, source_shard, destination_shard, range_lo, range_hi,
-                    start_epoch, schema_version, schema_epoch, schema_digest, status, completed_epoch,
+                    start_epoch, schema_version, schema_epoch, schema_digest, recovery_generation, status, completed_epoch,
                     created_at, updated_at
              FROM catalog_topology_operations WHERE status = 'active'`
         );
@@ -198,9 +211,9 @@ export class CatalogTopologyOperationStore {
         this.sql.exec(
             `INSERT INTO catalog_topology_operations
              (migration_id, source_shard, destination_shard, range_lo, range_hi,
-              start_epoch, schema_version, schema_epoch, schema_digest, status, completed_epoch,
+              start_epoch, schema_version, schema_epoch, schema_digest, recovery_generation, status, completed_epoch,
               created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)`,
             identity.migrationId,
             identity.sourceShard,
             identity.destinationShard,
@@ -210,6 +223,7 @@ export class CatalogTopologyOperationStore {
             identity.schemaVersion,
             identity.schemaEpoch,
             identity.schemaDigest,
+            identity.recoveryGeneration,
             nowMs,
             nowMs
         );

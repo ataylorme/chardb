@@ -1,9 +1,9 @@
 {
     "$schema": "https://mintlify.com/docs.json",
     "theme": "mint",
-    "name": "chardb",
+    "name": "CharDB",
     "description": "Better Auth-owned SQLite, files, and live Drizzle queries for Cloudflare Workers.",
-    "favicon": "/favicon.png",
+    "favicon": "/favicon.svg",
     "colors": {
         "primary": "#EC5713",
         "light": "#F0642B",
@@ -13,11 +13,15 @@
         "groups": [
             {
                 "group": "Core",
-                "pages": ["quickstart", "ownership", "live-queries", "files", "vectors"]
+                "pages": ["quickstart", "ownership"]
             },
             {
                 "group": "Clients",
-                "pages": ["clients"]
+                "pages": ["clients", "live-queries"]
+            },
+            {
+                "group": "Features",
+                "pages": ["files", "vectors"]
             },
             {
                 "group": "Operate",

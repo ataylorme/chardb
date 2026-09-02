@@ -24,6 +24,7 @@ export interface GatewayAuthorityExpectation {
     readonly shardId: string;
     readonly sourceCdbId: string;
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     readonly domainSchemaEpoch: number;
     readonly authEpochs: {
         readonly global: number;
@@ -88,6 +89,7 @@ export async function checkGatewayAuthorityFreshness(
         projected.route.shardId !== expected.shardId ||
         physicalId !== expected.sourceCdbId ||
         projected.route.schemaEpoch !== expected.schemaEpoch ||
+        projected.route.recoveryGeneration !== expected.recoveryGeneration ||
         projected.route.domainSchemaEpoch !== expected.domainSchemaEpoch
     ) {
         return { kind: "refetch" };

@@ -50,12 +50,26 @@ function construct(
         storage: {
             sql: sqlStorage(db, afterExec),
             transactionSync: <T>(callback: () => T): T => db.transaction(callback)(),
+            getCurrentBookmark: async () => "00000001-current",
+            onNextSessionRestoreBookmark: async () => "00000002-undo",
+            getAlarm: async () => null,
+            setAlarm: async () => undefined,
         },
         blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
             ready = callback();
         },
     } as unknown as DurableObjectState;
-    return { cdb: new CdbClass(state, {}), ready };
+    const recoveryNamespace = {
+        idFromName: () => "global",
+        get: () => ({
+            adminRecoveryAdmissionClock: async () => ({
+                generation: 0,
+                activeOperationId: null,
+                activeDigest: null,
+            }),
+        }),
+    } as unknown as DurableObjectNamespace;
+    return { cdb: new CdbClass(state, { CDB_RESHARD: recoveryNamespace }), ready };
 }
 
 const { cdbTable: globalTable } = globalScope();
@@ -155,6 +169,7 @@ function request(overrides: Partial<CdbBindingPlanRequest> = {}): CdbBindingPlan
         placement: { authority: "global", partitionKey: "shared" },
         auth: AUTH,
         schemaEpoch: 1,
+        recoveryGeneration: 0,
         domainSchemaEpoch: 1,
         ...overrides,
     };
@@ -207,6 +222,7 @@ describe("Cdb native binding select execution", () => {
                 placement: { authority: "global", partitionKey: "shared" },
                 auth: AUTH,
                 schemaEpoch: 1,
+                recoveryGeneration: 0,
                 domainSchemaEpoch: 1,
             })
         ).resolves.toEqual({
@@ -240,6 +256,7 @@ describe("Cdb native binding select execution", () => {
                 organizationId: TenantId("shared"),
                 placement,
                 schemaEpoch: 1,
+                recoveryGeneration: 0,
                 vshard: Number(vshardOf(["shared"])),
                 domainSchemaEpoch: 1,
                 ref: plannedRowsQuery.__chardbRef,
@@ -257,6 +274,7 @@ describe("Cdb native binding select execution", () => {
                 placement,
                 auth: AUTH,
                 schemaEpoch: 1,
+                recoveryGeneration: 0,
                 vshard: Number(vshardOf(["shared"])),
                 domainSchemaEpoch: 1,
             })
@@ -268,6 +286,72 @@ describe("Cdb native binding select execution", () => {
             ],
         });
         expect(plannedCompileRuns).toBe(1);
+    });
+
+    test("promotes a quiet subscription only after a generation-current registered query", async () => {
+        const { db, cdb } = await setup(undefined, PlannedConfiguredCdb);
+        const args = { scope: "shared", minimumRank: 2 };
+        const routed = routeValidatedQuery(plannedManifest, { ref: plannedRowsQuery.__chardbRef, args }, tables =>
+            cdbPolicyDigest(schema, tables)
+        );
+        const subscription = {
+            gatewayId: "binding-plan-recovery-gateway",
+            registrationId: "binding-plan-recovery-registration",
+            connectionId: "binding-plan-recovery-connection",
+            clientId: ClientId("binding-plan-recovery-client"),
+            subId: SubId(2),
+        };
+        const placement = { authority: "global" as const, partitionKey: "shared" };
+        const base = {
+            subscription,
+            placement,
+            schemaEpoch: 1,
+            vshard: Number(vshardOf(["shared"])),
+            domainSchemaEpoch: 1,
+        };
+        await expect(
+            cdb.subscribe({
+                ...base,
+                principalId: PrincipalId("user-1"),
+                organizationId: TenantId("shared"),
+                recoveryGeneration: 0,
+                ref: plannedRowsQuery.__chardbRef,
+                args,
+                queryHash: routed.queryHash,
+                tables: routed.intent.tables,
+                intervals: routed.intent.intervals ?? [],
+            })
+        ).resolves.toMatchObject({ ok: true });
+
+        const operationId = "00000000-0000-4000-8000-000000000001";
+        await cdb.adminArmRecoveryRestore({
+            bookmark: "00000000-history",
+            armedAt: 42,
+            operationId,
+            generation: 1,
+        });
+        await cdb.adminCancelRecoveryRestore({ bookmark: "00000000-history" });
+        await cdb.adminReleaseRecovery({ operationId, generation: 1 });
+
+        await expect(cdb.queryRegistered({ ...base, auth: AUTH, recoveryGeneration: 0 })).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_STALE_EPOCH" },
+        });
+        expect(
+            db
+                .query("SELECT recovery_generation FROM _chardb_live_subscriptions WHERE registration_id = ?")
+                .get(subscription.registrationId)
+        ).toEqual({ recovery_generation: 0 });
+
+        await expect(cdb.queryRegistered({ ...base, auth: AUTH, recoveryGeneration: 1 })).resolves.toMatchObject({
+            ok: true,
+            result: [{ id: "b" }, { id: "c" }],
+        });
+        expect(
+            db
+                .query("SELECT recovery_generation FROM _chardb_live_subscriptions WHERE registration_id = ?")
+                .get(subscription.registrationId)
+        ).toEqual({ recovery_generation: 1 });
     });
 
     test("enforces the planned row bound and exact UTF-8 byte result limit", async () => {
@@ -286,6 +370,7 @@ describe("Cdb native binding select execution", () => {
             placement: { authority: "global" as const, partitionKey: "limits" },
             auth: AUTH,
             schemaEpoch: 1,
+            recoveryGeneration: 0,
             domainSchemaEpoch: 1,
         };
         const exactRows = await cdb.query(request);
@@ -343,6 +428,7 @@ describe("Cdb native binding select execution", () => {
             organizationId: TenantId("shared"),
             placement,
             schemaEpoch: 1,
+            recoveryGeneration: 0,
             vshard: Number(vshardOf(["shared"])),
             domainSchemaEpoch: 1,
             ref: plannedRowsQuery.__chardbRef,
@@ -356,6 +442,7 @@ describe("Cdb native binding select execution", () => {
             placement,
             auth: AUTH,
             schemaEpoch: 1,
+            recoveryGeneration: 0,
             vshard: Number(vshardOf(["shared"])),
             domainSchemaEpoch: 1,
         };
@@ -424,6 +511,26 @@ describe("Cdb native binding select execution", () => {
         expect(advanced).toBe(true);
     });
 
+    test("rejects a select when recovery generation changes during the read", async () => {
+        let armed = false;
+        let advanced = false;
+        const { db, cdb } = await setup(query => {
+            if (armed && !advanced && /from\s+["`]binding_plan_cdb_rows["`]/i.test(query)) {
+                advanced = true;
+                db.run(
+                    "UPDATE _chardb_recovery_admission SET generation = 1, operation_id = NULL, state = 'open' WHERE singleton = 1"
+                );
+            }
+        });
+
+        armed = true;
+        await expect(cdb.executePlan(request())).resolves.toMatchObject({
+            ok: false,
+            error: { code: "CDB_STALE_EPOCH" },
+        });
+        expect(advanced).toBe(true);
+    });
+
     test("rederives user placement and refuses an auth snapshot for another user", async () => {
         const { cdb } = await setup();
         const userPlan: CdbBindingPlanRequest["plan"] = {
@@ -467,6 +574,7 @@ describe("Cdb native binding select execution", () => {
 
         const fileRequest = {
             organizationId: "org-1",
+            recoveryGeneration: 0,
             table: "binding_plan_cdb_file_rows",
             column: "attachment",
             rowId: "row-1",

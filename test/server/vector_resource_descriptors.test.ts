@@ -24,6 +24,7 @@ import { defineMigrations, defineSchemaBaseline, migrationDigestAt } from "../..
 import { renderVectorMutationTriggerSet } from "../../src/server/vector-triggers.ts";
 import { type VectorConfig, inlineVector, normalizeVectorConfig, vector } from "../../src/vector.ts";
 import { forOrg, forUser } from "../helpers/cdb-table.ts";
+import { withRecoveryEnv } from "../helpers/recovery.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -61,7 +62,7 @@ function construct(CdbClass: typeof Cdb, db: Database): { readonly cdb: Cdb; rea
             ready = callback();
         },
     } as unknown as DurableObjectState;
-    return { cdb: new CdbClass(state, {}), ready };
+    return { cdb: new CdbClass(state, withRecoveryEnv({})), ready };
 }
 
 const organization = sqliteTable("organization", { id: text("id").primaryKey() });
@@ -340,6 +341,7 @@ describe("internal organization vector resource contract", () => {
         ).toEqual([]);
         expect(
             cdb.prepareReshardFileSource({
+                recoveryGeneration: 0,
                 migId: "vector-only",
                 rangeLo: 0,
                 rangeHi: 0,
@@ -358,6 +360,7 @@ describe("internal organization vector resource contract", () => {
         });
         expect(
             cdb.prepareReshardFileSource({
+                recoveryGeneration: 0,
                 migId: "vector-only",
                 rangeLo: 0,
                 rangeHi: 0,
@@ -474,6 +477,7 @@ describe("internal organization vector resource contract", () => {
         const first = construct(V1, db);
         await first.ready;
         first.cdb.prepareSchemaMigration({
+            recoveryGeneration: 0,
             migrationId: "vector-v1",
             activeVersion: 0,
             activeDigest: migrationDigestAt(journalV1, 0),
@@ -481,8 +485,8 @@ describe("internal organization vector resource contract", () => {
             targetEpoch: 2,
             targetDigest: journalV1.digest,
         });
-        first.cdb.applySchemaMigration({ migrationId: "vector-v1", version: 1 });
-        await first.cdb.activateSchemaMigration({ migrationId: "vector-v1" });
+        first.cdb.applySchemaMigration({ recoveryGeneration: 0, migrationId: "vector-v1", version: 1 });
+        await first.cdb.activateSchemaMigration({ recoveryGeneration: 0, migrationId: "vector-v1" });
 
         const [resource] = collectSchemaResourceDescriptors({ messages: messagesV1 });
         if (!resource || resource.kind !== "vector") throw new Error("vector rebuild resource is missing");
@@ -541,6 +545,7 @@ describe("internal organization vector resource contract", () => {
         const second = construct(V2, db);
         await second.ready;
         second.cdb.prepareSchemaMigration({
+            recoveryGeneration: 0,
             migrationId: "vector-v2",
             activeVersion: 1,
             activeDigest: migrationDigestAt(journalV2, 1),
@@ -548,7 +553,7 @@ describe("internal organization vector resource contract", () => {
             targetEpoch: 3,
             targetDigest: journalV2.digest,
         });
-        second.cdb.applySchemaMigration({ migrationId: "vector-v2", version: 2 });
+        second.cdb.applySchemaMigration({ recoveryGeneration: 0, migrationId: "vector-v2", version: 2 });
         expect(db.query("SELECT id, embedding, note FROM vector_messages").get()).toEqual({
             id: "message-rebuild",
             embedding: vectorId,
@@ -564,7 +569,7 @@ describe("internal organization vector resource contract", () => {
                 statements: ["UPDATE vector_messages SET embedding = 'forged_vector'"],
             },
         ]);
-        await second.cdb.activateSchemaMigration({ migrationId: "vector-v2" });
+        await second.cdb.activateSchemaMigration({ recoveryGeneration: 0, migrationId: "vector-v2" });
         const Corrupt = configureCdbRuntime({
             schema: () => ({ messages: messagesV2 }),
             manifest: () => manifestFromExports({}),
@@ -573,6 +578,7 @@ describe("internal organization vector resource contract", () => {
         const third = construct(Corrupt, db);
         await third.ready;
         third.cdb.prepareSchemaMigration({
+            recoveryGeneration: 0,
             migrationId: "vector-v3",
             activeVersion: 2,
             activeDigest: migrationDigestAt(corruptJournal, 2),
@@ -580,9 +586,9 @@ describe("internal organization vector resource contract", () => {
             targetEpoch: 4,
             targetDigest: corruptJournal.digest,
         });
-        expect(() => third.cdb.applySchemaMigration({ migrationId: "vector-v3", version: 3 })).toThrow(
-            "without its exact vector head"
-        );
+        expect(() =>
+            third.cdb.applySchemaMigration({ recoveryGeneration: 0, migrationId: "vector-v3", version: 3 })
+        ).toThrow("without its exact vector head");
         expect(db.query("SELECT embedding FROM vector_messages").get()).toEqual({ embedding: vectorId });
         expect(db.query("SELECT COUNT(*) AS count FROM _chardb_schema_steps WHERE version = 3").get()).toEqual({
             count: 0,

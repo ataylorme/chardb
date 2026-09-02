@@ -58,6 +58,7 @@ function syncSql(db: Database): SyncSql {
 
 function registration(overrides: Partial<GatewayRegistrationInstall> = {}): GatewayRegistrationInstall {
     return {
+        recoveryGeneration: 0,
         registrationId: "registration-runner",
         principalId: PrincipalId("principal-1"),
         clientId: ClientId("client-1"),
@@ -114,16 +115,18 @@ describe("Gateway active snapshot runner", () => {
     let events: string[];
     let sockets: FakeSocket[];
     let queryCalls: unknown[];
-    let unsubscribeCalls: LiveSubscriptionId[];
-    let finalizeCalls: LiveSubscriptionId[];
+    let unsubscribeCalls: unknown[];
+    let finalizeCalls: unknown[];
     let queryBehavior: () => unknown | Promise<unknown>;
     let authorityBehavior: () => unknown | Promise<unknown>;
     let routePhysicalId: string;
     let routeSchemaEpoch: number;
+    let routeRecoveryGeneration: number;
     let routeDomainSchemaEpoch: number;
     let currentPolicyDigest: string;
     let failAlarmAt: number | null;
     let alarmFailures: number;
+    let staleCleanupGeneration: number | null;
 
     beforeEach(async () => {
         db = new Database(":memory:");
@@ -144,20 +147,29 @@ describe("Gateway active snapshot runner", () => {
             role: "member",
             roles: ["member"],
             authEpochs: { global: 10, tenant: 11, principal: 12 },
+            recoveryGeneration: routeRecoveryGeneration,
         });
         routePhysicalId = "physical-cdb-1";
         routeSchemaEpoch = 1;
+        routeRecoveryGeneration = 0;
         routeDomainSchemaEpoch = 1;
         currentPolicyDigest = "policy-digest-1";
         failAlarmAt = null;
         alarmFailures = 0;
+        staleCleanupGeneration = null;
 
         const catalog = {
             async resolveOrganizationAuthority() {
                 throw new Error("legacy authority RPC must not run");
             },
             async route() {
-                throw new Error("legacy route RPC must not run");
+                events.push("route");
+                return {
+                    shardId: ShardId("logical-shard-1"),
+                    schemaEpoch: routeSchemaEpoch,
+                    recoveryGeneration: routeRecoveryGeneration,
+                    domainSchemaEpoch: routeDomainSchemaEpoch,
+                };
             },
             async resolveOrganizationAuthorityRoute() {
                 events.push("authority");
@@ -168,6 +180,7 @@ describe("Gateway active snapshot runner", () => {
                     route: {
                         shardId: ShardId("logical-shard-1"),
                         schemaEpoch: routeSchemaEpoch,
+                        recoveryGeneration: routeRecoveryGeneration,
                         domainSchemaEpoch: routeDomainSchemaEpoch,
                     },
                 };
@@ -182,10 +195,25 @@ describe("Gateway active snapshot runner", () => {
                 events.push("query");
                 return await queryBehavior();
             },
-            async unsubscribe(subscription: LiveSubscriptionId) {
+            async unsubscribe(
+                subscription:
+                    | LiveSubscriptionId
+                    | { readonly subscription: LiveSubscriptionId; readonly recoveryGeneration?: number }
+            ) {
                 unsubscribeCalls.push(subscription);
+                if (
+                    staleCleanupGeneration !== null &&
+                    "subscription" in subscription &&
+                    subscription.recoveryGeneration === staleCleanupGeneration
+                ) {
+                    throw new Error("CDB_STALE_EPOCH: request belongs to another recovery generation");
+                }
             },
-            async finalizeUnsubscribe(subscription: LiveSubscriptionId) {
+            async finalizeUnsubscribe(
+                subscription:
+                    | LiveSubscriptionId
+                    | { readonly subscription: LiveSubscriptionId; readonly recoveryGeneration?: number }
+            ) {
                 finalizeCalls.push(subscription);
             },
         };
@@ -418,6 +446,7 @@ describe("Gateway active snapshot runner", () => {
             expect(
                 db.transaction(() =>
                     stageGatewaySnapshot(sql, {
+                        recoveryGeneration: 0,
                         principalId: input.principalId,
                         clientId: input.clientId,
                         subId: input.subId,
@@ -551,6 +580,7 @@ describe("Gateway active snapshot runner", () => {
         expect(
             db.transaction(() =>
                 stageGatewaySnapshot(sql, {
+                    recoveryGeneration: 0,
                     principalId: input.principalId,
                     clientId: input.clientId,
                     subId: input.subId,
@@ -609,6 +639,7 @@ describe("Gateway active snapshot runner", () => {
         )() as GatewayDirtyRun;
         db.transaction(() =>
             stageGatewaySnapshot(sql, {
+                recoveryGeneration: 0,
                 principalId: input.principalId,
                 clientId: input.clientId,
                 subId: input.subId,
@@ -752,6 +783,28 @@ describe("Gateway active snapshot runner", () => {
         });
     });
 
+    test("reauthorizes a quiet registration before promoting its recovery generation", async () => {
+        const input = registration({ recoveryGeneration: 0 });
+        installActive(input);
+        attach(input);
+        routeRecoveryGeneration = 1;
+
+        await fireAlarm();
+
+        expect(events.indexOf("authority")).toBeLessThan(events.indexOf("query"));
+        expect(queryCalls).toEqual([
+            expect.objectContaining({
+                auth: expect.objectContaining({ userId: "principal-1" }),
+                recoveryGeneration: 1,
+            }),
+        ]);
+        expect(
+            db
+                .query("SELECT recovery_generation FROM _gw_registration_generations WHERE registration_id = ?")
+                .get(input.registrationId)
+        ).toEqual({ recovery_generation: 1 });
+    });
+
     test("retires and refetches when Catalog advances the routing generation on the same Cdb", async () => {
         installActive();
         const socket = attach();
@@ -865,6 +918,7 @@ describe("Gateway active snapshot runner", () => {
         expect(
             db.transaction(() =>
                 stageGatewaySnapshot(sql, {
+                    recoveryGeneration: 0,
                     principalId: input.principalId,
                     clientId: input.clientId,
                     subId: input.subId,
@@ -931,20 +985,41 @@ describe("Gateway active snapshot runner", () => {
         expect(generationState()).toBeNull();
         expect(unsubscribeCalls).toEqual([
             {
-                gatewayId: "gateway-do-1",
-                registrationId: input.registrationId,
-                connectionId: input.connectionId,
-                clientId: input.clientId,
-                subId: input.subId,
+                recoveryGeneration: 0,
+                subscription: {
+                    gatewayId: "gateway-do-1",
+                    registrationId: input.registrationId,
+                    connectionId: input.connectionId,
+                    clientId: input.clientId,
+                    subId: input.subId,
+                },
             },
         ]);
         expect(finalizeCalls).toEqual(unsubscribeCalls);
         expect(currentAlarm).toBeNull();
     });
 
-    test("bounds expired-socket retries at the auth-refresh deadline, then retires", async () => {
+    test("reauthorizes stale cleanup against the current recovery generation", async () => {
+        const input = registration({ recoveryGeneration: 0 });
+        installActive(input);
+        staleCleanupGeneration = 0;
+        routeRecoveryGeneration = 1;
+
+        await fireAlarm();
+
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toBeNull();
+        expect(unsubscribeCalls).toEqual([
+            { recoveryGeneration: 0, subscription: expect.any(Object) },
+            { recoveryGeneration: 1, subscription: expect.any(Object) },
+        ]);
+        expect(finalizeCalls).toEqual([{ recoveryGeneration: 1, subscription: expect.any(Object) }]);
+        expect(events).toContain("route");
+    });
+
+    test("bounds expired-socket retries, then reports auth expiry and retires at the deadline", async () => {
         installActive();
-        attach(registration(), { jwtExp: 1 });
+        const socket = attach(registration(), { jwtExp: 1 });
         let release: (value: unknown) => void = () => {};
         queryBehavior = () =>
             new Promise(resolve => {
@@ -987,6 +1062,25 @@ describe("Gateway active snapshot runner", () => {
         expect(unsubscribeCalls).toHaveLength(1);
         expect(finalizeCalls).toEqual(unsubscribeCalls);
         expect(currentAlarm).toBeNull();
+        expect(socket.sent.map(message => JSON.parse(message))).toEqual([
+            expect.objectContaining({ t: "error", code: "CDB_FORBIDDEN", retryable: false }),
+        ]);
+        expect(socket.attachment).toMatchObject({ kind: "rejected", connectionId: "connection-1" });
+    });
+
+    test("terminal auth notification failure cannot block durable retirement", async () => {
+        installActive();
+        const socket = attach(registration(), { jwtExp: 1 });
+        socket.throwOnSend = true;
+        clock = 1_000 + GATEWAY_AUTH_REFRESH_GRACE_MS;
+
+        await fireAlarm();
+
+        expect(db.query("SELECT * FROM _gw_registration_heads").get()).toBeNull();
+        expect(generationState()).toBeNull();
+        expect(unsubscribeCalls).toHaveLength(1);
+        expect(finalizeCalls).toEqual(unsubscribeCalls);
+        expect(socket.attachment).toMatchObject({ kind: "rejected", connectionId: "connection-1" });
     });
 
     function socketMessages(): string[] {

@@ -1,16 +1,17 @@
 ---
-title: "Plan Ahead"
-description: "Know the recovery and scale boundaries before a Chardb experiment grows."
+title: "Plan ahead"
+description: "Know CharDB's recovery, scale, and availability limits."
 ---
 
-Chardb's supported path has strong correctness tests and real Cloudflare deployment proofs. It is still an experimental database. Decide how you will recover it and when you will move a shard before either becomes urgent.
+CharDB is experimental. It has no production availability SLA, automatic regional failover, or automatic load-based resharding. Decide how you will recover data and when you will move a shard before either becomes urgent.
 
 ## Take recovery points
 
-Deployed SQLite-backed Durable Objects retain native point-in-time recovery history for 30 days. Chardb can capture one recovery point across the Catalog and every active Cdb shard:
+Deployed SQLite-backed Durable Objects retain native point-in-time recovery history for 30 days. CharDB can capture one recovery point across the Catalog and every active Cdb shard:
+
+Run the command with the same `CHARDB_ADMIN_TOKEN` configured for the deployed Worker.
 
 ```sh
-export CHARDB_ADMIN_TOKEN="your-32-byte-or-longer-secret"
 bunx @chardb/core backups create --url https://api.example.com --out recovery.json
 ```
 
@@ -20,18 +21,18 @@ Store the manifest outside the deployment. To restore it:
 bunx @chardb/core backups restore --url https://api.example.com --from recovery.json
 ```
 
-Restore validates the manifest and topology, fences new traffic, arms every shard, and restarts the Durable Objects at their recorded bookmarks. It returns only after all restored sessions are active and authoritative vector heads have been requeued. Test the procedure against a disposable deployed Worker. Native PITR is not available in Miniflare.
+Restore validates the manifest and topology, fences Catalog and every shard, clears CharDB's live R2 keys and tracked Vectorize records, and restarts the Durable Objects at their recorded bookmarks. The CLI drives large restores through signed, bounded turns, then rebuilds every authoritative file and vector head before returning. Rerun the same command after an unknown result. The manifest digest prevents a different recovery point from crossing an active fence. Test the procedure against a disposable deployed Worker. Native PITR is not available in Miniflare.
 
-File uploads keep a content-addressed recovery copy in the bound R2 bucket. `setup:cloudflare` scopes a 31-day expiration rule to that private prefix, and Chardb refreshes the copy before managed replacement or deletion. A restored file row self-heals its live R2 key on the next read. R2 and Vectorize data created after the point may remain unreachable after restore, so include provider storage in post-restore checks.
+File uploads write an authoritative content-addressed object in the bound R2 bucket. CharDB does not set an expiry rule on that private prefix. Ordinary reads verify and stream those bytes without creating a live key. Restore verifies them again while rebuilding the canonical live keys. A failed provider cleanup leaves the recovery fence in place so the same command can resume. Rejected uploads and deleted files can leave invisible, billable content until provider-wide orphan collection is available.
 
 ## Record the deployed shape
 
 Keep the Worker version, migration journal, schema version and digest, Durable Object namespace bindings, recovery-point manifest, and any active migration or range-movement ID together.
 
-Monitor Chardb error codes and business-level row counts for data whose absence matters. If a migration, restore, or range movement has an unknown outcome, keep traffic closed until its durable state is known.
+Monitor CharDB error codes and business-level row counts for data whose absence matters. If a migration, restore, or range movement has an unknown outcome, keep traffic closed until its durable state is known.
 
 ## Leave shard headroom
 
-An organization or user is the placement and transaction boundary. Chardb can explicitly move a virtual-shard range, including its rows, file metadata, vector state, outboxes, and tombstones. It does not yet balance ranges from live load automatically.
+An organization or user is the placement and transaction boundary. CharDB can explicitly move a virtual-shard range, including its rows, file metadata, vector state, outboxes, and tombstones. It does not yet balance ranges from live load automatically.
 
 Set owner-level size and traffic limits in the application. Watch latency and rate-limit errors, leave room for spikes, and move a range before a physical shard is full. Workloads that require automatic balancing, cross-partition transactions, operator-controlled regional failover, or a production availability SLA are outside the current release.

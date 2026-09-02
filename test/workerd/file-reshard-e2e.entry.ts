@@ -117,6 +117,7 @@ interface Route {
     readonly shardId: string;
     readonly schemaEpoch: number;
     readonly domainSchemaEpoch: number;
+    readonly recoveryGeneration: number;
 }
 
 interface SplitSetup {
@@ -132,6 +133,7 @@ interface SplitIdentity {
     readonly schemaVersion: number;
     readonly schemaEpoch: number;
     readonly schemaDigest: string;
+    readonly recoveryGeneration: number;
     readonly tables: readonly TableSpec[];
 }
 
@@ -143,6 +145,7 @@ interface CdbRpc {
         fileId: string;
         schemaEpoch: number;
         domainSchemaEpoch: number;
+        recoveryGeneration: number;
         body: string;
     }): Promise<Record<string, unknown>>;
     fixtureSeedPendingFile(input: {
@@ -150,6 +153,7 @@ interface CdbRpc {
         fileId: string;
         schemaEpoch: number;
         domainSchemaEpoch: number;
+        recoveryGeneration: number;
         body: string;
     }): Promise<Record<string, unknown>>;
     fixtureState(input: { organizationIds: readonly string[]; migId: string }): Promise<Record<string, unknown>>;
@@ -165,6 +169,7 @@ interface CdbRpc {
         fileId: string;
         schemaEpoch: number;
         domainSchemaEpoch: number;
+        recoveryGeneration: number;
     }): Promise<void>;
     reserveFile(input: Record<string, unknown>): Promise<Record<string, unknown>>;
     markFileReady(input: Record<string, unknown>): Promise<Record<string, unknown>>;
@@ -208,7 +213,7 @@ interface CdbRpc {
         transactions: "single" | "separate";
     }): Promise<SplitCapacityState>;
     fixtureSplitCapacityState(input: { migId: string }): Promise<SplitCapacityState>;
-    readTailBatch(input: { migId: string; afterLsn: number; limit: number }): Promise<{
+    readTailBatch(input: { migId: string; afterLsn: number; limit: number; recoveryGeneration: number }): Promise<{
         transactions: readonly {
             sourceTxId: number;
             firstLsn: number;
@@ -273,12 +278,12 @@ interface FileAlarmFaultState {
 }
 
 interface CatalogRpc {
-    schemaState(): Promise<{ activeVersion: number }>;
+    schemaState(): Promise<{ activeVersion: number; recoveryGeneration: number }>;
     beginSchemaMigration(args: { migrationId: string; targetVersion: number }): Promise<unknown>;
     migrateSchemaShard(args: { migrationId: string; shardId: string }): Promise<unknown>;
     applyCatalogSchemaMigration(args: { migrationId: string; version: number }): Promise<unknown>;
     completeSchemaMigration(args: { migrationId: string }): Promise<unknown>;
-    mutateAuth(args: Record<string, unknown>): Promise<unknown>;
+    mutateAuth(args: Record<string, unknown>, _recoveryGeneration: number): Promise<unknown>;
     route(vshard: number): Promise<Route>;
     fixtureRunAlarm(): Promise<void>;
     fixtureDeletion(input: { organizationId: string }): Promise<Record<string, unknown>>;
@@ -761,6 +766,7 @@ export class Cdb extends app.Cdb {
         fileId: string;
         schemaEpoch: number;
         domainSchemaEpoch: number;
+        recoveryGeneration: number;
         body: string;
     }): Promise<Record<string, unknown>> {
         const nowMs = Date.now();
@@ -777,6 +783,7 @@ export class Cdb extends app.Cdb {
             contentType: "image/png",
             size: body.byteLength,
             nowMs,
+            recoveryGeneration: input.recoveryGeneration,
             schemaEpoch: input.schemaEpoch,
             domainSchemaEpoch: input.domainSchemaEpoch,
             auth: fileAuth(input.organizationId),
@@ -791,6 +798,7 @@ export class Cdb extends app.Cdb {
             sha256: digest,
             size: reserved.size,
             nowMs: nowMs + 1,
+            recoveryGeneration: input.recoveryGeneration,
             schemaEpoch: input.schemaEpoch,
             domainSchemaEpoch: input.domainSchemaEpoch,
             auth: fileAuth(input.organizationId),
@@ -801,6 +809,7 @@ export class Cdb extends app.Cdb {
             fileId: input.fileId,
             schemaEpoch: input.schemaEpoch,
             domainSchemaEpoch: input.domainSchemaEpoch,
+            recoveryGeneration: input.recoveryGeneration,
         });
         return { ...ready, rowId: input.rowId };
     }
@@ -810,6 +819,7 @@ export class Cdb extends app.Cdb {
         fileId: string;
         schemaEpoch: number;
         domainSchemaEpoch: number;
+        recoveryGeneration: number;
         body: string;
     }): Promise<Record<string, unknown>> {
         const fileId = FileId(input.fileId);
@@ -821,6 +831,7 @@ export class Cdb extends app.Cdb {
             contentType: "image/png",
             size: new TextEncoder().encode(input.body).byteLength,
             nowMs: 1,
+            recoveryGeneration: input.recoveryGeneration,
             schemaEpoch: input.schemaEpoch,
             domainSchemaEpoch: input.domainSchemaEpoch,
             auth: fileAuth(input.organizationId),
@@ -838,6 +849,7 @@ export class Cdb extends app.Cdb {
         fileId: string;
         schemaEpoch: number;
         domainSchemaEpoch: number;
+        recoveryGeneration: number;
     }): Promise<void> {
         const attached = await this.mutate({
             principalId: "file-e2e-user",
@@ -846,6 +858,7 @@ export class Cdb extends app.Cdb {
             args: { organizationId: input.organizationId, rowId: input.rowId, fileId: input.fileId },
             placement: { authority: "organization", partitionKey: input.organizationId },
             auth: fileAuth(input.organizationId),
+            recoveryGeneration: input.recoveryGeneration,
             schemaEpoch: input.schemaEpoch,
             domainSchemaEpoch: input.domainSchemaEpoch,
         });
@@ -964,43 +977,54 @@ async function activateSchema(env: Env): Promise<void> {
 }
 
 async function createOrganization(cat: CatalogRpc, organizationId: string): Promise<void> {
-    await cat.mutateAuth({
-        model: "organization",
-        op: "create",
-        payload: {
-            id: organizationId,
-            name: organizationId,
-            slug: organizationId,
-            createdAt: Date.now(),
+    const { recoveryGeneration } = await cat.schemaState();
+    await cat.mutateAuth(
+        {
+            model: "organization",
+            op: "create",
+            payload: {
+                id: organizationId,
+                name: organizationId,
+                slug: organizationId,
+                createdAt: Date.now(),
+            },
         },
-    });
+        recoveryGeneration
+    );
 }
 
 async function createHttpPrincipal(cat: CatalogRpc, organizationId: string, principalId: string): Promise<void> {
     const nowMs = Date.now();
-    await cat.mutateAuth({
-        model: "user",
-        op: "create",
-        payload: {
-            id: principalId,
-            name: principalId,
-            email: `${principalId}@file-reshard.invalid`,
-            emailVerified: true,
-            createdAt: nowMs,
-            updatedAt: nowMs,
+    const { recoveryGeneration } = await cat.schemaState();
+    await cat.mutateAuth(
+        {
+            model: "user",
+            op: "create",
+            payload: {
+                id: principalId,
+                name: principalId,
+                email: `${principalId}@file-reshard.invalid`,
+                emailVerified: true,
+                createdAt: nowMs,
+                updatedAt: nowMs,
+            },
         },
-    });
-    await cat.mutateAuth({
-        model: "member",
-        op: "create",
-        payload: {
-            id: `member-${principalId}`,
-            organizationId,
-            userId: principalId,
-            role: "member",
-            createdAt: nowMs,
+        recoveryGeneration
+    );
+    await cat.mutateAuth(
+        {
+            model: "member",
+            op: "create",
+            payload: {
+                id: `member-${principalId}`,
+                organizationId,
+                userId: principalId,
+                role: "member",
+                createdAt: nowMs,
+            },
         },
-    });
+        recoveryGeneration
+    );
 }
 
 async function driveMigrationTo(env: Env, migId: string, expectedPhase: number, limit = 128): Promise<void> {
@@ -1037,6 +1061,7 @@ async function setup(env: Env, input: SplitSetup): Promise<Record<string, unknow
                 fileId: `fil_${fileHex}`,
                 schemaEpoch: route.schemaEpoch,
                 domainSchemaEpoch: route.domainSchemaEpoch,
+                recoveryGeneration: route.recoveryGeneration,
                 body: `body-${index}`,
             })
         );
@@ -1056,6 +1081,7 @@ async function setup(env: Env, input: SplitSetup): Promise<Record<string, unknow
 async function splitIdentity(env: Env, input: SplitSetup): Promise<SplitIdentity> {
     const state = await cdb(env, SOURCE).schemaState();
     const placement = vshard(input.organizationIds[0]);
+    const route = await catalog(env).route(placement);
     return {
         migId: input.migId,
         rangeLo: placement,
@@ -1063,6 +1089,7 @@ async function splitIdentity(env: Env, input: SplitSetup): Promise<SplitIdentity
         schemaVersion: state.activeVersion,
         schemaEpoch: state.activeEpoch,
         schemaDigest: state.activeDigest,
+        recoveryGeneration: route.recoveryGeneration,
         tables: TABLES,
     };
 }
@@ -1135,6 +1162,7 @@ async function fileGate(
             contentType: "image/png",
             size: 1,
             nowMs: Date.now(),
+            recoveryGeneration: route.recoveryGeneration,
             schemaEpoch: route.schemaEpoch,
             domainSchemaEpoch: route.domainSchemaEpoch,
             auth: fileAuth(input.organizationId),
@@ -1145,6 +1173,7 @@ async function fileGate(
         table: "file_move_documents",
         column: "attachment",
         rowId: input.rowId,
+        recoveryGeneration: route.recoveryGeneration,
         schemaEpoch: route.schemaEpoch,
         domainSchemaEpoch: route.domainSchemaEpoch,
         auth: fileAuth(input.organizationId),
@@ -1195,16 +1224,16 @@ async function httpUploadAcrossCutover(
         get(target, property) {
             if (property === "put") {
                 return async (key: string, ...args: unknown[]) => {
-                    const livePut = !key.startsWith(RETAINED_FILE_PREFIX);
-                    if (livePut) putCalls++;
+                    const retainedPut = key.startsWith(RETAINED_FILE_PREFIX);
+                    if (retainedPut) putCalls++;
                     const written = await Reflect.apply(target.put, target, [key, ...args]);
-                    if (livePut && putCalls === 1) {
+                    if (retainedPut && putCalls === 1) {
                         objectAfterFirstPut = await r2State(env, [key]);
                         await driveMigrationTo(env, input.migId, RESHARDER_PHASE.DUAL_WRITE_OPEN);
                         const sha256 = objectAfterFirstPut[0]?.customMetadata;
                         const digest =
-                            sha256 && typeof sha256 === "object" && "chardbSha256" in sha256
-                                ? String(sha256.chardbSha256)
+                            sha256 && typeof sha256 === "object" && "chardbRetainedSha256" in sha256
+                                ? String(sha256.chardbRetainedSha256)
                                 : "";
                         try {
                             await cdb(env, SOURCE).markFileReady({
@@ -1213,6 +1242,7 @@ async function httpUploadAcrossCutover(
                                 sha256: digest,
                                 size: new TextEncoder().encode(input.fileBody).byteLength,
                                 nowMs: Date.now(),
+                                recoveryGeneration: sourceRoute.recoveryGeneration,
                                 schemaEpoch: sourceRoute.schemaEpoch,
                                 domainSchemaEpoch: sourceRoute.domainSchemaEpoch,
                                 auth: fileAuth(input.organizationId),
@@ -1260,6 +1290,7 @@ async function httpUploadAcrossCutover(
         fileId: expectedFileId,
         schemaEpoch: destinationRoute.schemaEpoch,
         domainSchemaEpoch: destinationRoute.domainSchemaEpoch,
+        recoveryGeneration: destinationRoute.recoveryGeneration,
     });
     const download = await handleOrganizationFileDownloadRequest({
         request: new Request(
@@ -1370,6 +1401,7 @@ export default {
                         fileId: String(body.fileId),
                         schemaEpoch: route.schemaEpoch,
                         domainSchemaEpoch: route.domainSchemaEpoch,
+                        recoveryGeneration: route.recoveryGeneration,
                         body: String(body.fileBody),
                     })
                 );
@@ -1383,6 +1415,7 @@ export default {
                         fileId: String(body.fileId),
                         schemaEpoch: route.schemaEpoch,
                         domainSchemaEpoch: route.domainSchemaEpoch,
+                        recoveryGeneration: route.recoveryGeneration,
                         body: String(body.fileBody),
                     })
                 );
@@ -1403,12 +1436,16 @@ export default {
             if (operation === "gate") return Response.json(await fileGate(env, body as never));
             if (operation === "delete") {
                 const organizationId = String(body.organizationId);
-                await catalog(env).mutateAuth({
-                    model: "organization",
-                    op: "delete",
-                    where: { id: organizationId },
-                    limitOne: true,
-                });
+                const route = await catalog(env).route(vshard(organizationId));
+                await catalog(env).mutateAuth(
+                    {
+                        model: "organization",
+                        op: "delete",
+                        where: { id: organizationId },
+                        limitOne: true,
+                    },
+                    route.recoveryGeneration
+                );
                 await catalog(env).fixtureRunAlarm();
                 const deletion = await catalog(env).fixtureDeletion({ organizationId });
                 const shard = (deletion.shards as readonly { readonly shard_id?: unknown }[] | undefined)?.[0];
@@ -1469,11 +1506,13 @@ export default {
                 return Response.json(await cdb(env, SOURCE).fixtureSplitCapacityState({ migId: String(body.migId) }));
             }
             if (operation === "capacityTailPage") {
+                const { recoveryGeneration } = await catalog(env).schemaState();
                 return Response.json(
                     await cdb(env, SOURCE).readTailBatch({
                         migId: String(body.migId),
                         afterLsn: Number(body.afterLsn),
                         limit: Number(body.limit),
+                        recoveryGeneration,
                     })
                 );
             }

@@ -96,6 +96,31 @@ describe("Cdb file lifecycle store", () => {
         expect(store.read("file_ready")).toMatchObject({ status: "deleting", updatedAt: 310 });
     });
 
+    test("pages only recoverable live files in stable file-id order", () => {
+        reserve("file_b", 4);
+        store.markReady("file_b", HASH_B, 4, 110);
+        store.attach("file_b", "org-1", "messages", "attachment", "row-b", 120);
+        reserve("file_a", 4);
+        store.markReady("file_a", HASH_A, 4, 110);
+        reserve("file_pending", 1);
+        reserve("file_deleting", 1);
+        store.markReady("file_deleting", HASH_A, 1, 110);
+        store.attach("file_deleting", "org-1", "messages", "attachment", "row-deleting", 120);
+        store.queueDelete("file_deleting", 130);
+
+        const first = store.recoveryPage("", 1);
+        expect(first.files.map(file => String(file.fileId))).toEqual(["file_a"]);
+        expect(first).toMatchObject({ afterFileId: "file_a", done: false });
+        const second = store.recoveryPage(first.afterFileId, 1);
+        expect(second.files.map(file => String(file.fileId))).toEqual(["file_b"]);
+        expect(second).toMatchObject({ afterFileId: "file_b", done: true });
+        expect(store.retentionPage("", 10).files.map(file => String(file.fileId))).toEqual([
+            "file_a",
+            "file_b",
+            "file_deleting",
+        ]);
+    });
+
     test("replaces atomically and exposes a bounded idempotent delete queue", () => {
         reserve("file_old", 4, 100);
         store.markReady("file_old", HASH_A, 4, 101);

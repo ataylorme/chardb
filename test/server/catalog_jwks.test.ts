@@ -3,6 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { exportJWK, generateKeyPair } from "jose";
 import { Catalog, configureCatalogRuntime } from "../../src/server/do/catalog.ts";
 import { defineMigrations } from "../../src/server/schema-migrations.ts";
+import { withRecoveryEnv } from "../helpers/recovery.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -38,7 +39,7 @@ async function catalogFixture(db: Database, CatalogClass: typeof Catalog = Catal
             bootstrap = callback().then(() => undefined);
         },
     } as unknown as DurableObjectState;
-    const catalog = new CatalogClass(state, {});
+    const catalog = new CatalogClass(state, withRecoveryEnv({}));
     await bootstrap;
     return catalog;
 }

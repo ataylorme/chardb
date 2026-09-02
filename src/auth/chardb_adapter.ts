@@ -43,11 +43,20 @@ interface CatalogRpc {
     authAdapterRpc(args: CatalogAuthAdapterRpcRequest): Promise<CatalogAuthAdapterRpcResult>;
 }
 
-export interface ChardbAuthAdapterOptions {
-    readonly env: ChardbAuthAdapterEnv;
+type UnstampedCatalogAuthRequest<T> = T extends unknown ? Omit<T, "recoveryGeneration"> : never;
+type CatalogAuthRequest = UnstampedCatalogAuthRequest<CatalogAuthAdapterRpcRequest>;
+
+interface CatalogClient {
+    authAdapterRpc(args: CatalogAuthRequest): Promise<CatalogAuthAdapterRpcResult>;
 }
 
-async function callCatalog<T>(catalog: CatalogRpc, request: CatalogAuthAdapterRpcRequest): Promise<T> {
+export interface ChardbAuthAdapterOptions {
+    readonly env: ChardbAuthAdapterEnv;
+    /** Fixed generation or a lazy resolver used before each Catalog operation. */
+    readonly recoveryGeneration: number | (() => Promise<number>);
+}
+
+async function callCatalog<T>(catalog: CatalogClient, request: CatalogAuthRequest): Promise<T> {
     const response = await catalog.authAdapterRpc(request);
     if (!response.ok) throw new CdbError(response.error);
     return response.value as T;
@@ -55,8 +64,28 @@ async function callCatalog<T>(catalog: CatalogRpc, request: CatalogAuthAdapterRp
 
 export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactory<BetterAuthOptions> {
     const { env } = opts;
-    const catalog = (): CatalogRpc =>
-        env.CDB_CATALOG.get(env.CDB_CATALOG.idFromName("global")) as unknown as CatalogRpc;
+    const recoveryGeneration =
+        typeof opts.recoveryGeneration === "function"
+            ? opts.recoveryGeneration
+            : async (): Promise<number> => opts.recoveryGeneration as number;
+    const catalog = (): CatalogClient => {
+        const rpc = env.CDB_CATALOG.get(env.CDB_CATALOG.idFromName("global")) as unknown as CatalogRpc;
+        return {
+            authAdapterRpc: async request => {
+                const generation = await recoveryGeneration();
+                if (!Number.isSafeInteger(generation) || generation < 0) {
+                    throw new CdbError({
+                        code: "CDB_CATALOG_UNAVAILABLE",
+                        message: "Catalog recovery generation is invalid",
+                    });
+                }
+                return rpc.authAdapterRpc({
+                    ...request,
+                    recoveryGeneration: generation,
+                } as CatalogAuthAdapterRpcRequest);
+            },
+        };
+    };
 
     return createAdapterFactory({
         config: {
@@ -152,7 +181,10 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
 
                 async count({ model, where }) {
                     const filters = where ? whereToReadFilters(where) : [];
-                    return callCatalog<number>(catalog(), { operation: "count", args: { model, where: filters } });
+                    return callCatalog<number>(catalog(), {
+                        operation: "count",
+                        args: { model, where: filters },
+                    });
                 },
 
                 async update({ model, where, update }) {
@@ -202,6 +234,15 @@ export function chardbAuthAdapter(opts: ChardbAuthAdapterOptions): AdapterFactor
                         args: { model, op: "delete", where: flat, limitOne: false },
                     });
                     return r.affected ?? 0;
+                },
+
+                async consumeOne({ model, where }) {
+                    const flat = whereToFlat(where);
+                    const r = await callCatalog<CatalogAuthMutationResult>(catalog(), {
+                        operation: "mutate",
+                        args: { model, op: "delete", where: flat, returnRow: true, limitOne: true },
+                    });
+                    return (r.row ?? null) as never;
                 },
 
                 async incrementOne({ model, where, increment, set }) {

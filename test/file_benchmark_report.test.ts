@@ -58,6 +58,7 @@ function operationSamples(
     return Array.from({ length: count }, (_, sequence) => ({
         sequence,
         objectSequence: sequence % uploadCount,
+        attempts: 1,
         latencyMs: latency,
         bytes: operation === "attach" ? 0 : payloadBytes,
         correctness: correctness(),
@@ -196,18 +197,18 @@ describe("file benchmark reports", () => {
         const [small, large] = local.aggregate.byPayload;
         expect(small).toMatchObject({
             payloadBytes: 65_536,
-            upload: { operations: 160, concurrency: 4, totalBytes: 10_485_760 },
-            attach: { operations: 160, concurrency: 4, totalBytes: 0 },
-            download: { operations: 320, concurrency: 8, totalBytes: 20_971_520 },
+            upload: { operations: 160, attempts: 160, retries: 0, concurrency: 4, totalBytes: 10_485_760 },
+            attach: { operations: 160, attempts: 160, retries: 0, concurrency: 4, totalBytes: 0 },
+            download: { operations: 320, attempts: 320, retries: 0, concurrency: 8, totalBytes: 20_971_520 },
         });
         expect(small?.upload.rawLatencyMs).toHaveLength(160);
         expect(small?.attach.rawLatencyMs).toHaveLength(160);
         expect(small?.download.rawLatencyMs).toHaveLength(320);
         expect(large).toMatchObject({
             payloadBytes: 5_242_880,
-            upload: { operations: 20, concurrency: 1, totalBytes: 104_857_600 },
-            attach: { operations: 20, concurrency: 1, totalBytes: 0 },
-            download: { operations: 40, concurrency: 2, totalBytes: 209_715_200 },
+            upload: { operations: 20, attempts: 20, retries: 0, concurrency: 1, totalBytes: 104_857_600 },
+            attach: { operations: 20, attempts: 20, retries: 0, concurrency: 1, totalBytes: 0 },
+            download: { operations: 40, attempts: 40, retries: 0, concurrency: 2, totalBytes: 209_715_200 },
         });
         expect(large?.upload.rawLatencyMs).toHaveLength(20);
         expect(large?.attach.rawLatencyMs).toHaveLength(20);
@@ -236,6 +237,10 @@ describe("file benchmark reports", () => {
         const invalidPayloadDigest = mutableReport("local");
         first(first(invalidPayloadDigest.runs).payloads).payloadSha256 = "not-a-digest";
         expect(() => assertFileBenchmarkReport(invalidPayloadDigest)).toThrow("payloadSha256");
+
+        const hiddenRetry = mutableReport("local");
+        first(first(first(hiddenRetry.runs).payloads).operations.attach.samples).attempts = 2;
+        expect(() => assertFileBenchmarkReport(hiddenRetry)).toThrow("bounded operation contract");
     });
 
     test("reports strict descriptive Cloudflare-to-local ratios without a threshold", () => {

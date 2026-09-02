@@ -20,7 +20,7 @@ pub enum ErrorKind {
     Capacity,
 }
 
-/// A Chardb client failure.
+/// A `CharDB` client failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Error {
     kind: ErrorKind,

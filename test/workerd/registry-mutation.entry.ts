@@ -182,6 +182,8 @@ export class Cdb extends app.Cdb {
     }
 }
 
+export class Resharder extends app.Resharder {}
+
 export class InvalidationGateway extends DurableObject<Record<string, never>> {
     constructor(state: DurableObjectState, env: Record<string, never>) {
         super(state, env);
@@ -242,6 +244,7 @@ function subscriptionRequest(gatewayId: string): CdbSubscriptionRequest {
         },
         principalId: PrincipalId(AUTH.userId),
         organizationId: TenantId(AUTH.tenantId),
+        recoveryGeneration: 0,
         schemaEpoch: 1,
         vshard: Number(vshardOf([AUTH.tenantId])),
         domainSchemaEpoch: 1,
@@ -269,6 +272,7 @@ function registeredSubscriptionRequest(gatewayId: string, registrationId: string
         principalId: PrincipalId(AUTH.userId),
         organizationId: TenantId(AUTH.userId),
         placement: { authority: "user", partitionKey: AUTH.userId },
+        recoveryGeneration: 0,
         schemaEpoch: 1,
         vshard: Number(vshardOf([AUTH.userId])),
         domainSchemaEpoch: 1,
@@ -296,7 +300,7 @@ export default {
             corruptRegisteredQuery(registrationId: string, kind: "malformed" | "mismatch" | "mapping"): Promise<void>;
             subscribeForProof(input: CdbSubscriptionRequest): Promise<Record<string, unknown>>;
             subscribe(input: CdbSubscriptionRequest): Promise<unknown>;
-            unsubscribe(input: LiveSubscriptionId): Promise<void>;
+            unsubscribe(input: { subscription: LiveSubscriptionId; recoveryGeneration: number }): Promise<void>;
             queryRegistered(input: CdbRegisteredQueryRequest): Promise<unknown>;
             prepareRoutingFence(input: RoutingFenceIdentity): Promise<unknown>;
             activateRoutingFence(input: RoutingFenceIdentity): Promise<unknown>;
@@ -314,11 +318,11 @@ export default {
             return Response.json(await stub.subscribe(subscribeRequest));
         }
         if (url.pathname === "/unsubscribe") {
-            await stub.unsubscribe(subscribeRequest.subscription);
+            await stub.unsubscribe({ subscription: subscribeRequest.subscription, recoveryGeneration: 0 });
             return Response.json({ ok: true });
         }
         if (url.pathname.startsWith("/routing-fence/")) {
-            const body = (await request.json()) as RoutingFenceIdentity;
+            const body = { ...((await request.json()) as RoutingFenceIdentity), recoveryGeneration: 0 };
             if (url.pathname === "/routing-fence/prepare") return Response.json(await stub.prepareRoutingFence(body));
             if (url.pathname === "/routing-fence/activate") {
                 return Response.json(await stub.activateRoutingFence(body));
@@ -342,7 +346,7 @@ export default {
                 return Response.json(await stub.subscribeForProof(registered));
             }
             if (url.pathname === "/registered/unsubscribe") {
-                await stub.unsubscribe(registered.subscription);
+                await stub.unsubscribe({ subscription: registered.subscription, recoveryGeneration: 0 });
                 return Response.json({ ok: true });
             }
             if (url.pathname === "/registered/corrupt") {
@@ -361,6 +365,7 @@ export default {
                             userId: body.forgedPrincipal ? "forged-principal" : AUTH.userId,
                             claims: { probe: "fresh-query-auth" },
                         },
+                        recoveryGeneration: 0,
                         schemaEpoch: 1,
                         vshard: Number(vshardOf([AUTH.userId])),
                         domainSchemaEpoch: 1,
@@ -406,6 +411,7 @@ export default {
                 ? {}
                 : { placement: { authority: route.authority, partitionKey: route.partitionKey } }),
             auth: requestAuth,
+            recoveryGeneration: 0,
             schemaEpoch: body.schemaEpoch ?? 1,
             domainSchemaEpoch: 1,
         };
@@ -419,4 +425,5 @@ interface RoutingFenceIdentity {
     readonly rangeHi: number;
     readonly sourceGeneration: number;
     readonly destinationGeneration: number;
+    readonly recoveryGeneration?: number;
 }

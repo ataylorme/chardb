@@ -234,7 +234,7 @@ describe("Cloudflare Vectorize proof planning", () => {
             "--metric",
             "cosine",
             "--description",
-            `Chardb disposable proof ${digest.slice(0, 12)}`,
+            `CharDB disposable proof ${digest.slice(0, 12)}`,
             "--json",
         ]);
         expect(plan.creation.find(command => command.phase === "metadata-index-create")?.args).toContain(

@@ -1,23 +1,17 @@
 {
     "name": "@chardb/core",
     "version": "0.1.0",
-    "description": "Cloudflare-native SQL with per-tenant ACID and live Drizzle queries",
+    "description": "Cloudflare-native SQL with identity-owned SQLite transactions and live Drizzle queries",
     "type": "module",
     "license": "MIT",
     "publishConfig": {
         "access": "public"
     },
     "homepage": "https://chardb.dev",
-    "repository": {
-        "type": "git",
-        "url": "git+https://github.com/zpg6/chardb.git"
-    },
-    "bugs": {
-        "url": "https://github.com/zpg6/chardb/issues"
-    },
     "packageManager": "bun@1.2.22",
     "engines": {
-        "bun": ">=1.2.22"
+        "bun": ">=1.2.22",
+        "node": ">=22"
     },
     "bin": {
         "chardb": "./dist/cli/bin.mjs",

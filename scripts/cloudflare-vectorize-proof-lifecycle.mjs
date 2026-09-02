@@ -1499,6 +1499,267 @@ export function createCloudflareVectorizeProofLifecycle(dependencies = {}) {
         return freeze({ ...inspected, matches });
     };
 
+    const vectorPresence = async input => {
+        const expectedVectorId = vectorId(input.vectorId);
+        const result = await requestJson({
+            origin: input.origin,
+            path: "/proof/vector-presence",
+            method: "POST",
+            headers: proofHeaders(input.admin),
+            body: {
+                organizationId: organizationId(input.organizationId),
+                vectorId: expectedVectorId,
+                versions: [1, 2],
+            },
+            label: "vector provider presence",
+        });
+        const body = exactFields(result.body, "vector provider presence result", ["records", "vectorId"]);
+        check(body.vectorId === expectedVectorId, "vector provider presence changed logical identity");
+        check(Array.isArray(body.records) && body.records.length === 2, "vector provider presence is incomplete");
+        const records = body.records.map((value, index) => {
+            const record = exactFields(value, `vector provider presence record ${index}`, ["physicalId", "present"]);
+            const parsed = physicalId(record.physicalId, `vector provider presence record ${index} physical id`);
+            check(
+                parsed.vectorId === expectedVectorId && parsed.version === index + 1,
+                "vector provider presence physical identity drifted"
+            );
+            check(typeof record.present === "boolean", "vector provider presence flag is invalid");
+            return freeze({ physicalId: parsed.id, present: record.present });
+        });
+        return freeze({ vectorId: expectedVectorId, records });
+    };
+
+    const recoveryOperation = async (input, operation) => {
+        let continuation;
+        for (let turn = 0; turn < 1_024; turn++) {
+            const result = await requestJson({
+                origin: input.origin,
+                path: `/_chardb/backups/${operation}`,
+                method: "POST",
+                headers: { authorization: `Bearer ${text(input.adminToken, "recovery admin token", 512)}` },
+                body: { recoveryPoint: input.recoveryPoint, ...(continuation === undefined ? {} : { continuation }) },
+                label: `recovery ${operation}`,
+            });
+            const body = object(result.body, `recovery ${operation} response`);
+            check(body.recoveryPointDigest === input.recoveryPoint.digest, `recovery ${operation} digest drifted`);
+            if (body.pending === true) {
+                check(
+                    body.ok === true && body.continuation !== undefined,
+                    `recovery ${operation} continuation is invalid`
+                );
+                continuation = body.continuation;
+                continue;
+            }
+            return body;
+        }
+        throw new Error(`recovery ${operation} exceeded 1024 continuation turns`);
+    };
+
+    const proveRecovery = async input => {
+        const origin = normalizeOrigin(input.origin);
+        const admin = object(input.admin, "recovery proof admin");
+        const timeoutMs = positiveInteger(input.timeoutMs, "recovery proof timeout", 30 * 60_000);
+        const intervalMs = positiveInteger(input.intervalMs ?? 1_000, "recovery proof interval", timeoutMs);
+        let owner = await signInAnonymous({ origin });
+        const owning = await createOrganization({
+            origin,
+            principal: owner,
+            name: text(input.organizationName, "recovery proof organization name", 128),
+            slug: text(input.organizationSlug, "recovery proof organization slug", 128),
+        });
+        owner = await setActiveOrganization({
+            origin,
+            principal: { ...owner, cookie: owning.cookie },
+            organizationId: owning.organizationId,
+        });
+        const documentId = identity(input.documentId, "recovery proof document id");
+        const mutationRunId = identity(input.mutationRunId, "recovery proof mutation run id");
+        const initial = await mutateVector({
+            origin,
+            principal: owner,
+            organizationId: owning.organizationId,
+            action: "create",
+            id: documentId,
+            text: text(input.initialText, "recovery proof initial text", 2_000),
+            values: input.initialValues,
+            mutId: `${mutationRunId}:create`,
+        });
+        const firstIntent = await vectorIntent({
+            origin,
+            admin,
+            organizationId: owning.organizationId,
+            id: documentId,
+            action: "replace",
+        });
+        check(
+            firstIntent.vectorId === initial.vectorId && firstIntent.nextVersion === 2,
+            "recovery proof point is not version 1"
+        );
+        const firstPhysicalId = physicalId(firstIntent.physicalIds[0], "recovery proof version 2 physical id");
+        const versionOnePhysicalId = firstPhysicalId.id.replace(/_2$/, "_1");
+        physicalId(versionOnePhysicalId, "recovery proof version 1 physical id");
+        check(
+            typeof input.recordPhysicalIds === "function",
+            "recovery proof physical-id recorder is required",
+            TypeError
+        );
+        await input.recordPhysicalIds([versionOnePhysicalId, firstPhysicalId.id]);
+        await pollReady({
+            origin,
+            admin,
+            organizationId: owning.organizationId,
+            vectorId: initial.vectorId,
+            version: 1,
+            requiredPhases: [],
+            timeoutMs,
+            intervalMs,
+        });
+        const pointPresence = await vectorPresence({
+            origin,
+            admin,
+            organizationId: owning.organizationId,
+            vectorId: initial.vectorId,
+        });
+        check(
+            pointPresence.records[0].present === true && pointPresence.records[1].present === false,
+            "recovery point provider state is not exactly version 1"
+        );
+        const created = await requestJson({
+            origin,
+            path: "/_chardb/backups/create",
+            method: "POST",
+            headers: { authorization: `Bearer ${text(admin.token, "recovery admin token", 512)}` },
+            body: {},
+            label: "recovery point create",
+        });
+        const createdBody = object(created.body, "recovery point create response");
+        const recoveryPoint = object(createdBody.recoveryPoint, "recovery point");
+        check(
+            recoveryPoint.format === "chardb-recovery-point/v1" &&
+                typeof recoveryPoint.digest === "string" &&
+                SHA256.test(recoveryPoint.digest),
+            "recovery point is invalid"
+        );
+        const replacement = await mutateVector({
+            origin,
+            principal: owner,
+            organizationId: owning.organizationId,
+            action: "replace",
+            id: documentId,
+            text: text(input.replacementText, "recovery proof replacement text", 2_000),
+            values: input.replacementValues,
+            mutId: `${mutationRunId}:replace`,
+        });
+        check(replacement.vectorId === initial.vectorId, "recovery proof replacement changed logical identity");
+        await pollReady({
+            origin,
+            admin,
+            organizationId: owning.organizationId,
+            vectorId: initial.vectorId,
+            version: 2,
+            requiredPhases: [],
+            timeoutMs,
+            intervalMs,
+        });
+        const postPointPresence = await vectorPresence({
+            origin,
+            admin,
+            organizationId: owning.organizationId,
+            vectorId: initial.vectorId,
+        });
+        check(
+            postPointPresence.records[0].present === false && postPointPresence.records[1].present === true,
+            "post-point provider state is not exactly version 2"
+        );
+        const restored = await recoveryOperation({ origin, adminToken: admin.token, recoveryPoint }, "restore");
+        const providerReset = object(restored.providerReset, "recovery provider reset");
+        check(
+            restored.ok === true &&
+                restored.accepted === true &&
+                Number.isSafeInteger(providerReset.files) &&
+                providerReset.files >= 0 &&
+                Number.isSafeInteger(providerReset.vectors) &&
+                providerReset.vectors >= 1,
+            "recovery restore did not scrub the post-point vector"
+        );
+        const scrubbedPresence = await vectorPresence({
+            origin,
+            admin,
+            organizationId: owning.organizationId,
+            vectorId: initial.vectorId,
+        });
+        check(
+            scrubbedPresence.records.every(record => record.present === false),
+            "recovery restore left a physical vector before reconciliation"
+        );
+        check(
+            Number.isSafeInteger(restored.reconcileAfterMs) && restored.reconcileAfterMs > 0,
+            "recovery restore returned an invalid reconcile delay"
+        );
+        await sleep(restored.reconcileAfterMs);
+        const reconciled = await recoveryOperation({ origin, adminToken: admin.token, recoveryPoint }, "reconcile");
+        check(
+            reconciled.ok === true &&
+                reconciled.reconciled === true &&
+                Number.isSafeInteger(reconciled.filesRehydrated) &&
+                reconciled.filesRehydrated >= 0 &&
+                Number.isSafeInteger(reconciled.vectorsRequeued) &&
+                reconciled.vectorsRequeued >= 1,
+            "recovery reconciliation did not requeue the point-in-time vector"
+        );
+        const ready = await pollReady({
+            origin,
+            admin,
+            organizationId: owning.organizationId,
+            vectorId: initial.vectorId,
+            version: 1,
+            requiredPhases: [],
+            timeoutMs,
+            intervalMs,
+        });
+        const finalPresence = await vectorPresence({
+            origin,
+            admin,
+            organizationId: owning.organizationId,
+            vectorId: initial.vectorId,
+        });
+        check(
+            finalPresence.records[0].present === true && finalPresence.records[1].present === false,
+            "recovery provider state is not exactly restored version 1"
+        );
+        const rows = await listVectorDocuments({
+            origin,
+            principal: owner,
+            organizationId: owning.organizationId,
+            limit: 10,
+        });
+        check(
+            rows.length === 1 && rows[0].id === documentId && rows[0].body === input.initialText,
+            "recovery did not restore the authoritative version 1 row"
+        );
+        return assertSecretFreeVectorEvidence(
+            freeze({
+                recoveryPointDigest: recoveryPoint.digest,
+                vectorId: initial.vectorId,
+                physicalIds: [versionOnePhysicalId, firstPhysicalId.id],
+                authoritativeVersion: ready.state.head.version,
+                providerReset: { files: providerReset.files, vectors: providerReset.vectors },
+                reconciliation: {
+                    filesRehydrated: reconciled.filesRehydrated,
+                    vectorsRequeued: reconciled.vectorsRequeued,
+                },
+                providerPresence: {
+                    atPoint: pointPresence.records.map(record => record.present),
+                    postPoint: postPointPresence.records.map(record => record.present),
+                    afterScrub: scrubbedPresence.records.map(record => record.present),
+                    afterRequeue: finalPresence.records.map(record => record.present),
+                },
+                restoredRow: { id: rows[0].id, body: rows[0].body },
+            }),
+            [admin.token, owner.cookie, owner.token]
+        );
+    };
+
     const vectorSearchAudit = async input => {
         check(input.action === "cursor" || input.action === "observe", "vector search audit action is invalid");
         check(
@@ -2123,6 +2384,8 @@ export function createCloudflareVectorizeProofLifecycle(dependencies = {}) {
         openLiveVectorSubscription,
         mutateVectorAdversary,
         queryVectorAdversary,
+        vectorPresence,
+        proveRecovery,
         vectorSearchAudit,
         armFault,
         vectorState,

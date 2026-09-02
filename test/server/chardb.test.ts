@@ -83,6 +83,15 @@ const auth = defineAuth({
 
 type RoutedArgs = { readonly organizationId: string } & { readonly [key: string]: RawJson };
 type RoutedQueryArgs = { readonly organizationId: string; readonly limit: number };
+
+function requestEnv(): unknown {
+    const catalog = {
+        async schemaState() {
+            return { activeVersion: 0, status: "active" as const, recoveryGeneration: 0 };
+        },
+    };
+    return { CDB_CATALOG: { idFromName: () => "global", get: () => catalog } };
+}
 const routedMutation = defineMutation<unknown, RoutedArgs, null>(() => null, {
     ref: "api/items#route",
     authority: "organization",
@@ -225,7 +234,7 @@ describe("chardb({…})", () => {
         app.get("/hello", c => c.text("world"));
         const res = await app.fetch(
             new Request("https://example.com/hello"),
-            {} as Parameters<typeof app.fetch>[1],
+            requestEnv() as Parameters<typeof app.fetch>[1],
             { waitUntil() {}, passThroughOnException() {}, props: undefined } as Parameters<typeof app.fetch>[2]
         );
         expect(res.status).toBe(200);
@@ -242,7 +251,7 @@ describe("chardb({…})", () => {
         });
         const response = await app.fetch(
             new Request("https://example.com/forbidden"),
-            {} as Parameters<typeof app.fetch>[1],
+            requestEnv() as Parameters<typeof app.fetch>[1],
             { waitUntil() {}, passThroughOnException() {}, props: undefined } as Parameters<typeof app.fetch>[2]
         );
         expect(response.status).toBe(403);
@@ -288,7 +297,7 @@ describe("chardb({…})", () => {
     test("pins unconfigured Better Auth instances to each canonical request origin", async () => {
         const app = chardb({ ownership: "user", auth: defineAuth({}), schema: {} });
         app.get("/auth-origin", c => c.json({ baseURL: c.var.auth.options.baseURL }));
-        const env = {} as Parameters<typeof app.fetch>[1];
+        const env = requestEnv() as Parameters<typeof app.fetch>[1];
         const ctx = {
             waitUntil() {},
             passThroughOnException() {},
@@ -316,7 +325,7 @@ describe("chardb({…})", () => {
             });
         });
 
-        const env = {} as Parameters<typeof app.fetch>[1];
+        const env = requestEnv() as Parameters<typeof app.fetch>[1];
         const db = {
             async executeQuery() {
                 return { ok: true as const, result: null };
@@ -344,7 +353,7 @@ describe("chardb({…})", () => {
             hasCreateOrganization: true,
             reused: true,
         });
-        expect((await (await request({} as Parameters<typeof app.fetch>[1])).json()) as unknown).toEqual({
+        expect((await (await request(requestEnv() as Parameters<typeof app.fetch>[1])).json()) as unknown).toEqual({
             hasGetSession: true,
             hasCreateOrganization: true,
             reused: false,
@@ -360,9 +369,19 @@ describe("chardb({…})", () => {
                 router.get("/inline-auth", c => c.json({ available: typeof c.var.auth.api.getSession === "function" }));
             },
         });
+        const unavailableCatalogEnv = {
+            CDB_CATALOG: {
+                idFromName: () => "global",
+                get: () => ({
+                    schemaState: async () => {
+                        throw new Error("Catalog should stay lazy for this route");
+                    },
+                }),
+            },
+        };
         const response = await app.fetch(
             new Request("https://example.com/inline-auth"),
-            {} as Parameters<typeof app.fetch>[1],
+            unavailableCatalogEnv as unknown as Parameters<typeof app.fetch>[1],
             { waitUntil() {}, passThroughOnException() {}, props: undefined } as Parameters<typeof app.fetch>[2]
         );
         expect((await response.json()) as unknown).toEqual({ available: true });
@@ -385,7 +404,7 @@ describe("chardb({…})", () => {
 
         const response = await app.fetch(
             new Request("https://example.com/auth-profile"),
-            {} as Parameters<typeof app.fetch>[1],
+            requestEnv() as Parameters<typeof app.fetch>[1],
             { waitUntil() {}, passThroughOnException() {}, props: undefined } as Parameters<typeof app.fetch>[2]
         );
         expect((await response.json()) as unknown).toEqual({
@@ -408,7 +427,7 @@ describe("chardb({…})", () => {
         app.get("/binding", c => c.json({ available: c.env.DB === db }));
         const res = await app.fetch(
             new Request("https://example.com/binding"),
-            {} as Parameters<typeof app.fetch>[1],
+            requestEnv() as Parameters<typeof app.fetch>[1],
             {
                 exports: { DB: db },
                 waitUntil() {},

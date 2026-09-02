@@ -141,6 +141,8 @@ describe("candidate-bound Cloudflare Vectorize proof fixture", () => {
         expect(worker).toContain('app.post("/proof/vector-descriptor"');
         expect(worker).toContain('app.post("/proof/vector-adversary"');
         expect(worker).toContain('app.post("/proof/vector-adversary/query"');
+        expect(worker).toContain('app.post("/proof/vector-presence"');
+        expect(worker).toContain("env.CDB_PROOF_VECTORS.getByIds([...physicalIds])");
         expect(worker).toContain('app.post("/proof/vector-search-audit"');
         expect(worker).toContain("protected override resolveVectorSearchIndex");
         expect(worker).toContain("assertVectorProofSearchAuditSequence(afterSequence, latestSequence, row.sequence)");

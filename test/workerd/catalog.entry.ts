@@ -6,6 +6,7 @@ import { organization } from "better-auth/plugins/organization";
 import { bindAuthRuntime } from "../../src/auth/runtime.ts";
 import { defineAuth, synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import { Catalog as ProductionCatalog } from "../../src/server/do/catalog.ts";
+import { Resharder as ProductionResharder } from "../../src/server/do/resharder.ts";
 
 const auth = defineAuth({ appName: "catalog-workerd-test", plugins: [organization()] });
 bindAuthRuntime({
@@ -20,6 +21,8 @@ export class Catalog extends ProductionCatalog {
         return this.fixtureId;
     }
 }
+
+export class Resharder extends ProductionResharder {}
 
 interface Env {
     CATALOG: DurableObjectNamespace;
@@ -52,6 +55,8 @@ export default {
                 result = await stubAny.route(body?.vshard);
             } else if (op === "fixtureInstanceId") {
                 result = await stubAny.fixtureInstanceId();
+            } else if (op === "mutateAuth" || op === "queryAuth") {
+                result = await (stubAny[op] as (arg: unknown, recoveryGeneration: number) => Promise<unknown>)(body, 0);
             } else {
                 result = await stubAny[op](body);
             }

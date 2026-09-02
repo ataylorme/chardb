@@ -8,6 +8,7 @@ import { ChardbRef, ClientId, PrincipalId, SubId, TenantId } from "../../src/typ
 import { stableHashHex } from "../../src/util/canonical.ts";
 import { vshardOf } from "../../src/vshard.ts";
 import { forOrg } from "../helpers/cdb-table.ts";
+import { withRecoveryEnv } from "../helpers/recovery.ts";
 
 const organization = sqliteTable("organization", { id: text("id").primaryKey() });
 const { cdbTable } = forOrg();
@@ -109,6 +110,7 @@ function request(
         principalId: PrincipalId("user-1"),
         organizationId: TenantId("org-1"),
         schemaEpoch: 1,
+        recoveryGeneration: 0,
         vshard: Number(vshardOf(["org-1"])),
         domainSchemaEpoch: 1,
         ref: ChardbRef("queries.ts#messages"),
@@ -127,7 +129,7 @@ describe("Cdb live subscription identity", () => {
     let state: DurableObjectState;
 
     async function reconstruct(): Promise<void> {
-        cdb = new ConfiguredCdb(state, {});
+        cdb = new ConfiguredCdb(state, withRecoveryEnv({}));
         await bootstrap;
     }
 
@@ -197,7 +199,7 @@ describe("Cdb live subscription identity", () => {
             invalidations: [],
         });
 
-        await cdb.unsubscribe({ ...second });
+        await cdb.unsubscribe({ subscription: second, recoveryGeneration: 0 });
         await reconstruct();
 
         expect(durableLiveState(db)).toEqual({
@@ -340,6 +342,7 @@ describe("Cdb live subscription identity", () => {
             principalId: legacyRequest.principalId,
             organizationId: legacyRequest.organizationId,
             schemaEpoch: legacyRequest.schemaEpoch,
+            recoveryGeneration: 0,
             vshard: legacyRequest.vshard,
             domainSchemaEpoch: legacyRequest.domainSchemaEpoch,
             ref: legacyRequest.ref,
@@ -352,10 +355,10 @@ describe("Cdb live subscription identity", () => {
         db.prepare(
             `INSERT INTO _chardb_live_subscriptions
              (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-              principal_id, organization_id, schema_epoch, vshard, domain_schema_epoch,
+              principal_id, organization_id, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
               ref, args_json, policy_digest, query_hash,
               tables_json, intervals_json)
-             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(
             legacy.gatewayId,
             legacy.registrationId,
@@ -386,12 +389,12 @@ describe("Cdb live subscription identity", () => {
             ok: false,
             error: { code: "CDB_RATE_LIMITED" },
         });
-        await cdb.unsubscribe(first);
+        await cdb.unsubscribe({ subscription: first, recoveryGeneration: 0 });
         await expect(cdb.subscribe(request(excess))).resolves.toMatchObject({
             ok: false,
             error: { code: "CDB_RATE_LIMITED" },
         });
-        await cdb.unsubscribe(active[1] as LiveSubscriptionId);
+        await cdb.unsubscribe({ subscription: active[1] as LiveSubscriptionId, recoveryGeneration: 0 });
         await expect(cdb.subscribe(request(excess))).resolves.toEqual({
             ok: true,
             subscription: excess,
@@ -410,14 +413,14 @@ describe("Cdb live subscription identity", () => {
         ).run(identity.gatewayId, identity.registrationId, "messages");
 
         await expect(cdb.subscribe(original)).rejects.toMatchObject({ code: "CDB_INVARIANT" });
-        cdb = new ConfiguredCdb(state, {});
+        cdb = new ConfiguredCdb(state, withRecoveryEnv({}));
         await expect(bootstrap).rejects.toMatchObject({ code: "CDB_INVARIANT" });
     });
 
     test("unsubscribe-before-subscribe stays fenced until exact Gateway finalization", async () => {
         const identity = subscription("gateway-do-1", "client-1", "registration-retired");
 
-        await cdb.unsubscribe(identity);
+        await cdb.unsubscribe({ subscription: identity, recoveryGeneration: 0 });
         expect(
             db
                 .prepare(
@@ -447,28 +450,35 @@ describe("Cdb live subscription identity", () => {
             invalidations: [],
         });
 
-        await expect(cdb.finalizeUnsubscribe({ ...identity, connectionId: "connection-forged" })).rejects.toMatchObject(
-            {
-                code: "CDB_INVARIANT",
-            }
-        );
-        await cdb.finalizeUnsubscribe(identity);
-        await cdb.finalizeUnsubscribe(identity);
+        await expect(
+            cdb.finalizeUnsubscribe({
+                subscription: { ...identity, connectionId: "connection-forged" },
+                recoveryGeneration: 0,
+            })
+        ).rejects.toMatchObject({
+            code: "CDB_INVARIANT",
+        });
+        await cdb.finalizeUnsubscribe({ subscription: identity, recoveryGeneration: 0 });
+        await cdb.finalizeUnsubscribe({ subscription: identity, recoveryGeneration: 0 });
         expect(durableLiveState(db)).toEqual({ registrations: [], tables: [], invalidations: [] });
         await expect(cdb.subscribe(request(identity))).resolves.toEqual({
             ok: true,
             subscription: identity,
             changeSeq: 0,
         });
-        await expect(cdb.finalizeUnsubscribe(identity)).rejects.toMatchObject({ code: "CDB_INVARIANT" });
+        await expect(cdb.finalizeUnsubscribe({ subscription: identity, recoveryGeneration: 0 })).rejects.toMatchObject({
+            code: "CDB_INVARIANT",
+        });
     });
 
     test("bounds retained subscription rows and identity bytes before tombstone insertion", async () => {
         const exactIdentity = subscription("g".repeat(256), "c".repeat(256), "r".repeat(256), "n".repeat(256));
-        await cdb.unsubscribe(exactIdentity);
-        await cdb.finalizeUnsubscribe(exactIdentity);
+        await cdb.unsubscribe({ subscription: exactIdentity, recoveryGeneration: 0 });
+        await cdb.finalizeUnsubscribe({ subscription: exactIdentity, recoveryGeneration: 0 });
         const oversized = subscription("g".repeat(257), "client", "registration", "connection");
-        await expect(cdb.unsubscribe(oversized)).rejects.toMatchObject({ code: "CDB_INVALID_ARGS" });
+        await expect(cdb.unsubscribe({ subscription: oversized, recoveryGeneration: 0 })).rejects.toMatchObject({
+            code: "CDB_INVALID_ARGS",
+        });
 
         const insert = db.prepare(
             `INSERT INTO _chardb_live_subscriptions
@@ -481,7 +491,7 @@ describe("Cdb live subscription identity", () => {
             }
         })();
         const excess = subscription("gateway-cap", "client-excess", "retired-excess", "connection-excess");
-        await expect(cdb.unsubscribe(excess)).rejects.toMatchObject({
+        await expect(cdb.unsubscribe({ subscription: excess, recoveryGeneration: 0 })).rejects.toMatchObject({
             code: "CDB_RATE_LIMITED",
             retryable: true,
         });
@@ -498,9 +508,11 @@ describe("Cdb live subscription identity", () => {
             clientId: ClientId("client-0"),
             subId: SubId(0),
         };
-        await cdb.finalizeUnsubscribe(released);
-        await expect(cdb.unsubscribe(excess)).resolves.toBeUndefined();
-        expect(db.prepare("SELECT COUNT(*) AS count FROM _chardb_live_subscriptions").get()).toEqual({ count: 8_192 });
+        await cdb.finalizeUnsubscribe({ subscription: released, recoveryGeneration: 0 });
+        await expect(cdb.unsubscribe({ subscription: excess, recoveryGeneration: 0 })).resolves.toBeUndefined();
+        expect(db.prepare("SELECT COUNT(*) AS count FROM _chardb_live_subscriptions").get()).toEqual({
+            count: 8_192,
+        });
     });
 
     test("a retired active registration stays absent after reconstruction", async () => {
@@ -508,7 +520,7 @@ describe("Cdb live subscription identity", () => {
         const retired = subscription("gateway-do-1", "client-1", "registration-retired");
         await cdb.subscribe(request(active));
         await cdb.subscribe(request(retired));
-        await cdb.unsubscribe(retired);
+        await cdb.unsubscribe({ subscription: retired, recoveryGeneration: 0 });
 
         await reconstruct();
 
@@ -523,7 +535,12 @@ describe("Cdb live subscription identity", () => {
         const identity = subscription("gateway-do-1", "client-1", "registration-1", "connection-1");
         await cdb.subscribe(request(identity));
 
-        await expect(cdb.unsubscribe({ ...identity, connectionId: "connection-forged" })).rejects.toMatchObject({
+        await expect(
+            cdb.unsubscribe({
+                subscription: { ...identity, connectionId: "connection-forged" },
+                recoveryGeneration: 0,
+            })
+        ).rejects.toMatchObject({
             code: "CDB_INVARIANT",
         });
         expect(
@@ -539,7 +556,7 @@ describe("Cdb live subscription identity", () => {
             identity.registrationId
         );
 
-        cdb = new Cdb(state, {});
+        cdb = new Cdb(state, withRecoveryEnv({}));
         await expect(bootstrap).rejects.toMatchObject({ code: "CDB_INVARIANT" });
     });
 
@@ -588,7 +605,7 @@ describe("Cdb live subscription identity", () => {
                     legacyReady = callback();
                 },
             } as unknown as DurableObjectState;
-            const legacyCdb = new Cdb(legacyState, {});
+            const legacyCdb = new Cdb(legacyState, withRecoveryEnv({}));
             await legacyReady;
 
             expect(

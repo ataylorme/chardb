@@ -1,12 +1,12 @@
-# Chardb
+# CharDB
 
 An auth-native database for Cloudflare Workers.
 
-Chardb turns a Better Auth user or organization into the ownership, authorization, and placement boundary for a sharded SQLite database. It runs on Durable Objects, uses Drizzle schemas and migrations, works through Wrangler and Miniflare, and gives browser clients typed queries, mutations, files, and live updates.
-
-The project is experimental. The supported path is real, packaged, and tested end to end.
+CharDB turns a Better Auth user or organization into the ownership, authorization, and placement boundary for a sharded SQLite database. It runs on Durable Objects, uses Drizzle schemas and migrations, works through Wrangler and Miniflare, and gives browser clients typed queries, mutations, files, and live updates.
 
 ## Build one
+
+Use Bun 1.2.22 or newer and Node.js 22 or newer.
 
 ```sh
 bunx @chardb/core init my-chardb-app
@@ -27,10 +27,11 @@ Choose one ownership mode for the application: `organization` or `user`. There i
 // src/auth.ts
 import { jwt } from "better-auth/plugins/jwt";
 import { organization } from "better-auth/plugins/organization";
+import { anonymous } from "better-auth/plugins/anonymous";
 import { defineAuth } from "@chardb/core/server";
 
 export const auth = defineAuth({
-    plugins: [organization(), jwt()],
+    plugins: [anonymous(), organization(), jwt()],
 });
 
 // src/schema.ts
@@ -61,7 +62,7 @@ export const messages = cdbTable(
 );
 ```
 
-`forOrg(auth)` adds the managed organization key. Chardb gets it from the verified Better Auth session, refreshes membership and role state through the Catalog, routes the operation to that organization, then applies the table policy inside the same SQLite transaction.
+`forOrg(auth)` adds the managed organization key. CharDB gets it from the verified Better Auth session, refreshes membership and role state through the Catalog, routes the operation to that organization, then applies the table policy inside the same SQLite transaction.
 
 Use `forOrgUser(auth)` when rows belong to a user inside an organization. Use `forUser(auth)` for applications without organizations.
 
@@ -126,7 +127,11 @@ export const app = chardb({
     migrations,
 });
 
-app.get("/health", c => c.json({ ok: true }));
+app.get("/health", c => c.json({
+    ok: true,
+    schemaVersion: migrations.version,
+    schemaDigest: migrations.digest,
+}));
 
 export default app;
 export const { DB, Catalog, Cdb, Gateway, Resharder } = app;
@@ -136,10 +141,23 @@ export const { DB, Catalog, Cdb, Gateway, Resharder } = app;
 
 Worker routes can also use the native `DB` binding with the structured Drizzle client from `@chardb/core`.
 
+Browser imports of registered handles need the CharDB Vite plugin:
+
+```ts
+// vite.config.ts
+import react from "@vitejs/plugin-react";
+import { chardb as chardbVite } from "@chardb/core/vite";
+import { defineConfig } from "vite";
+
+export default defineConfig({
+    plugins: [react(), chardbVite()],
+});
+```
+
 ## Use it from React
 
 ```tsx
-import { organizationClient, jwtClient } from "better-auth/client/plugins";
+import { anonymousClient, organizationClient, jwtClient } from "better-auth/client/plugins";
 import { createAuthClient } from "better-auth/react";
 import { createChardbReactClient } from "@chardb/react";
 import { listMessages, postMessage } from "./messages.ts";
@@ -149,31 +167,53 @@ export const db = createChardbReactClient({
     ownership: "organization",
     auth: ({ baseURL }) => createAuthClient({
         baseURL,
-        plugins: [organizationClient(), jwtClient()],
+        plugins: [anonymousClient(), organizationClient(), jwtClient()],
     }),
 });
 
 function Messages() {
+    const identity = db.useIdentity();
     const messages = db.useQuery(listMessages, { limit: 50 });
     const mutate = db.useMutation(postMessage);
 
+    if (identity.status === "select-organization") {
+        return <button onClick={() => void createOrganization()}>Create an organization</button>;
+    }
+
     return (
-        <button onClick={() => mutate({ id: crypto.randomUUID(), body: "hello" })}>
+        <button onClick={() => void mutate({ id: crypto.randomUUID(), body: "hello" })}>
             {messages.data?.length ?? 0} messages
         </button>
     );
 }
 
+async function createOrganization() {
+    const suffix = crypto.randomUUID().slice(0, 8);
+    const created = await db.auth.organization.create({
+        name: "My organization",
+        slug: `my-organization-${suffix}`,
+        keepCurrentActiveOrganization: true,
+    });
+    if (created.data) {
+        await db.auth.organization.setActive({ organizationId: created.data.id });
+    }
+}
+
 export function App() {
     const session = db.auth.useSession();
     if (!session.data) {
-        return <button onClick={() => db.auth.signIn.social({ provider: "github" })}>Sign in</button>;
+        return <button onClick={() => void db.auth.signIn.anonymous()}>Sign in</button>;
     }
-    return <db.Provider><Messages /></db.Provider>;
+    return (
+        <db.Provider>
+            <Messages />
+            <button onClick={() => void db.auth.signOut()}>Sign out</button>
+        </db.Provider>
+    );
 }
 ```
 
-The configured public Worker URL connects both Better Auth and Chardb. The React client follows the active Better Auth organization and injects its ID into owned query and mutation arguments, so components supply only business data.
+The configured public Worker URL connects both Better Auth and CharDB. The React client follows the active Better Auth organization and injects its ID into owned query and mutation arguments, so components supply only business data.
 
 ## Files and vectors
 
@@ -215,19 +255,13 @@ Migration generation is deterministic. It writes immutable, digest-chained JSON 
 
 The public migration path accepts additive SQLite changes that do not require a table rewrite or data cleanup. Destructive and ambiguous changes fail generation.
 
-## Replication and recovery
+## Recovery
 
-Chardb uses Cloudflare's native storage guarantees instead of maintaining an application-level replica protocol:
+Capture and restore a coordinated Durable Object recovery point with the CLI:
 
-- Durable Object SQLite is strongly consistent, persistent, and managed across Cloudflare infrastructure.
-- R2 objects are synchronously written with eleven nines of annual durability and strong consistency.
-- Vectorize is a derived index. SQLite keeps the authoritative vector state and a durable delivery outbox.
-
-For operator recovery, a Chardb recovery point captures the Catalog and every active Cdb shard at one requested time using native Durable Object point-in-time recovery bookmarks. The manifest includes schema identity, routing epoch, every shard bookmark, and a SHA-256 digest.
+Use the `CHARDB_ADMIN_TOKEN` already configured for the deployed Worker. Do not generate a different token for recovery.
 
 ```sh
-export CHARDB_ADMIN_TOKEN="$(openssl rand -hex 32)"
-
 bunx @chardb/core backups create \
     --url https://api.example.com \
     --out recovery-2026-09-01.json
@@ -237,15 +271,15 @@ bunx @chardb/core backups restore \
     --from recovery-2026-09-01.json
 ```
 
-Restore verifies the manifest and topology, fences traffic, arms every shard, and restarts the Durable Objects at their bookmarks. It waits until every restored session is active before returning. Cloudflare retains native Durable Object PITR history for 30 days. Native PITR is available in deployed Workers, not local Miniflare.
+Restore verifies the manifest and topology, fences Catalog and every shard, and removes the current derived provider records before it restarts the Durable Objects at their bookmarks. The CLI advances large restores through signed, bounded turns. Rerunning the same restore after a lost response resumes the same operation. A different manifest cannot cross the existing fence. Cloudflare retains native Durable Object PITR history for 30 days. Native PITR is available in deployed Workers, not local Miniflare. Read [Plan ahead](docs/plan-ahead.mdx) before relying on recovery or adding production data.
 
-Chardb coordinates the external stores around that rewind:
+## Verify the package
 
-- Each upload writes one content-addressed R2 recovery copy per unique payload. Chardb refreshes it before a managed replacement or deletion. A missing live body self-heals from that verified copy after SQLite is restored.
-- Generated projects install a 31-day lifecycle rule scoped to `_chardb/retained/`. It does not change lifecycle rules for application objects.
-- Restored vector heads, including pending deletes, are requeued from authoritative SQLite after every shard has restarted. Searches continue to validate Vectorize candidates against current ownership, policy, and vector version.
+- Each upload writes one content-addressed R2 object per unique payload. Ordinary reads verify and stream that retained object without creating a mutable live key. Restore removes every CharDB-owned live key and eagerly rebuilds the files present at the recovery point from verified retained bytes.
+- Retained objects have no automatic expiry because they are the authoritative file bytes. Content left by a rejected upload or deleted file is invisible to application reads but remains billable until provider-wide orphan collection is available.
+- While every shard is fenced, restore deletes each tracked physical Vectorize record and proves exact-id absence. After SQLite restarts, it requeues the authoritative heads, including pending deletes. Searches continue to validate Vectorize candidates against current ownership, policy, and vector version.
 
-R2 and Vectorize do not expose transactional PITR with Durable Objects. Objects and vectors created after a recovery point can remain as unreachable provider data after restore. They cannot be returned through Chardb, but they still consume provider storage until removed.
+If provider cleanup or rewind fails, CharDB keeps the recovery fence in place. Rerun the same command to resume the durable operation and converge after an unknown result.
 
 ## What the release gate proves
 
@@ -257,7 +291,7 @@ The release suite builds one paired `@chardb/core` and `@chardb/react` candidate
 - R2 upload, attach, read, range requests, replacement, deletion, and organization cleanup
 - Vectorize delivery, retries, stale-candidate filtering, policy checks, and deletion settlement
 - combined row, file, and vector movement across physical shards
-- deployed recovery-point creation, traffic fencing, SQLite rewind, retained-file self-healing, vector reconciliation, and exact cleanup
+- deployed recovery-point creation, traffic fencing, SQLite rewind, retained-file restoration, vector reconciliation, and exact cleanup
 - generated-project browser behavior through Vite, Wrangler, Miniflare, and Playwright
 - clean package consumption on Linux, macOS, and Windows
 
@@ -274,16 +308,16 @@ bun run test:correctness
 | Package | Purpose |
 | --- | --- |
 | `@chardb/core` | Worker runtime, browser client, native binding client, CLI, files, vectors, Vite, and shared types |
-| `@chardb/react` | Better Auth-connected React provider and owner-scoped hooks |
-| `chardb-client` | Low-dependency Rust client with blocking and runtime-neutral async APIs |
+| `@chardb/react` | React client included in this repository; registry publication is pending |
+| `chardb-client` | Rust client included in this repository; registry publication is pending |
 
 Generated projects use `wrangler.toml`. The CLI also reads `wrangler.json` and `wrangler.jsonc`.
 
 ## Current boundary
 
-Chardb's first release is experimental. Organization-owned and user-owned SQLite, organization files, organization vectors, live queries, migrations, explicit range movement, coordinated recovery points, and bounded R2 recovery retention are implemented and tested.
+CharDB's first release is experimental. Organization-owned and user-owned SQLite, organization files, organization vectors, live queries, migrations, explicit range movement, coordinated recovery points, provider cleanup, and bounded R2 recovery retention are implemented and tested.
 
-Automatic load-based resharding, vector-search continuation, provider-wide orphan collection, regional failover controls, cross-partition transactions, and a production availability SLA are not part of this release.
+Automatic load-based resharding, vector-search continuation, regional failover controls, cross-partition transactions, and a production availability SLA are not part of this release.
 
 ## License
 

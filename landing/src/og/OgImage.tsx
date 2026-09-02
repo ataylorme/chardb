@@ -19,7 +19,7 @@ export function OgImage() {
                     </h1>
 
                     <p className="mt-7 text-fg-muted" style={{ fontSize: 24, lineHeight: 1.5, maxWidth: 640 }}>
-                        Tenant-shaped SQL, Better Auth, files, vectors, and live data in one typed Worker binding.
+                        Tenant-shaped SQL, Better Auth, files, vectors, and live data in one app-facing Worker binding.
                     </p>
 
                     <div className="mt-8 inline-flex items-center rounded-full border border-line2 bg-ink-850 px-6 py-2.5 font-mono">

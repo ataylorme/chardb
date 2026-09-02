@@ -301,7 +301,7 @@ describe("createChardbClient — wire round-trip", () => {
         controller.client.close();
         controller.start();
         expect(() => controller.client.subscribe("queries.ts#closed", {}, () => {})).toThrow(
-            "cannot open a subscription after the Chardb client has closed"
+            "cannot open a subscription after the CharDB client has closed"
         );
         await expect(controller.client.mutate("mutations.ts#closed", {})).rejects.toMatchObject({
             code: "CDB_STREAM_ABORTED",
@@ -798,7 +798,7 @@ describe("createChardbClient — wire round-trip", () => {
         for (const error of await Promise.all(mutationErrors)) {
             expect(error).toMatchObject({
                 code: "CDB_UNSUPPORTED_FEATURE",
-                message: "server selected an unsupported Chardb protocol version",
+                message: "server selected an unsupported CharDB protocol version",
             });
         }
         c.close();
@@ -848,7 +848,7 @@ describe("createChardbClient — wire round-trip", () => {
         expect(diagnostics).toEqual([{ code: "CDB_INVARIANT", reason: "connect" }]);
         await expect(mutationError).resolves.toMatchObject({
             code: "CDB_INVARIANT",
-            message: "failed to establish Chardb client session",
+            message: "failed to establish CharDB client session",
         });
     });
 
@@ -903,7 +903,7 @@ describe("createChardbClient — wire round-trip", () => {
         expect(diagnostics).toEqual([{ code: "CDB_INVARIANT", reason: "connect" }]);
         await expect(mutationError).resolves.toMatchObject({
             code: "CDB_INVARIANT",
-            message: "failed to establish Chardb client session",
+            message: "failed to establish CharDB client session",
         });
         await new Promise(resolve => setTimeout(resolve, 300));
         expect(FakeWS.instances).toHaveLength(0);
@@ -923,7 +923,7 @@ describe("createChardbClient — wire round-trip", () => {
         expect(subscriptionNotifications).toBe(1);
         await expect(mutationError).resolves.toMatchObject({
             code: "CDB_INVARIANT",
-            message: "server sent an invalid Chardb handshake message",
+            message: "server sent an invalid CharDB handshake message",
         });
     });
 
@@ -940,7 +940,7 @@ describe("createChardbClient — wire round-trip", () => {
         expect(ws.readyState).toBe(FakeWS.CLOSED);
         await expect(mutationError).resolves.toMatchObject({
             code: "CDB_INVARIANT",
-            message: "server sent an invalid Chardb handshake message",
+            message: "server sent an invalid CharDB handshake message",
         });
     });
 
@@ -970,7 +970,7 @@ describe("createChardbClient — wire round-trip", () => {
             expect(seen).toHaveLength(2);
             await expect(mutationError).resolves.toMatchObject({
                 code: "CDB_INVARIANT",
-                message: "server sent an invalid Chardb session message",
+                message: "server sent an invalid CharDB session message",
             });
             expect(timeoutSpy.calls).toHaveLength(1);
             expect(ws.readyState).toBe(FakeWS.CLOSED);
@@ -1021,7 +1021,7 @@ describe("createChardbClient — wire round-trip", () => {
             expect(ws.readyState).toBe(FakeWS.CLOSED);
             await expect(mutationError).resolves.toMatchObject({
                 code: "CDB_INVARIANT",
-                message: "server sent an invalid Chardb session message",
+                message: "server sent an invalid CharDB session message",
             });
         }
     });
@@ -1045,7 +1045,7 @@ describe("createChardbClient — wire round-trip", () => {
             expect(subscriptionNotifications).toBe(1);
             await expect(mutationError).resolves.toMatchObject({
                 code: "CDB_INVARIANT",
-                message: "server sent an invalid Chardb session message",
+                message: "server sent an invalid CharDB session message",
             });
             expect(timers.scheduledDelays()).toEqual([]);
             expect(ws.readyState).toBe(FakeWS.CLOSED);
@@ -3607,7 +3607,7 @@ describe("createChardbClient — wire round-trip", () => {
         expect(rejectionCount).toBe(1);
         await expect(mutationError).resolves.toMatchObject({
             code: "CDB_STREAM_ABORTED",
-            message: "Chardb client closed before pending work settled",
+            message: "CharDB client closed before pending work settled",
         });
         await new Promise(resolve => setTimeout(resolve, 300));
         expect(FakeWS.instances).toHaveLength(1);

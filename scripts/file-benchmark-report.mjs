@@ -113,6 +113,10 @@ function assertOperationSample(sample, index, operation, payloadPlan, label) {
     if (sample.objectSequence >= payloadPlan.operationsPerRun.upload.count) {
         throw new Error(`${label}.objectSequence does not identify an uploaded object`);
     }
+    positiveInteger(sample.attempts, `${label}.attempts`);
+    if ((operation === "upload" && sample.attempts > 3) || (operation !== "upload" && sample.attempts !== 1)) {
+        throw new Error(`${label}.attempts does not match the bounded operation contract`);
+    }
     finitePositive(sample.latencyMs, `${label}.latencyMs`);
     const expectedBytes = operation === "attach" ? 0 : payloadPlan.payloadBytes;
     if (sample.bytes !== expectedBytes) throw new Error(`${label}.bytes must equal ${expectedBytes}`);
@@ -210,9 +214,12 @@ function aggregateOperation(runs, payloadIndex, operation, payloadPlan) {
         samples.push(...operationMeasurement.samples);
     }
     const totalBytes = samples.reduce((sum, sample) => sum + sample.bytes, 0);
+    const attempts = samples.reduce((sum, sample) => sum + sample.attempts, 0);
     const rawLatencyMs = samples.map(sample => sample.latencyMs);
     return {
         operations: samples.length,
+        attempts,
+        retries: attempts - samples.length,
         concurrency: payloadPlan.operationsPerRun[operation].concurrency,
         elapsedMs,
         totalBytes,
@@ -240,13 +247,18 @@ function assertMetric(metric, expected, label) {
     record(metric, label);
     for (const field of [
         "operations",
+        "attempts",
+        "retries",
         "concurrency",
         "elapsedMs",
         "totalBytes",
         "operationsPerSecond",
         "bytesPerSecond",
     ]) {
-        const validator = field === "bytesPerSecond" || field === "totalBytes" ? finiteNonnegative : finitePositive;
+        const validator =
+            field === "bytesPerSecond" || field === "totalBytes" || field === "retries"
+                ? finiteNonnegative
+                : finitePositive;
         validator(metric[field], `${label}.${field}`);
         if (!approximatelyEqual(metric[field], expected[field]))
             throw new Error(`${label}.${field} does not match runs`);

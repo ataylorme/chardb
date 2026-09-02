@@ -6,7 +6,7 @@ import {
 } from "../../src/server/organization-deletion-status.ts";
 
 function route(shardId: string, schemaEpoch: number): RouteResult {
-    return { shardId: shardId as RouteResult["shardId"], schemaEpoch, domainSchemaEpoch: 7 };
+    return { shardId: shardId as RouteResult["shardId"], schemaEpoch, recoveryGeneration: 0, domainSchemaEpoch: 7 };
 }
 
 function purge(organizationId: string, remainingHeads: number) {
@@ -41,11 +41,11 @@ describe("current-owner organization deletion purge status", () => {
         expect(calls).toEqual([
             {
                 shardId: "source",
-                input: { organizationId: "org-1", schemaEpoch: 1, domainSchemaEpoch: 7 },
+                input: { organizationId: "org-1", schemaEpoch: 1, recoveryGeneration: 0, domainSchemaEpoch: 7 },
             },
             {
                 shardId: "destination",
-                input: { organizationId: "org-1", schemaEpoch: 2, domainSchemaEpoch: 7 },
+                input: { organizationId: "org-1", schemaEpoch: 2, recoveryGeneration: 0, domainSchemaEpoch: 7 },
             },
         ]);
         expect(result).toMatchObject({ organizationId: "org-1", remainingHeads: 2 });

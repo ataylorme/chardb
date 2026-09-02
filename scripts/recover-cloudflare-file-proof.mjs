@@ -343,7 +343,7 @@ export async function recoverCloudflareFileProof(input, dependencies = {}) {
                 "--tag",
                 `${ledger.nonce}-recovery`,
                 "--message",
-                "Chardb disposable R2 proof recovery",
+                "CharDB disposable R2 proof recovery",
             ],
             "R2 recovery Worker deploy"
         );

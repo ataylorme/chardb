@@ -254,6 +254,7 @@ export async function dispatchTrustedBindingPlan(
                     placement: { authority: resolved.authority, partitionKey: resolved.partitionKey },
                     auth: projected.auth,
                     schemaEpoch: location.schemaEpoch,
+                    recoveryGeneration: location.recoveryGeneration,
                     domainSchemaEpoch: location.domainSchemaEpoch,
                 })
             );

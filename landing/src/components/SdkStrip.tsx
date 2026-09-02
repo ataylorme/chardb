@@ -10,17 +10,16 @@ const sdks = [
 export function SdkStrip() {
     return (
         <section aria-labelledby="sdk-heading" className="border-t border-line">
-            <div className="mx-auto max-w-page px-5 py-10 sm:px-8">
-                <div className="mb-5 flex items-end justify-between gap-6">
+            <div className="mx-auto max-w-page px-5 py-8 sm:px-8">
+                <div className="mb-4 flex items-end justify-between gap-6">
                     <div>
                         <p id="sdk-heading" className="font-mono text-xs text-accent">
-                            Take your data anywhere
+                            Client SDKs
                         </p>
                         <p className="mt-2 text-sm text-fg-muted">
-                            One identity and live-data protocol across clients.
+                            React and Rust are included in the repository. More clients are planned.
                         </p>
                     </div>
-                    <p className="hidden text-xs text-fg-dim sm:block">React + Rust ship today</p>
                 </div>
                 <ul className="sdk-grid" aria-label="SDK availability">
                     {sdks.map(sdk => (
@@ -29,7 +28,7 @@ export function SdkStrip() {
                                 <img src={sdk.icon} alt="" width="28" height="28" />
                             </span>
                             <span className="sdk-name">{sdk.name}</span>
-                            <span className="sdk-status">{sdk.available ? "Available" : "Coming soon"}</span>
+                            <span className="sdk-status">{sdk.available ? "Included" : "Coming soon"}</span>
                         </li>
                     ))}
                 </ul>

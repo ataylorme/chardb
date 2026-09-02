@@ -62,6 +62,56 @@ interface RpcCall {
     readonly body?: unknown;
 }
 
+const RECOVERY_FENCED_OPS = new Set([
+    "prepareSchemaMigration",
+    "provisionFreshReshardDestination",
+    "prepareReshardDestOwnership",
+    "beginReshardSource",
+    "beginReshardDest",
+    "activateReshardDestServing",
+    "_activateReshardDestThenLoseResponse",
+    "_ackThenLoseResponse",
+    "_ackSplitOpLogThenLoseResponse",
+    "_stageTailThenLoseResponse",
+    "_finishReshardSourceThenLoseResponse",
+    "prepareRoutingFence",
+    "activateRoutingFence",
+    "tailWatermark",
+    "reshardTableOrder",
+    "bulkCopyBatch",
+    "applyBulkBatch",
+    "closeReshardBulkDest",
+    "readTailBatch",
+    "ackTail",
+    "applyTailBatch",
+    "stageTailBatch",
+    "readStagedTailBatch",
+    "ackStagedTail",
+    "closeTailStaging",
+    "stopReshardCapture",
+    "readSplitOpLogBatch",
+    "ackSplitOpLog",
+    "applySplitOpLogBatch",
+    "dropMigratedRange",
+    "finishReshardSource",
+    "finishReshardDest",
+    "abortReshardSource",
+    "beginReshardDestAbort",
+    "abortReshardDestBatch",
+]);
+
+const SCHEMA_IDENTITY_OPS = new Set([
+    "beginReshardSource",
+    "beginReshardDest",
+    "activateReshardDestServing",
+    "_activateReshardDestThenLoseResponse",
+    "finishReshardSource",
+    "finishReshardDest",
+    "abortReshardSource",
+    "beginReshardDestAbort",
+    "abortReshardDestBatch",
+]);
+
 let mf: Miniflare | undefined;
 let workerSource = "";
 let temporaryPath = "";
@@ -91,6 +141,7 @@ function createRuntime(): Miniflare {
             CDB: { className: "TestCdb", useSQLite: true },
             FRESH: { className: "FreshTestCdb", useSQLite: true },
             REPLICATED: { className: "ReplicatedTestCdb", useSQLite: true },
+            CDB_RESHARD: { className: "Resharder", useSQLite: true },
         },
         durableObjectsPersist: path.join(temporaryPath, "durable-objects"),
         compatibilityDate: "2024-09-23",
@@ -133,28 +184,17 @@ afterAll(async () => {
 async function rpc({ op, target, body }: RpcCall): Promise<unknown> {
     if (!mf) throw new Error("miniflare not initialized");
     let requestBody = body;
-    if (
-        [
-            "beginReshardSource",
-            "beginReshardDest",
-            "activateReshardDestServing",
-            "_activateReshardDestThenLoseResponse",
-            "finishReshardSource",
-            "finishReshardDest",
-            "abortReshardSource",
-            "beginReshardDestAbort",
-            "abortReshardDestBatch",
-        ].includes(op) &&
-        body &&
-        typeof body === "object"
-    ) {
+    if (RECOVERY_FENCED_OPS.has(op) && body && typeof body === "object") {
+        requestBody = { ...(body as Record<string, unknown>), recoveryGeneration: 0 };
+    }
+    if (SCHEMA_IDENTITY_OPS.has(op) && body && typeof body === "object") {
         const schema = (await rpc({ op: "schemaState", target })) as {
             activeVersion: number;
             activeEpoch: number;
             activeDigest: string;
         };
         requestBody = {
-            ...(body as Record<string, unknown>),
+            ...(requestBody as Record<string, unknown>),
             schemaVersion: schema.activeVersion,
             schemaEpoch: schema.activeEpoch,
             schemaDigest: schema.activeDigest,
@@ -276,6 +316,7 @@ describe("workerd reshard harness", () => {
             args: { id: "admitted", orgId: organizationId, value: "after-cutover" },
             placement: { authority: "global", partitionKey: organizationId },
             auth: { userId: "user-destination-admission", role: "member", roles: ["member"], claims: {} },
+            recoveryGeneration: 0,
             schemaEpoch: 2,
             domainSchemaEpoch: 1,
         } as const;
@@ -302,6 +343,7 @@ describe("workerd reshard harness", () => {
                     ref: "workerd-reshard.ts#missingQuery",
                     args: {},
                     auth: request.auth,
+                    recoveryGeneration: 0,
                     schemaEpoch: 2,
                     domainSchemaEpoch: 1,
                 },
@@ -342,6 +384,7 @@ describe("workerd reshard harness", () => {
                     ...request,
                     mutId: "mutation-later-global-epoch",
                     args: { ...request.args, id: "later-global-epoch" },
+                    recoveryGeneration: 0,
                     schemaEpoch: 3,
                 },
             })
@@ -350,7 +393,7 @@ describe("workerd reshard harness", () => {
             rpc({
                 op: "mutate",
                 target: destination,
-                body: { ...request, mutId: "mutation-stale-destination", schemaEpoch: 1 },
+                body: { ...request, mutId: "mutation-stale-destination", recoveryGeneration: 0, schemaEpoch: 1 },
             })
         ).resolves.toMatchObject({ ok: false, error: { code: "CDB_STALE_EPOCH" } });
     }, 30_000);
@@ -632,6 +675,7 @@ describe("workerd reshard harness", () => {
             args: { id: "record-1", orgId: organizationId, value: "committed-on-source" },
             placement: { authority: "global", partitionKey: organizationId },
             auth: { userId: "user-response-loss", role: "member", roles: ["member"], claims: {} },
+            recoveryGeneration: 0,
             schemaEpoch: 1,
             domainSchemaEpoch: 1,
         } as const;
@@ -726,7 +770,7 @@ describe("workerd reshard harness", () => {
         const replay = (await rpc({
             op: "mutate",
             target: destination,
-            body: { ...request, schemaEpoch: 2 },
+            body: { ...request, recoveryGeneration: 0, schemaEpoch: 2 },
         })) as { ok: boolean; ran: boolean; result: unknown };
         expect(replay).toMatchObject({
             ok: true,
@@ -746,6 +790,7 @@ describe("workerd reshard harness", () => {
             body: {
                 ...request,
                 args: { ...request.args, value: "different-payload" },
+                recoveryGeneration: 0,
                 schemaEpoch: 2,
             },
         })) as { ok: boolean; error: { code: string } };
@@ -797,6 +842,7 @@ describe("workerd reshard harness", () => {
             args: { id: "abort-record", orgId: organizationId, value: "copied" },
             placement: { authority: "global", partitionKey: organizationId },
             auth: { userId: "abort-user", role: "member", roles: ["member"], claims: {} },
+            recoveryGeneration: 0,
             schemaEpoch: 1,
             domainSchemaEpoch: 1,
         } as const;
@@ -999,6 +1045,7 @@ describe("workerd reshard harness", () => {
                 args: { id: "finish-record", orgId: organizationId, value: "retained" },
                 placement: { authority: "global", partitionKey: organizationId },
                 auth: { userId: "finish-user", role: "member", roles: ["member"], claims: {} },
+                recoveryGeneration: 0,
                 schemaEpoch: 1,
                 domainSchemaEpoch: 1,
             },
@@ -2201,6 +2248,7 @@ describe("workerd reshard harness", () => {
             rangeLo: vshard,
             rangeHi: vshard,
             schemaVersion: schema.activeVersion,
+            recoveryGeneration: 0,
             schemaEpoch: schema.activeEpoch,
             schemaDigest: schema.activeDigest,
             tables: MOVABLE_TABLES,

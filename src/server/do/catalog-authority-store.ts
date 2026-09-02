@@ -78,12 +78,17 @@ export interface CatalogAuthQueryRequest {
 }
 
 export type CatalogAuthAdapterRpcRequest =
-    | { readonly operation: "mutate"; readonly args: CatalogAuthMutationRequest }
-    | { readonly operation: "increment"; readonly args: CatalogAuthIncrementRequest }
-    | { readonly operation: "query"; readonly args: CatalogAuthQueryRequest }
+    | { readonly operation: "mutate"; readonly args: CatalogAuthMutationRequest; readonly recoveryGeneration: number }
+    | {
+          readonly operation: "increment";
+          readonly args: CatalogAuthIncrementRequest;
+          readonly recoveryGeneration: number;
+      }
+    | { readonly operation: "query"; readonly args: CatalogAuthQueryRequest; readonly recoveryGeneration: number }
     | {
           readonly operation: "count";
           readonly args: Pick<CatalogAuthQueryRequest, "model" | "where">;
+          readonly recoveryGeneration: number;
       };
 
 export type CatalogAuthAdapterRpcValue =
@@ -111,6 +116,7 @@ export interface OrganizationAuthorityRequest {
 }
 
 export interface OrganizationAuthority {
+    readonly recoveryGeneration: number;
     readonly principalId: PrincipalId;
     readonly organizationId: TenantId;
     /** Canonical comma-separated Better Auth membership role. */
@@ -132,6 +138,7 @@ export interface UserAuthorityRequest {
 }
 
 export interface UserAuthority {
+    readonly recoveryGeneration: number;
     readonly principalId: PrincipalId;
     /** Canonical comma-separated Better Auth user role. */
     readonly role: string;
@@ -398,10 +405,15 @@ export function mutateCatalogAuthWithEffects(
                   })()
                 : args.where;
             if (!mutationWhere) break;
+            // This path is used by Better Auth's native consumeOne adapter
+            // operation. Catalog serializes the read and delete inside the
+            // same Durable Object transaction, preserving single-use tokens.
+            const fullBefore = args.returnRow ? authFindOne(sql, table, mutationWhere) : null;
             const preloadColumns = args.model === "organization" ? [...new Set([...scopeColumns, "id"])] : scopeColumns;
             const before = authPreloadScopeRows(sql, table, mutationWhere, preloadColumns);
             affected = authDelete(sql, table, mutationWhere).affected;
             if (affected > 0) {
+                row = fullBefore;
                 if (placement.kind === "replicated") addEpochScope(scopes, "global", "global");
                 for (const previous of before.rows) {
                     addRowEpochScopes(scopes, args.model, previous);
@@ -518,7 +530,7 @@ export function catalogUserAuthorityAvailable(): boolean {
 export function resolveOrganizationAuthorityFromCatalog(
     sql: CatalogSql,
     args: OrganizationAuthorityRequest
-): OrganizationAuthority | null {
+): Omit<OrganizationAuthority, "recoveryGeneration"> | null {
     const organization = authFindOne(sql, tableFor("organization"), { id: args.organizationId });
     if (!organization) return null;
     const membership = authFindOne(sql, tableFor("member"), {
@@ -544,7 +556,10 @@ export function resolveOrganizationAuthorityFromCatalog(
     };
 }
 
-export function resolveUserAuthorityFromCatalog(sql: CatalogSql, args: UserAuthorityRequest): UserAuthority | null {
+export function resolveUserAuthorityFromCatalog(
+    sql: CatalogSql,
+    args: UserAuthorityRequest
+): Omit<UserAuthority, "recoveryGeneration"> | null {
     const user = authFindOne(sql, tableFor("user"), { id: args.principalId });
     if (!user) return null;
     const storedRoles = canonicalMembershipRoles(user.role);

@@ -186,6 +186,7 @@ function createRuntime(): Miniflare {
         durableObjects: {
             CDB_CATALOG: { className: "Catalog", useSQLite: true },
             CDB_SHARD: { className: "Cdb", useSQLite: true },
+            CDB_RESHARD: { className: "Resharder", useSQLite: true },
             VECTOR_INDEX: { className: "VectorIndexProbe", useSQLite: true },
         },
         durableObjectsPersist: path.join(runtimePersistencePath, "durable-objects"),
@@ -511,7 +512,7 @@ describe("vector-aware Better Auth organization deletion on native Durable Objec
         expect(await call("cutover", { organizationId, migrationId })).toMatchObject({
             cutover: { applied: true, newEpoch: setup.schemaEpoch + 1 },
             operation: { status: "completed" },
-            route: { shardId: setup.otherShardId, schemaEpoch: setup.schemaEpoch + 1 },
+            route: { shardId: setup.otherShardId, recoveryGeneration: 0, schemaEpoch: setup.schemaEpoch + 1 },
         });
         expect(await call<CatalogState>("catalog-state", { organizationId })).toMatchObject({
             deletion: { status: "complete" },

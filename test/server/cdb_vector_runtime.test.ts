@@ -1162,7 +1162,7 @@ describe("Cdb vector alarm delivery", () => {
             cdbVectorizePhysicalId(VECTOR_RUNTIME, 1),
             cdbVectorizePhysicalId(VECTOR_RUNTIME, 1),
         ]);
-        expect(admissions).toHaveLength(7);
+        expect(admissions).toHaveLength(10);
         expect(settlements).toEqual([`${VECTOR_RUNTIME}:1:ready`]);
         expect(Math.min(...alarms)).toBe(1_000);
     });

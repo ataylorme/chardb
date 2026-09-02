@@ -25,6 +25,7 @@ const authority = {
     role: "member",
     roles: ["member"],
     authEpochs: { global: 1, tenant: 2, principal: 3 },
+    recoveryGeneration: 0,
 };
 
 const bucket = {} as R2Bucket;
@@ -134,6 +135,7 @@ describe("private organization file dispatcher", () => {
                         route: {
                             shardId: (++resolutions === 1 ? "shard-a" : "shard-b") as never,
                             schemaEpoch: 1,
+                            recoveryGeneration: 0,
                             domainSchemaEpoch: 2,
                         },
                     }),

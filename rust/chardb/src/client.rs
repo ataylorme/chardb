@@ -879,7 +879,7 @@ impl Session {
             if Instant::now() >= deadline {
                 return Err(Error::local(
                     ErrorKind::Timeout,
-                    "timed out waiting for Chardb welcome",
+                    "timed out waiting for CharDB welcome",
                 ));
             }
             match read_down(&mut socket) {
@@ -921,7 +921,7 @@ impl Session {
                         retryable,
                         Some(correlation_id),
                         Some(docs),
-                        "server rejected the Chardb handshake",
+                        "server rejected the CharDB handshake",
                     ));
                 }
                 Ok(Some(_)) => {
@@ -1191,7 +1191,7 @@ impl Session {
                     retryable,
                     Some(correlation_id),
                     Some(docs),
-                    "Chardb rejected an operation",
+                    "CharDB rejected an operation",
                 ),
                 sub_id,
             ),
@@ -2176,7 +2176,7 @@ fn transport_io(error: &io::Error) -> Error {
 }
 
 fn closed_error() -> Error {
-    Error::local(ErrorKind::Closed, "Chardb client is closed")
+    Error::local(ErrorKind::Closed, "CharDB client is closed")
 }
 
 #[cfg(test)]
