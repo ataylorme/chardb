@@ -1,4 +1,4 @@
-//! CharDB protocol v3 wire types.
+//! `CharDB` protocol v3 wire types.
 //!
 //! The tag set and fields are closed at version 3. Unknown error codes and
 //! refetch reasons are the two additive exceptions described by the server

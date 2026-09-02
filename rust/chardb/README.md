@@ -1,6 +1,6 @@
-# CharDB Rust client
+# `CharDB` Rust client
 
-`chardb-client` is the native Rust client for CharDB protocol version 3.
+`chardb-client` is the native Rust client for `CharDB` protocol version 3.
 Blocking and async callers use one session worker, so reconnects, deadlines,
 subscription state, and mutation replay have the same implementation in both
 APIs. Repository CI is configured to test native builds on Windows, macOS, and
@@ -77,7 +77,7 @@ let json = serde_json::to_value(contract)?;
 # }
 ```
 
-This is application type metadata. CharDB still validates authorization,
+This is application type metadata. `CharDB` still validates authorization,
 routing, and the registered server handle independently.
 
 ## Blocking client
@@ -278,7 +278,7 @@ The default mutation deadline is 60 seconds and includes reconnect time. If it
 expires, the error kind is `MutationOutcomeUnknown`, the code is
 `CDB_MUTATION_OUTCOME_UNKNOWN`, and `Error::mutation_id()` returns the ID needed
 for reconciliation. Use `mutate_with_id` when the application must persist the
-ID before dispatch. CharDB currently retains mutation replay records for 24
+ID before dispatch. `CharDB` currently retains mutation replay records for 24
 hours, so a mutation ID is not a permanent idempotency key.
 
 Only one unsettled operation may own a mutation ID in a client session. A
