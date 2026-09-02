@@ -3,7 +3,7 @@ title: "Ownership"
 description: "Bind tables to organization, user, or organization-and-user ownership."
 ---
 
-Every Worker chooses one ownership mode in `chardb()`. Organization mode accepts tables from `forOrg(auth)` and `forOrgUser(auth)`. User mode accepts only `forUser(auth)`. Chardb rejects a schema that mixes the two modes.
+Every Worker chooses one ownership mode in `chardb()`. Organization mode accepts tables from `forOrg(auth)` and `forOrgUser(auth)`. User mode accepts only `forUser(auth)`. CharDB rejects a schema that mixes the two modes.
 
 ## Own rows with an organization
 
@@ -41,11 +41,11 @@ export const messages = cdbTable(
 );
 ```
 
-`forOrg(auth)` adds `organizationId` as a non-null Drizzle reference to `auth.organization.id`. Chardb uses that schema reference to derive ownership; shard migrations do not install a physical foreign key to the Catalog-owned auth table. The column selects the partition, and the policy decides which current members may read or write each column.
+`forOrg(auth)` adds `organizationId` as a non-null Drizzle reference to `auth.organization.id`. CharDB uses that schema reference to derive ownership; shard migrations do not install a physical foreign key to the Catalog-owned auth table. The column selects the partition, and the policy decides which current members may read or write each column.
 
-Query definitions keep `organizationId` because the router needs one exact partition. The configured `@chardb/react` client reads the active organization from Better Auth and adds it to query and mutation arguments. Chardb still verifies the JWT and current membership before using it.
+Query definitions keep `organizationId` because the router needs one exact partition. The configured `@chardb/react` client reads the active organization from Better Auth and adds it to query and mutation arguments. CharDB still verifies the JWT and current membership before using it.
 
-Chardb fills `organizationId` and `authorId` from verified authority during inserts. Mutation handlers omit both values. Defining `organizationId` yourself is a type error and a runtime error.
+CharDB fills `organizationId` and `authorId` from verified authority during inserts. Mutation handlers omit both values. Defining `organizationId` yourself is a type error and a runtime error.
 
 ## Own rows with a user
 
@@ -92,6 +92,6 @@ export const drafts = cdbTable(
 );
 ```
 
-Chardb adds, fills, and checks both foreign keys. Organization admins can read every draft under this policy. Other members see only their own.
+CharDB adds, fills, and checks both foreign keys. Organization admins can read every draft under this policy. Other members see only their own.
 
 Next, make the message list update in [Live queries](/live-queries).

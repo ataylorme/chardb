@@ -255,7 +255,7 @@ describe("file reshard deployment proof runner", () => {
                 "--metric",
                 "cosine",
                 "--description",
-                "Chardb disposable cross-resource movement proof",
+                "CharDB disposable cross-resource movement proof",
                 "--json",
             ],
             ["vectorize", "create-metadata-index", NAME, "--propertyName", "cdb_resource", "--type", "string"],
@@ -271,7 +271,7 @@ describe("file reshard deployment proof runner", () => {
                 "--tag",
                 "proof-v1",
                 "--message",
-                "Chardb disposable file reshard proof",
+                "CharDB disposable file reshard proof",
             ],
         ]);
         expect(wranglerDisposableCleanupCommands(NAME, NAME, NAME)).toEqual([

@@ -10,7 +10,7 @@ You need Bun 1.2.22 or newer. Local development does not need a Cloudflare accou
 Run the initializer from the directory that should contain your new project. It creates `my-chardb-app` for you.
 
 ```bash
-bunx @chardb/core@0.1.0 init my-chardb-app
+bunx @chardb/core init my-chardb-app
 cd my-chardb-app
 bun install
 bun run typecheck
@@ -45,7 +45,7 @@ You will make most changes here:
 - `src/auth.ts` defines the Better Auth plugins.
 - `src/schema.ts` declares the organization table and policy.
 - `src/queries.ts` and `src/api.ts` declare the live read and mutations.
-- `src/worker.ts` mounts Chardb and application routes.
+- `src/worker.ts` mounts CharDB and application routes.
 - `wrangler.toml` binds Catalog, Cdb, Gateway, Resharder, and R2.
 
 Next, read [Ownership](/ownership). It explains the three public ownership factories.

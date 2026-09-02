@@ -1,6 +1,6 @@
-# Chardb Rust client
+# CharDB Rust client
 
-`chardb-client` is the native Rust client for Chardb protocol version 3.
+`chardb-client` is the native Rust client for CharDB protocol version 3.
 Blocking and async callers use one session worker, so reconnects, deadlines,
 subscription state, and mutation replay have the same implementation in both
 APIs. Repository CI is configured to test native builds on Windows, macOS, and
@@ -12,9 +12,6 @@ one API declaration instead of every call site. Rust then checks the operation
 kind, arguments, and decoded output before the program runs. A handle is one
 `&'static str`, has no allocation, and writes that string unchanged to protocol
 v3's `ref` field.
-
-Chardb and this crate are experimental. `SQLite` recovery points are an operator
-feature of the server CLI; this client does not manage deployment recovery.
 
 ## Install
 
@@ -82,7 +79,7 @@ let json = serde_json::to_value(contract)?;
 # }
 ```
 
-This is application type metadata. Chardb still validates authorization,
+This is application type metadata. CharDB still validates authorization,
 routing, and the registered server handle independently.
 
 ## Blocking client
@@ -127,10 +124,10 @@ const LIST_MESSAGES: Query<ListArgs, Message> =
 const POST_MESSAGE: Mutation<PostArgs, Posted> =
     Mutation::new("messages#create");
 
-# fn get_jwt() -> Result<String, String> { unimplemented!() }
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
+let jwt = std::env::var("CHARDB_JWT")?;
 let client = Client::connect(
-    ClientConfig::new("wss://example.com/ws", get_jwt)
+    ClientConfig::with_token("wss://example.com/ws", jwt)
         .connect_timeout(Duration::from_secs(10))
         .mutation_timeout(Duration::from_secs(60)),
 )?;
@@ -175,9 +172,10 @@ const POST_MESSAGE: Mutation<serde_json::Value, serde_json::Value> =
     Mutation::new("messages#create");
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let jwt = std::env::var("CHARDB_JWT")?;
 let client = AsyncClient::connect(ClientConfig::with_token(
     "wss://example.com/ws",
-    "signed-jwt",
+    jwt,
 )).await?;
 
 let mut rows = client.subscribe(
@@ -282,7 +280,7 @@ The default mutation deadline is 60 seconds and includes reconnect time. If it
 expires, the error kind is `MutationOutcomeUnknown`, the code is
 `CDB_MUTATION_OUTCOME_UNKNOWN`, and `Error::mutation_id()` returns the ID needed
 for reconciliation. Use `mutate_with_id` when the application must persist the
-ID before dispatch. Chardb currently retains mutation replay records for 24
+ID before dispatch. CharDB currently retains mutation replay records for 24
 hours, so a mutation ID is not a permanent idempotency key.
 
 Only one unsettled operation may own a mutation ID in a client session. A

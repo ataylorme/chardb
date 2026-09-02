@@ -59,7 +59,7 @@ describe("private organization file schema contract", () => {
                 contentTypes: ["application/pdf", "image/png"],
             },
         ]);
-        expect(() => FileId("bucket/key")).toThrow(/invalid Chardb FileId/);
+        expect(() => FileId("bucket/key")).toThrow(/invalid CharDB FileId/);
     });
 
     test("bounds file configuration before it reaches a migration", () => {

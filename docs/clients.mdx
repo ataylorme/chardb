@@ -3,7 +3,7 @@ title: "Clients"
 description: "Connect from React or native Rust."
 ---
 
-Chardb ships a React client for browser applications and a native Rust client for services and command-line programs. Both use registered query and mutation handles rather than accepting SQL from the caller.
+CharDB has a React client for browser applications and a native Rust client for services and command-line programs. Both use registered query and mutation handles rather than accepting SQL from the caller.
 
 ## React
 
@@ -13,7 +13,24 @@ Install the configured React client beside the core package:
 bun add @chardb/core @chardb/react
 ```
 
-`createChardbReactClient` gives Better Auth, live WebSockets, and organization file routes one public Worker URL. It preserves Better Auth's inferred client plugins and adds the verified user or active organization to query and mutation arguments.
+Configure the client with the same public URL that serves Better Auth and the CharDB Worker:
+
+```tsx src/web/App.tsx
+import { anonymousClient, jwtClient, organizationClient } from "better-auth/client/plugins";
+import { createAuthClient } from "better-auth/react";
+import { createChardbReactClient } from "@chardb/react";
+
+export const db = createChardbReactClient({
+  url: window.location.origin,
+  ownership: "organization",
+  auth: ({ baseURL }) => createAuthClient({
+    baseURL,
+    plugins: [anonymousClient(), organizationClient(), jwtClient()],
+  }),
+});
+```
+
+`createChardbReactClient` uses that URL for Better Auth, live WebSockets, and organization file routes. It preserves Better Auth's inferred client plugins and adds the verified user or active organization to query and mutation arguments.
 
 Follow [Live queries](/live-queries) for the client setup and [Files](/files) for the organization-scoped file API.
 
@@ -28,6 +45,6 @@ chardb-client = "0.1"
 
 Typed `Query<Arguments, Row>` and `Mutation<Arguments, Output>` handles bind each server reference to its Serde request and response types. The default build includes both client styles and Rustls; optional features select native roots or JSON Schema introspection.
 
-The Rust client supports registered live queries, mutations, reconnects, mutation replay, and auth refresh. It does not implement files, vectors, `workers-rs`, or `wasm32` transport.
+The Rust client supports registered live queries, mutations, reconnects, mutation replay, and auth refresh. Your application must obtain the initial Better Auth JWT and provide refreshed JWTs when the client requests one. The crate does not perform sign-in. It also does not implement files, vectors, `workers-rs`, or `wasm32` transport.
 
 See the [crate README](https://github.com/zpg6/chardb/tree/main/rust/chardb) for connection, TLS, timeout, and feature details.

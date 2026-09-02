@@ -1,5 +1,5 @@
 /**
- * Keep Chardb query and mutation handles safe to import from browser code.
+ * Keep CharDB query and mutation handles safe to import from browser code.
  *
  * Browser builds receive ref-only handles. Query callbacks, mutation
  * handlers, validators, schema imports, and every other server dependency
@@ -338,7 +338,7 @@ function eraseBrowserHandleModule(code: string, id: string, found: readonly Foun
     return [
         "const __chardbBrowserHandle = (kind, ref) => Object.defineProperties(",
         "  function chardbBrowserHandle() {",
-        "    throw new Error(`Chardb ${kind} handles cannot execute in the browser; pass the handle to the Chardb client or React hook`);",
+        "    throw new Error(`CharDB ${kind} handles cannot execute in the browser; pass the handle to the CharDB client or React hook`);",
         "  },",
         "  {",
         "    __chardbKind: { value: kind, enumerable: false, configurable: true },",

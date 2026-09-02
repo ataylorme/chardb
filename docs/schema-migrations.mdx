@@ -37,9 +37,9 @@ The generated Vitest path covers a fresh Miniflare database. Before changing a s
 
 ## Apply it
 
-`bun run deploy` uploads the Worker and runs the packaged journal in maintenance mode. Application traffic stays closed while Chardb upgrades each organization shard and the Better Auth catalog.
+`bun run deploy` uploads the Worker and runs the packaged journal in maintenance mode. Application traffic stays closed while CharDB upgrades each organization shard and the Better Auth catalog.
 
-If the command stops halfway through, rerun it with the same migration ID and target. Chardb resumes from durable progress rather than replaying completed steps.
+If the command stops halfway through, rerun it with the same migration ID and target. CharDB resumes from durable progress rather than replaying completed steps.
 
 Schema history moves forward. There is no down migration, rollback endpoint, or abort path for statements that already ran. To undo an application change, ship another forward migration and compatible code.
 

@@ -193,7 +193,7 @@ export function wranglerDisposableDeploymentCommands(input) {
             "--metric",
             "cosine",
             "--description",
-            "Chardb disposable cross-resource movement proof",
+            "CharDB disposable cross-resource movement proof",
             "--json",
         ]),
         Object.freeze([
@@ -217,7 +217,7 @@ export function wranglerDisposableDeploymentCommands(input) {
             "--tag",
             input.tag,
             "--message",
-            "Chardb disposable file reshard proof",
+            "CharDB disposable file reshard proof",
         ]),
     ]);
 }

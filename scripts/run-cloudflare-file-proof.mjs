@@ -1085,7 +1085,7 @@ async function main() {
                 "--tag",
                 `${nonce}-v1`,
                 "--message",
-                "Chardb disposable R2 proof v1",
+                "CharDB disposable R2 proof v1",
             ],
             { cwd: app, label: "initial proof deploy", secrets }
         );
@@ -1616,7 +1616,7 @@ async function main() {
                 "--tag",
                 `${nonce}-v2`,
                 "--message",
-                "Chardb byte-identical disposable R2 proof redeploy",
+                "CharDB byte-identical disposable R2 proof redeploy",
             ],
             { cwd: app, label: "byte-identical version upload", secrets }
         );

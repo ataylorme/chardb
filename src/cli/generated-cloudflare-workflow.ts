@@ -176,10 +176,10 @@ async function readOwnershipMarker(run = command) {
     });
     if (isMissingObject(result)) return null;
     if (result.exitCode !== 0) {
-      throw new Error("could not inspect the Chardb R2 ownership marker: " + detail(result));
+      throw new Error("could not inspect the CharDB R2 ownership marker: " + detail(result));
     }
     if (!(await Bun.file(path).exists())) {
-      throw new Error("Wrangler did not write the Chardb R2 ownership marker");
+      throw new Error("Wrangler did not write the CharDB R2 ownership marker");
     }
     return Bun.file(path).text();
   });
@@ -198,7 +198,7 @@ async function writeOwnershipMarker(run = command) {
       capture: true,
     });
     if (result.exitCode !== 0) {
-      throw new Error("could not write the Chardb R2 ownership marker: " + detail(result));
+      throw new Error("could not write the CharDB R2 ownership marker: " + detail(result));
     }
   });
 }
@@ -206,7 +206,7 @@ async function writeOwnershipMarker(run = command) {
 function assertOwnershipMarker(marker) {
   if (marker !== ownershipMarker) {
     throw new Error(
-      "R2 bucket " + filesBucket + " has a different Chardb ownership marker; refusing to modify it",
+      "R2 bucket " + filesBucket + " has a different CharDB ownership marker; refusing to modify it",
     );
   }
 }
@@ -229,7 +229,7 @@ export async function setupFilesBucket({ adoptExistingBucket = false, run = comm
     if (marker === null) {
       if (!createdBucket && !adoptExistingBucket) {
         throw new Error(
-          "R2 bucket " + filesBucket + " already exists without Chardb ownership; " +
+          "R2 bucket " + filesBucket + " already exists without CharDB ownership; " +
           "review it, then rerun with --adopt-existing-bucket to adopt it",
         );
       }
@@ -246,7 +246,6 @@ export async function setupFilesBucket({ adoptExistingBucket = false, run = comm
       }
     }
     throw error;
-  }
 }
 
 async function main() {

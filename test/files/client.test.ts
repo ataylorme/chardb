@@ -130,6 +130,6 @@ describe("public file client", () => {
         ) as unknown as typeof globalThis.fetch;
         await expect(
             client.upload({ organizationId: "org-1", file: new Blob(["x"], { type: "image/png" }) })
-        ).rejects.toThrow("invalid Chardb FileId");
+        ).rejects.toThrow("invalid CharDB FileId");
     });
 });

@@ -773,7 +773,7 @@ async function main() {
             console.log(`no prior Worker version found for ${label}; deploy will prove the target exists`);
         }
         const command = path.join(app, "node_modules", ".bin", "wrangler");
-        const message = `Chardb automated promotion ${label}`;
+        const message = `CharDB automated promotion ${label}`;
         const tag = `${options.migrationPrefix}-${label}`;
         if (!before) {
             await runCommand(command, wranglerInitialDeployArgs(options.worker, secretsPath, tag, message), {

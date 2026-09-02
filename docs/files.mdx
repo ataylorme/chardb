@@ -69,7 +69,7 @@ await post({
 });
 ```
 
-The configured client adds the active organization to writes, uploads, and downloads. File routes use the Worker URL configured on `createChardbReactClient`, and the browser sends the Better Auth session cookie automatically. Chardb checks the active organization, current membership, table policy, row ID, and opaque file ID before returning bytes.
+The configured client adds the active organization to writes, uploads, and downloads. File routes use the Worker URL configured on `createChardbReactClient`, and the browser sends the Better Auth session cookie automatically. CharDB checks the active organization, current membership, table policy, row ID, and opaque file ID before returning bytes.
 
 <Note>
   Do not store an R2 URL or object key. Store only the `FileId` returned by the upload.

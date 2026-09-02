@@ -1,23 +1,24 @@
 ---
-title: "chardb"
+title: "CharDB"
 description: "Better Auth-owned SQLite and live queries inside a Cloudflare Worker."
 ---
 
 # A real database inside your Worker
 
-Chardb gives a Cloudflare Worker a typed database binding. Better Auth users or organizations decide where rows live and who can read or change them.
+CharDB gives a Cloudflare Worker a typed database binding. The Worker owns Better Auth, Durable Object storage, and registered operations. React and Rust clients call those operations through the Worker's public URL.
 
 The generated app includes organization messages, live queries, and an authenticated R2 attachment path. Generate it first. Its schema, tests, Wrangler config, and deployment scripts are the reference application.
 
-<Warning>
-  Chardb is experimental. Coordinated SQLite, R2 file, and Vectorize recovery is implemented. Automatic regional failover and a production SLA are not.
-</Warning>
+Review the operational limits in [Plan ahead](/plan-ahead) before using CharDB with data you cannot recreate.
 
 <CardGroup cols={2}>
   <Card title="Run the starter" icon="bolt" href="/quickstart">
     Generate the exact starter and run it through Miniflare.
   </Card>
   <Card title="Set ownership" icon="users" href="/ownership">
-    Choose organization-wide or organization-and-user rows.
+    Choose organization, organization-and-user, or user ownership.
+  </Card>
+  <Card title="Connect a client" icon="code" href="/clients">
+    Use registered queries and mutations from React or Rust.
   </Card>
 </CardGroup>

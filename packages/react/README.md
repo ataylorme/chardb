@@ -1,6 +1,6 @@
 # @chardb/react
 
-React hooks for Chardb. Configure Better Auth once, then query and mutate with the authenticated user or organization scope.
+React hooks for CharDB. Configure Better Auth once, then query and mutate with the authenticated user or organization scope.
 
 ```tsx
 import { organizationClient, jwtClient } from "better-auth/client/plugins";

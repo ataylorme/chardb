@@ -28,7 +28,7 @@ class_name = "Gateway"
 name = "CDB_RESHARD"
 class_name = "Resharder"
 
-# Static assets. The live Chardb routes run through the Worker first.
+# Static assets. The live CharDB routes run through the Worker first.
 [assets]
 directory = "./dist"
 binding = "ASSETS"

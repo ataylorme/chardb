@@ -178,10 +178,7 @@ describe("generated tutorial flow", () => {
         expect(versionOne).toContain('"digest": "0fd0fcf9a9449e01fdeeb9834234b794a8d6b20b8031319aa0734b2ea03481f7"');
         expect(versionOne).toContain(".initialMigration");
         expect(JSON.parse(snapshotOne)).toEqual(SCAFFOLD_INITIAL_SNAPSHOT);
-        expect(readme).toContain(
-            "run `bunx @chardb/core migrations generate --name <name>` to append the next sequential version"
-        );
-        expect(readme).toContain("verifies the full JSON digest chain, every generated TypeScript file");
+        expect(readme).toContain("bunx @chardb/core migrations generate --name add_messages");
         expect(readme).not.toContain("shards split");
         expect(readme).not.toContain("virtual-shard range");
     });

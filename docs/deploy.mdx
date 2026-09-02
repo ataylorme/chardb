@@ -1,13 +1,18 @@
 ---
 title: "Deploy"
-description: "Configure Cloudflare, deploy the Worker, and keep the limits visible."
+description: "Configure Cloudflare and deploy the Worker."
 ---
-
-Chardb is experimental. Deploy with a tested recovery procedure and enough shard headroom for your workload.
 
 ## Set production secrets
 
-Copy the generated file and replace every placeholder.
+Authenticate Wrangler, then copy the generated environment template.
+
+```bash
+bunx wrangler login
+cp .env.example .env.local
+```
+
+Set `CHARDB_URL` to the public URL Wrangler prints for the Worker, usually `https://<worker-name>.<account-subdomain>.workers.dev`. If you use a custom domain, configure that route before bootstrapping. Replace both secret placeholders.
 
 ```dotenv .env.local
 CHARDB_URL=https://your-worker.example.com
@@ -19,12 +24,9 @@ Do not commit `.env.local`. The bootstrap script sends both secrets through a mo
 
 ## First deploy
 
-Run the checks once more, create the external resources, then bootstrap the Worker.
+Create the external resources, then bootstrap the Worker. The bootstrap script runs type checks, tests, and both builds before it uploads.
 
 ```bash
-bun run typecheck
-bun run test
-bun run build
 bun run setup:cloudflare
 bun run deploy:bootstrap
 ```
@@ -33,12 +35,9 @@ bun run deploy:bootstrap
 
 ## Later deploys
 
-Use the shorter release path when the resources already exist.
+Use the routine release path when the resources already exist. It runs the same checks and builds before upload.
 
 ```bash
-bun run typecheck
-bun run test
-bun run build
 bun run deploy
 ```
 
@@ -50,7 +49,7 @@ Routine `deploy` requires an existing Worker and refuses a package or migration 
 
 ## Cost boundary
 
-Chardb adds no hosted-service fee. Cloudflare bills Workers, Durable Objects, R2, and Vectorize from the bindings and traffic in your application. One application mutation can cause several Durable Object calls and SQLite row operations.
+CharDB adds no hosted-service fee. Cloudflare bills Workers, Durable Objects, R2, and Vectorize from the bindings and traffic in your application. One application mutation can cause several Durable Object calls and SQLite row operations.
 
 File uploads write one content-addressed R2 object per unique payload digest, so identical payloads share bytes. Those objects do not expire automatically. Bytes left by rejected uploads or deleted files remain billable until provider-wide orphan collection is available. A completed restore also materializes one live key for each restored file until normal deletion removes it. Current evidence measures latency and operation counts, not a complete Cloudflare invoice. It does not collect every Worker CPU-ms, Durable Object duration, R2 GB-month, or Vectorize billing dimension.
 
@@ -68,8 +67,10 @@ Store the manifest outside the deployment. Restore validates the current topolog
 bunx @chardb/core backups restore --url https://your-worker.example.com --from recovery.json
 ```
 
-Cloudflare retains Durable Object PITR history for 30 days. Chardb keeps authoritative R2 file bodies without automatic expiry. During restore it clears Chardb's current live R2 keys and tracked Vectorize records in signed, bounded turns, restarts every Durable Object, eagerly rebuilds authoritative files, and requeues authoritative vectors. The same manifest resumes after an unknown result. Chardb does not provide automatic regional failover or a production SLA.
+Cloudflare retains Durable Object PITR history for 30 days. CharDB keeps authoritative R2 file bodies without automatic expiry. During restore it clears CharDB's current live R2 keys and tracked Vectorize records in signed, bounded turns, restarts every Durable Object, eagerly rebuilds authoritative files, and requeues authoritative vectors. The same manifest resumes after an unknown result. CharDB does not provide automatic regional failover or a production SLA.
 
 Automatic resharding and range merging are unsupported.
+
+For recovery, resharding, and availability limits, read [Plan ahead](/plan-ahead).
 
 Read [Schema migrations](/schema-migrations) before changing a deployed table.

@@ -455,8 +455,8 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.get("/tmp/proj/vite.config.ts")).toContain(
             '"/ws": { target: workerSocket, ws: true, changeOrigin: true }'
         );
-        expect(files.get("/tmp/proj/README.md")).toContain("same-Worker Durable Object bindings");
         expect(files.get("/tmp/proj/README.md")).toContain("bun run dev");
+        expect(files.get("/tmp/proj/README.md")).toContain("bun run deploy:bootstrap");
         expect(files.get("/tmp/proj/README.md")).not.toContain("shards split");
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain(
             'throw new Error("/health did not identify the expected local Worker " + deploymentId)'

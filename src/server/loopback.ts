@@ -39,7 +39,7 @@ function isDbBinding(value: unknown): boolean {
 }
 
 /**
- * Resolve Chardb's generated same-Worker Durable Object bindings. Native
+ * Resolve CharDB's generated same-Worker Durable Object bindings. Native
  * `ctx.exports` and Miniflare's exported-name bindings remain fallbacks for
  * embedded runtimes and older fixtures. Explicit Wrangler bindings win.
  */

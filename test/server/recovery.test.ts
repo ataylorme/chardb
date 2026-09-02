@@ -183,7 +183,7 @@ describe("Durable Object point-in-time recovery", () => {
         expect(restoreTargets).toEqual([]);
         await recovery.commit("00000000-history");
         expect(() => abortForArmedRecoveryRestore(state, adaptSqlStorage(storage.sql))).toThrow(
-            "applying Chardb point-in-time restore"
+            "applying CharDB point-in-time restore"
         );
     });
 });

@@ -222,8 +222,8 @@ describe("init target contract", () => {
         expect(manifest.dependencies["@chardb/core"]).toBe(specifier);
         expect(manifest.dependencies["@chardb/react"]).toBe("file:/private/tmp/exact-chardb-react-candidate.tgz");
         expect(manifest.overrides).toEqual({ "@chardb/core": "$@chardb/core" });
-        expect(readme).toContain("bunx @chardb/core migrations generate --name <name>");
-        expect(readme).toContain("bunx @chardb/core vectorize prepare");
+        expect(readme).toContain("bunx @chardb/core migrations generate --name add_messages");
+        expect(readme).toContain("bun run deploy:bootstrap");
         expect(readme).not.toMatch(/\bbun chardb\b/);
     });
 });

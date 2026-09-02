@@ -392,7 +392,7 @@ try {
 
     const deletionErrors = browserErrors.splice(deletionErrorCursor);
     browserErrors.push(
-        ...deletionErrors.filter(error => !/^Chardb WebSocket error CDB_FORBIDDEN for sub \d+$/.test(error))
+        ...deletionErrors.filter(error => !/^CharDB WebSocket error CDB_FORBIDDEN for sub \d+$/.test(error))
     );
 
     assertBetterAuthRoutes(authRoutes);
@@ -693,7 +693,7 @@ function collectBrowserErrors(page, errors) {
             try {
                 const message = JSON.parse(event.payload);
                 if (message?.t === "error") {
-                    errors.push(`Chardb WebSocket error ${String(message.code)} for sub ${String(message.subId)}`);
+                    errors.push(`CharDB WebSocket error ${String(message.code)} for sub ${String(message.subId)}`);
                 }
             } catch {
                 // Non-JSON frames are rejected by the client itself; they are not useful diagnostics here.
@@ -841,7 +841,7 @@ async function sendMessage(page, body, attachment) {
     if (uploadResponsePromise) {
         const response = await uploadResponsePromise;
         if (!response.ok()) {
-            throw new Error(`Chardb file upload failed with status ${response.status()}: ${await response.text()}`);
+            throw new Error(`CharDB file upload failed with status ${response.status()}: ${await response.text()}`);
         }
     }
     await waitForMessage(page, body);

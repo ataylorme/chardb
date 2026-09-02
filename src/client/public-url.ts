@@ -4,13 +4,13 @@ export function normalizePublicWorkerUrl(value: string): string {
     try {
         url = new URL(value);
     } catch {
-        throw new TypeError("Chardb public Worker URL must be an absolute URL");
+        throw new TypeError("CharDB public Worker URL must be an absolute URL");
     }
     if (url.protocol !== "http:" && url.protocol !== "https:") {
-        throw new TypeError("Chardb public Worker URL must use http or https");
+        throw new TypeError("CharDB public Worker URL must use http or https");
     }
     if (url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
-        throw new TypeError("Chardb public Worker URL must contain only an origin");
+        throw new TypeError("CharDB public Worker URL must contain only an origin");
     }
     return url.origin;
 }

@@ -181,7 +181,7 @@ export function chardb<
     //
     // The caller's plugin tuple and plugin options pass through unchanged.
     // Better Auth owns organization and user-management permissions;
-    // Chardb enforces domain table policy independently.
+    // CharDB enforces domain table policy independently.
     const mounted = mountChardb(
         Chardb,
         { fetch: honoFetch as Parameters<typeof mountChardb>[1]["fetch"] },

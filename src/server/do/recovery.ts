@@ -93,7 +93,7 @@ export function abortForArmedRecoveryRestore(state: DurableObjectState, sql: Syn
     const armed = readArmedRecoveryRestore(sql);
     if (!armed) return false;
     if (!armed.nativeScheduled) return true;
-    state.abort("applying Chardb point-in-time restore");
+    state.abort("applying CharDB point-in-time restore");
     return true;
 }
 
