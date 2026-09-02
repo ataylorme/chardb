@@ -14,6 +14,8 @@ Commands:
   chardb doctor [wrangler]      validate wrangler.toml or wrangler.jsonc
   chardb migrations generate --name <name>
                                 append the next immutable additive migration
+  chardb migrations rebaseline --name <name> --confirm-local-reset
+                                replace a local-only version-one baseline after discarding state
   chardb vectorize prepare      create or verify required Vectorize metadata indexes
   chardb migrate --url <worker> --id <id> --target <version> [--concurrency <1-32>] [--baseline]
   chardb backups create --url <worker> --out <file> [--at <ISO-8601>]
@@ -90,16 +92,28 @@ export async function runCli(ctx: CliContext, argv: readonly string[]): Promise<
             return r.ok ? 0 : 1;
         }
         case "migrations": {
-            if (rest.length !== 3 || rest[0] !== "generate" || rest[1] !== "--name" || !rest[2]) {
-                ctx.stderr("usage: chardb migrations generate --name <name>\n");
+            const isGenerate = rest.length === 3 && rest[0] === "generate" && rest[1] === "--name" && rest[2];
+            const isRebaseline =
+                rest.length === 4 &&
+                rest[0] === "rebaseline" &&
+                rest[1] === "--name" &&
+                rest[2] &&
+                rest[3] === "--confirm-local-reset";
+            if (!isGenerate && !isRebaseline) {
+                ctx.stderr(
+                    "usage: chardb migrations generate --name <name>\n       chardb migrations rebaseline --name <name> --confirm-local-reset\n"
+                );
                 return 2;
             }
             try {
-                const { runMigrationsGenerate } = await import("./commands/migrations-generate.ts");
-                await runMigrationsGenerate(ctx, { name: rest[2] });
+                const { runMigrationsGenerate, runMigrationsRebaseline } = await import(
+                    "./commands/migrations-generate.ts"
+                );
+                if (isGenerate) await runMigrationsGenerate(ctx, { name: rest[2] as string });
+                else await runMigrationsRebaseline(ctx, { name: rest[2] as string, confirmLocalReset: true });
                 return 0;
             } catch (error) {
-                ctx.stderr(`chardb migrations generate: ${error instanceof Error ? error.message : String(error)}\n`);
+                ctx.stderr(`chardb migrations: ${error instanceof Error ? error.message : String(error)}\n`);
                 return 1;
             }
         }
