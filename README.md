@@ -237,15 +237,15 @@ bunx @chardb/core backups restore \
     --from recovery-2026-09-01.json
 ```
 
-Restore verifies the manifest and topology, fences traffic, arms every shard, and restarts the Durable Objects at their bookmarks. It waits until every restored session is active before returning. Cloudflare retains native Durable Object PITR history for 30 days. Native PITR is available in deployed Workers, not local Miniflare.
+Restore verifies the manifest and topology, fences Catalog and every shard, and removes the current derived provider records before it restarts the Durable Objects at their bookmarks. The CLI advances large restores through signed, bounded turns. Rerunning the same restore after a lost response resumes the same operation. A different manifest cannot cross the existing fence. Cloudflare retains native Durable Object PITR history for 30 days. Native PITR is available in deployed Workers, not local Miniflare.
 
 Chardb coordinates the external stores around that rewind:
 
-- Each upload writes one content-addressed R2 recovery copy per unique payload. Chardb refreshes it before a managed replacement or deletion. A missing live body self-heals from that verified copy after SQLite is restored.
-- Generated projects install a 31-day lifecycle rule scoped to `_chardb/retained/`. It does not change lifecycle rules for application objects.
-- Restored vector heads, including pending deletes, are requeued from authoritative SQLite after every shard has restarted. Searches continue to validate Vectorize candidates against current ownership, policy, and vector version.
+- Each upload writes one content-addressed R2 object per unique payload. Ordinary reads verify and stream that retained object without creating a mutable live key. Restore removes every Chardb-owned live key and eagerly rebuilds the files present at the recovery point from verified retained bytes.
+- Retained objects have no automatic expiry because they are the authoritative file bytes. Content left by a rejected upload or deleted file is invisible to application reads but remains billable until provider-wide orphan collection is available.
+- While every shard is fenced, restore deletes each tracked physical Vectorize record and proves exact-id absence. After SQLite restarts, it requeues the authoritative heads, including pending deletes. Searches continue to validate Vectorize candidates against current ownership, policy, and vector version.
 
-R2 and Vectorize do not expose transactional PITR with Durable Objects. Objects and vectors created after a recovery point can remain as unreachable provider data after restore. They cannot be returned through Chardb, but they still consume provider storage until removed.
+If provider cleanup or rewind fails, Chardb keeps the recovery fence in place. Rerun the same command to resume the durable operation and converge after an unknown result.
 
 ## What the release gate proves
 
@@ -257,7 +257,7 @@ The release suite builds one paired `@chardb/core` and `@chardb/react` candidate
 - R2 upload, attach, read, range requests, replacement, deletion, and organization cleanup
 - Vectorize delivery, retries, stale-candidate filtering, policy checks, and deletion settlement
 - combined row, file, and vector movement across physical shards
-- deployed recovery-point creation, traffic fencing, SQLite rewind, retained-file self-healing, vector reconciliation, and exact cleanup
+- deployed recovery-point creation, traffic fencing, SQLite rewind, retained-file restoration, vector reconciliation, and exact cleanup
 - generated-project browser behavior through Vite, Wrangler, Miniflare, and Playwright
 - clean package consumption on Linux, macOS, and Windows
 
@@ -281,9 +281,9 @@ Generated projects use `wrangler.toml`. The CLI also reads `wrangler.json` and `
 
 ## Current boundary
 
-Chardb's first release is experimental. Organization-owned and user-owned SQLite, organization files, organization vectors, live queries, migrations, explicit range movement, coordinated recovery points, and bounded R2 recovery retention are implemented and tested.
+Chardb's first release is experimental. Organization-owned and user-owned SQLite, organization files, organization vectors, live queries, migrations, explicit range movement, coordinated recovery points, provider cleanup, and bounded R2 recovery retention are implemented and tested.
 
-Automatic load-based resharding, vector-search continuation, provider-wide orphan collection, regional failover controls, cross-partition transactions, and a production availability SLA are not part of this release.
+Automatic load-based resharding, vector-search continuation, regional failover controls, cross-partition transactions, and a production availability SLA are not part of this release.
 
 ## License
 
