@@ -116,6 +116,7 @@ function fileOperationSamples(
     return Array.from({ length: count }, (_, sequence) => ({
         sequence,
         objectSequence: sequence % uploadCount,
+        attempts: 1,
         latencyMs: latency,
         bytes: operation === "attach" ? 0 : payloadBytes,
         correctness: {
@@ -335,12 +336,17 @@ export function buildCloudflareFileProof(candidate: ExactCandidate, pairSha256: 
             schemaVersion: 1,
             routingEpoch: 2,
             acceptedStatus: 202,
+            filesReset: 2,
+            filesRetained: 2,
+            vectorsReset: 0,
+            filesRehydrated: 1,
             vectorsRequeued: 0,
             postPointRowReadableBeforeRestore: true,
             pointRowReadableAfterRestore: true,
             postPointRowHiddenAfterRestore: true,
-            postPointR2ObjectRetained: true,
+            postPointR2ObjectRemoved: true,
             pointFileRecoveredFromRetention: true,
+            pointFileRetentionRefreshedBeforeScrub: true,
         },
         lifecycle: {
             uploadIdempotent: true,

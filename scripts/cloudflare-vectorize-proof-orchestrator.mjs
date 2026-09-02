@@ -1310,6 +1310,7 @@ function controllerDefaults(prepared, execution, provisioning, options) {
 
 async function finalizeCloudflareVectorizeProofReport(input) {
     const lifecycle = exactObject(input.lifecycle, "Vectorize lifecycle report evidence");
+    const recovery = exactObject(input.recovery, "Vectorize recovery report evidence");
     const cleanup = exactObject(input.cleanupResult, "Vectorize cleanup result");
     const localRemotePhysicalIds = exactPhysicalIds(
         input.benchmarkPreparation.localRemotePhysicalIds,
@@ -1327,7 +1328,7 @@ async function finalizeCloudflareVectorizeProofReport(input) {
     const filesScanned = outputFiles.length + 2;
     const completedAt = new Date(input.now()).toISOString();
     const report = {
-        schema: "chardb.cloudflare-vectorize-proof.report.v2",
+        schema: "chardb.cloudflare-vectorize-proof.report.v3",
         ok: true,
         startedAt: input.startedAt,
         completedAt,
@@ -1355,6 +1356,7 @@ async function finalizeCloudflareVectorizeProofReport(input) {
         faults: lifecycle.faults,
         search: lifecycle.search,
         settlement: lifecycle.settlement,
+        recovery,
         benchmark: lifecycle.benchmark,
         cleanup: {
             expectedPhysicalIds,
@@ -1444,6 +1446,7 @@ export async function executePreparedCloudflareVectorizeProof(input, dependencie
         provisioning: null,
         benchmarkPreparation: null,
         deployedLifecycle: null,
+        recovery: null,
         lifecycle: null,
         redeploy: null,
         cleanup: null,
@@ -1564,6 +1567,23 @@ export async function executePreparedCloudflareVectorizeProof(input, dependencie
                 return Object.freeze({ released: true, gateDeadline: body.gateDeadline });
             },
             recordDeployedLifecycle: async deployedLifecycle => {
+                const recovery = await lifecycle.proveRecovery({
+                    origin: prepared.origin,
+                    admin: Object.freeze({ token: execution.secrets.adminToken, runId: execution.secrets.runId }),
+                    organizationName: `Vector recovery ${execution.ledger.nonce}`,
+                    organizationSlug: `vector-proof-recovery-${execution.ledger.nonce}`,
+                    mutationRunId: `vector-proof-recovery-${execution.ledger.nonce}`,
+                    documentId: `vector-proof-recovery-document-${execution.ledger.nonce}`,
+                    initialText: "Cloudflare Vectorize recovery point document",
+                    initialValues: PROOF_VECTOR_INITIAL_VALUES,
+                    replacementText: "Cloudflare Vectorize post-point document",
+                    replacementValues: PROOF_VECTOR_REPLACEMENT_VALUES,
+                    timeoutMs: input.lifecycleTimeoutMs ?? VECTORIZE_LIFECYCLE_TIMEOUT_MS,
+                    intervalMs: input.lifecycleIntervalMs ?? 1_000,
+                    recordPhysicalIds: async ids => {
+                        await appendOwnedIds(prepared.ledgerPath, execution.candidate.digest, ids);
+                    },
+                });
                 evidence = {
                     ...evidence,
                     phase: "deployed-lifecycle",
@@ -1573,6 +1593,7 @@ export async function executePreparedCloudflareVectorizeProof(input, dependencie
                         secrets,
                         "deployed Vectorize lifecycle evidence"
                     ),
+                    recovery: assertSecretFreeExecutionValue(recovery, secrets, "Vectorize recovery evidence"),
                 };
                 await persist();
             },
@@ -1766,6 +1787,7 @@ export async function executePreparedCloudflareVectorizeProof(input, dependencie
             primaryError === undefined &&
             cleanupError === undefined &&
             evidence.lifecycle !== null &&
+            evidence.recovery !== null &&
             cleanupResult !== undefined;
         evidence = {
             ...evidence,
@@ -1780,7 +1802,13 @@ export async function executePreparedCloudflareVectorizeProof(input, dependencie
         await assertNoCloudflareVectorizeProofSecrets([evidencePath, checksumPath], secrets);
     }
     let finalReport;
-    if (!primaryError && !cleanupError && evidence.lifecycle !== null && cleanupResult !== undefined) {
+    if (
+        !primaryError &&
+        !cleanupError &&
+        evidence.lifecycle !== null &&
+        evidence.recovery !== null &&
+        cleanupResult !== undefined
+    ) {
         try {
             finalReport = await finalizeCloudflareVectorizeProofReport({
                 prepared,
@@ -1790,6 +1818,7 @@ export async function executePreparedCloudflareVectorizeProof(input, dependencie
                 startedAt,
                 provisioning,
                 lifecycle: evidence.lifecycle,
+                recovery: evidence.recovery,
                 benchmarkPreparation: evidence.benchmarkPreparation,
                 cleanupResult,
                 executionPath: evidencePath,

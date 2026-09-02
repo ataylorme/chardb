@@ -188,12 +188,17 @@ function assertRecovery(value) {
         "schemaVersion",
         "routingEpoch",
         "acceptedStatus",
+        "filesReset",
+        "filesRetained",
+        "vectorsReset",
+        "filesRehydrated",
         "vectorsRequeued",
         "postPointRowReadableBeforeRestore",
         "pointRowReadableAfterRestore",
         "postPointRowHiddenAfterRestore",
-        "postPointR2ObjectRetained",
+        "postPointR2ObjectRemoved",
         "pointFileRecoveredFromRetention",
+        "pointFileRetentionRefreshedBeforeScrub",
     ]);
     if (value.format !== "chardb-recovery-point/v1") {
         throw new Error("Cloudflare file recovery proof format is invalid");
@@ -204,13 +209,22 @@ function assertRecovery(value) {
     assertPositiveInteger(value.routingEpoch, "Cloudflare file recovery routing epoch");
     if (
         value.acceptedStatus !== 202 ||
+        !Number.isSafeInteger(value.filesReset) ||
+        value.filesReset < 0 ||
+        !Number.isSafeInteger(value.filesRetained) ||
+        value.filesRetained < 1 ||
+        !Number.isSafeInteger(value.vectorsReset) ||
+        value.vectorsReset < 0 ||
+        !Number.isSafeInteger(value.filesRehydrated) ||
+        value.filesRehydrated < 0 ||
         !Number.isSafeInteger(value.vectorsRequeued) ||
         value.vectorsRequeued < 0 ||
         value.postPointRowReadableBeforeRestore !== true ||
         value.pointRowReadableAfterRestore !== true ||
         value.postPointRowHiddenAfterRestore !== true ||
-        value.postPointR2ObjectRetained !== true ||
-        value.pointFileRecoveredFromRetention !== true
+        value.postPointR2ObjectRemoved !== true ||
+        value.pointFileRecoveredFromRetention !== true ||
+        value.pointFileRetentionRefreshedBeforeScrub !== true
     ) {
         throw new Error("Cloudflare file recovery proof did not demonstrate coordinated recovery");
     }

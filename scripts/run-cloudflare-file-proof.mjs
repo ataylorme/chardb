@@ -37,6 +37,7 @@ const COMMAND_TIMEOUT_MS = 15 * 60_000;
 const MIGRATION_EDGE_404_WINDOW_MS = 30_000;
 const MIGRATION_EDGE_404_BASE_DELAY_MS = 1_000;
 const MIGRATION_EDGE_404_MAX_DELAY_MS = 5_000;
+const RECOVERY_OPERATION_TURNS = 10_000;
 
 export async function resolveWranglerExecutable(packageJsonAnchor) {
     const resolver = createRequire(path.resolve(packageJsonAnchor));
@@ -710,33 +711,38 @@ async function createRecoveryPoint(origin, adminToken) {
 }
 
 async function restoreRecoveryPoint(origin, adminToken, recoveryPoint) {
-    const result = await request(origin, "/_chardb/backups/restore", {
-        method: "POST",
-        headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
-        body: JSON.stringify({ recoveryPoint }),
-    });
+    const result = await runRecoveryOperation(origin, adminToken, "restore", recoveryPoint);
     const accepted =
         result.response.status === 202 &&
         result.body?.accepted === true &&
-        result.body?.recoveryPointDigest === recoveryPoint.digest;
+        result.body?.recoveryPointDigest === recoveryPoint.digest &&
+        Number.isSafeInteger(result.body?.providerReset?.files) &&
+        result.body.providerReset.files >= 0 &&
+        Number.isSafeInteger(result.body?.providerReset?.filesRetained) &&
+        result.body.providerReset.filesRetained >= 0 &&
+        Number.isSafeInteger(result.body?.providerReset?.vectors) &&
+        result.body.providerReset.vectors >= 0;
     const diagnostic =
         typeof result.body === "object" && result.body !== null
             ? [result.body.code, result.body.error].filter(value => typeof value === "string").join(": ")
             : "";
     check(accepted, `recovery-point restore returned ${result.response.status}${diagnostic ? `: ${diagnostic}` : ""}`);
-    return result.response.status;
+    return {
+        status: result.response.status,
+        filesReset: result.body.providerReset.files,
+        filesRetained: result.body.providerReset.filesRetained,
+        vectorsReset: result.body.providerReset.vectors,
+    };
 }
 
 async function reconcileRecoveryPoint(origin, adminToken, recoveryPoint) {
-    const result = await request(origin, "/_chardb/backups/reconcile", {
-        method: "POST",
-        headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
-        body: JSON.stringify({ recoveryPoint }),
-    });
+    const result = await runRecoveryOperation(origin, adminToken, "reconcile", recoveryPoint);
     const reconciled =
         result.response.ok &&
         result.body?.reconciled === true &&
         result.body?.recoveryPointDigest === recoveryPoint.digest &&
+        Number.isSafeInteger(result.body?.filesRehydrated) &&
+        result.body.filesRehydrated >= 0 &&
         Number.isSafeInteger(result.body?.vectorsRequeued) &&
         result.body.vectorsRequeued >= 0;
     const diagnostic =
@@ -747,7 +753,34 @@ async function reconcileRecoveryPoint(origin, adminToken, recoveryPoint) {
         reconciled,
         `recovery reconciliation returned ${result.response.status}${diagnostic ? `: ${diagnostic}` : ""}`
     );
-    return result.body.vectorsRequeued;
+    return { filesRehydrated: result.body.filesRehydrated, vectorsRequeued: result.body.vectorsRequeued };
+}
+
+async function runRecoveryOperation(origin, adminToken, action, recoveryPoint) {
+    let continuation;
+    let continuationIdentity;
+    for (let turn = 0; turn < RECOVERY_OPERATION_TURNS; turn++) {
+        const result = await request(origin, `/_chardb/backups/${action}`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
+            body: JSON.stringify(continuation === undefined ? { recoveryPoint } : { recoveryPoint, continuation }),
+        });
+        if (result.body?.pending !== true) return result;
+        const next = result.body?.continuation;
+        check(
+            result.response.status === 202 &&
+                result.body?.recoveryPointDigest === recoveryPoint.digest &&
+                next !== null &&
+                typeof next === "object" &&
+                !Array.isArray(next),
+            `recovery ${action} returned an invalid continuation`
+        );
+        const nextIdentity = JSON.stringify(next);
+        check(nextIdentity !== continuationIdentity, `recovery ${action} returned a stalled continuation`);
+        continuation = next;
+        continuationIdentity = nextIdentity;
+    }
+    throw new Error(`recovery ${action} exceeded its continuation bound`);
 }
 
 function boundedDiagnostic(value) {
@@ -1408,17 +1441,51 @@ async function main() {
 
         const recoveryPoint = await createRecoveryPoint(origin, adminToken);
         const survivorObject = `v1/${organizationB}/${survivor.fileId}`;
+        const survivorRetainedObject = `_chardb/retained/sha256/${survivor.sha256}`;
         const pointFileState = await proofState(origin, adminToken, runId, organizationB);
-        await runWrangler(["r2", "object", "delete", `${names.bucket}/${survivorObject}`, "--remote", "--force"], {
-            cwd: app,
-            label: "recovery retained-file fault",
-            secrets,
-        });
-        const missingPointFileState = await proofState(origin, adminToken, runId, organizationB);
+        const originalRetainedPath = path.join(privateDir, "original-survivor-retained-object.bin");
+        await runWrangler(
+            [
+                "r2",
+                "object",
+                "get",
+                `${names.bucket}/${survivorRetainedObject}`,
+                "--remote",
+                "--file",
+                originalRetainedPath,
+            ],
+            { cwd: app, label: "original retained-file verification", secrets }
+        );
         check(
-            missingPointFileState.count === pointFileState.count - 1 &&
-                missingPointFileState.digest !== pointFileState.digest,
-            "recovery retained-file fault did not remove exactly one live object"
+            sha256(await readFile(originalRetainedPath)) === survivor.sha256,
+            "recovery fault target was not retained before deletion"
+        );
+        await runWrangler(
+            ["r2", "object", "delete", `${names.bucket}/${survivorRetainedObject}`, "--remote", "--force"],
+            {
+                cwd: app,
+                label: "recovery expired-retention fault",
+                secrets,
+            }
+        );
+        const deletedRetainedPath = path.join(privateDir, "deleted-survivor-retained-object.bin");
+        const missingRetainedObject = await runWrangler(
+            [
+                "r2",
+                "object",
+                "get",
+                `${names.bucket}/${survivorRetainedObject}`,
+                "--remote",
+                "--file",
+                deletedRetainedPath,
+            ],
+            { cwd: app, label: "expired retained-file absence check", secrets, allowFailure: true }
+        );
+        check(missingRetainedObject.exitCode !== 0, "recovery fault did not remove the retained object");
+        const livePointFileState = await proofState(origin, adminToken, runId, organizationB);
+        check(
+            livePointFileState.count === pointFileState.count && livePointFileState.digest === pointFileState.digest,
+            "recovery retained-file fault changed the live object set"
         );
         const afterPointBytes = new TextEncoder().encode(`after-recovery-point-${nonce}`);
         const afterPointFile = await upload(
@@ -1445,13 +1512,16 @@ async function main() {
             beforeRestore.response.ok && sha256(beforeRestore.bytes) === afterPointFile.sha256,
             "post-recovery-point row was not readable before restore"
         );
-        const acceptedStatus = await restoreRecoveryPoint(origin, adminToken, recoveryPoint);
+        const recoveryAccepted = await restoreRecoveryPoint(origin, adminToken, recoveryPoint);
         await retry(async () => {
             const restoredAfterPoint = await download(origin, principal, organizationB, afterPointRow);
             check(restoredAfterPoint.response.status === 404, "recovery point did not remove the later row");
             return true;
         }, 120_000);
-        const vectorsRequeued = await retry(() => reconcileRecoveryPoint(origin, adminToken, recoveryPoint), 120_000);
+        const recoveryReconciled = await retry(
+            () => reconcileRecoveryPoint(origin, adminToken, recoveryPoint),
+            120_000
+        );
         const restoredSurvivor = await download(origin, principal, organizationB, survivorRow);
         check(
             restoredSurvivor.response.ok && sha256(restoredSurvivor.bytes) === survivor.sha256,
@@ -1466,34 +1536,48 @@ async function main() {
             sha256(await readFile(restoredSurvivorPath)) === survivor.sha256,
             "retained file was not restored to its canonical live R2 key"
         );
-        const afterPointObject = `v1/${organizationB}/${afterPointFile.fileId}`;
-        const afterPointObjectPath = path.join(privateDir, "after-recovery-point-object.bin");
+        const refreshedRetainedPath = path.join(privateDir, "refreshed-survivor-retained-object.bin");
         await runWrangler(
-            ["r2", "object", "get", `${names.bucket}/${afterPointObject}`, "--remote", "--file", afterPointObjectPath],
-            { cwd: app, label: "post-restore R2 independence check", secrets }
+            [
+                "r2",
+                "object",
+                "get",
+                `${names.bucket}/${survivorRetainedObject}`,
+                "--remote",
+                "--file",
+                refreshedRetainedPath,
+            ],
+            { cwd: app, label: "refreshed retained-file verification", secrets }
         );
         check(
-            sha256(await readFile(afterPointObjectPath)) === afterPointFile.sha256,
-            "restore unexpectedly changed the later R2 object"
+            sha256(await readFile(refreshedRetainedPath)) === survivor.sha256,
+            "restore did not recreate the expired retained object from live bytes"
         );
-        await runWrangler(["r2", "object", "delete", `${names.bucket}/${afterPointObject}`, "--remote", "--force"], {
-            cwd: app,
-            label: "post-restore orphan cleanup",
-            secrets,
-        });
+        const afterPointObject = `v1/${organizationB}/${afterPointFile.fileId}`;
+        const afterPointObjectPath = path.join(privateDir, "after-recovery-point-object.bin");
+        const removedAfterPointObject = await runWrangler(
+            ["r2", "object", "get", `${names.bucket}/${afterPointObject}`, "--remote", "--file", afterPointObjectPath],
+            { cwd: app, label: "post-restore R2 cleanup check", secrets, allowFailure: true }
+        );
+        check(removedAfterPointObject.exitCode !== 0, "restore left the later R2 object behind");
         report.recovery = {
             format: recoveryPoint.format,
             digest: recoveryPoint.digest,
             shardCount: recoveryPoint.shards.length,
             schemaVersion: recoveryPoint.schema.version,
             routingEpoch: recoveryPoint.routingEpoch,
-            acceptedStatus,
-            vectorsRequeued,
+            acceptedStatus: recoveryAccepted.status,
+            filesReset: recoveryAccepted.filesReset,
+            filesRetained: recoveryAccepted.filesRetained,
+            vectorsReset: recoveryAccepted.vectorsReset,
+            filesRehydrated: recoveryReconciled.filesRehydrated,
+            vectorsRequeued: recoveryReconciled.vectorsRequeued,
             postPointRowReadableBeforeRestore: true,
             pointRowReadableAfterRestore: true,
             postPointRowHiddenAfterRestore: true,
-            postPointR2ObjectRetained: true,
+            postPointR2ObjectRemoved: true,
             pointFileRecoveredFromRetention: true,
+            pointFileRetentionRefreshedBeforeScrub: true,
         };
 
         const inputAfterSeed = await fingerprintDeployment(

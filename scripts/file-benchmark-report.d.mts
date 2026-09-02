@@ -26,6 +26,7 @@ export declare const FILE_BENCHMARK_PROFILE: FileBenchmarkProfile;
 export interface FileBenchmarkOperationSample {
     readonly sequence: number;
     readonly objectSequence: number;
+    readonly attempts: number;
     readonly latencyMs: number;
     readonly bytes: number;
     readonly correctness: {
@@ -63,6 +64,8 @@ export interface FileBenchmarkLogicalRun {
 
 export interface FileBenchmarkMetric {
     readonly operations: number;
+    readonly attempts: number;
+    readonly retries: number;
     readonly concurrency: number;
     readonly elapsedMs: number;
     readonly totalBytes: number;

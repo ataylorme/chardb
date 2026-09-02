@@ -22,6 +22,8 @@ export const FILE_BENCHMARK_DEFAULTS = Object.freeze({
 
 const MAX_FILE_BYTES = 25 * 1_024 * 1_024;
 const REQUEST_TIMEOUT_MS = 60_000;
+const MAX_UPLOAD_ATTEMPTS = 3;
+const RETRYABLE_UPLOAD_STATUSES = new Set([408, 429, 502, 503, 504]);
 const PAIR_INVARIANTS = ["nativeBetterAuth", "organizationIsolation", "exactBytes", "exactDigest", "cleanupComplete"];
 
 function value(argv, flag) {
@@ -167,6 +169,33 @@ async function request(origin, pathname, init = {}) {
     return { ...result, body };
 }
 
+function retryDelayMs(response, attempt) {
+    const retryAfter = response.headers.get("retry-after");
+    if (retryAfter !== null && /^\d+$/.test(retryAfter)) {
+        return Math.min(Number(retryAfter) * 1_000, 5_000);
+    }
+    return 100 * 2 ** (attempt - 1);
+}
+
+/** Retry only an idempotent upload whose exact request identity is preserved by the caller. */
+export async function runRetryableFileUpload(operation, pause = Bun.sleep) {
+    let lastError;
+    for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt++) {
+        try {
+            const value = await operation();
+            if (!RETRYABLE_UPLOAD_STATUSES.has(value.response.status) || attempt === MAX_UPLOAD_ATTEMPTS) {
+                return { value, attempts: attempt };
+            }
+            await pause(retryDelayMs(value.response, attempt));
+        } catch (error) {
+            lastError = error;
+            if (attempt === MAX_UPLOAD_ATTEMPTS) throw error;
+            await pause(100 * 2 ** (attempt - 1));
+        }
+    }
+    throw lastError ?? new Error("file upload retry exhausted without a response");
+}
+
 function sessionCookies(headers) {
     const values = typeof headers.getSetCookie === "function" ? headers.getSetCookie() : [headers.get("set-cookie")];
     return values
@@ -253,26 +282,36 @@ async function uploadFile(target, payload, payloadSha256, fileKey) {
         column: "attachment",
     });
     const upload = await timed(() =>
-        request(target.origin, `/_chardb/files/upload?${uploadQuery}`, {
-            method: "PUT",
-            headers: {
-                "content-type": "application/octet-stream",
-                "idempotency-key": fileKey,
-                cookie: target.cookie,
-                origin: target.origin.origin,
-            },
-            body: payload,
-        })
+        runRetryableFileUpload(() =>
+            request(target.origin, `/_chardb/files/upload?${uploadQuery}`, {
+                method: "PUT",
+                headers: {
+                    "content-type": "application/octet-stream",
+                    "idempotency-key": fileKey,
+                    cookie: target.cookie,
+                    origin: target.origin.origin,
+                },
+                body: payload,
+            })
+        )
     );
-    const file = upload.result.body?.file;
-    check(upload.result.response.ok, `${target.kind} upload failed with ${upload.result.response.status}`);
+    const result = upload.result.value;
+    const file = result.body?.file;
+    check(result.response.ok, `${target.kind} upload failed with ${result.response.status}`);
     check(file?.size === payload.byteLength && file?.sha256 === payloadSha256, `${target.kind} upload digest drifted`);
     const completedAt = performance.now();
     await runFileBenchmarkUploadHook(target.onUpload, target.kind, {
         organizationId: target.primaryOrganizationId,
         fileId: file.fileId,
     });
-    return { fileKey, file, latencyMs: upload.elapsed, status: upload.result.response.status, completedAt };
+    return {
+        fileKey,
+        file,
+        attempts: upload.result.attempts,
+        latencyMs: upload.elapsed,
+        status: result.response.status,
+        completedAt,
+    };
 }
 
 async function attachFile(target, uploaded) {
@@ -337,6 +376,7 @@ function uploadSample(uploaded, sequence, objectSequence, payload, payloadSha256
     return {
         sequence,
         objectSequence,
+        attempts: uploaded.attempts,
         latencyMs: uploaded.latencyMs,
         bytes: payload.byteLength,
         correctness: operationCorrectness(
@@ -351,6 +391,7 @@ function attachSample(attached, sequence, objectSequence, payload, payloadSha256
     return {
         sequence,
         objectSequence,
+        attempts: 1,
         latencyMs: attached.attachLatencyMs,
         bytes: 0,
         correctness: operationCorrectness(
@@ -365,6 +406,7 @@ function downloadSample(downloaded, sequence, objectSequence, payload, payloadSh
     return {
         sequence,
         objectSequence,
+        attempts: 1,
         latencyMs: downloaded.downloadLatencyMs,
         bytes: downloaded.downloadSize,
         correctness: operationCorrectness(

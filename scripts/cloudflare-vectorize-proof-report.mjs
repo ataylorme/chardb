@@ -3,12 +3,13 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
-export const CLOUDFLARE_VECTORIZE_PROOF_REPORT_SCHEMA = "chardb.cloudflare-vectorize-proof.report.v2";
-export const CLOUDFLARE_VECTORIZE_PROOF_VALIDATION_SCHEMA = "chardb.cloudflare-vectorize-proof.validation.v2";
+export const CLOUDFLARE_VECTORIZE_PROOF_REPORT_SCHEMA = "chardb.cloudflare-vectorize-proof.report.v3";
+export const CLOUDFLARE_VECTORIZE_PROOF_VALIDATION_SCHEMA = "chardb.cloudflare-vectorize-proof.validation.v3";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const WIRE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const RESOURCE_ID = /^vr1_[a-f0-9]{64}$/;
+const VECTOR_ID = /^vec1_[a-f0-9]{64}$/;
 const RESOURCE_FILTER = /^r1_[A-Za-z0-9_-]{43}$/;
 const PHYSICAL_ID = /^p1_([A-Za-z0-9_-]{43})_([1-9a-z][0-9a-z]*)$/;
 const NAMESPACE_ID = /^o1_[A-Za-z0-9_-]{43}$/;
@@ -1195,7 +1196,82 @@ function assertBenchmark(value) {
     });
 }
 
-function assertCleanup(value, delivery, liveDelivery) {
+function assertRecovery(value) {
+    object(value, "Cloudflare Vectorize recovery proof", [
+        "recoveryPointDigest",
+        "vectorId",
+        "physicalIds",
+        "authoritativeVersion",
+        "providerReset",
+        "reconciliation",
+        "providerPresence",
+        "restoredRow",
+    ]);
+    digest(value.recoveryPointDigest, "recovery point digest");
+    if (typeof value.vectorId !== "string" || !VECTOR_ID.test(value.vectorId)) {
+        throw new Error("recovery vector id is invalid");
+    }
+    const physicalIds = exactStringArray(value.physicalIds, "recovery physical ids", physicalId, {
+        nonempty: true,
+        maximum: 2,
+    });
+    const wireDigest = Buffer.from(value.vectorId.slice("vec1_".length), "hex").toString("base64url");
+    if (
+        physicalIds.length !== 2 ||
+        physicalIds[0] !== `p1_${wireDigest}_1` ||
+        physicalIds[1] !== `p1_${wireDigest}_2` ||
+        value.authoritativeVersion !== 1
+    ) {
+        throw new Error("recovery physical identities do not prove restored version 1");
+    }
+    object(value.providerReset, "recovery provider reset", ["files", "vectors"]);
+    if (
+        !Number.isSafeInteger(value.providerReset.files) ||
+        value.providerReset.files < 0 ||
+        !Number.isSafeInteger(value.providerReset.vectors) ||
+        value.providerReset.vectors < 1
+    ) {
+        throw new Error("recovery provider reset did not scrub a vector");
+    }
+    object(value.reconciliation, "recovery reconciliation", ["filesRehydrated", "vectorsRequeued"]);
+    if (
+        !Number.isSafeInteger(value.reconciliation.filesRehydrated) ||
+        value.reconciliation.filesRehydrated < 0 ||
+        !Number.isSafeInteger(value.reconciliation.vectorsRequeued) ||
+        value.reconciliation.vectorsRequeued < 1
+    ) {
+        throw new Error("recovery reconciliation did not requeue a vector");
+    }
+    object(value.providerPresence, "recovery provider presence", [
+        "atPoint",
+        "postPoint",
+        "afterScrub",
+        "afterRequeue",
+    ]);
+    for (const [name, expected] of [
+        ["atPoint", [true, false]],
+        ["postPoint", [false, true]],
+        ["afterScrub", [false, false]],
+        ["afterRequeue", [true, false]],
+    ]) {
+        if (!isDeepStrictEqual(value.providerPresence[name], expected)) {
+            throw new Error(`recovery provider presence ${name} is invalid`);
+        }
+    }
+    object(value.restoredRow, "recovery restored row", ["id", "body"]);
+    if (
+        typeof value.restoredRow.id !== "string" ||
+        !WIRE_ID.test(value.restoredRow.id) ||
+        typeof value.restoredRow.body !== "string" ||
+        value.restoredRow.body.length < 1 ||
+        TEXT.encode(value.restoredRow.body).byteLength > 2_000
+    ) {
+        throw new Error("recovery restored row is invalid");
+    }
+    return value;
+}
+
+function assertCleanup(value, delivery, liveDelivery, recovery) {
     object(value, "Cloudflare Vectorize proof cleanup", [
         "expectedPhysicalIds",
         "discoveredPhysicalIds",
@@ -1222,6 +1298,7 @@ function assertCleanup(value, delivery, liveDelivery) {
         delivery.upsertResponseLoss.physicalId,
         ...delivery.deleteResponseLoss.physicalIds,
         ...localRemote,
+        ...recovery.physicalIds,
     ]);
     const live = expected.filter(item => !nonLive.has(item));
     const liveHashes = new Set(live.map(item => sha256(item)));
@@ -1278,6 +1355,7 @@ export function assertCloudflareVectorizeProofReport(report, expectedCandidate) 
         "faults",
         "search",
         "settlement",
+        "recovery",
         "benchmark",
         "cleanup",
         "evidence",
@@ -1304,8 +1382,9 @@ export function assertCloudflareVectorizeProofReport(report, expectedCandidate) 
     assertFaults(report.faults);
     assertSearch(report.search);
     assertSettlement(report.settlement);
+    const recovery = assertRecovery(report.recovery);
     assertBenchmark(report.benchmark);
-    assertCleanup(report.cleanup, report.delivery, report.search.liveDelivery);
+    assertCleanup(report.cleanup, report.delivery, report.search.liveDelivery, recovery);
     assertEvidence(report.evidence);
     return report;
 }
