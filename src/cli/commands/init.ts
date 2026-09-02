@@ -16,6 +16,7 @@ export interface InitOptions {
 const ALLOWED_EXISTING_ROOT_ENTRIES = new Set([".DS_Store", ".git"]);
 
 const DEFAULT_COMPAT_DATE = "2026-05-10";
+const generatedDeploymentId = (): string => `chardb.app.v1/${crypto.randomUUID()}`;
 
 const PACKAGE_TEMPLATE = (name: string, corePackage: string, reactPackage: string) =>
     `${JSON.stringify(
@@ -25,6 +26,10 @@ const PACKAGE_TEMPLATE = (name: string, corePackage: string, reactPackage: strin
             version: "0.0.0",
             type: "module",
             packageManager: "bun@1.2.22",
+            engines: {
+                node: ">=22",
+                bun: ">=1.2.22",
+            },
             scripts: {
                 typecheck: "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
                 test: "bun scripts/test.mjs",
@@ -285,6 +290,7 @@ describe("generated Cloudflare Worker", () => {
     expect(health.response.status, JSON.stringify(health.body)).toBe(200);
     expect(health.body).toMatchObject({
       ok: true,
+      deploymentId: {{DEPLOYMENT_ID}},
       schemaVersion: migrations.version,
       schemaDigest: migrations.digest,
     });
@@ -415,11 +421,11 @@ bun run deploy
 
 Bun loads \`.env.local\` for these scripts. Git ignores that file. The commands never put either secret in process arguments.
 
-\`setup:cloudflare\` probes or creates the exact R2 bucket named in \`wrangler.toml\` and installs the scoped 31-day Chardb recovery lifecycle. It does not infer Vectorize indexes. Provision any future vector bindings explicitly, then run \`bunx @chardb/core vectorize prepare\`.
+\`setup:cloudflare\` probes or creates the exact R2 bucket named in \`wrangler.toml\`. It does not install an expiry rule because Chardb's private content-addressed objects are the authoritative file bytes. It does not infer Vectorize indexes. Provision any future vector bindings explicitly, then run \`bunx @chardb/core vectorize prepare\`.
 
 The bootstrap command refuses an invalid or implicit \`CHARDB_URL\`. On the first Worker upload it passes the two secrets through a mode-0600 temporary file, removes that file, waits for the exact packaged migration version and digest, and runs the packaged \`chardb migrate\` command with a content-derived migration ID. Rerunning it after an interrupted migration resumes without changing secrets. Routine \`deploy\` requires an existing Worker, checks that its current package and active migration agree, and never uploads secrets.
 
-The current chardb package is still experimental. Do not deploy this scaffold with production data.
+The current chardb package is experimental. Test its deployed recovery command before putting data you care about into it.
 `;
 
 const AUTH_TEMPLATE = `import { anonymous } from "better-auth/plugins/anonymous";
@@ -505,7 +511,18 @@ const VITE_CONFIG_TEMPLATE = `import react from "@vitejs/plugin-react";
 import { chardb } from "@chardb/core/vite";
 import { defineConfig } from "vite";
 
-const workerOrigin = process.env.CHARDB_URL ?? "http://127.0.0.1:8787";
+function localOrigin(raw: string | undefined, fallback: string, name: string): string {
+  const url = new URL(raw ?? fallback);
+  if (
+    url.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) ||
+    url.username || url.password || (url.pathname !== "" && url.pathname !== "/") || url.search || url.hash
+  ) {
+    throw new Error(name + " must be a loopback HTTP origin");
+  }
+  return url.origin;
+}
+
+const workerOrigin = localOrigin(process.env.CHARDB_DEV_URL, "http://127.0.0.1:8787", "CHARDB_DEV_URL");
 const workerSocket = workerOrigin.replace(/^http/, "ws");
 
 export default defineConfig({
@@ -1116,12 +1133,33 @@ if (watchdogIndex !== -1) {
   process.exit(0);
 }
 
-const origin = new URL(process.env.CHARDB_URL ?? "http://127.0.0.1:8787");
-const webOrigin = new URL(process.env.CHARDB_WEB_URL ?? "http://127.0.0.1:5173");
-const adminToken = process.env.CHARDB_ADMIN_TOKEN ?? "local-chardb-admin";
-const authSecret = process.env.BETTER_AUTH_SECRET ?? "local-chardb-auth-secret-that-is-at-least-32-characters";
+function localOrigin(raw, fallback, name) {
+  const url = new URL(raw ?? fallback);
+  if (
+    url.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) ||
+    url.username || url.password || (url.pathname !== "" && url.pathname !== "/") || url.search || url.hash
+  ) {
+    throw new Error(name + " must be a loopback HTTP origin");
+  }
+  return url;
+}
+
+function localChildEnvironment(extra = {}) {
+  const env = { ...process.env };
+  delete env.CHARDB_URL;
+  delete env.CHARDB_WEB_URL;
+  delete env.CHARDB_ADMIN_TOKEN;
+  delete env.BETTER_AUTH_SECRET;
+  return { ...env, ...extra };
+}
+
+const deploymentId = {{DEPLOYMENT_ID}};
+const origin = localOrigin(process.env.CHARDB_DEV_URL, "http://127.0.0.1:8787", "CHARDB_DEV_URL");
+const webOrigin = localOrigin(process.env.CHARDB_DEV_WEB_URL, "http://127.0.0.1:5173", "CHARDB_DEV_WEB_URL");
+const adminToken = "local-chardb-admin";
+const authSecret = "local-chardb-auth-secret-that-is-at-least-32-characters";
 const projectRoot = realpathSync.native(fileURLToPath(new URL("..", import.meta.url)));
-const persistTo = process.env.CHARDB_PERSIST_TO ?? join(projectRoot, ".wrangler", "state");
+const persistTo = process.env.CHARDB_DEV_PERSIST_TO ?? join(projectRoot, ".wrangler", "state");
 const wranglerModule = join(
   dirname(fileURLToPath(import.meta.resolve("wrangler/package.json"))),
   "bin",
@@ -1160,7 +1198,13 @@ const worker = Bun.spawn(
     "--var",
     "BETTER_AUTH_SECRET:" + authSecret,
   ],
-  { stdin: "inherit", stdout: "inherit", stderr: "inherit", detached: process.platform !== "win32" },
+  {
+    env: localChildEnvironment(),
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+    detached: process.platform !== "win32",
+  },
 );
 
 let web;
@@ -1255,12 +1299,12 @@ async function waitForWorker() {
         throw new Error("/health returned invalid JSON");
       }
       if (
-        body && typeof body === "object" && body.ok === true &&
+        body && typeof body === "object" && body.ok === true && body.deploymentId === deploymentId &&
         Number.isSafeInteger(body.schemaVersion) && body.schemaVersion >= 1
       ) {
         return body.schemaVersion;
       }
-      throw new Error("/health returned an invalid schema version");
+      throw new Error("/health did not identify the expected local Worker " + deploymentId);
     }
     await Bun.sleep(100);
   }
@@ -1300,7 +1344,7 @@ async function applyMigrations(targetVersion) {
       "4",
     ],
     {
-      env: { ...process.env, CHARDB_ADMIN_TOKEN: adminToken },
+      env: localChildEnvironment({ CHARDB_ADMIN_TOKEN: adminToken }),
       stdout: "inherit",
       stderr: "inherit",
     },
@@ -1318,6 +1362,7 @@ try {
     [nodeRuntime, viteModule, "--host", webOrigin.hostname, "--port", webOrigin.port || "5173", "--strictPort"],
     {
       cwd: projectRoot,
+      env: localChildEnvironment({ CHARDB_DEV_URL: origin.origin }),
       stdin: "inherit",
       stdout: "inherit",
       stderr: "inherit",
@@ -1419,6 +1464,7 @@ export const app = chardb({
 
 app.get("/health", (c) => c.json({
   ok: true,
+  deploymentId: {{DEPLOYMENT_ID}},
   schemaVersion: migrations.version,
   schemaDigest: migrations.digest,
 }));
@@ -1509,6 +1555,7 @@ export async function runInit(ctx: CliContext, opts: InitOptions): Promise<void>
     const reactPackage = opts.reactPackage ?? "0.1.0";
     if (!reactPackage) throw new Error("react package specifier must not be empty");
     const filesBucket = generatedFilesBucket(opts.name);
+    const deploymentId = generatedDeploymentId();
     const wrangler = renderWrangler({
         name: opts.name,
         compatibilityDate: compat,
@@ -1532,7 +1579,10 @@ export async function runInit(ctx: CliContext, opts: InitOptions): Promise<void>
         { path: `${root}/src/migrations.ts`, contents: INITIAL_MIGRATION_ARTIFACTS.journal },
         { path: `${root}/src/migrations/v1.ts`, contents: INITIAL_MIGRATION_ARTIFACTS.versionOne },
         { path: `${root}/src/migrations/v1.json`, contents: INITIAL_MIGRATION_ARTIFACTS.snapshotOne },
-        { path: `${root}/src/worker.ts`, contents: WORKER_TEMPLATE },
+        {
+            path: `${root}/src/worker.ts`,
+            contents: WORKER_TEMPLATE.replace("{{DEPLOYMENT_ID}}", JSON.stringify(deploymentId)),
+        },
         { path: `${root}/src/web/App.tsx`, contents: WEB_APP_TEMPLATE },
         { path: `${root}/src/web/main.tsx`, contents: WEB_MAIN_TEMPLATE },
         { path: `${root}/src/web/styles.css`, contents: WEB_STYLES_TEMPLATE },
@@ -1540,17 +1590,33 @@ export async function runInit(ctx: CliContext, opts: InitOptions): Promise<void>
         { path: `${root}/vitest.config.ts`, contents: VITEST_CONFIG_TEMPLATE },
         { path: `${root}/test/tsconfig.json`, contents: TEST_TSCONFIG_TEMPLATE },
         { path: `${root}/test/env.d.ts`, contents: TEST_ENV_TEMPLATE },
-        { path: `${root}/test/worker.test.ts`, contents: WORKER_TEST_TEMPLATE },
+        {
+            path: `${root}/test/worker.test.ts`,
+            contents: WORKER_TEST_TEMPLATE.replace("{{DEPLOYMENT_ID}}", JSON.stringify(deploymentId)),
+        },
         { path: `${root}/scripts/build.mjs`, contents: BUILD_SCRIPT_TEMPLATE },
         { path: `${root}/scripts/test.mjs`, contents: TEST_SCRIPT_TEMPLATE },
-        { path: `${root}/scripts/dev.mjs`, contents: DEV_SCRIPT_TEMPLATE },
+        {
+            path: `${root}/scripts/dev.mjs`,
+            contents: DEV_SCRIPT_TEMPLATE.replace("{{DEPLOYMENT_ID}}", JSON.stringify(deploymentId)),
+        },
         {
             path: `${root}/scripts/setup-cloudflare.mjs`,
-            contents: renderCloudflareSetupScript({ workerName: opts.name, filesBucket, packageName: "@chardb/core" }),
+            contents: renderCloudflareSetupScript({
+                workerName: opts.name,
+                filesBucket,
+                packageName: "@chardb/core",
+                deploymentId,
+            }),
         },
         {
             path: `${root}/scripts/deploy.mjs`,
-            contents: renderCloudflareDeployScript({ workerName: opts.name, filesBucket, packageName: "@chardb/core" }),
+            contents: renderCloudflareDeployScript({
+                workerName: opts.name,
+                filesBucket,
+                packageName: "@chardb/core",
+                deploymentId,
+            }),
         },
         { path: `${root}/index.html`, contents: INDEX_TEMPLATE },
         { path: `${root}/public/.gitkeep`, contents: "" },

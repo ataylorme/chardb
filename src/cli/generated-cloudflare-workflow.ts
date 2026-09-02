@@ -2,18 +2,35 @@ export interface GeneratedCloudflareWorkflowInput {
     readonly workerName: string;
     readonly filesBucket: string;
     readonly packageName: string;
+    readonly deploymentId: string;
+}
+
+const DEPLOYMENT_ID = /^chardb\.app\.v1\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function requireDeploymentId(input: GeneratedCloudflareWorkflowInput): void {
+    if (!DEPLOYMENT_ID.test(input.deploymentId)) {
+        throw new TypeError("generated Cloudflare workflow requires a chardb.app.v1 UUID deployment ID");
+    }
 }
 
 /** Render the one-time native-resource setup used by generated projects. */
 export function renderCloudflareSetupScript(input: GeneratedCloudflareWorkflowInput): string {
-    return `import { dirname, join } from "node:path";
+    requireDeploymentId(input);
+    return `import { mkdtemp, open, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const workerName = ${JSON.stringify(input.workerName)};
 const filesBucket = ${JSON.stringify(input.filesBucket)};
-const recoveryLifecycleRule = "chardb-recovery-retention";
-const recoveryPrefix = "_chardb/retained/";
-const recoveryDays = "31";
+const deploymentId = ${JSON.stringify(input.deploymentId)};
+const ownershipKey = "_chardb/control/ownership.json";
+const ownershipMarker = JSON.stringify({
+  format: "chardb.r2-ownership.v1",
+  deploymentId,
+  workerName,
+  filesBucket,
+}) + "\\n";
 const wranglerModule = fileURLToPath(import.meta.resolve("wrangler"));
 const chardbModule = join(dirname(fileURLToPath(import.meta.resolve(${JSON.stringify(input.packageName)}))), "cli", "bin.mjs");
 const wrangler = (...args) => [process.execPath, wranglerModule, ...args];
@@ -50,10 +67,18 @@ export function isMissingBucket(result) {
   return result.exitCode !== 0 && /The specified bucket does not exist\\./i.test(result.stderr + "\\n" + result.stdout);
 }
 
-export function isMissingLifecycleRule(result) {
-  return result.exitCode !== 0 && (result.stderr + "\\n" + result.stdout).includes(
-    "Lifecycle rule with ID '" + recoveryLifecycleRule + "' not found in configuration",
+export function isMissingObject(result) {
+  return result.exitCode !== 0 && /The specified (?:key|object) does not exist\.|object not found/i.test(
+    result.stderr + "\\n" + result.stdout,
   );
+}
+
+export function parseSetupArguments(args) {
+  const adoptExistingBucket = args.includes("--adopt-existing-bucket");
+  if (args.some(arg => arg !== "--adopt-existing-bucket") || args.length !== (adoptExistingBucket ? 1 : 0)) {
+    throw new Error("usage: bun scripts/setup-cloudflare.mjs [--adopt-existing-bucket]");
+  }
+  return { adoptExistingBucket };
 }
 
 function parseTomlString(line, key) {
@@ -117,8 +142,8 @@ async function requireCurrentConfig() {
   assertGeneratedConfig(await Bun.file(path).text());
 }
 
-async function probeBucket() {
-  const result = await command(wrangler("r2", "bucket", "info", filesBucket, "--json"), { capture: true });
+async function probeBucket(run = command) {
+  const result = await run(wrangler("r2", "bucket", "info", filesBucket, "--json"), { capture: true });
   if (result.exitCode !== 0) return { result };
   let parsed;
   try {
@@ -132,23 +157,98 @@ async function probeBucket() {
   return { result, parsed };
 }
 
-async function configureRecoveryLifecycle() {
-  const removed = await command(wrangler(
-    "r2", "bucket", "lifecycle", "remove", filesBucket, "--name", recoveryLifecycleRule,
-  ), { capture: true });
-  if (removed.exitCode !== 0 && !isMissingLifecycleRule(removed)) {
-    throw new Error("could not inspect or replace the Chardb R2 recovery lifecycle: " + detail(removed));
+async function withTemporaryDirectory(callback) {
+  const directory = await mkdtemp(join(tmpdir(), "chardb-r2-ownership-"));
+  try {
+    return await callback(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
-  const added = await command(wrangler(
-    "r2", "bucket", "lifecycle", "add", filesBucket, recoveryLifecycleRule, recoveryPrefix,
-    "--expire-days", recoveryDays, "--force",
-  ), { capture: true });
-  if (added.exitCode !== 0) {
-    throw new Error("could not configure the Chardb R2 recovery lifecycle: " + detail(added));
+}
+
+async function readOwnershipMarker(run = command) {
+  return withTemporaryDirectory(async directory => {
+    const path = join(directory, "ownership.json");
+    const result = await run(wrangler("r2", "object", "get", filesBucket + "/" + ownershipKey, "--file", path), {
+      capture: true,
+    });
+    if (isMissingObject(result)) return null;
+    if (result.exitCode !== 0) {
+      throw new Error("could not inspect the Chardb R2 ownership marker: " + detail(result));
+    }
+    if (!(await Bun.file(path).exists())) {
+      throw new Error("Wrangler did not write the Chardb R2 ownership marker");
+    }
+    return Bun.file(path).text();
+  });
+}
+
+async function writeOwnershipMarker(run = command) {
+  await withTemporaryDirectory(async directory => {
+    const path = join(directory, "ownership.json");
+    const file = await open(path, "wx", 0o600);
+    try {
+      await file.writeFile(ownershipMarker);
+    } finally {
+      await file.close();
+    }
+    const result = await run(wrangler("r2", "object", "put", filesBucket + "/" + ownershipKey, "--file", path), {
+      capture: true,
+    });
+    if (result.exitCode !== 0) {
+      throw new Error("could not write the Chardb R2 ownership marker: " + detail(result));
+    }
+  });
+}
+
+function assertOwnershipMarker(marker) {
+  if (marker !== ownershipMarker) {
+    throw new Error(
+      "R2 bucket " + filesBucket + " has a different Chardb ownership marker; refusing to modify it",
+    );
+  }
+}
+
+export async function setupFilesBucket({ adoptExistingBucket = false, run = command } = {}) {
+  const before = await probeBucket(run);
+  let createdBucket = false;
+  try {
+    if (!before.parsed) {
+      if (!isMissingBucket(before.result)) {
+        throw new Error("could not inspect R2 bucket " + filesBucket + ": " + detail(before.result));
+      }
+      const created = await run(wrangler("r2", "bucket", "create", filesBucket));
+      if (created.exitCode !== 0) throw new Error("could not create R2 bucket " + filesBucket);
+      createdBucket = true;
+      const after = await probeBucket(run);
+      if (!after.parsed) throw new Error("R2 bucket " + filesBucket + " was not visible after creation");
+    }
+    const marker = await readOwnershipMarker(run);
+    if (marker === null) {
+      if (!createdBucket && !adoptExistingBucket) {
+        throw new Error(
+          "R2 bucket " + filesBucket + " already exists without Chardb ownership; " +
+          "review it, then rerun with --adopt-existing-bucket to adopt it",
+        );
+      }
+      await writeOwnershipMarker(run);
+      assertOwnershipMarker(await readOwnershipMarker(run));
+    } else {
+      assertOwnershipMarker(marker);
+    }
+  } catch (error) {
+    if (createdBucket) {
+      const rollback = await run(wrangler("r2", "bucket", "delete", filesBucket), { capture: true });
+      if (rollback.exitCode !== 0) {
+        throw new AggregateError([error, new Error("could not roll back the new R2 bucket: " + detail(rollback))]);
+      }
+    }
+    throw error;
   }
 }
 
 async function main() {
+  const { adoptExistingBucket } = parseSetupArguments(process.argv.slice(2));
   for (const path of [wranglerModule, chardbModule]) {
     if (!(await Bun.file(path).exists())) throw new Error("missing local dependencies; run bun install first");
   }
@@ -156,30 +256,8 @@ async function main() {
   if (doctor.exitCode !== 0) throw new Error("chardb doctor rejected wrangler.toml");
   await requireCurrentConfig();
 
-  const before = await probeBucket();
-  let createdBucket = false;
-  if (!before.parsed) {
-    if (!isMissingBucket(before.result)) {
-      throw new Error("could not inspect R2 bucket " + filesBucket + ": " + detail(before.result));
-    }
-    const created = await command(wrangler("r2", "bucket", "create", filesBucket));
-    if (created.exitCode !== 0) throw new Error("could not create R2 bucket " + filesBucket);
-    createdBucket = true;
-    const after = await probeBucket();
-    if (!after.parsed) throw new Error("R2 bucket " + filesBucket + " was not visible after creation");
-  }
-  try {
-    await configureRecoveryLifecycle();
-  } catch (error) {
-    if (createdBucket) {
-      const rollback = await command(wrangler("r2", "bucket", "delete", filesBucket), { capture: true });
-      if (rollback.exitCode !== 0) {
-        throw new AggregateError([error, new Error("could not roll back the new R2 bucket: " + detail(rollback))]);
-      }
-    }
-    throw error;
-  }
-  console.log("Cloudflare R2 bucket " + filesBucket + " and its recovery lifecycle are ready for " + workerName);
+  await setupFilesBucket({ adoptExistingBucket });
+  console.log("Cloudflare R2 bucket " + filesBucket + " is owned by " + workerName);
 }
 
 if (import.meta.main) await main();
@@ -188,6 +266,7 @@ if (import.meta.main) await main();
 
 /** Render the resumable bootstrap and routine deployment driver used by generated projects. */
 export function renderCloudflareDeployScript(input: GeneratedCloudflareWorkflowInput): string {
+    requireDeploymentId(input);
     return `import { mkdtemp, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -195,6 +274,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const workerName = ${JSON.stringify(input.workerName)};
 const filesBucket = ${JSON.stringify(input.filesBucket)};
+const deploymentId = ${JSON.stringify(input.deploymentId)};
 const wranglerModule = fileURLToPath(import.meta.resolve("wrangler"));
 const chardbModule = join(dirname(fileURLToPath(import.meta.resolve(${JSON.stringify(input.packageName)}))), "cli", "bin.mjs");
 const wrangler = (...args) => [process.execPath, wranglerModule, ...args];
@@ -391,14 +471,15 @@ async function fetchJson(url, init = {}) {
   }
 }
 
-function validateHealth(body) {
+export function validateHealth(body) {
   if (
     body.ok !== true || !Number.isSafeInteger(body.schemaVersion) || body.schemaVersion < 1 ||
-    typeof body.schemaDigest !== "string" || !/^[a-f0-9]{64}$/.test(body.schemaDigest)
+    typeof body.schemaDigest !== "string" || !/^[a-f0-9]{64}$/.test(body.schemaDigest) ||
+    body.deploymentId !== deploymentId
   ) {
-    throw new Error("/health returned an invalid schema version or digest");
+    throw new Error("/health did not identify the expected Worker " + deploymentId);
   }
-  return { version: body.schemaVersion, digest: body.schemaDigest };
+  return { version: body.schemaVersion, digest: body.schemaDigest, deploymentId: body.deploymentId };
 }
 
 async function health(origin) {
@@ -427,6 +508,9 @@ export function deploymentDecision({ bootstrap, exists, health, state, expected 
     return "bootstrap-upload";
   }
   if (!health || !state) throw new Error("an existing Worker requires health and migration state");
+  if (health.deploymentId !== deploymentId) {
+    throw new Error("CHARDB_URL points at a different Worker: expected " + deploymentId);
+  }
   const packageIsExpected = health.version === expected.version && health.digest === expected.digest;
   if (packageIsExpected) {
     if (state.status === "migrating") {
@@ -520,9 +604,8 @@ async function main() {
   await requireCurrentConfig();
   await requireFilesBucket();
   const exists = await workerExists();
-  const [beforeHealth, beforeState] = exists
-    ? await Promise.all([health(origin), migrationState(origin, adminToken)])
-    : [null, null];
+  const beforeHealth = exists ? await health(origin) : null;
+  const beforeState = exists ? await migrationState(origin, adminToken) : null;
   const decision = deploymentDecision({ bootstrap, exists, health: beforeHealth, state: beforeState, expected });
   if (decision === "resume") {
     console.log("the expected Worker package already exists; resuming without uploading code or secrets");

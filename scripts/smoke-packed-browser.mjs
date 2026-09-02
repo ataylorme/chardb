@@ -12,8 +12,7 @@ if (await isolateProcessTree(import.meta.url, { label: "packed browser smoke", t
     process.exit(0);
 }
 
-const ADMIN_TOKEN = "packed-browser-migration-secret";
-const AUTH_SECRET = "packed-browser-auth-secret-at-least-32-characters";
+const ADMIN_TOKEN = "local-chardb-admin";
 const tarballArgument = process.argv[2];
 const reactArgumentIndex = process.argv.indexOf("--react");
 const reactTarballArgument = reactArgumentIndex < 0 ? undefined : process.argv[reactArgumentIndex + 1];
@@ -595,10 +594,8 @@ async function startGeneratedApp(cwd, workerPort, webPort) {
         env: {
             ...process.env,
             ...environment,
-            CHARDB_ADMIN_TOKEN: ADMIN_TOKEN,
-            BETTER_AUTH_SECRET: AUTH_SECRET,
-            CHARDB_URL: workerOrigin.origin,
-            CHARDB_WEB_URL: webOrigin.origin,
+            CHARDB_DEV_URL: workerOrigin.origin,
+            CHARDB_DEV_WEB_URL: webOrigin.origin,
         },
         stdout: "pipe",
         stderr: "pipe",

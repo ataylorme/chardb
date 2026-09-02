@@ -451,7 +451,7 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.get("/tmp/proj/test/worker.test.ts")).toContain('body: "written inside workerd"');
         expect(files.get("/tmp/proj/vite.config.ts")).toContain("publicDir: false");
         expect(files.get("/tmp/proj/vite.config.ts")).toContain('outDir: "public"');
-        expect(files.get("/tmp/proj/vite.config.ts")).toContain('process.env.CHARDB_URL ?? "http://127.0.0.1:8787"');
+        expect(files.get("/tmp/proj/vite.config.ts")).toContain('process.env.CHARDB_DEV_URL, "http://127.0.0.1:8787"');
         expect(files.get("/tmp/proj/vite.config.ts")).toContain(
             '"/ws": { target: workerSocket, ws: true, changeOrigin: true }'
         );
@@ -459,7 +459,7 @@ describe("chardb init + doctor end-to-end", () => {
         expect(files.get("/tmp/proj/README.md")).toContain("bun run dev");
         expect(files.get("/tmp/proj/README.md")).not.toContain("shards split");
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain(
-            'throw new Error("/health returned an invalid schema version")'
+            'throw new Error("/health did not identify the expected local Worker " + deploymentId)'
         );
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("String(targetVersion)");
         expect(files.get("/tmp/proj/scripts/dev.mjs")).toContain("await waitForWeb()");
