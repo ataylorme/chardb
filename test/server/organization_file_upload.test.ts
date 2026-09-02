@@ -98,7 +98,7 @@ function fixture() {
 }
 
 describe("organization file upload sequence", () => {
-    test("reserves, writes immutable bytes, refreshes authority, and marks ready in order", async () => {
+    test("reserves, retains immutable bytes, refreshes authority, and marks ready in order", async () => {
         const f = fixture();
         const result = await f.upload();
         expect(result).toEqual({
@@ -106,25 +106,21 @@ describe("organization file upload sequence", () => {
             size: 11,
             sha256: "e38e581aade78b64cc86f7ac9f3555ca78c2dcca747942a7f1d9b3275a834f75",
         });
-        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "r2.put", "auth.refresh", "cdb.ready"]);
-        expect(f.object()).toMatchObject({
-            key: "v1/org-1/file_a",
-            size: 11,
-            customMetadata: { chardbFileId: "file_a", chardbSha256: result.sha256 },
-        });
+        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "auth.refresh", "cdb.ready"]);
+        expect(f.object()).toBeUndefined();
         expect(f.objects.get(`_chardb/retained/sha256/${result.sha256}`)).toMatchObject({
             size: 11,
             customMetadata: { chardbRetainedSha256: result.sha256, chardbRetainedSize: "11" },
         });
     });
 
-    test("reuses the same immutable object after a lost response", async () => {
+    test("reuses the same retained object after a lost response", async () => {
         const f = fixture();
         const first = await f.upload();
         f.calls.splice(0);
         const retry = await f.upload();
         expect(retry).toEqual(first);
-        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "r2.head", "r2.put", "auth.refresh", "cdb.ready"]);
+        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "auth.refresh", "cdb.ready"]);
     });
 
     test("does not mark ready when the post-write authority refresh fails", async () => {
@@ -134,18 +130,22 @@ describe("organization file upload sequence", () => {
                 throw new Error("membership revoked");
             })
         ).rejects.toThrow(/membership revoked/);
-        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "r2.put", "auth.refresh"]);
-        expect(f.object()).toBeDefined();
+        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "auth.refresh"]);
+        expect(f.object()).toBeUndefined();
+        expect(f.objects.size).toBe(1);
     });
 
-    test("removes a late object when organization deletion wins the post-write refresh", async () => {
+    test("leaves only an invisible retained orphan when a recovery fence wins after the write", async () => {
         const f = fixture();
         await expect(
             f.upload(async () => {
-                throw new CdbError({ code: "CDB_FORBIDDEN", message: "organization deleted" });
+                throw new CdbError({ code: "CDB_STALE_EPOCH", message: "point-in-time restore is in progress" });
             })
-        ).rejects.toMatchObject({ code: "CDB_FORBIDDEN" });
-        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "r2.put", "auth.refresh", "r2.delete"]);
+        ).rejects.toMatchObject({ code: "CDB_STALE_EPOCH" });
+        expect(f.calls).toEqual(["cdb.reserve", "r2.put", "auth.refresh"]);
         expect(f.object()).toBeUndefined();
+        expect([...f.objects.keys()]).toEqual([
+            "_chardb/retained/sha256/e38e581aade78b64cc86f7ac9f3555ca78c2dcca747942a7f1d9b3275a834f75",
+        ]);
     });
 });

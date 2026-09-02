@@ -344,7 +344,7 @@ export function buildCloudflareFileProof(candidate: ExactCandidate, pairSha256: 
             postPointRowReadableBeforeRestore: true,
             pointRowReadableAfterRestore: true,
             postPointRowHiddenAfterRestore: true,
-            postPointR2ObjectRemoved: true,
+            postPointLiveKeyAbsent: true,
             pointFileRecoveredFromRetention: true,
             pointFileRetentionRefreshedBeforeScrub: true,
         },

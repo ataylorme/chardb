@@ -244,6 +244,7 @@ describe("Cdb invalidation outbox", () => {
         readonly cdb: Cdb;
         readonly clock: { value: number };
         readonly alarms: number[];
+        readonly restoreTargets: string[];
         readonly gateway: {
             calls: GatewayInvalidationRequest[];
             behavior: (request: GatewayInvalidationRequest) => unknown | Promise<unknown>;
@@ -254,6 +255,7 @@ describe("Cdb invalidation outbox", () => {
         databases.push(db);
         const clock = { value: 10_000 };
         const alarms: number[] = [];
+        const restoreTargets: string[] = [];
         const alarm: { fail: boolean; beforeSet?: () => Promise<void> } = { fail: false };
         const gateway = {
             calls: [] as GatewayInvalidationRequest[],
@@ -282,6 +284,13 @@ describe("Cdb invalidation outbox", () => {
                     if (alarm.beforeSet) await alarm.beforeSet();
                     alarms.push(scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime);
                 },
+                async getCurrentBookmark() {
+                    return "00000001-current";
+                },
+                async onNextSessionRestoreBookmark(bookmark: string) {
+                    restoreTargets.push(bookmark);
+                    return "00000002-undo";
+                },
             },
             blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
                 ready = callback();
@@ -294,8 +303,102 @@ describe("Cdb invalidation outbox", () => {
         }
         const cdb = new TestCdb(state, { CDB_GATEWAY: gatewayNamespace });
         await ready;
-        return { db, cdb, clock, alarms, gateway, alarm };
+        return { db, cdb, clock, alarms, restoreTargets, gateway, alarm };
     }
+
+    test("skips background delivery while a recovery fence is prepared", async () => {
+        const { db, cdb, gateway, restoreTargets } = await setup();
+        await cdb.subscribe(subscription(identity("recovery-fence", 1), ["outbox_messages"]));
+        await cdb.mutate(mutation(putMessage, "recovery-fence", { id: "recovery-fence", value: 1 }));
+        const deliveryCalls = gateway.calls.length;
+
+        await cdb.adminArmRecoveryRestore({ bookmark: "00000000-history", armedAt: 42 });
+        await cdb.alarm();
+
+        expect(gateway.calls).toHaveLength(deliveryCalls);
+        expect(restoreTargets).toEqual([]);
+        expect(
+            db.prepare("SELECT target_bookmark, commit_at FROM _chardb_recovery_restore WHERE singleton = 1").get()
+        ).toEqual({ target_bookmark: "00000000-history", commit_at: null });
+    });
+
+    test("rejects every private file and vector RPC at the local recovery boundary", async () => {
+        const { db, cdb, alarms } = await setup();
+        await cdb.adminArmRecoveryRestore({ bookmark: "00000000-history", armedAt: 42 });
+        const auth = {
+            userId: "user-1",
+            tenantId: "org-1",
+            role: "member",
+            roles: ["member"],
+            claims: {},
+        } as const;
+        await expect(
+            cdb.reserveFile({
+                fileId: "file_recovery_fence",
+                organizationId: "org-1",
+                table: "messages",
+                column: "attachment",
+                contentType: "text/plain",
+                size: 4,
+                nowMs: 100,
+                domainSchemaEpoch: 1,
+                schemaEpoch: 1,
+                auth,
+            })
+        ).rejects.toThrow("CDB_STALE_EPOCH: point-in-time restore is in progress");
+        await expect(
+            Promise.resolve().then(() =>
+                cdb.markFileReady({
+                    fileId: "file_recovery_fence",
+                    organizationId: "org-1",
+                    sha256: "a".repeat(64),
+                    size: 4,
+                    nowMs: 101,
+                    domainSchemaEpoch: 1,
+                    schemaEpoch: 1,
+                    auth,
+                })
+            )
+        ).rejects.toThrow("CDB_STALE_EPOCH: point-in-time restore is in progress");
+        await expect(
+            cdb.resolveFileDownload({
+                organizationId: "org-1",
+                table: "messages",
+                column: "attachment",
+                rowId: "row-1",
+                domainSchemaEpoch: 1,
+                schemaEpoch: 1,
+                auth,
+            })
+        ).rejects.toThrow("CDB_STALE_EPOCH: point-in-time restore is in progress");
+        await expect(
+            cdb.resolveOrganizationVectorSearch({
+                auth,
+                organizationId: "org-1",
+                resource: {} as never,
+                resourceId: "resource-1",
+                matches: [],
+                limit: 1,
+                route: { shardId: "ShardDO_0" as never, schemaEpoch: 1, domainSchemaEpoch: 1 },
+            })
+        ).rejects.toThrow("CDB_STALE_EPOCH: point-in-time restore is in progress");
+        await expect(
+            cdb.deleteOrganizationFiles({ organizationId: "org-1", nowMs: 102, domainSchemaEpoch: 1 })
+        ).rejects.toMatchObject({ code: "CDB_STALE_EPOCH" });
+        await expect(
+            Promise.resolve().then(() =>
+                cdb.vectorOrganizationPurgeStatus({
+                    organizationId: "org-1",
+                    domainSchemaEpoch: 1,
+                    schemaEpoch: 1,
+                })
+            )
+        ).rejects.toThrow("CDB_STALE_EPOCH: point-in-time restore is in progress");
+
+        expect(alarms).toEqual([]);
+        expect(db.prepare("SELECT * FROM outbox_messages").all()).toEqual([]);
+        expect(db.prepare("SELECT * FROM _chardb_op_log").all()).toEqual([]);
+    });
 
     test("rejects hostile mutation args before descriptor lookup, alarm, handler, or transaction", async () => {
         const { db, cdb, alarms } = await setup();

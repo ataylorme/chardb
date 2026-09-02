@@ -1,11 +1,13 @@
 import { resolve } from "node:path";
+import { stableJson } from "../../util/canonical.ts";
 import type { CliContext, CliFetch } from "../context.ts";
 
 const RESPONSE_MAX_BYTES = 2 * 1_024 * 1_024;
 const REQUEST_ATTEMPTS = 3;
-const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 60_000;
 const RECONCILE_ATTEMPTS = 60;
 const RECONCILE_RETRY_MS = 1_000;
+const RECOVERY_OPERATION_TURNS = 6_000_000;
 
 interface BackupCommonOptions {
     readonly baseUrl: string;
@@ -63,10 +65,7 @@ export async function runBackupRestore(
     const digest = (recoveryPoint as Record<string, unknown>).digest;
     if (typeof digest !== "string") throw new Error("recovery point file has no digest");
     const request = backupRequest(options);
-    const response = await request("restore", {
-        method: "POST",
-        body: JSON.stringify({ recoveryPoint }),
-    });
+    const response = await runRecoveryOperation(request, "restore", recoveryPoint, digest);
     if (
         response.accepted !== true ||
         response.recoveryPointDigest !== digest ||
@@ -76,21 +75,79 @@ export async function runBackupRestore(
     ) {
         throw new Error("backup endpoint returned an invalid restore acknowledgement");
     }
+    const providerReset = response.providerReset;
+    if (typeof providerReset !== "object" || providerReset === null || Array.isArray(providerReset)) {
+        throw new Error("backup endpoint omitted the provider reset result");
+    }
+    const reset = providerReset as Record<string, unknown>;
+    if (
+        !Number.isSafeInteger(reset.files) ||
+        (reset.files as number) < 0 ||
+        !Number.isSafeInteger(reset.filesRetained) ||
+        (reset.filesRetained as number) < 0 ||
+        !Number.isSafeInteger(reset.vectors) ||
+        (reset.vectors as number) < 0
+    ) {
+        throw new Error("backup endpoint returned an invalid provider reset result");
+    }
     const reconcileAfterMs = response.reconcileAfterMs as number;
     if (reconcileAfterMs > 0) await new Promise(resolve => setTimeout(resolve, reconcileAfterMs));
-    const reconciled = await request("reconcile", {
-        method: "POST",
-        body: JSON.stringify({ recoveryPoint }),
-    });
+    const reconciled = await runRecoveryOperation(request, "reconcile", recoveryPoint, digest);
     if (
         reconciled.reconciled !== true ||
         reconciled.recoveryPointDigest !== digest ||
+        !Number.isSafeInteger(reconciled.filesRehydrated) ||
+        (reconciled.filesRehydrated as number) < 0 ||
         !Number.isSafeInteger(reconciled.vectorsRequeued) ||
         (reconciled.vectorsRequeued as number) < 0
     ) {
         throw new Error("backup endpoint returned an invalid recovery reconciliation");
     }
-    ctx.stdout(`restored ${digest}; files are recoverable and ${reconciled.vectorsRequeued} vectors were requeued\n`);
+    ctx.stdout(
+        `restored ${digest}; retained ${reset.filesRetained} files, reset ${reset.files} file objects and ${reset.vectors} vector records, then rehydrated ${reconciled.filesRehydrated} files and requeued ${reconciled.vectorsRequeued} vectors\n`
+    );
+}
+
+async function runRecoveryOperation(
+    request: ReturnType<typeof backupRequest>,
+    action: "restore" | "reconcile",
+    recoveryPoint: unknown,
+    digest: string
+): Promise<Record<string, unknown>> {
+    let continuation: unknown;
+    let continuationIdentity: string | undefined;
+    for (let turn = 0; turn < RECOVERY_OPERATION_TURNS; turn++) {
+        const body = continuation === undefined ? { recoveryPoint } : { recoveryPoint, continuation };
+        const response = await request(action, { method: "POST", body: JSON.stringify(body) });
+        if (response.pending !== true) return response;
+        if (
+            response.recoveryPointDigest !== digest ||
+            typeof response.continuation !== "object" ||
+            response.continuation === null ||
+            Array.isArray(response.continuation)
+        ) {
+            throw new Error(`backup endpoint returned an invalid ${action} continuation`);
+        }
+        let retryAfterMs = 0;
+        if (response.retryAfterMs !== undefined) {
+            if (
+                !Number.isSafeInteger(response.retryAfterMs) ||
+                (response.retryAfterMs as number) < 0 ||
+                (response.retryAfterMs as number) > 30_000
+            ) {
+                throw new Error(`backup endpoint returned an invalid ${action} retry delay`);
+            }
+            retryAfterMs = response.retryAfterMs as number;
+        }
+        const nextIdentity = stableJson(response.continuation);
+        if (nextIdentity === continuationIdentity && retryAfterMs === 0) {
+            throw new Error(`backup endpoint returned a stalled ${action} continuation`);
+        }
+        continuation = response.continuation;
+        continuationIdentity = nextIdentity;
+        if (retryAfterMs > 0) await new Promise(resolve => setTimeout(resolve, retryAfterMs));
+    }
+    throw new Error(`backup ${action} exceeded its continuation bound`);
 }
 
 function backupRequest(options: BackupCommonOptions) {

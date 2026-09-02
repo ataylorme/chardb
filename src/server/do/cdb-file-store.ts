@@ -134,6 +134,12 @@ export interface FilePlacementBackfillResult {
     readonly done: boolean;
 }
 
+export interface CdbFileRecoveryPage {
+    readonly files: readonly StoredFile[];
+    readonly afterFileId: string;
+    readonly done: boolean;
+}
+
 function invalid(message: string): never {
     throw new CdbError({ code: "CDB_INVALID_ARGS", message: `file store: ${message}` });
 }
@@ -289,6 +295,41 @@ export class CdbFileStore {
         }
         this.sql = sql;
         this.limits = Object.freeze({ ...limits });
+    }
+
+    recoveryPage(afterFileId: string, limit: number): CdbFileRecoveryPage {
+        return this.fileRecoveryPage(afterFileId, limit, false);
+    }
+
+    retentionPage(afterFileId: string, limit: number): CdbFileRecoveryPage {
+        return this.fileRecoveryPage(afterFileId, limit, true);
+    }
+
+    private fileRecoveryPage(afterFileId: string, limit: number, includeDeleting: boolean): CdbFileRecoveryPage {
+        if (
+            typeof afterFileId !== "string" ||
+            new TextEncoder().encode(afterFileId).byteLength > 256 ||
+            !Number.isSafeInteger(limit) ||
+            limit < 1 ||
+            limit > 500
+        ) {
+            invalid("recovery page is invalid");
+        }
+        const rows = this.sql.all<StoredFileRow>(
+            `SELECT * FROM _chardb_files
+             WHERE file_id > ?
+               AND status IN ('ready', 'attached'${includeDeleting ? ", 'deleting'" : ""})
+               AND sha256 IS NOT NULL
+             ORDER BY file_id LIMIT ?`,
+            afterFileId,
+            limit + 1
+        );
+        const selected = rows.slice(0, limit);
+        return Object.freeze({
+            files: Object.freeze(selected.map(project)),
+            afterFileId: selected.at(-1)?.file_id ?? afterFileId,
+            done: rows.length <= limit,
+        });
     }
 
     reserve(input: {

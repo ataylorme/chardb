@@ -4,6 +4,7 @@ import {
     DurableObjectRecovery,
     abortForArmedRecoveryRestore,
     assertRecoveryAvailable,
+    assertRecoveryAvailableFor,
     initializeRecoveryStorage,
     readArmedRecoveryRestore,
 } from "../../src/server/do/recovery.ts";
@@ -90,35 +91,83 @@ describe("Durable Object point-in-time recovery", () => {
         await expect(recovery.bookmark(Date.now() + 1_000)).rejects.toMatchObject({ code: "CDB_INVALID_ARGS" });
     });
 
-    test("arms idempotently, fences traffic, and schedules activation", async () => {
+    test("arms only the fence and schedules native recovery on commit", async () => {
         const armed = await recovery.arm("00000000-history", 42);
         expect(armed).toEqual({
             targetBookmark: "00000000-history",
-            undoBookmark: "00000002-undo",
+            undoBookmark: currentBookmark,
             armedAt: 42,
+            commitAt: null,
+            nativeScheduled: false,
         });
         expect(readArmedRecoveryRestore(adaptSqlStorage(storage.sql))).toEqual(armed);
-        expect(restoreTargets).toEqual(["00000000-history"]);
+        expect(restoreTargets).toEqual([]);
         await expect(recovery.arm("00000000-other", 43)).rejects.toMatchObject({ code: "CDB_STALE_EPOCH" });
         expect(await recovery.arm("00000000-history", 44)).toEqual(armed);
+        expect(restoreTargets).toEqual([]);
         expect(() => assertRecoveryAvailable(adaptSqlStorage(storage.sql))).toThrow("restore is in progress");
+        expect(() => assertRecoveryAvailableFor(adaptSqlStorage(storage.sql), "00000000-history")).not.toThrow();
+        expect(() => assertRecoveryAvailableFor(adaptSqlStorage(storage.sql), "00000000-other")).toThrow(
+            "different recovery point"
+        );
 
         const committedAt = Date.now();
         expect(await recovery.commit("00000000-history")).toEqual({ scheduled: true });
+        expect(restoreTargets).toEqual(["00000000-history"]);
+        expect(readArmedRecoveryRestore(adaptSqlStorage(storage.sql))).toMatchObject({
+            undoBookmark: "00000002-undo",
+            nativeScheduled: true,
+        });
         expect(alarms).toHaveLength(1);
         expect(alarms[0]).toBeGreaterThanOrEqual(committedAt + 4_900);
+        expect(await recovery.commit("00000000-history")).toEqual({ scheduled: true });
+        expect(restoreTargets).toEqual(["00000000-history"]);
+        expect(alarms).toHaveLength(2);
+        expect(alarms[1]).toBe(alarms[0]);
     });
 
-    test("cancels an armed restore by replacing the native target with current storage", async () => {
+    test("cancels a prepared restore without creating a latent native target", async () => {
         await recovery.arm("00000000-history", 42);
         currentBookmark = "00000003-after-arm";
         expect(await recovery.cancel("00000000-history")).toEqual({ cancelled: true });
-        expect(restoreTargets).toEqual(["00000000-history", "00000003-after-arm"]);
+        expect(restoreTargets).toEqual([]);
+        expect(readArmedRecoveryRestore(adaptSqlStorage(storage.sql))).toBeNull();
+        initializeRecoveryStorage(adaptSqlStorage(storage.sql));
         expect(readArmedRecoveryRestore(adaptSqlStorage(storage.sql))).toBeNull();
         expect(await recovery.cancel("00000000-history")).toEqual({ cancelled: false });
     });
 
-    test("aborts an alarm turn only while a restore is armed", async () => {
+    test("rejects cancellation after native recovery commit begins", async () => {
+        await recovery.arm("00000000-history", 42);
+        await recovery.commit("00000000-history");
+        await expect(recovery.cancel("00000000-history")).rejects.toMatchObject({ code: "CDB_STALE_EPOCH" });
+        expect(readArmedRecoveryRestore(adaptSqlStorage(storage.sql))).toMatchObject({
+            targetBookmark: "00000000-history",
+            nativeScheduled: true,
+        });
+    });
+
+    test("keeps the fence when the native commit response is uncertain", async () => {
+        let call = 0;
+        storage.onNextSessionRestoreBookmark = async bookmark => {
+            restoreTargets.push(bookmark);
+            call++;
+            if (call === 1) throw new Error("native arm response lost");
+            return "00000002-undo";
+        };
+        await recovery.arm("00000000-history", 42);
+        await expect(recovery.commit("00000000-history")).rejects.toThrow("native arm response lost");
+        expect(restoreTargets).toEqual(["00000000-history"]);
+        expect(readArmedRecoveryRestore(adaptSqlStorage(storage.sql))).toMatchObject({
+            targetBookmark: "00000000-history",
+            commitAt: expect.any(Number),
+            nativeScheduled: false,
+        });
+        expect(await recovery.commit("00000000-history")).toEqual({ scheduled: true });
+        expect(restoreTargets).toEqual(["00000000-history", "00000000-history"]);
+    });
+
+    test("skips prepared alarms and aborts only after native recovery is committed", async () => {
         let abortedWith = "";
         const state = {
             abort(reason: string) {
@@ -126,9 +175,13 @@ describe("Durable Object point-in-time recovery", () => {
                 throw new Error(reason);
             },
         } as unknown as DurableObjectState;
-        abortForArmedRecoveryRestore(state, adaptSqlStorage(storage.sql));
+        expect(abortForArmedRecoveryRestore(state, adaptSqlStorage(storage.sql))).toBe(false);
         expect(abortedWith).toBe("");
         await recovery.arm("00000000-history", 42);
+        expect(abortForArmedRecoveryRestore(state, adaptSqlStorage(storage.sql))).toBe(true);
+        expect(abortedWith).toBe("");
+        expect(restoreTargets).toEqual([]);
+        await recovery.commit("00000000-history");
         expect(() => abortForArmedRecoveryRestore(state, adaptSqlStorage(storage.sql))).toThrow(
             "applying Chardb point-in-time restore"
         );

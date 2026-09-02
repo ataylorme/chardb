@@ -39,6 +39,11 @@ import type {
     CdbVectorReshardSourceDeleteCursor,
     CdbVectorReshardSourcePrepareCursor,
 } from "./cdb-vector-reshard-source-drain.ts";
+import {
+    RecoveryCoordinatorStore,
+    type RecoveryProviderCounts,
+    type RecoveryReconcileCounts,
+} from "./recovery-coordinator.ts";
 import { RESHARDER_FILE_CURSOR_DDL, ResharderFileCursorStore } from "./resharder-file-cursor-store.ts";
 import {
     RESHARDER_START_INTENT_DDL,
@@ -652,6 +657,114 @@ export class Resharder extends DurableObject<ResharderEnv> {
         return null;
     }
 
+    async adminRecoveryCoordinatorState(args: { readonly digest: string }) {
+        return new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).read(args.digest);
+    }
+
+    async adminClaimRecoveryPreparation(args: { readonly digest: string; readonly continuationJson: string }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).claimPreparation(
+                args.digest,
+                args.continuationJson
+            )
+        );
+    }
+
+    async adminSaveRecoveryPreparation(args: { readonly digest: string; readonly continuationJson: string }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).savePreparation(
+                args.digest,
+                args.continuationJson
+            )
+        );
+    }
+
+    async adminBeginRecoveryCommits(args: { readonly digest: string; readonly counts: RecoveryProviderCounts }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).beginCommits(args.digest, args.counts)
+        );
+    }
+
+    async adminFinishRecoveryShardCommits(args: {
+        readonly digest: string;
+        readonly continuationJson: string;
+        readonly shardCount: number;
+    }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).finishShards(
+                args.digest,
+                args.continuationJson,
+                args.shardCount
+            )
+        );
+    }
+
+    async adminAdvanceRecoveryShardCommit(args: {
+        readonly digest: string;
+        readonly index: number;
+        readonly objectId: string;
+    }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).advanceShard(
+                args.digest,
+                args.index,
+                args.objectId
+            )
+        );
+    }
+
+    async adminSaveRecoveryReconcile(args: { readonly digest: string; readonly continuationJson: string }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).saveReconcile(
+                args.digest,
+                args.continuationJson
+            )
+        );
+    }
+
+    async adminBeginRecoveryCatalogCommit(args: {
+        readonly digest: string;
+        readonly counts: RecoveryReconcileCounts;
+    }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).beginCatalog(args.digest, args.counts)
+        );
+    }
+
+    async adminCompleteRecovery(args: { readonly digest: string }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).complete(args.digest)
+        );
+    }
+
+    async adminBeginRecoveryObjectCommit(args: {
+        readonly digest: string;
+        readonly objectId: string;
+        readonly bookmark: string;
+    }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).beginObject(
+                args.digest,
+                args.objectId,
+                args.bookmark
+            )
+        );
+    }
+
+    async adminFinishRecoveryObjectCommit(args: {
+        readonly digest: string;
+        readonly objectId: string;
+        readonly bookmark: string;
+    }) {
+        return this.ctx.storage.transactionSync(() =>
+            new RecoveryCoordinatorStore(adaptSqlStorage(this.ctx.storage.sql)).finishObject(
+                args.digest,
+                args.objectId,
+                args.bookmark
+            )
+        );
+    }
+
     private bootstrap(): void {
         if (this.bootstrapped) return;
         const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -742,7 +855,14 @@ export class Resharder extends DurableObject<ResharderEnv> {
         }
         const startIdentity = this.startIdentity(args, tablesJson);
         this.ctx.storage.transactionSync(() => {
-            new ResharderStartIntentStore(adaptSqlStorage(this.ctx.storage.sql)).begin(startIdentity, Date.now());
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            if (new RecoveryCoordinatorStore(sql).hasActiveRecovery()) {
+                throw new CdbError({
+                    code: "CDB_RESHARD_PHASE_MISMATCH",
+                    message: "point-in-time recovery blocks resharding",
+                });
+            }
+            new ResharderStartIntentStore(sql).begin(startIdentity, Date.now());
         });
         const catalog = this.catalog();
         const topology = await catalog.beginTopologyOperation(

@@ -10,7 +10,7 @@ import {
     type OrganizationFileLocator,
     dispatchOrganizationFileOperation,
 } from "./file-auth-dispatch.ts";
-import { readRecoverableFile } from "./file-retention.ts";
+import { fileProviderCall, readRecoverableFile } from "./file-retention.ts";
 import { cdbHttpErrorResponse } from "./http-errors.ts";
 import { type OrganizationFileUploadCdb, uploadOrganizationFile } from "./organization-file-upload.ts";
 import type { ChardbFileResourceDescriptor } from "./resource-descriptors.ts";
@@ -281,7 +281,7 @@ export async function handleOrganizationFileDownloadRequest(input: {
                     stored = await resolve(refreshed.route, refreshed.auth);
                 }
                 if (!stored) return null;
-                const object = await readRecoverableFile(context.bucket, stored);
+                const object = await fileProviderCall(() => readRecoverableFile(context.bucket, stored));
                 return { object, stored };
             },
         });

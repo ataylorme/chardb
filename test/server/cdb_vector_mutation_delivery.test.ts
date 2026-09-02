@@ -47,6 +47,8 @@ function construct(CdbClass: typeof Cdb, db: Database, index: object) {
                 alarm = deadline;
             },
             getAlarm: async (): Promise<number | null> => alarm,
+            getCurrentBookmark: async () => "00000001-current",
+            onNextSessionRestoreBookmark: async () => "00000002-undo",
         },
         blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
             ready = callback();
@@ -879,6 +881,66 @@ describe("private organization vector mutation delivery", () => {
             next_attempt_at: 2_000,
         });
         expect(configured.alarm()).toBe(2_000);
+    });
+
+    test("quiesces a pre-arm provider mutation before recovery scrub can start", async () => {
+        const db = new Database(":memory:");
+        databases.push(db);
+        const f = fixture();
+        let releaseFirst: (() => void) | undefined;
+        let markFirstStarted: (() => void) | undefined;
+        const firstGate = new Promise<void>(resolve => {
+            releaseFirst = resolve;
+        });
+        const firstStarted = new Promise<void>(resolve => {
+            markFirstStarted = resolve;
+        });
+        let providerCalls = 0;
+        const configured = construct(
+            configureCdbRuntime({ schema: () => f.schema, manifest: () => manifestFromExports({ put: f.put }) }),
+            db,
+            {
+                async upsert(records: readonly { id: string }[]) {
+                    providerCalls++;
+                    if (providerCalls === 1) {
+                        markFirstStarted?.();
+                        await firstGate;
+                    }
+                    return { count: records.length, ids: records.map(record => record.id) };
+                },
+                deleteByIds: () => ({ count: 0, ids: [] }),
+                getByIds: () => [],
+            }
+        );
+        await configured.ready;
+        await expect(
+            configured.cdb.mutate({
+                principalId: "user-1",
+                mutId: "vector-recovery-quiescence-1",
+                ref: f.put.__chardbRef,
+                args: { organizationId: "org-1", id: "message-quiescence", body: "held", values: [1, 0, 0] },
+                auth: { userId: "user-1", tenantId: "org-1", role: "member", roles: ["member"], claims: {} },
+                placement: { authority: "organization", partitionKey: "org-1" },
+                schemaEpoch: 1,
+                domainSchemaEpoch: 1,
+            })
+        ).resolves.toMatchObject({ ok: true, ran: true });
+
+        const ordinaryDelivery = configured.cdb.alarm();
+        await firstStarted;
+        await configured.cdb.adminArmRecoveryRestore({ bookmark: "00000000-history", armedAt: 42 });
+        releaseFirst?.();
+        await ordinaryDelivery;
+        expect(providerCalls).toBe(1);
+        expect(db.query("SELECT COUNT(*) AS count FROM _chardb_vector_outbox").get()).toEqual({ count: 1 });
+
+        db.run("UPDATE _chardb_vector_outbox SET next_attempt_at = 0, leased_until = NULL, lease_token = NULL");
+        await expect(configured.cdb.adminQuiesceRecoveryVectors({ bookmark: "00000000-history" })).resolves.toEqual({
+            pending: 0,
+            terminal: 0,
+        });
+        expect(providerCalls).toBe(2);
+        expect(db.query("SELECT COUNT(*) AS count FROM _chardb_vector_outbox").get()).toEqual({ count: 0 });
     });
 
     test("rolls back unstaged domain pointers and staged orphan heads", async () => {

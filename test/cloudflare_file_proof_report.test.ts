@@ -111,7 +111,7 @@ function reportFor(exactCandidate = candidate()) {
             postPointRowReadableBeforeRestore: true,
             pointRowReadableAfterRestore: true,
             postPointRowHiddenAfterRestore: true,
-            postPointR2ObjectRemoved: true,
+            postPointLiveKeyAbsent: true,
             pointFileRecoveredFromRetention: true,
             pointFileRetentionRefreshedBeforeScrub: true,
         },

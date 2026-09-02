@@ -107,6 +107,7 @@ import {
     DurableObjectRecovery,
     abortForArmedRecoveryRestore,
     assertRecoveryAvailable,
+    assertRecoveryAvailableFor,
     initializeRecoveryStorage,
 } from "./recovery.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
@@ -605,7 +606,7 @@ export class Catalog extends DurableObject<CatalogEnv> {
     }
 
     override async alarm(): Promise<void> {
-        abortForArmedRecoveryRestore(this.ctx, adaptSqlStorage(this.ctx.storage.sql));
+        if (abortForArmedRecoveryRestore(this.ctx, adaptSqlStorage(this.ctx.storage.sql))) return;
         const nowMs = Date.now();
         await this.deliverAuthInvalidations(nowMs);
         if (this.hasOrganizationCleanupResources()) await this.deliverOrganizationDeletions(nowMs);
@@ -903,6 +904,10 @@ export class Catalog extends DurableObject<CatalogEnv> {
         return await this.adminMigrationRpc(() => this.recovery.commit(args.bookmark));
     }
 
+    async adminRecoveryRestoreStatus(args: { readonly bookmark: string }) {
+        return await this.adminMigrationRpc(() => this.recovery.status(args.bookmark));
+    }
+
     async adminSchemaState(): Promise<CatalogSchemaState> {
         return await this.adminMigrationRpc(() => this.schemaState());
     }
@@ -1085,14 +1090,14 @@ export class Catalog extends DurableObject<CatalogEnv> {
         return this.routingStore.listShardIds();
     }
 
-    async adminRecoveryInventory(): Promise<{
+    async adminRecoveryInventory(args: { readonly armedBookmark?: string } = {}): Promise<{
         readonly schema: CatalogSchemaState;
         readonly routingEpoch: number;
         readonly shardIds: readonly ShardId[];
     }> {
         return await this.adminMigrationRpc(() => {
-            this.assertRecoveryAvailable();
             const sql = adaptSqlStorage(this.ctx.storage.sql);
+            assertRecoveryAvailableFor(sql, args.armedBookmark);
             new CatalogTopologyOperationStore(sql).assertNoActive();
             const schema = this.readSchemaState();
             if (schema.status !== "active") {

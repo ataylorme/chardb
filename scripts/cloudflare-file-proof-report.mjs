@@ -196,7 +196,7 @@ function assertRecovery(value) {
         "postPointRowReadableBeforeRestore",
         "pointRowReadableAfterRestore",
         "postPointRowHiddenAfterRestore",
-        "postPointR2ObjectRemoved",
+        "postPointLiveKeyAbsent",
         "pointFileRecoveredFromRetention",
         "pointFileRetentionRefreshedBeforeScrub",
     ]);
@@ -222,7 +222,7 @@ function assertRecovery(value) {
         value.postPointRowReadableBeforeRestore !== true ||
         value.pointRowReadableAfterRestore !== true ||
         value.postPointRowHiddenAfterRestore !== true ||
-        value.postPointR2ObjectRemoved !== true ||
+        value.postPointLiveKeyAbsent !== true ||
         value.pointFileRecoveredFromRetention !== true ||
         value.pointFileRetentionRefreshedBeforeScrub !== true
     ) {

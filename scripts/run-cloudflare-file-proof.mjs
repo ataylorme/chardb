@@ -775,10 +775,19 @@ async function runRecoveryOperation(origin, adminToken, action, recoveryPoint) {
                 !Array.isArray(next),
             `recovery ${action} returned an invalid continuation`
         );
+        const retryAfterMs = result.body?.retryAfterMs ?? 0;
+        check(
+            Number.isSafeInteger(retryAfterMs) && retryAfterMs >= 0 && retryAfterMs <= 30_000,
+            `recovery ${action} returned an invalid retry delay`
+        );
         const nextIdentity = JSON.stringify(next);
-        check(nextIdentity !== continuationIdentity, `recovery ${action} returned a stalled continuation`);
+        check(
+            nextIdentity !== continuationIdentity || retryAfterMs > 0,
+            `recovery ${action} returned a stalled continuation`
+        );
         continuation = next;
         continuationIdentity = nextIdentity;
+        if (retryAfterMs > 0) await Bun.sleep(retryAfterMs);
     }
     throw new Error(`recovery ${action} exceeded its continuation bound`);
 }
@@ -1308,7 +1317,8 @@ async function main() {
             }
         );
         check(oversizedUpload.response.status === 400, "oversized upload was not rejected");
-        const firstObject = `v1/${organizationA}/${first.fileId}`;
+        const firstObject = `_chardb/retained/sha256/${first.sha256}`;
+        const firstLiveObject = `v1/${organizationA}/${first.fileId}`;
         const firstObjectPath = path.join(privateDir, "first-object.bin");
         await runWrangler(
             ["r2", "object", "get", `${names.bucket}/${firstObject}`, "--remote", "--file", firstObjectPath],
@@ -1319,6 +1329,11 @@ async function main() {
             }
         );
         check(sha256(await readFile(firstObjectPath)) === first.sha256, "independent R2 digest drifted");
+        const missingFirstLive = await runWrangler(
+            ["r2", "object", "get", `${names.bucket}/${firstLiveObject}`, "--remote", "--file", firstObjectPath],
+            { cwd: app, label: "ordinary upload live-key absence", secrets, allowFailure: true }
+        );
+        check(missingFirstLive.exitCode !== 0, "ordinary upload created a mutable live R2 key");
 
         const replacementBytes = new TextEncoder().encode(`replacement-${nonce}`);
         const replacement = await upload(origin, principal, organizationA, replacementBytes, `replacement-${nonce}`);
@@ -1335,7 +1350,7 @@ async function main() {
         check(mutation.response.ok, `document replacement failed with ${mutation.response.status}`);
         await retry(async () => {
             const old = await runWrangler(
-                ["r2", "object", "get", `${names.bucket}/${firstObject}`, "--remote", "--file", firstObjectPath],
+                ["r2", "object", "get", `${names.bucket}/${firstLiveObject}`, "--remote", "--file", firstObjectPath],
                 { cwd: app, label: "old object cleanup poll", secrets, allowFailure: true }
             );
             check(old.exitCode !== 0, "superseded object still exists");
@@ -1442,7 +1457,6 @@ async function main() {
         const recoveryPoint = await createRecoveryPoint(origin, adminToken);
         const survivorObject = `v1/${organizationB}/${survivor.fileId}`;
         const survivorRetainedObject = `_chardb/retained/sha256/${survivor.sha256}`;
-        const pointFileState = await proofState(origin, adminToken, runId, organizationB);
         const originalRetainedPath = path.join(privateDir, "original-survivor-retained-object.bin");
         await runWrangler(
             [
@@ -1460,6 +1474,11 @@ async function main() {
             sha256(await readFile(originalRetainedPath)) === survivor.sha256,
             "recovery fault target was not retained before deletion"
         );
+        await runWrangler(
+            ["r2", "object", "put", `${names.bucket}/${survivorObject}`, "--remote", "--file", originalRetainedPath],
+            { cwd: app, label: "legacy live-key recovery fixture", secrets }
+        );
+        const pointFileState = await proofState(origin, adminToken, runId, organizationB);
         await runWrangler(
             ["r2", "object", "delete", `${names.bucket}/${survivorRetainedObject}`, "--remote", "--force"],
             {
@@ -1575,7 +1594,7 @@ async function main() {
             postPointRowReadableBeforeRestore: true,
             pointRowReadableAfterRestore: true,
             postPointRowHiddenAfterRestore: true,
-            postPointR2ObjectRemoved: true,
+            postPointLiveKeyAbsent: true,
             pointFileRecoveredFromRetention: true,
             pointFileRetentionRefreshedBeforeScrub: true,
         };

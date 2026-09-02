@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { StoredFile } from "../../src/server/do/cdb-file-store.ts";
-import { deleteRecoverableFile, readRecoverableFile, retainUploadedFile } from "../../src/server/file-retention.ts";
+import {
+    deleteRecoverableFile,
+    readRecoverableFile,
+    refreshRecoverableFile,
+    rehydrateRecoverableFile,
+    retainUploadedFile,
+} from "../../src/server/file-retention.ts";
 
 const BYTES = new TextEncoder().encode("recover me");
 const SHA256 = "bc54d1d8c0a99336ea2c89cccee81d1545b9e5c10791b3e5a7140803035213fb";
@@ -79,7 +85,7 @@ describe("R2 file recovery retention", () => {
         expect(fixture.calls).toEqual([`put:${key}`, `put:${key}`]);
     });
 
-    test("retains before delete and self-heals the live key after SQLite rewind", async () => {
+    test("retains before delete and reads attached bytes without recreating the live key", async () => {
         const fixture = bucketFixture();
         await fixture.bucket.put(file.objectKey, BYTES, {
             customMetadata: { chardbFileId: file.fileId, chardbSha256: SHA256 },
@@ -91,9 +97,8 @@ describe("R2 file recovery retention", () => {
 
         const restored = await readRecoverableFile(fixture.bucket, file);
         expect(await new Response(restored.body).text()).toBe("recover me");
-        expect(fixture.objects.get(file.objectKey)).toMatchObject({
-            customMetadata: { chardbFileId: file.fileId, chardbSha256: SHA256 },
-        });
+        expect(fixture.objects.has(file.objectKey)).toBe(false);
+        expect(fixture.calls.filter(call => call === `put:${file.objectKey}`)).toHaveLength(1);
     });
 
     test("rejects corrupt retained bytes instead of restoring them", async () => {
@@ -107,6 +112,55 @@ describe("R2 file recovery retention", () => {
         });
         await expect(readRecoverableFile(fixture.bucket, file)).rejects.toThrow(/body does not match its digest/);
         expect(fixture.objects.has(file.objectKey)).toBe(false);
+    });
+
+    test("rehydrates a live key eagerly without returning its body", async () => {
+        const fixture = bucketFixture();
+        await retainUploadedFile(fixture.bucket, {
+            sha256: SHA256,
+            size: BYTES.byteLength,
+            contentType: "text/plain",
+            bytes: BYTES,
+        });
+        await rehydrateRecoverableFile(fixture.bucket, file);
+        expect(fixture.objects.get(file.objectKey)).toMatchObject({
+            size: BYTES.byteLength,
+            customMetadata: { chardbFileId: file.fileId, chardbSha256: SHA256 },
+        });
+    });
+
+    test("refreshes a missing retained copy from verified legacy live bytes before scrub", async () => {
+        const fixture = bucketFixture();
+        await fixture.bucket.put(file.objectKey, BYTES, {
+            customMetadata: { chardbFileId: file.fileId, chardbSha256: SHA256 },
+        });
+        const retainedKey = `_chardb/retained/sha256/${SHA256}`;
+        expect(fixture.objects.has(retainedKey)).toBe(false);
+
+        await refreshRecoverableFile(fixture.bucket, file);
+        await fixture.bucket.delete(file.objectKey);
+        const restored = await readRecoverableFile(fixture.bucket, file);
+
+        expect(await new Response(restored.body).text()).toBe("recover me");
+        expect(fixture.objects.get(retainedKey)).toMatchObject({
+            size: BYTES.byteLength,
+            customMetadata: { chardbRetainedSha256: SHA256, chardbRetainedSize: String(BYTES.byteLength) },
+        });
+    });
+
+    test("refreshes retained bytes when a deleting row has no live key", async () => {
+        const fixture = bucketFixture();
+        await retainUploadedFile(fixture.bucket, {
+            sha256: SHA256,
+            size: BYTES.byteLength,
+            contentType: "text/plain",
+            bytes: BYTES,
+        });
+        const key = `_chardb/retained/sha256/${SHA256}`;
+        await refreshRecoverableFile(fixture.bucket, { ...file, status: "deleting" });
+        expect(fixture.calls.filter(call => call === `put:${key}`)).toHaveLength(2);
+        expect(fixture.calls).toContain(`get:${file.objectKey}`);
+        expect(fixture.objects.get(key)?.bytes).toEqual(BYTES);
     });
 
     test("does not finish a retrying delete from corrupt retained bytes", async () => {
