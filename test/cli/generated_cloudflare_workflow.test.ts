@@ -173,13 +173,13 @@ bucket_name = "stale-files"
 
         const mismatched = scenario({ bucketExists: true, marker: '{"owner":"someone-else"}\n' });
         await expect(generated.setupFilesBucket({ run: mismatched.run, adoptExistingBucket: true })).rejects.toThrow(
-            "different Chardb ownership marker"
+            "different CharDB ownership marker"
         );
         expect(mismatched.operations.some(args => args[2] === "put")).toBe(false);
 
         const rollback = scenario({ bucketExists: false, failMarkerPut: true });
         await expect(generated.setupFilesBucket({ run: rollback.run })).rejects.toThrow(
-            "could not write the Chardb R2 ownership marker"
+            "could not write the CharDB R2 ownership marker"
         );
         expect(rollback.state()).toEqual({ bucketExists: false, marker: null });
         expect(rollback.operations.at(-1)?.slice(0, 3)).toEqual(["r2", "bucket", "delete"]);

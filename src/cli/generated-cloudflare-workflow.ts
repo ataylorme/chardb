@@ -247,6 +247,7 @@ export async function setupFilesBucket({ adoptExistingBucket = false, run = comm
     }
     throw error;
 }
+}
 
 async function main() {
   const { adoptExistingBucket } = parseSetupArguments(process.argv.slice(2));
