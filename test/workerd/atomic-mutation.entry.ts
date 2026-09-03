@@ -134,6 +134,7 @@ export class AtomicMutationProbe extends DurableObject<ProbeEnv> {
                     roles: ["member"],
                     claims: {},
                 },
+                recoveryGeneration: 0,
                 schemaEpoch: 1,
             },
             cookie: `probe:${args.mutId}`,

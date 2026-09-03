@@ -2,6 +2,7 @@ import { CdbError, isCdbError } from "../../errors.ts";
 import { stableJson } from "../../util/canonical.ts";
 import { type VectorResourceV1, cdbVectorResourceId } from "../resource-descriptors.ts";
 import {
+    CDB_VECTOR_MAX_DELETE_IDS,
     CDB_VECTOR_MAX_VALUES_BYTES,
     type CdbVectorClaim,
     type CdbVectorHead,
@@ -45,6 +46,11 @@ export interface CdbVectorizeMutationIndex {
 export type CdbVectorizeMutationReceipt =
     | { readonly kind: "accepted"; readonly mutationId: string }
     | { readonly kind: "processed" };
+
+export interface CdbVectorizeDeleteBatch {
+    readonly receipt: CdbVectorizeMutationReceipt;
+    readonly wireIds: readonly string[];
+}
 
 export interface CdbVectorizeMatch {
     readonly id: string;
@@ -265,6 +271,59 @@ function deleteWireIds(claim: Extract<CdbVectorClaim, { readonly operation: "del
             return physical.wireId;
         })
     );
+}
+
+function recoveryDeleteWireIds(physicalIds: readonly string[]): readonly string[] {
+    if (!Array.isArray(physicalIds) || physicalIds.length < 1 || physicalIds.length > CDB_VECTOR_MAX_DELETE_IDS) {
+        invalid(`recovery delete must contain between 1 and ${CDB_VECTOR_MAX_DELETE_IDS} physical ids`);
+    }
+    const wireIds = physicalIds.map(value => cdbVectorizePhysicalIdFromCanonical(value).wireId);
+    if (new Set(wireIds).size !== wireIds.length) invalid("recovery delete contains duplicate physical ids");
+    return Object.freeze(wireIds);
+}
+
+/** Delete one bounded set of provider records during point-in-time recovery. */
+export async function deleteCdbVectorizePhysicalIds(
+    index: CdbVectorizeMutationIndex,
+    physicalIds: readonly string[]
+): Promise<CdbVectorizeDeleteBatch> {
+    const wireIds = recoveryDeleteWireIds(physicalIds);
+    const result = await index.deleteByIds(wireIds);
+    return Object.freeze({ receipt: mutationAccepted(result, wireIds), wireIds });
+}
+
+/** Prove that a recovery delete reached Vectorize's exact-id read path. */
+export async function verifyCdbVectorizePhysicalIdsDeleted(
+    index: CdbVectorizeMutationIndex,
+    batch: CdbVectorizeDeleteBatch
+): Promise<boolean> {
+    if (batch.receipt.kind === "accepted") {
+        const details = await (index.describe?.() ??
+            invariant("recovery delete verification requires the Vectorize V2 describe capability"));
+        if (typeof details !== "object" || details === null || Array.isArray(details)) {
+            invariant("describe returned an invalid result");
+        }
+        const processedUpToMutation = (details as { readonly processedUpToMutation?: unknown }).processedUpToMutation;
+        if (typeof processedUpToMutation !== "string" || processedUpToMutation.length === 0) {
+            invariant("describe returned an invalid processed mutation watermark");
+        }
+        if (processedUpToMutation !== batch.receipt.mutationId) return false;
+    }
+    const result = await index.getByIds(batch.wireIds);
+    if (!Array.isArray(result)) invariant("getByIds returned an invalid result");
+    if (result.length > batch.wireIds.length) invariant("getByIds returned more vectors than requested");
+    const seen = new Set<string>();
+    for (const value of result) {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) {
+            invariant("getByIds returned an invalid vector");
+        }
+        const id = (value as { readonly id?: unknown }).id;
+        if (typeof id !== "string" || !batch.wireIds.includes(id) || seen.has(id)) {
+            invariant("getByIds returned an unexpected vector id");
+        }
+        seen.add(id);
+    }
+    return result.length === 0;
 }
 
 /**

@@ -9,6 +9,7 @@ import {
     deterministicFilePayload,
     parseFileBenchmarkArgs,
     runFileBenchmarkUploadHook,
+    runRetryableFileUpload,
     validateFileBenchmarkEvidence,
 } from "../scripts/run-file-benchmark.mjs";
 
@@ -185,6 +186,48 @@ describe("paired file benchmark runner", () => {
                 fileId: "file-2",
             })
         ).rejects.toThrow("target kind");
+    });
+
+    test("retries only bounded transient upload outcomes while preserving caller identity", async () => {
+        const pauses: number[] = [];
+        const identities: string[] = [];
+        const responses = [
+            new Response(JSON.stringify({ error: { code: "CDB_SHARD_UNAVAILABLE", retryable: true } }), {
+                status: 503,
+                headers: { "retry-after": "1" },
+            }),
+            new Response("upstream unavailable", { status: 502 }),
+            new Response(JSON.stringify({ file: { fileId: "fil-1" } }), { status: 200 }),
+        ];
+        const recovered = await runRetryableFileUpload(
+            async () => {
+                identities.push("same-idempotency-key");
+                const response = responses.shift() as Response;
+                return {
+                    response,
+                    body: await response
+                        .clone()
+                        .json()
+                        .catch(() => null),
+                    bytes: new Uint8Array(),
+                };
+            },
+            async milliseconds => {
+                pauses.push(milliseconds);
+            }
+        );
+        expect(recovered.attempts).toBe(3);
+        expect(recovered.value.response.status).toBe(200);
+        expect(identities).toEqual(["same-idempotency-key", "same-idempotency-key", "same-idempotency-key"]);
+        expect(pauses).toEqual([1_000, 200]);
+
+        let terminalCalls = 0;
+        const terminal = await runRetryableFileUpload(async () => {
+            terminalCalls++;
+            return { response: new Response("internal", { status: 500 }) };
+        });
+        expect(terminal.value.response.status).toBe(500);
+        expect(terminalCalls).toBe(1);
     });
 
     test("rejects unknown pair fields and canonical path, digest, order, and run drift", async () => {

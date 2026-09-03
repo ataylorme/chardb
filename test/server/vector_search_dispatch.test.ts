@@ -28,6 +28,7 @@ const session = {
 };
 
 const authority = {
+    recoveryGeneration: 0,
     principalId: "user-1",
     organizationId: "org-1",
     role: "member",
@@ -38,6 +39,7 @@ const authority = {
 const route = {
     shardId: "shard-1" as never,
     schemaEpoch: 4,
+    recoveryGeneration: 0,
     domainSchemaEpoch: 5,
 };
 
@@ -85,9 +87,10 @@ describe("private organization vector search dispatcher", () => {
                 return {
                     authority: {
                         ...authority,
+                        recoveryGeneration: resolutions === 1 ? 0 : 1,
                         authEpochs: { ...authority.authEpochs, tenant: resolutions },
                     },
-                    route: { ...route, schemaEpoch: resolutions },
+                    route: { ...route, recoveryGeneration: resolutions === 1 ? 0 : 1 },
                 };
             }),
             indexes: {
@@ -113,8 +116,18 @@ describe("private organization vector search dispatcher", () => {
                 ];
             },
         });
-        expect(resolutions).toBe(2);
+        expect(resolutions).toBe(3);
         expect(indexCalls).toEqual([
+            {
+                values: [1, 2, 3],
+                options: {
+                    topK: 20,
+                    namespace: cdbVectorizeOrganizationNamespace("org-1"),
+                    returnValues: false,
+                    returnMetadata: "none",
+                    filter: { cdb_resource: cdbVectorizeResourceFilter(cdbVectorResourceId(resource)) },
+                },
+            },
             {
                 values: [1, 2, 3],
                 options: {
@@ -130,9 +143,9 @@ describe("private organization vector search dispatcher", () => {
             expect.objectContaining({
                 auth: expect.objectContaining({
                     tenantId: "org-1",
-                    authEpochs: expect.objectContaining({ tenant: 2 }),
+                    authEpochs: expect.objectContaining({ tenant: 3 }),
                 }),
-                route: expect.objectContaining({ schemaEpoch: 2 }),
+                route: expect.objectContaining({ schemaEpoch: 4, recoveryGeneration: 1 }),
                 resource,
                 organizationId: "org-1",
                 resourceId: cdbVectorResourceId(resource),
@@ -278,6 +291,22 @@ describe("private organization vector search dispatcher", () => {
                 },
                 schemaEpoch: { enumerable: true, value: 1 },
                 domainSchemaEpoch: { enumerable: true, value: 1 },
+                recoveryGeneration: { enumerable: true, value: 0 },
+            }
+        );
+        const accessorRecoveryGeneration = Object.defineProperties(
+            {},
+            {
+                shardId: { enumerable: true, value: "shard-1" },
+                schemaEpoch: { enumerable: true, value: 1 },
+                domainSchemaEpoch: { enumerable: true, value: 1 },
+                recoveryGeneration: {
+                    enumerable: true,
+                    get() {
+                        getterCalls++;
+                        return 0;
+                    },
+                },
             }
         );
         const routes: unknown[] = [
@@ -292,7 +321,10 @@ describe("private organization vector search dispatcher", () => {
             { ...route, schemaEpoch: Number.NaN },
             { ...route, domainSchemaEpoch: 0 },
             { ...route, domainSchemaEpoch: Number.POSITIVE_INFINITY },
+            { ...route, recoveryGeneration: -1 },
+            { ...route, recoveryGeneration: 0.5 },
             accessorShardId,
+            accessorRecoveryGeneration,
         ];
         const resolutions = [inherited, accessorRoute, ...routes.map(candidate => ({ authority, route: candidate }))];
         for (const resolution of resolutions) {

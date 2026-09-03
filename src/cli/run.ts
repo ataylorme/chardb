@@ -6,7 +6,7 @@ import { runShards } from "./commands/shards.ts";
 import { runVectorizePrepare } from "./commands/vectorize.ts";
 import type { CliContext } from "./context.ts";
 
-const HELP = `chardb — experimental organization database for Cloudflare Workers
+const HELP = `chardb — organization database for Cloudflare Workers
 
 Commands:
   chardb init <name> [--core-package <specifier>] [--react-package <specifier>]

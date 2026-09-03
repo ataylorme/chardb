@@ -930,7 +930,7 @@ export async function orchestrateFileReshardCloudflareProof(options, dependencie
                     "x-chardb-proof-run-id": prepared.evidence.runId,
                 },
                 healthReady: body =>
-                    body?.schema === "chardb.file-vector-reshard-proof-capabilities.v2" &&
+                    body?.schema === "chardb.file-vector-reshard-proof-capabilities.v3" &&
                     body.releaseSha256 === candidate.digest &&
                     body.runId === prepared.evidence.runId &&
                     body.target?.kind === "local" &&

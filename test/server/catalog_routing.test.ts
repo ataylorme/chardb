@@ -5,6 +5,7 @@ import { Catalog, configureCatalogRuntime } from "../../src/server/do/catalog.ts
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { defineMigrations } from "../../src/server/schema-migrations.ts";
 import { PrincipalId, ShardId, TenantId } from "../../src/types.ts";
+import { withRecoveryEnv } from "../helpers/recovery.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -92,7 +93,7 @@ describe("Catalog routing inventory", () => {
                 bootstrap = callback();
             },
         } as unknown as DurableObjectState;
-        catalog = new Catalog(state, {});
+        catalog = new Catalog(state, withRecoveryEnv({}));
         await bootstrap;
     });
 
@@ -125,23 +126,39 @@ describe("Catalog routing inventory", () => {
                 },
             }),
         } as unknown as DurableObjectNamespace;
-        catalog = new Catalog(state, { CDB_SHARD: shardNamespace });
+        catalog = new Catalog(state, withRecoveryEnv({ CDB_SHARD: shardNamespace }));
         await bootstrap;
 
         await catalog.bumpAuthEpoch("tenant", "org-rpc-contract");
         await catalog.alarm();
 
         expect(calls).toHaveLength(1);
-        expect(Object.keys(calls[0] ?? {}).sort()).toEqual(["epoch", "scope", "scopeId"]);
-        expect(calls[0]).toEqual({ scope: "tenant", scopeId: "org-rpc-contract", epoch: 1 });
+        expect(Object.keys(calls[0] ?? {}).sort()).toEqual(["epoch", "recoveryGeneration", "scope", "scopeId"]);
+        expect(calls[0]).toEqual({
+            scope: "tenant",
+            scopeId: "org-rpc-contract",
+            epoch: 1,
+            recoveryGeneration: 0,
+        });
     });
 
     test("projects auth epochs to both topology participants through cutover, then only the destination", async () => {
-        const calls: Array<{ shardId: string; scope: string; scopeId: string; epoch: number }> = [];
+        const calls: Array<{
+            shardId: string;
+            scope: string;
+            scopeId: string;
+            epoch: number;
+            recoveryGeneration: number;
+        }> = [];
         const shardNamespace = {
             idFromName: (name: string) => ({ name }),
             get: (id: { name: string }) => ({
-                invalidateAuthScope(input: { scope: "tenant"; scopeId: string; epoch: number }) {
+                invalidateAuthScope(input: {
+                    scope: "tenant";
+                    scopeId: string;
+                    epoch: number;
+                    recoveryGeneration: number;
+                }) {
                     calls.push({ shardId: id.name, ...input });
                     return { ...input, accepted: true, registrations: 0, changeSeq: 0 };
                 },
@@ -153,10 +170,11 @@ describe("Catalog routing inventory", () => {
         ).blockConcurrencyWhile = callback => {
             ready = callback();
         };
-        const projected = new Catalog(state, { CDB_SHARD: shardNamespace });
+        const projected = new Catalog(state, withRecoveryEnv({ CDB_SHARD: shardNamespace }));
         await ready;
         const topology = {
             migId: "auth-cutover-projection",
+            recoveryGeneration: 0,
             sourceShard: "ShardDO_0",
             destinationShard: "ShardDO_1",
             rangeLo: 0,
@@ -168,11 +186,12 @@ describe("Catalog routing inventory", () => {
         await projected.bumpAuthEpoch("tenant", "org-moving");
         await projected.alarm();
         expect(calls.splice(0)).toEqual([
-            { shardId: "ShardDO_0", scope: "tenant", scopeId: "org-moving", epoch: 1 },
-            { shardId: "ShardDO_1", scope: "tenant", scopeId: "org-moving", epoch: 1 },
+            { shardId: "ShardDO_0", scope: "tenant", scopeId: "org-moving", epoch: 1, recoveryGeneration: 0 },
+            { shardId: "ShardDO_1", scope: "tenant", scopeId: "org-moving", epoch: 1, recoveryGeneration: 0 },
         ]);
 
         await projected.cutover({
+            recoveryGeneration: 0,
             migId: topology.migId,
             lo: topology.rangeLo,
             hi: topology.rangeHi,
@@ -183,14 +202,16 @@ describe("Catalog routing inventory", () => {
         await projected.bumpAuthEpoch("tenant", "org-moving");
         await projected.alarm();
         expect(calls.splice(0)).toEqual([
-            { shardId: "ShardDO_0", scope: "tenant", scopeId: "org-moving", epoch: 2 },
-            { shardId: "ShardDO_1", scope: "tenant", scopeId: "org-moving", epoch: 2 },
+            { shardId: "ShardDO_0", scope: "tenant", scopeId: "org-moving", epoch: 2, recoveryGeneration: 0 },
+            { shardId: "ShardDO_1", scope: "tenant", scopeId: "org-moving", epoch: 2, recoveryGeneration: 0 },
         ]);
 
         projected.completeTopologyOperation(topology);
         await projected.bumpAuthEpoch("tenant", "org-moving");
         await projected.alarm();
-        expect(calls).toEqual([{ shardId: "ShardDO_1", scope: "tenant", scopeId: "org-moving", epoch: 3 }]);
+        expect(calls).toEqual([
+            { shardId: "ShardDO_1", scope: "tenant", scopeId: "org-moving", epoch: 3, recoveryGeneration: 0 },
+        ]);
     });
 
     test("bounds a legacy persisted multi-shard deletion inventory and retries only its failed target", async () => {
@@ -232,7 +253,7 @@ describe("Catalog routing inventory", () => {
         ).blockConcurrencyWhile = callback => {
             ready = callback();
         };
-        let configured = new ConfiguredCatalog(state, { CDB_SHARD: shardNamespace });
+        let configured = new ConfiguredCatalog(state, withRecoveryEnv({ CDB_SHARD: shardNamespace }));
         await ready;
 
         const sql = adaptSqlStorage(state.storage.sql);
@@ -276,7 +297,7 @@ describe("Catalog routing inventory", () => {
             );
 
             ready = Promise.resolve();
-            configured = new ConfiguredCatalog(state, { CDB_SHARD: shardNamespace });
+            configured = new ConfiguredCatalog(state, withRecoveryEnv({ CDB_SHARD: shardNamespace }));
             await ready;
             Date.now = () => 101;
             await configured.alarm();
@@ -336,7 +357,7 @@ describe("Catalog routing inventory", () => {
         ).blockConcurrencyWhile = callback => {
             ready = callback();
         };
-        const configured = new ConfiguredCatalog(state, { CDB_SHARD: shardNamespace });
+        const configured = new ConfiguredCatalog(state, withRecoveryEnv({ CDB_SHARD: shardNamespace }));
         await ready;
 
         const sql = adaptSqlStorage(state.storage.sql);
@@ -348,6 +369,11 @@ describe("Catalog routing inventory", () => {
                 journal.digest
             );
             new CatalogOrganizationDeletionStore(sql).record("org-vector-cleanup", 0, 100);
+            sql.exec(
+                `UPDATE _chardb_recovery_admission
+                 SET generation = 1, operation_id = '00000000-0000-4000-8000-000000000001', state = 'released'
+                 WHERE singleton = 1`
+            );
         });
 
         const originalNow = Date.now;
@@ -361,7 +387,12 @@ describe("Catalog routing inventory", () => {
         expect(calls).toEqual([
             {
                 shardId: "ShardDO_0",
-                input: { organizationId: "org-vector-cleanup", nowMs: 100, domainSchemaEpoch: 2 },
+                input: {
+                    organizationId: "org-vector-cleanup",
+                    nowMs: 100,
+                    recoveryGeneration: 1,
+                    domainSchemaEpoch: 2,
+                },
             },
         ]);
         expect(new CatalogOrganizationDeletionStore(sql).read("org-vector-cleanup")).toMatchObject({
@@ -397,7 +428,7 @@ describe("Catalog routing inventory", () => {
         ).blockConcurrencyWhile = callback => {
             ready = callback();
         };
-        const configured = new ConfiguredCatalog(state, {});
+        const configured = new ConfiguredCatalog(state, withRecoveryEnv({}));
         await ready;
         const sql = adaptSqlStorage(state.storage.sql);
         state.storage.transactionSync(() => {
@@ -454,7 +485,7 @@ describe("Catalog routing inventory", () => {
         ).blockConcurrencyWhile = callback => {
             ready = callback();
         };
-        const configured = new ConfiguredCatalog(state, { CDB_SHARD: shardNamespace });
+        const configured = new ConfiguredCatalog(state, withRecoveryEnv({ CDB_SHARD: shardNamespace }));
         await ready;
         const sql = adaptSqlStorage(state.storage.sql);
         state.storage.transactionSync(() => {
@@ -483,11 +514,13 @@ describe("Catalog routing inventory", () => {
         expect(await catalog.route(0)).toEqual({
             shardId: ShardId("ShardDO_0"),
             schemaEpoch: epochBefore.epoch,
+            recoveryGeneration: 0,
             domainSchemaEpoch: 1,
         });
 
         const request = {
             migId: "migration-commit-failure",
+            recoveryGeneration: 0,
             lo: 0,
             hi: 0,
             fromShard: "ShardDO_0",
@@ -499,6 +532,7 @@ describe("Catalog routing inventory", () => {
         });
         await expect(
             catalog.beginOrganizationDeletionBarrier({
+                recoveryGeneration: 0,
                 migId: request.migId,
                 rangeLo: request.lo,
                 rangeHi: request.hi,
@@ -507,8 +541,9 @@ describe("Catalog routing inventory", () => {
             code: "CDB_STALE_EPOCH",
             message: "organization deletion barrier does not match an active topology operation",
         });
-        expect(catalog.topologyOperation({ migrationId: request.migId })).toBeNull();
+        expect(catalog.topologyOperation({ recoveryGeneration: 0, migrationId: request.migId })).toBeNull();
         catalog.beginTopologyOperation({
+            recoveryGeneration: 0,
             migId: request.migId,
             sourceShard: request.fromShard,
             destinationShard: request.toShard,
@@ -518,7 +553,12 @@ describe("Catalog routing inventory", () => {
         });
         const deletions = new CatalogOrganizationDeletionStore(adaptSqlStorage(state.storage.sql));
         deletions.record("pre-barrier-delete", request.lo, 10);
-        const deletionBarrierRequest = { migId: request.migId, rangeLo: request.lo, rangeHi: request.hi };
+        const deletionBarrierRequest = {
+            migId: request.migId,
+            recoveryGeneration: request.recoveryGeneration,
+            rangeLo: request.lo,
+            rangeHi: request.hi,
+        };
         await expect(catalog.beginOrganizationDeletionBarrier(deletionBarrierRequest)).resolves.toMatchObject({
             status: "active",
         });
@@ -541,6 +581,7 @@ describe("Catalog routing inventory", () => {
         expect(await catalog.route(0)).toEqual({
             shardId: ShardId("ShardDO_0"),
             schemaEpoch: epochBefore.epoch,
+            recoveryGeneration: 0,
             domainSchemaEpoch: 1,
         });
         expect(catalog.organizationDeletionBarrierStatus(deletionBarrierRequest)).toMatchObject({
@@ -552,6 +593,7 @@ describe("Catalog routing inventory", () => {
         expect(await catalog.route(0)).toEqual({
             shardId: ShardId("ShardDO_1"),
             schemaEpoch: epochBefore.epoch + 1,
+            recoveryGeneration: 0,
             domainSchemaEpoch: 1,
         });
         expect(catalog.organizationDeletionBarrierStatus(deletionBarrierRequest)).toMatchObject({
@@ -567,6 +609,7 @@ describe("Catalog routing inventory", () => {
     test("reconstructs one exact topology lease and excludes schema migration until completion", async () => {
         const request = {
             migId: "durable-split-1",
+            recoveryGeneration: 0,
             sourceShard: "ShardDO_0",
             destinationShard: "ShardDO_1",
             rangeLo: 0,
@@ -574,12 +617,13 @@ describe("Catalog routing inventory", () => {
             startEpoch: 1,
         };
         expect(catalog.beginTopologyOperation(request)).toMatchObject({
+            recoveryGeneration: 0,
             migrationId: request.migId,
             status: "active",
             schemaVersion: 0,
             schemaEpoch: 1,
         });
-        expect(catalog.beginTopologyOperation(request)).toMatchObject({ status: "active" });
+        expect(catalog.beginTopologyOperation(request)).toMatchObject({ recoveryGeneration: 0, status: "active" });
         expect(catalog.topologyRoutingStatus(request)).toEqual({
             owner: "source",
             schemaEpoch: 1,
@@ -595,9 +639,9 @@ describe("Catalog routing inventory", () => {
         ).blockConcurrencyWhile = callback => {
             reconstructedReady = callback();
         };
-        const reconstructed = new Catalog(state, {});
+        const reconstructed = new Catalog(state, withRecoveryEnv({}));
         await reconstructedReady;
-        expect(reconstructed.topologyOperation({ migrationId: request.migId })).toMatchObject({
+        expect(reconstructed.topologyOperation({ recoveryGeneration: 0, migrationId: request.migId })).toMatchObject({
             status: "active",
             rangeLo: 0,
             rangeHi: 31,
@@ -611,7 +655,7 @@ describe("Catalog routing inventory", () => {
         ).blockConcurrencyWhile = callback => {
             futureReady = callback();
         };
-        const futureCatalog = new FutureCatalog(state, {});
+        const futureCatalog = new FutureCatalog(state, withRecoveryEnv({}));
         await futureReady;
         expect(() => futureCatalog.beginSchemaMigration({ migrationId: "schema-v1", targetVersion: 1 })).toThrow(
             expect.objectContaining({
@@ -622,6 +666,7 @@ describe("Catalog routing inventory", () => {
 
         await expect(
             futureCatalog.cutover({
+                recoveryGeneration: 0,
                 migId: request.migId,
                 lo: request.rangeLo,
                 hi: request.rangeHi,
@@ -634,6 +679,7 @@ describe("Catalog routing inventory", () => {
 
         await expect(
             reconstructed.cutover({
+                recoveryGeneration: 0,
                 migId: request.migId,
                 lo: request.rangeLo,
                 hi: request.rangeHi,
@@ -647,22 +693,35 @@ describe("Catalog routing inventory", () => {
             schemaEpoch: 2,
             operationStatus: "active",
         });
-        expect(reconstructed.topologyOperation({ migrationId: request.migId })).toMatchObject({ status: "active" });
-        expect(reconstructed.beginTopologyOperation(request)).toMatchObject({ status: "active" });
+        expect(reconstructed.topologyOperation({ recoveryGeneration: 0, migrationId: request.migId })).toMatchObject({
+            status: "active",
+        });
+        expect(reconstructed.beginTopologyOperation(request)).toMatchObject({
+            recoveryGeneration: 0,
+            status: "active",
+        });
 
         expect(reconstructed.completeTopologyOperation(request)).toMatchObject({
+            recoveryGeneration: 0,
             status: "completed",
             completedEpoch: 2,
         });
-        expect(reconstructed.completeTopologyOperation(request)).toMatchObject({ status: "completed" });
+        expect(reconstructed.completeTopologyOperation(request)).toMatchObject({
+            recoveryGeneration: 0,
+            status: "completed",
+        });
         expect(reconstructed.topologyRoutingStatus(request)).toEqual({
             owner: "destination",
             schemaEpoch: 2,
             operationStatus: "completed",
         });
-        expect(reconstructed.beginTopologyOperation(request)).toMatchObject({ status: "completed" });
+        expect(reconstructed.beginTopologyOperation(request)).toMatchObject({
+            recoveryGeneration: 0,
+            status: "completed",
+        });
         await expect(
             reconstructed.cutover({
+                recoveryGeneration: 0,
                 migId: request.migId,
                 lo: request.rangeLo,
                 hi: request.rangeHi,
@@ -679,15 +738,17 @@ describe("Catalog routing inventory", () => {
     test("atomically derives and claims one exact current topology owner", () => {
         expect(() =>
             catalog.beginDerivedTopologyOperation({
+                recoveryGeneration: 0,
                 migId: "invalid-range",
                 destinationShard: "ShardDO_1",
                 rangeLo: 15,
                 rangeHi: 8,
             })
         ).toThrow(expect.objectContaining({ code: "CDB_INVALID_ARGS", message: "topology vshard range is invalid" }));
-        expect(catalog.topologyOperation({ migrationId: "invalid-range" })).toBeNull();
+        expect(catalog.topologyOperation({ recoveryGeneration: 0, migrationId: "invalid-range" })).toBeNull();
         expect(() =>
             catalog.beginDerivedTopologyOperation({
+                recoveryGeneration: 0,
                 migId: "invalid-destination",
                 destinationShard: "bad shard",
                 rangeLo: 8,
@@ -696,10 +757,11 @@ describe("Catalog routing inventory", () => {
         ).toThrow(
             expect.objectContaining({ code: "CDB_INVALID_ARGS", message: "topology destination shard is invalid" })
         );
-        expect(catalog.topologyOperation({ migrationId: "invalid-destination" })).toBeNull();
+        expect(catalog.topologyOperation({ recoveryGeneration: 0, migrationId: "invalid-destination" })).toBeNull();
 
         expect(() =>
             catalog.beginDerivedTopologyOperation({
+                recoveryGeneration: 0,
                 migId: "same-owner",
                 destinationShard: "ShardDO_0",
                 rangeLo: 8,
@@ -711,20 +773,22 @@ describe("Catalog routing inventory", () => {
                 message: "topology source and destination must differ",
             })
         );
-        expect(catalog.topologyOperation({ migrationId: "same-owner" })).toBeNull();
+        expect(catalog.topologyOperation({ recoveryGeneration: 0, migrationId: "same-owner" })).toBeNull();
 
         failNextTransactionCommit = true;
         expect(() =>
             catalog.beginDerivedTopologyOperation({
+                recoveryGeneration: 0,
                 migId: "derived-split",
                 destinationShard: "ShardDO_1",
                 rangeLo: 8,
                 rangeHi: 15,
             })
         ).toThrow(/injected transaction commit failure/);
-        expect(catalog.topologyOperation({ migrationId: "derived-split" })).toBeNull();
+        expect(catalog.topologyOperation({ recoveryGeneration: 0, migrationId: "derived-split" })).toBeNull();
 
         const claimed = catalog.beginDerivedTopologyOperation({
+            recoveryGeneration: 0,
             migId: "derived-split",
             destinationShard: "ShardDO_1",
             rangeLo: 8,
@@ -743,6 +807,7 @@ describe("Catalog routing inventory", () => {
         });
         expect(
             catalog.beginDerivedTopologyOperation({
+                recoveryGeneration: 0,
                 migId: "derived-split",
                 destinationShard: "ShardDO_1",
                 rangeLo: 8,
@@ -751,6 +816,7 @@ describe("Catalog routing inventory", () => {
         ).toEqual(claimed);
         expect(() =>
             catalog.beginDerivedTopologyOperation({
+                recoveryGeneration: 0,
                 migId: "derived-split",
                 destinationShard: "ShardDO_2",
                 rangeLo: 8,
@@ -759,6 +825,7 @@ describe("Catalog routing inventory", () => {
         ).toThrow(expect.objectContaining({ code: "CDB_STALE_EPOCH", message: "topology operation identity changed" }));
         expect(() =>
             catalog.beginDerivedTopologyOperation({
+                recoveryGeneration: 0,
                 migId: "conflicting-split",
                 destinationShard: "ShardDO_2",
                 rangeLo: 16,
@@ -780,6 +847,7 @@ describe("Catalog routing inventory", () => {
 
         expect(() =>
             catalog.beginDerivedTopologyOperation({
+                recoveryGeneration: 0,
                 migId: "derived-crossing-owner",
                 destinationShard: "ShardDO_1",
                 rangeLo: 0,
@@ -791,11 +859,12 @@ describe("Catalog routing inventory", () => {
                 message: "topology range does not have one exact current owner",
             })
         );
-        expect(catalog.topologyOperation({ migrationId: "derived-crossing-owner" })).toBeNull();
+        expect(catalog.topologyOperation({ recoveryGeneration: 0, migrationId: "derived-crossing-owner" })).toBeNull();
     });
 
     test("aborts only a pre-cutover topology lease and releases the next lease", async () => {
         const request = {
+            recoveryGeneration: 0,
             migId: "abort-split-1",
             sourceShard: "ShardDO_0",
             destinationShard: "ShardDO_1",
@@ -805,6 +874,7 @@ describe("Catalog routing inventory", () => {
         };
         catalog.beginTopologyOperation(request);
         const deletionBarrierRequest = {
+            recoveryGeneration: 0,
             migId: request.migId,
             rangeLo: request.rangeLo,
             rangeHi: request.rangeHi,
@@ -812,13 +882,18 @@ describe("Catalog routing inventory", () => {
         await expect(catalog.beginOrganizationDeletionBarrier(deletionBarrierRequest)).resolves.toMatchObject({
             status: "active",
         });
-        expect(catalog.abortTopologyOperation(request)).toMatchObject({ status: "aborted", completedEpoch: null });
+        expect(catalog.abortTopologyOperation(request)).toMatchObject({
+            recoveryGeneration: 0,
+            status: "aborted",
+            completedEpoch: null,
+        });
         expect(catalog.organizationDeletionBarrierStatus(deletionBarrierRequest)).toMatchObject({
             barrier: { status: "aborted", finishedAt: expect.any(Number) },
         });
-        expect(catalog.abortTopologyOperation(request)).toMatchObject({ status: "aborted" });
+        expect(catalog.abortTopologyOperation(request)).toMatchObject({ recoveryGeneration: 0, status: "aborted" });
         expect(
             catalog.beginTopologyOperation({
+                recoveryGeneration: 0,
                 migId: "after-abort",
                 sourceShard: "ShardDO_0",
                 destinationShard: "ShardDO_2",
@@ -828,7 +903,7 @@ describe("Catalog routing inventory", () => {
             })
         ).toMatchObject({ status: "active" });
         expect(await catalog.route(8)).toMatchObject({ shardId: "ShardDO_0", schemaEpoch: 1 });
-        expect(catalog.abortTopologyOperation(request)).toMatchObject({ status: "aborted" });
+        expect(catalog.abortTopologyOperation(request)).toMatchObject({ recoveryGeneration: 0, status: "aborted" });
     });
 
     test("rejects a topology lease whose matching endpoints hide another range owner", async () => {
@@ -839,6 +914,7 @@ describe("Catalog routing inventory", () => {
         db.run("UPDATE catalog_epoch SET epoch = 2 WHERE scope = 'schema' AND scope_id = 'global'");
         expect(() =>
             catalog.beginTopologyOperation({
+                recoveryGeneration: 0,
                 migId: "crossing-owner",
                 sourceShard: "ShardDO_0",
                 destinationShard: "ShardDO_1",
@@ -852,7 +928,7 @@ describe("Catalog routing inventory", () => {
                 message: "topology source identity does not match current routing",
             })
         );
-        expect(catalog.topologyOperation({ migrationId: "crossing-owner" })).toBeNull();
+        expect(catalog.topologyOperation({ recoveryGeneration: 0, migrationId: "crossing-owner" })).toBeNull();
     });
 
     test("persists migration ownership, fences routes, and activates one exact journal version", async () => {
@@ -867,7 +943,7 @@ describe("Catalog routing inventory", () => {
         ).blockConcurrencyWhile = callback => {
             configuredReady = callback();
         };
-        const configured = new ConfiguredCatalog(state, {});
+        const configured = new ConfiguredCatalog(state, withRecoveryEnv({}));
         await configuredReady;
 
         expect(configured.schemaState()).toMatchObject({
@@ -904,12 +980,15 @@ describe("Catalog routing inventory", () => {
         ).blockConcurrencyWhile = callback => {
             futureReady = callback();
         };
-        const reconstructed = new FutureCatalog(state, {
-            CDB_SHARD: {
-                idFromName: (name: string) => ({ toString: () => name }),
-                get: () => migrationCdb,
-            } as unknown as DurableObjectNamespace,
-        });
+        const reconstructed = new FutureCatalog(
+            state,
+            withRecoveryEnv({
+                CDB_SHARD: {
+                    idFromName: (name: string) => ({ toString: () => name }),
+                    get: () => migrationCdb,
+                } as unknown as DurableObjectNamespace,
+            })
+        );
         await futureReady;
         failNextTransactionCommit = true;
         expect(() => reconstructed.beginSchemaMigration({ migrationId: "deploy-3", targetVersion: 1 })).toThrow(
@@ -927,6 +1006,7 @@ describe("Catalog routing inventory", () => {
         });
         expect(() =>
             reconstructed.beginTopologyOperation({
+                recoveryGeneration: 0,
                 migId: "topology-during-schema",
                 sourceShard: "ShardDO_0",
                 destinationShard: "ShardDO_1",
@@ -940,7 +1020,9 @@ describe("Catalog routing inventory", () => {
                 message: "schema migration blocks topology operation",
             })
         );
-        expect(reconstructed.topologyOperation({ migrationId: "topology-during-schema" })).toBeNull();
+        expect(
+            reconstructed.topologyOperation({ recoveryGeneration: 0, migrationId: "topology-during-schema" })
+        ).toBeNull();
         expect(reconstructed.beginSchemaMigration({ migrationId: "deploy-3", targetVersion: 1 })).toMatchObject({
             status: "migrating",
         });
@@ -1025,12 +1107,15 @@ describe("Catalog routing inventory", () => {
         ).blockConcurrencyWhile = callback => {
             ready = callback();
         };
-        const adopting = new FutureCatalog(state, {
-            CDB_SHARD: {
-                idFromName: (name: string) => ({ toString: () => name }),
-                get: () => migrationCdb,
-            } as unknown as DurableObjectNamespace,
-        });
+        const adopting = new FutureCatalog(
+            state,
+            withRecoveryEnv({
+                CDB_SHARD: {
+                    idFromName: (name: string) => ({ toString: () => name }),
+                    get: () => migrationCdb,
+                } as unknown as DurableObjectNamespace,
+            })
+        );
         await ready;
 
         expect(adopting.beginSchemaBaseline({ migrationId: "baseline-v1", targetVersion: 1 })).toMatchObject({
@@ -1046,6 +1131,7 @@ describe("Catalog routing inventory", () => {
         expect(calls).toEqual([
             {
                 migrationId: "baseline-v1",
+                recoveryGeneration: 0,
                 targetVersion: 1,
                 targetEpoch: 2,
                 targetDigest: journal.digest,

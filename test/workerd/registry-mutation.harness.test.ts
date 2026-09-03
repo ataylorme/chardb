@@ -57,6 +57,7 @@ beforeAll(async () => {
         durableObjects: {
             CDB: { className: "Cdb", useSQLite: true },
             CDB_GATEWAY: { className: "InvalidationGateway", useSQLite: true },
+            CDB_RESHARD: { className: "Resharder", useSQLite: true },
         },
         compatibilityDate: "2025-09-01",
         compatibilityFlags: ["nodejs_compat"],
@@ -100,7 +101,9 @@ async function routingFence(
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
     });
-    return (await response.json()) as Record<string, unknown>;
+    const text = await response.text();
+    if (!response.ok) throw new Error(`routing fence ${phase} failed ${response.status}: ${text}`);
+    return JSON.parse(text) as Record<string, unknown>;
 }
 
 async function inspectAtomicState(): Promise<{
@@ -150,7 +153,9 @@ async function registeredProof(
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
     });
-    return (await response.json()) as Record<string, unknown>;
+    const text = await response.text();
+    if (!response.ok) throw new Error(`registered ${operation} failed ${response.status}: ${text}`);
+    return JSON.parse(text) as Record<string, unknown>;
 }
 
 describe("configured Cdb local mutation registry", () => {

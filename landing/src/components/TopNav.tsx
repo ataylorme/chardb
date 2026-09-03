@@ -1,5 +1,3 @@
-import { GITHUB_URL } from "../lib/constants";
-
 type TopNavProps = {
     homeHref?: string;
     storyActive?: boolean;
@@ -18,7 +16,7 @@ export function TopNav({ homeHref = "#top", storyActive = false }: TopNavProps) 
                 </a>
 
                 <nav aria-label="Primary" className="flex items-center gap-5">
-                    <ul className="hidden sm:flex items-center gap-5 text-sm text-fg-muted">
+                    <ul className="flex items-center gap-4 text-xs text-fg-muted sm:gap-5 sm:text-sm">
                         <li>
                             <a
                                 href="/why/"
@@ -29,18 +27,11 @@ export function TopNav({ homeHref = "#top", storyActive = false }: TopNavProps) 
                             </a>
                         </li>
                         <li>
-                            <a href="/docs" className="nav-link text-fg-dim hover:text-fg transition-colors">
-                                docs
-                            </a>
+                            <span className="text-fg-dim" aria-label="Documentation coming soon">
+                                docs soon
+                            </span>
                         </li>
                     </ul>
-                    <a
-                        href={GITHUB_URL}
-                        rel="noopener"
-                        className="text-sm text-fg hover:text-accent transition-colors inline-flex items-center gap-1"
-                    >
-                        GitHub <span aria-hidden="true">→</span>
-                    </a>
                 </nav>
             </div>
         </header>

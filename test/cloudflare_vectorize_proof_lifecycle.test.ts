@@ -102,6 +102,157 @@ function vectorState(input: {
 }
 
 describe("Cloudflare Vectorize proof HTTP lifecycle", () => {
+    test("proves real-provider recovery identity across scrub and requeue", async () => {
+        const recoveryDigest = "c".repeat(64);
+        const calls: string[] = [];
+        const recorded: string[][] = [];
+        const sleeps: number[] = [];
+        let stage: "initial" | "post-point" | "scrubbed" | "restored" = "initial";
+        let restoreTurns = 0;
+        let reconcileTurns = 0;
+        const lifecycle = createCloudflareVectorizeProofLifecycle({
+            sleep: async milliseconds => {
+                sleeps.push(milliseconds);
+            },
+            fetch: async (input, init) => {
+                const url = requestUrl(input);
+                calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
+                if (url.pathname === "/api/auth/sign-in/anonymous") {
+                    return response({}, { headers: { "set-cookie": "session=owner; Path=/; HttpOnly" } });
+                }
+                if (url.pathname === "/api/auth/get-session") return response({ user: { id: "owner-user" } });
+                if (url.pathname === "/api/auth/token") return response({ token: "owner-token" });
+                if (url.pathname === "/api/auth/organization/create") return response({ id: "org-owning" });
+                if (url.pathname === "/api/auth/organization/set-active") return response({ ok: true });
+                if (url.pathname === "/api/vector-documents" && init?.method === "POST") {
+                    const body = requestBody(init);
+                    if (body.action === "replace") stage = "post-point";
+                    return response({ id: "document-1", vectorId: VECTOR_ID });
+                }
+                if (url.pathname === "/api/vector-documents") {
+                    return response([{ id: "document-1", body: "point body" }]);
+                }
+                if (url.pathname === "/proof/vector-intent") {
+                    return response({
+                        vectorId: VECTOR_ID,
+                        action: "upsert",
+                        nextVersion: 2,
+                        physicalIds: [PHYSICAL_ID_2],
+                    });
+                }
+                if (url.pathname === "/proof/vector-state") {
+                    const version = stage === "post-point" ? 2 : 1;
+                    return response(vectorState({ state: "ready", version, deliveredVersion: version }));
+                }
+                if (url.pathname === "/proof/vector-presence") {
+                    const presence =
+                        stage === "initial"
+                            ? [true, false]
+                            : stage === "post-point"
+                              ? [false, true]
+                              : stage === "scrubbed"
+                                ? [false, false]
+                                : [true, false];
+                    return response({
+                        vectorId: VECTOR_ID,
+                        records: [
+                            { physicalId: PHYSICAL_ID, present: presence[0] },
+                            { physicalId: PHYSICAL_ID_2, present: presence[1] },
+                        ],
+                    });
+                }
+                if (url.pathname === "/_chardb/backups/create") {
+                    return response({
+                        ok: true,
+                        recoveryPoint: { format: "chardb-recovery-point/v1", digest: recoveryDigest },
+                    });
+                }
+                if (url.pathname === "/_chardb/backups/restore") {
+                    restoreTurns++;
+                    if (restoreTurns === 1) {
+                        return response({
+                            ok: true,
+                            pending: true,
+                            recoveryPointDigest: recoveryDigest,
+                            continuation: { value: "restore" },
+                        });
+                    }
+                    stage = "scrubbed";
+                    return response(
+                        {
+                            ok: true,
+                            accepted: true,
+                            recoveryPointDigest: recoveryDigest,
+                            reconcileAfterMs: 6_000,
+                            providerReset: { files: 0, vectors: 1 },
+                        },
+                        { status: 202 }
+                    );
+                }
+                if (url.pathname === "/_chardb/backups/reconcile") {
+                    reconcileTurns++;
+                    if (reconcileTurns === 1) {
+                        return response({
+                            ok: true,
+                            pending: true,
+                            recoveryPointDigest: recoveryDigest,
+                            continuation: { value: "reconcile" },
+                        });
+                    }
+                    stage = "restored";
+                    return response({
+                        ok: true,
+                        reconciled: true,
+                        recoveryPointDigest: recoveryDigest,
+                        filesRehydrated: 0,
+                        vectorsRequeued: 1,
+                    });
+                }
+                throw new Error(`unexpected request ${url.pathname}`);
+            },
+        });
+
+        const proof = await lifecycle.proveRecovery({
+            origin: ORIGIN,
+            admin: ADMIN,
+            organizationName: "Recovery proof",
+            organizationSlug: "recovery-proof",
+            mutationRunId: "recovery-proof-run",
+            documentId: "document-1",
+            initialText: "point body",
+            initialValues: VECTOR_VALUES,
+            replacementText: "post-point body",
+            replacementValues: REPLACEMENT_VALUES,
+            timeoutMs: 10_000,
+            intervalMs: 100,
+            recordPhysicalIds: async ids => {
+                recorded.push([...ids]);
+            },
+        });
+
+        expect(recorded).toEqual([[PHYSICAL_ID, PHYSICAL_ID_2]]);
+        expect(sleeps).toContain(6_000);
+        expect(restoreTurns).toBe(2);
+        expect(reconcileTurns).toBe(2);
+        expect(proof).toMatchObject({
+            recoveryPointDigest: recoveryDigest,
+            vectorId: VECTOR_ID,
+            physicalIds: [PHYSICAL_ID, PHYSICAL_ID_2],
+            authoritativeVersion: 1,
+            providerReset: { files: 0, vectors: 1 },
+            reconciliation: { filesRehydrated: 0, vectorsRequeued: 1 },
+            providerPresence: {
+                atPoint: [true, false],
+                postPoint: [false, true],
+                afterScrub: [false, false],
+                afterRequeue: [true, false],
+            },
+            restoredRow: { id: "document-1", body: "point body" },
+        });
+        expect(calls.filter(call => call === "POST /_chardb/backups/restore")).toHaveLength(2);
+        expect(calls.filter(call => call === "POST /_chardb/backups/reconcile")).toHaveLength(2);
+    });
+
     test("rejects malformed, oversized, failed, redirected, and timed-out HTTP responses", async () => {
         let malformedCalls = 0;
         const malformed = createCloudflareVectorizeProofLifecycle({

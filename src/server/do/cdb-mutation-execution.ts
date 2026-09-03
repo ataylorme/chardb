@@ -143,6 +143,7 @@ function snapshotMutationRequest(input: CdbMutationRequest): CdbMutationRequest 
     const mutId = input.mutId;
     const ref = input.ref;
     const schemaEpoch = input.schemaEpoch;
+    const recoveryGeneration = input.recoveryGeneration;
     const domainSchemaEpoch = input.domainSchemaEpoch;
     const placement =
         input.placement === undefined
@@ -158,6 +159,7 @@ function snapshotMutationRequest(input: CdbMutationRequest): CdbMutationRequest 
         ...(placement === undefined ? {} : { placement }),
         auth,
         schemaEpoch,
+        recoveryGeneration,
         domainSchemaEpoch,
     };
 }

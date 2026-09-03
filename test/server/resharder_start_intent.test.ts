@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { RESHARDER_PHASE, Resharder } from "../../src/server/do/resharder.ts";
+import { serializeRecoveryContinuationState } from "../../src/server/recovery-continuation.ts";
 import { VSHARD_COUNT } from "../../src/vshard.ts";
 
 interface Cursor<T> extends Iterable<T> {
@@ -135,6 +136,38 @@ describe("Resharder durable start intent", () => {
         expect(
             db.query("SELECT state, src_shard, dst_shard FROM migration_start_intent WHERE mig_id = ?").get(split.migId)
         ).toEqual({ state: "abort_requested", src_shard: split.srcShard, dst_shard: split.dstShard });
+    });
+
+    test("an active recovery claim rejects resharding before Catalog mutation", async () => {
+        let topologyBegins = 0;
+        const resharder = await construct({
+            async beginTopologyOperation() {
+                topologyBegins++;
+                return { status: "active" as const, ...topologySchema };
+            },
+        });
+        await resharder.adminClaimRecoveryPreparation({
+            operationId: "00000000-0000-4000-8000-000000000001",
+            digest: "d".repeat(64),
+            continuationJson: serializeRecoveryContinuationState({
+                kind: "restore",
+                phase: "arm",
+                shardIndex: 0,
+                afterRetainedFileId: "",
+                afterVectorId: "",
+                afterPhysicalVersion: 0,
+                files: 0,
+                filePages: 0,
+                filesRetained: 0,
+                retentionPages: 0,
+                quiescenceTurns: 0,
+                vectors: 0,
+                vectorPages: 0,
+                commitPolls: 0,
+            }),
+        });
+        await expect(resharder.startSplit(split)).rejects.toMatchObject({ code: "CDB_RESHARD_PHASE_MISMATCH" });
+        expect(topologyBegins).toBe(0);
     });
 
     test("an unknown abort permanently cancels the id before Catalog acquisition", async () => {

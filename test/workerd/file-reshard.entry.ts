@@ -176,9 +176,10 @@ export class FileRuntimeCdb extends ConfiguredFileRuntimeCdb {
             targetVersion: RUNTIME_FILE_MIGRATIONS.version,
             targetEpoch: 2,
             targetDigest: RUNTIME_FILE_MIGRATIONS.digest,
+            recoveryGeneration: 0,
         });
-        this.applySchemaMigration({ migrationId, version: 1 });
-        const active = await this.activateSchemaMigration({ migrationId });
+        this.applySchemaMigration({ migrationId, version: 1, recoveryGeneration: 0 });
+        const active = await this.activateSchemaMigration({ migrationId, recoveryGeneration: 0 });
         return {
             activeVersion: active.activeVersion,
             activeEpoch: active.activeEpoch,
@@ -215,6 +216,7 @@ export class FileRuntimeCdb extends ConfiguredFileRuntimeCdb {
     }): { vshard: number } {
         const vshard = placement(input.organizationId);
         this.prepareReshardDestOwnership({
+            recoveryGeneration: 0,
             migId: input.migId,
             rangeLo: vshard,
             rangeHi: vshard,
@@ -361,6 +363,7 @@ export class FileRuntimeCdb extends ConfiguredFileRuntimeCdb {
                 column: RUNTIME_FILE_RESOURCE.column,
                 rowId: input.rowId,
                 domainSchemaEpoch: input.domainSchemaEpoch,
+                recoveryGeneration: 0,
                 auth: input.auth,
             },
             async () => {
@@ -856,6 +859,7 @@ export class LegacyFileReshardProof extends DurableObject<Env> {
 
 const LEGACY_RECOVERY_SCHEMA = {
     schemaVersion: 3,
+    recoveryGeneration: 0,
     schemaEpoch: 4,
     schemaDigest: "b".repeat(64),
 } as const;
@@ -889,6 +893,7 @@ export class LegacyRecoveryCatalog extends DurableObject<Env> {
         await this.record(migId, "routing-status");
         return {
             owner,
+            recoveryGeneration: 0,
             schemaEpoch: Number(input.startEpoch) + (owner === "destination" ? 1 : 0),
             operationStatus: topology.status,
         };

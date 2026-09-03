@@ -9,6 +9,7 @@
             "ci-candidate",
             "rust/target",
             ".chardb",
+            ".omx",
             "**/.wrangler",
             "bun.lockb",
             "*.md",

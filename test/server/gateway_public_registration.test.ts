@@ -135,12 +135,14 @@ describe("Gateway public durable registration", () => {
                     role: "member",
                     roles: ["member"],
                     authEpochs: { global: 10, tenant: 11, principal: 12 },
+                    recoveryGeneration: 0,
                 };
             },
             async route() {
                 return {
                     shardId: ShardId("logical-shard-1"),
                     schemaEpoch: 4,
+                    recoveryGeneration: 0,
                     domainSchemaEpoch: 1,
                 };
             },
@@ -153,11 +155,19 @@ describe("Gateway public durable registration", () => {
                 subscribeCalls.push(request);
                 return await subscribeBehavior(request);
             },
-            async unsubscribe(subscription: LiveSubscriptionId) {
-                unsubscribeCalls.push(subscription);
+            async unsubscribe(
+                request:
+                    | LiveSubscriptionId
+                    | { readonly subscription: LiveSubscriptionId; readonly recoveryGeneration: number }
+            ) {
+                unsubscribeCalls.push("subscription" in request ? request.subscription : request);
             },
-            async finalizeUnsubscribe(subscription: LiveSubscriptionId) {
-                finalizeCalls.push(subscription);
+            async finalizeUnsubscribe(
+                request:
+                    | LiveSubscriptionId
+                    | { readonly subscription: LiveSubscriptionId; readonly recoveryGeneration: number }
+            ) {
+                finalizeCalls.push("subscription" in request ? request.subscription : request);
             },
             async queryRegistered(request: unknown) {
                 registeredQueryCalls.push(request);
@@ -762,7 +772,7 @@ describe("Gateway public durable registration", () => {
         expect(unsubscribeCalls).toEqual([]);
     });
 
-    test("a clean idle head keeps its auth deadline armed and retires exactly when grace ends", async () => {
+    test("a clean idle head reports terminal auth expiry before retiring at the grace deadline", async () => {
         await subscribe();
         await waitFor(() => generation()?.lifecycle === "active", "subscription activation");
         currentAlarm = null;
@@ -804,6 +814,11 @@ describe("Gateway public durable registration", () => {
         expect(unsubscribeCalls).toHaveLength(1);
         expect(finalizeCalls).toEqual(unsubscribeCalls);
         expect(currentAlarm).toBeNull();
+        expect(socket.sent.map(message => JSON.parse(message))).toContainEqual(
+            expect.objectContaining({ t: "error", code: "CDB_FORBIDDEN", retryable: false })
+        );
+        expect(socket.attachment).toMatchObject({ kind: "rejected", connectionId: "connection-1" });
+        expect(socket.closed).toEqual([{ code: 1008, reason: "CDB_FORBIDDEN" }]);
     });
 
     test("auth retirement indexes each socket once across multiple active heads", async () => {
@@ -1061,6 +1076,45 @@ describe("Gateway public durable registration", () => {
             subIds: [1],
             reason: "shardsChanged",
         });
+    });
+
+    test("keeps a resumed fallback available until Cdb accepts the subscription", async () => {
+        socket.attachment = { ...socket.attachment, resumeRefetchPendingSubIds: [] };
+
+        await subscribe();
+        expect(JSON.parse(socket.sent.at(-1) as string)).toEqual({
+            t: "mustRefetch",
+            subIds: [1],
+            reason: "lagged",
+        });
+        expect(socket.attachment.resumeRefetchPendingSubIds).toEqual([SubId(1)]);
+        expect(subscribeCalls).toEqual([]);
+
+        subscribeBehavior = request => ({
+            ok: false,
+            registrationState: "absent",
+            subscription: request.subscription,
+            error: new CdbError({ code: "CDB_FORBIDDEN", message: "subscription rejected" }).toJSON(),
+        });
+        await subscribe();
+        expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({
+            t: "error",
+            subId: 1,
+            code: "CDB_FORBIDDEN",
+        });
+        expect(socket.attachment.resumeRefetchPendingSubIds).toEqual([SubId(1)]);
+        expect(head()).toBeNull();
+
+        subscribeBehavior = request => ({ ok: true, subscription: request.subscription, changeSeq: 1 });
+        await subscribe();
+        await waitFor(() => generation()?.lifecycle === "active", "resumed fallback activation");
+        expect(socket.attachment.resumeRefetchPendingSubIds).toEqual([]);
+        expect(subscribeCalls).toHaveLength(2);
+
+        const sentBeforeReplacement = socket.sent.length;
+        await subscribe();
+        expect(subscribeCalls).toHaveLength(3);
+        expect(socket.sent).toHaveLength(sentBeforeReplacement);
     });
 
     test("unsubscribe during ambiguous settlement suppresses the stale response-loss error", async () => {

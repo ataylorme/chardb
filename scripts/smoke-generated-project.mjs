@@ -471,16 +471,24 @@ async function proveGeneratedDevProxy(cwd, extraEnvironment) {
     const webOrigin = new URL(`http://127.0.0.1:${webPort}`);
     const devPath = join(cwd, "scripts", "dev.mjs");
     await writeFile(devPath, injectGeneratedDevInspectorPort(await readFile(devPath, "utf8"), inspectorPort));
+    await writeFile(
+        join(cwd, ".env.local"),
+        [
+            "CHARDB_URL=https://production-worker.invalid",
+            "CHARDB_WEB_URL=https://production-web.invalid",
+            "CHARDB_ADMIN_TOKEN=production-admin-token-must-never-reach-local-dev",
+            "BETTER_AUTH_SECRET=production-better-auth-secret-must-never-reach-local-dev",
+            "",
+        ].join("\n")
+    );
     const managed = spawnManagedProcess([process.execPath, "run", "dev"], {
         label: "generated dev command",
         cwd,
         env: {
             ...process.env,
             ...extraEnvironment,
-            CHARDB_URL: workerOrigin.origin,
-            CHARDB_WEB_URL: webOrigin.origin,
-            CHARDB_ADMIN_TOKEN: ADMIN_TOKEN,
-            BETTER_AUTH_SECRET: AUTH_SECRET,
+            CHARDB_DEV_URL: workerOrigin.origin,
+            CHARDB_DEV_WEB_URL: webOrigin.origin,
         },
         stdin: "ignore",
         stdout: "pipe",

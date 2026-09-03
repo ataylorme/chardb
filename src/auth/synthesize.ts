@@ -332,7 +332,7 @@ export type ChardbAuth<TPlugins extends readonly unknown[] = [], TExtra extends 
 
 /**
  * Bundle the caller's exact Better Auth profile with its synthesized
- * tables. Chardb does not add, remove, reorder, or reconstruct plugins;
+ * tables. CharDB does not add, remove, reorder, or reconstruct plugins;
  * the configured plugin tuple remains the single source of truth.
  */
 export function defineAuth<

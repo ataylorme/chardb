@@ -286,9 +286,9 @@ function seedRegistrations(db, count, fanout) {
     const subscription = db.prepare(
         `INSERT INTO _chardb_live_subscriptions
            (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-            principal_id, organization_id, authority, schema_epoch, vshard, domain_schema_epoch,
+            principal_id, organization_id, authority, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
             ref, args_json, policy_digest, query_hash, tables_json, intervals_json)
-         VALUES ('gateway', ?, ?, 'client', ?, 'active', 'hash', 'user', ?, 'organization', 1, ?, 1,
+         VALUES ('gateway', ?, ?, 'client', ?, 'active', 'hash', 'user', ?, 'organization', 1, 0, ?, 1,
                  'query', '{}', 'policy', 'query-hash', '[]', '[]')`
     );
     const dependency = db.prepare("INSERT INTO _chardb_live_subscription_vectors VALUES ('gateway', ?, ?)");

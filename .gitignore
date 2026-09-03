@@ -16,3 +16,4 @@ artifacts/
 .DS_Store
 test/workerd/.test-*.bundle.mjs
 landing/.tsbuild/
+/.omx/

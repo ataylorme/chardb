@@ -17,6 +17,7 @@ import { synthesizeAuthSchema } from "../../src/auth/synthesize.ts";
 import { type SplitLogCapacity, type TableSpec, renderTableTriggers } from "../../src/reshard/triggers.ts";
 import { createApi } from "../../src/server/define.ts";
 import { CdbOpLogRetentionStore } from "../../src/server/do/cdb-oplog-retention-store.ts";
+export { Resharder } from "../../src/server/do/resharder.ts";
 import { type TailTransaction, configureCdbRuntime } from "../../src/server/do/cdb.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { manifestFromExports } from "../../src/server/manifest.ts";
@@ -253,18 +254,27 @@ export class TestCdb extends ConfiguredTestCdb {
         throw new Error("simulated response loss after destination activation");
     }
 
-    async _ackThenLoseResponse(args: { migId: string; throughLsn: number }): Promise<never> {
+    async _ackThenLoseResponse(args: {
+        migId: string;
+        recoveryGeneration: number;
+        throughLsn: number;
+    }): Promise<never> {
         await this.ackTail(args);
         throw new Error("simulated response loss after tail acknowledgement");
     }
 
-    async _ackSplitOpLogThenLoseResponse(args: { migId: string; throughLsn: number }): Promise<never> {
+    async _ackSplitOpLogThenLoseResponse(args: {
+        migId: string;
+        recoveryGeneration: number;
+        throughLsn: number;
+    }): Promise<never> {
         await this.ackSplitOpLog(args);
         throw new Error("simulated response loss after split-oplog acknowledgement");
     }
 
     async _stageTailThenLoseResponse(args: {
         migId: string;
+        recoveryGeneration: number;
         tables: readonly TableSpec[];
         range: { lo: number; hi: number };
         transactions: readonly TailTransaction[];
@@ -345,6 +355,7 @@ interface Env {
     CDB: DurableObjectNamespace;
     FRESH: DurableObjectNamespace;
     REPLICATED: DurableObjectNamespace;
+    CDB_RESHARD: DurableObjectNamespace;
 }
 
 type ReshardOp =
@@ -433,6 +444,7 @@ export default {
                     rangeLo: number;
                     rangeHi: number;
                     destinationGeneration: number;
+                    recoveryGeneration: number;
                 }): Promise<unknown>;
                 schemaState(): Promise<{ activeVersion: number; activeEpoch: number; activeDigest: string }>;
                 provisionFreshReshardDestination(args: {
@@ -440,6 +452,7 @@ export default {
                     targetVersion: number;
                     targetEpoch: number;
                     targetDigest: string;
+                    recoveryGeneration: number;
                 }): Promise<unknown>;
             };
             const before = await fresh.schemaState();
@@ -448,12 +461,14 @@ export default {
                 rangeLo: 10,
                 rangeHi: 10,
                 destinationGeneration: 2,
+                recoveryGeneration: 0,
             });
             await fresh.provisionFreshReshardDestination({
                 migrationId: "reshard-dest:fresh-native-1",
                 targetVersion: 1,
                 targetEpoch: 7,
                 targetDigest: freshJournal.digest,
+                recoveryGeneration: 0,
             });
             const after = await fresh.schemaState();
             return jsonResponse({ before, after });

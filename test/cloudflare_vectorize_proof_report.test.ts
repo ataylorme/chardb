@@ -85,6 +85,9 @@ function reportFor(exactCandidate = candidate()) {
     const localRemote = physical("local-remote");
     const liveCreate = physical("live-create");
     const liveReplacement = physical("live-replacement", 2);
+    const recoveryVectorId = `vec1_${hash("recovery")}`;
+    const recoveryV1 = physical("recovery");
+    const recoveryV2 = physical("recovery", 2);
     const deploymentFiles = [
         { path: "chardb-proof.tgz", bytes: exactCandidate.bytes, sha256: exactCandidate.digest },
         { path: "package-lock.json", bytes: 200, sha256: hash("package lock") },
@@ -329,6 +332,21 @@ function reportFor(exactCandidate = candidate()) {
             transientHttpFailureOverflowCount: 0,
             hardBoundClaimed: false,
         },
+        recovery: {
+            recoveryPointDigest: hash("recovery point"),
+            vectorId: recoveryVectorId,
+            physicalIds: [recoveryV1, recoveryV2],
+            authoritativeVersion: 1,
+            providerReset: { files: 0, vectors: 1 },
+            reconciliation: { filesRehydrated: 0, vectorsRequeued: 1 },
+            providerPresence: {
+                atPoint: [true, false],
+                postPoint: [false, true],
+                afterScrub: [false, false],
+                afterRequeue: [true, false],
+            },
+            restoredRow: { id: "recovery-document", body: "recovery point document" },
+        },
         benchmark: {
             schema: "chardb.vectorize.deployment-benchmark.v2",
             workload: {
@@ -393,8 +411,24 @@ function reportFor(exactCandidate = candidate()) {
             },
         },
         cleanup: {
-            expectedPhysicalIds: [first, physical("second", 2), liveCreate, liveReplacement, localRemote],
-            discoveredPhysicalIds: [first, physical("second", 2), liveCreate, liveReplacement, localRemote],
+            expectedPhysicalIds: [
+                first,
+                physical("second", 2),
+                liveCreate,
+                liveReplacement,
+                recoveryV1,
+                recoveryV2,
+                localRemote,
+            ],
+            discoveredPhysicalIds: [
+                first,
+                physical("second", 2),
+                liveCreate,
+                liveReplacement,
+                recoveryV1,
+                recoveryV2,
+                localRemote,
+            ],
             localRemotePhysicalIds: [localRemote],
             exactIdsDeleted: true,
             finalVectorCount: 0,
@@ -473,6 +507,30 @@ describe("Cloudflare Vectorize proof report validator", () => {
             },
             value => {
                 (value.search.adversarialFiltering.injected as Record<string, unknown>).rawValues = [1, 0];
+            },
+        ] as Array<(value: ReturnType<typeof reportFor>) => void>) {
+            expect(() => assertCloudflareVectorizeProofReport(changed(report, mutate), exactCandidate)).toThrow();
+        }
+    });
+
+    test("requires post-point scrub and authoritative point-in-time requeue evidence", () => {
+        const exactCandidate = candidate();
+        const report = reportFor(exactCandidate);
+        for (const mutate of [
+            value => {
+                value.recovery.providerReset.vectors = 0;
+            },
+            value => {
+                value.recovery.reconciliation.vectorsRequeued = 0;
+            },
+            value => {
+                value.recovery.authoritativeVersion = 2 as 1;
+            },
+            value => {
+                value.recovery.providerPresence.afterScrub = [false, true] as unknown as [false, false];
+            },
+            value => {
+                value.recovery.providerPresence.afterRequeue = [true, true] as unknown as [true, false];
             },
         ] as Array<(value: ReturnType<typeof reportFor>) => void>) {
             expect(() => assertCloudflareVectorizeProofReport(changed(report, mutate), exactCandidate)).toThrow();

@@ -43,6 +43,7 @@ async function runtime(): Promise<Miniflare> {
             CATALOG: { className: "Catalog", useSQLite: true },
             VECTOR_CATALOG: { className: "VectorCatalog", useSQLite: true },
             CDB_SHARD: { className: "CdbProbe", useSQLite: true },
+            CDB_RESHARD: { className: "Resharder", useSQLite: true },
         },
         durableObjectsPersist: path.join(temporaryPath, "durable-objects"),
         compatibilityDate: "2025-09-01",

@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS _chardb_routing_fences (
   range_hi INTEGER NOT NULL CHECK (range_hi >= range_lo AND range_hi < 16384),
   source_generation INTEGER NOT NULL CHECK (source_generation >= 1),
   destination_generation INTEGER NOT NULL CHECK (destination_generation = source_generation + 1),
+  recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0),
   status TEXT NOT NULL CHECK (status IN ('prepared', 'active', 'cleaned', 'superseded')),
   prepared_at INTEGER NOT NULL CHECK (prepared_at >= 0),
   activated_at INTEGER CHECK (activated_at IS NULL OR activated_at >= prepared_at),
@@ -32,6 +33,7 @@ export interface CdbRoutingFenceIdentity {
     readonly rangeHi: number;
     readonly sourceGeneration: number;
     readonly destinationGeneration: number;
+    readonly recoveryGeneration: number;
 }
 
 export interface CdbRoutingFence extends CdbRoutingFenceIdentity {
@@ -48,6 +50,7 @@ interface StoredCdbRoutingFence {
     readonly range_hi: number;
     readonly source_generation: number;
     readonly destination_generation: number;
+    readonly recovery_generation: number;
     readonly status: CdbRoutingFence["status"];
     readonly prepared_at: number;
     readonly activated_at: number | null;
@@ -57,6 +60,15 @@ interface StoredCdbRoutingFence {
 
 const MIGRATION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 export const CDB_ROUTING_FENCE_MAX_ROWS = VSHARD_COUNT;
+
+export function initializeCdbRoutingFenceStore(sql: SyncSql): void {
+    const columns = sql.all<{ name: string }>("PRAGMA table_info(_chardb_routing_fences)");
+    if (!columns.some(column => column.name === "recovery_generation")) {
+        sql.exec(
+            "ALTER TABLE _chardb_routing_fences ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0)"
+        );
+    }
+}
 
 /**
  * Durable source-side routing fence for one physical vshard move.
@@ -117,13 +129,15 @@ export class CdbRoutingFenceStore {
 
             sql.exec(
                 `INSERT INTO _chardb_routing_fences
-                 (migration_id, range_lo, range_hi, source_generation, destination_generation, status, prepared_at)
-                 VALUES (?, ?, ?, ?, ?, 'prepared', ?)`,
+                 (migration_id, range_lo, range_hi, source_generation, destination_generation,
+                  recovery_generation, status, prepared_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?)`,
                 identity.migrationId,
                 identity.rangeLo,
                 identity.rangeHi,
                 identity.sourceGeneration,
                 identity.destinationGeneration,
+                identity.recoveryGeneration,
                 nowMs
             );
             result = this.required(identity.migrationId, sql);
@@ -231,7 +245,7 @@ export class CdbRoutingFenceStore {
 
     byMigrationId(migrationId: string, sql = adaptSqlStorage(this.storage.sql)): CdbRoutingFence | null {
         const row = sql.one<StoredCdbRoutingFence>(
-            `SELECT migration_id, range_lo, range_hi, source_generation, destination_generation,
+            `SELECT migration_id, range_lo, range_hi, source_generation, destination_generation, recovery_generation,
                     status, prepared_at, activated_at, cleaned_at, superseded_at
              FROM _chardb_routing_fences
              WHERE migration_id = ?`,
@@ -244,7 +258,7 @@ export class CdbRoutingFenceStore {
     activeSourceFence(vshard: number, sql = adaptSqlStorage(this.storage.sql)): CdbRoutingFence | null {
         assertVshard(vshard);
         const rows = sql.all<StoredCdbRoutingFence>(
-            `SELECT migration_id, range_lo, range_hi, source_generation, destination_generation,
+            `SELECT migration_id, range_lo, range_hi, source_generation, destination_generation, recovery_generation,
                     status, prepared_at, activated_at, cleaned_at, superseded_at
              FROM _chardb_routing_fences
              WHERE range_lo <= ? AND range_hi >= ? AND status IN ('active', 'cleaned')
@@ -265,7 +279,7 @@ export class CdbRoutingFenceStore {
         assertGeneration(input.schemaEpoch, "mutation routing generation");
         assertVshard(input.vshard);
         const fences = sql.all<StoredCdbRoutingFence>(
-            `SELECT migration_id, range_lo, range_hi, source_generation, destination_generation,
+            `SELECT migration_id, range_lo, range_hi, source_generation, destination_generation, recovery_generation,
                     status, prepared_at, activated_at, cleaned_at, superseded_at
              FROM _chardb_routing_fences
              WHERE range_lo <= ? AND range_hi >= ? AND status != 'superseded'
@@ -299,7 +313,7 @@ export class CdbRoutingFenceStore {
     private overlapping(rangeLo: number, rangeHi: number, sql: SyncSql): readonly CdbRoutingFence[] {
         return sql
             .all<StoredCdbRoutingFence>(
-                `SELECT migration_id, range_lo, range_hi, source_generation, destination_generation,
+                `SELECT migration_id, range_lo, range_hi, source_generation, destination_generation, recovery_generation,
                         status, prepared_at, activated_at, cleaned_at, superseded_at
                  FROM _chardb_routing_fences
                  WHERE status != 'superseded' AND range_lo <= ? AND range_hi >= ?
@@ -322,6 +336,7 @@ function assertIdentity(identity: CdbRoutingFenceIdentity): void {
     }
     assertGeneration(identity.sourceGeneration, "routing fence source generation");
     assertGeneration(identity.destinationGeneration, "routing fence destination generation");
+    assertRecoveryGeneration(identity.recoveryGeneration);
     if (identity.destinationGeneration !== identity.sourceGeneration + 1) {
         throw new CdbError({
             code: "CDB_INVALID_ARGS",
@@ -336,7 +351,8 @@ function assertSameIdentity(stored: CdbRoutingFence, input: CdbRoutingFenceIdent
         stored.rangeLo !== input.rangeLo ||
         stored.rangeHi !== input.rangeHi ||
         stored.sourceGeneration !== input.sourceGeneration ||
-        stored.destinationGeneration !== input.destinationGeneration
+        stored.destinationGeneration !== input.destinationGeneration ||
+        stored.recoveryGeneration !== input.recoveryGeneration
     ) {
         throw staleFence("routing fence migration id belongs to a different immutable identity");
     }
@@ -351,6 +367,12 @@ function assertVshard(value: number): void {
 function assertGeneration(value: number, subject: string): void {
     if (!Number.isSafeInteger(value) || value < 1) {
         throw new CdbError({ code: "CDB_INVALID_ARGS", message: `${subject} is invalid` });
+    }
+}
+
+function assertRecoveryGeneration(value: number): void {
+    if (!Number.isSafeInteger(value) || value < 0) {
+        throw new CdbError({ code: "CDB_INVALID_ARGS", message: "routing fence recovery generation is invalid" });
     }
 }
 
@@ -371,6 +393,8 @@ function parseFence(row: StoredCdbRoutingFence): CdbRoutingFence {
         !Number.isSafeInteger(row.source_generation) ||
         row.source_generation < 1 ||
         row.destination_generation !== row.source_generation + 1 ||
+        !Number.isSafeInteger(row.recovery_generation) ||
+        row.recovery_generation < 0 ||
         !["prepared", "active", "cleaned", "superseded"].includes(row.status)
     ) {
         throw corruptFence("stored routing fence is malformed");
@@ -381,6 +405,7 @@ function parseFence(row: StoredCdbRoutingFence): CdbRoutingFence {
         rangeHi: row.range_hi,
         sourceGeneration: row.source_generation,
         destinationGeneration: row.destination_generation,
+        recoveryGeneration: row.recovery_generation,
         status: row.status,
         preparedAt: row.prepared_at,
         activatedAt: row.activated_at,

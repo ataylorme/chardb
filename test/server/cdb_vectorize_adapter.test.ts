@@ -7,10 +7,12 @@ import type {
 import { cdbVectorPhysicalId } from "../../src/server/do/cdb-vector-outbox-store.ts";
 import {
     CDB_VECTORIZE_QUERY_TIMEOUT_MS,
+    deleteCdbVectorizePhysicalIds,
     deliverCdbVectorClaim,
     queryCdbVectorizeCandidates,
     validateCdbVectorMatches,
     verifyCdbVectorClaim,
+    verifyCdbVectorizePhysicalIdsDeleted,
 } from "../../src/server/do/cdb-vectorize-adapter.ts";
 import {
     cdbVectorizeOrganizationNamespace,
@@ -313,6 +315,42 @@ describe("Cdb Vectorize adapter", () => {
                 UPSERT
             )
         ).rejects.toThrow(/invalid receipt/);
+    });
+
+    test("deletes and proves bounded recovery batches through exact provider ids", async () => {
+        const deleted: string[][] = [];
+        const index = {
+            upsert: () => ({ mutationId: "unused" }),
+            deleteByIds(ids: readonly string[]) {
+                deleted.push([...ids]);
+                return { ids, count: ids.length };
+            },
+            getByIds: () => [],
+        };
+        const batch = await deleteCdbVectorizePhysicalIds(index, [cdbVectorPhysicalId(RESOURCE_ID, VECTOR_ID, 2)]);
+        expect(batch).toEqual({ receipt: { kind: "processed" }, wireIds: [WIRE_PHYSICAL_2] });
+        expect(deleted).toEqual([[WIRE_PHYSICAL_2]]);
+        expect(await verifyCdbVectorizePhysicalIdsDeleted(index, batch)).toBe(true);
+        await expect(
+            deleteCdbVectorizePhysicalIds(index, [
+                cdbVectorPhysicalId(RESOURCE_ID, VECTOR_ID, 2),
+                cdbVectorPhysicalId(RESOURCE_ID, VECTOR_ID, 2),
+            ])
+        ).rejects.toMatchObject({ code: "CDB_INVALID_ARGS" });
+    });
+
+    test("does not claim an accepted recovery delete before its exact watermark", async () => {
+        let watermark = "other-mutation";
+        const index = {
+            upsert: () => ({ mutationId: "unused" }),
+            deleteByIds: () => ({ mutationId: "recovery-delete" }),
+            getByIds: () => [],
+            describe: () => ({ processedUpToMutation: watermark }),
+        };
+        const batch = await deleteCdbVectorizePhysicalIds(index, [cdbVectorPhysicalId(RESOURCE_ID, VECTOR_ID, 1)]);
+        expect(await verifyCdbVectorizePhysicalIdsDeleted(index, batch)).toBe(false);
+        watermark = "recovery-delete";
+        expect(await verifyCdbVectorizePhysicalIdsDeleted(index, batch)).toBe(true);
     });
 
     test("does not call Vectorize for a delete with no attempted physical ids", async () => {

@@ -23,7 +23,7 @@ impl<Arguments: ?Sized, Row> Query<Arguments, Row> {
     pub const fn new(reference: &'static str) -> Self {
         assert!(
             is_valid_reference(reference),
-            "Chardb reference must be nonempty and contain '#'"
+            "CharDB reference must be nonempty and contain '#'"
         );
         Self {
             reference,
@@ -60,7 +60,7 @@ impl<Arguments: ?Sized, Output> Mutation<Arguments, Output> {
     pub const fn new(reference: &'static str) -> Self {
         assert!(
             is_valid_reference(reference),
-            "Chardb reference must be nonempty and contain '#'"
+            "CharDB reference must be nonempty and contain '#'"
         );
         Self {
             reference,
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Chardb reference must be nonempty and contain '#'")]
+    #[should_panic(expected = "CharDB reference must be nonempty and contain '#'")]
     fn runtime_declarations_reject_malformed_references() {
         let _ = Query::<(), ()>::new("queries.ts");
     }

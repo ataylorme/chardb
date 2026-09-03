@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS _gw_registration_generations (
   shard_id TEXT NOT NULL,
   source_cdb_id TEXT NOT NULL,
   schema_epoch INTEGER NOT NULL CHECK (schema_epoch >= 0),
+  recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0),
   domain_schema_epoch INTEGER NOT NULL CHECK (domain_schema_epoch > 0),
   auth_global_epoch INTEGER NOT NULL CHECK (auth_global_epoch >= 0),
   auth_tenant_epoch INTEGER NOT NULL CHECK (auth_tenant_epoch >= 0),
@@ -99,6 +100,7 @@ CREATE TABLE IF NOT EXISTS _gw_snapshot_replay (
   shard_id TEXT NOT NULL,
   source_cdb_id TEXT NOT NULL,
   schema_epoch INTEGER NOT NULL CHECK (schema_epoch >= 0),
+  recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0),
   domain_schema_epoch INTEGER NOT NULL CHECK (domain_schema_epoch > 0),
   auth_global_epoch INTEGER NOT NULL CHECK (auth_global_epoch >= 0),
   auth_tenant_epoch INTEGER NOT NULL CHECK (auth_tenant_epoch >= 0),
@@ -191,7 +193,7 @@ function gatewayPayloadByteExpression(sql: SyncSql, table: string, columns: read
 }
 
 const GATEWAY_RETIRED_PAYLOAD_ASSIGNMENTS = `
-    organization_id = '', ref = '', args_json = 'null', intent_json = 'null',
+    ref = '', args_json = 'null', intent_json = 'null',
     policy_digest = '', query_hash = '', shard_id = '',
     last_cookie = NULL, last_snapshot_cookie = NULL`;
 
@@ -353,6 +355,7 @@ export interface GatewayRegistrationInstall extends GatewayRegistrationKey {
     /** Physical Cdb Durable Object identifier that emits invalidations. */
     readonly sourceCdbId: string;
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     readonly domainSchemaEpoch: number;
     readonly authEpochs: {
         readonly global: number;
@@ -424,6 +427,7 @@ export interface GatewayDirtyRun {
     readonly shardId: string;
     readonly sourceCdbId: string;
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     readonly domainSchemaEpoch: number;
     readonly intentJson: string;
     readonly policyDigest: string;
@@ -437,6 +441,7 @@ export interface GatewaySnapshotStage extends GatewayRegistrationKey {
     readonly targetVersion: number;
     readonly cookie: Cookie;
     readonly rows: readonly RawJson[];
+    readonly recoveryGeneration: number;
     readonly authEpochs: {
         readonly global: number;
         readonly tenant: number;
@@ -455,6 +460,7 @@ export interface GatewaySnapshotReplayLookup extends GatewayRegistrationKey {
     readonly shardId: string;
     readonly sourceCdbId: string;
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     readonly domainSchemaEpoch: number;
     readonly authEpochs: {
         readonly global: number;
@@ -497,6 +503,7 @@ export interface GatewaySnapshotSendAttempt extends GatewayRegistrationKey {
     readonly shardId: string;
     readonly sourceCdbId: string;
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     readonly domainSchemaEpoch: number;
     readonly authEpochs: {
         readonly global: number;
@@ -592,6 +599,8 @@ export interface StoredGatewayCleanupRow {
     readonly registration_id: string;
     readonly connection_id: string;
     readonly source_cdb_id: string | null;
+    readonly organization_id: string;
+    readonly recovery_generation: number;
     readonly retry_count: number;
 }
 
@@ -629,12 +638,12 @@ export function installGatewayRegistration(
         `INSERT INTO _gw_registration_generations
          (registration_id, principal_id, client_id, sub_id, connection_id, organization_id,
           ref, args_json, intent_json, policy_digest, query_hash, shard_id, source_cdb_id, schema_epoch,
-          domain_schema_epoch,
+          recovery_generation, domain_schema_epoch,
           auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
           lifecycle, cdb_state, dirty_version, delivered_version, run_token, run_target_version,
           run_lease_expires_at, run_version,
           last_cookie, retry_count, retry_at, retry_error, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                  'installing', 'pending', 0, 0, NULL, NULL, NULL, 0, ?, 0, NULL, NULL, ?, ?)`,
         input.registrationId,
         input.principalId,
@@ -650,6 +659,7 @@ export function installGatewayRegistration(
         input.shardId,
         input.sourceCdbId,
         input.schemaEpoch,
+        input.recoveryGeneration,
         input.domainSchemaEpoch,
         input.authEpochs.global,
         input.authEpochs.tenant,
@@ -1036,12 +1046,14 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         shard_id: string;
         source_cdb_id: string;
         schema_epoch: number;
+        recovery_generation: number;
         domain_schema_epoch: number;
         intent_json: string;
         policy_digest: string;
     }>(
         `SELECT g.dirty_version, g.delivered_version, g.run_token, g.run_version,
                 g.organization_id, g.ref, g.args_json, g.shard_id, g.source_cdb_id, g.schema_epoch,
+                g.recovery_generation,
                 g.domain_schema_epoch,
                 g.intent_json, g.policy_digest
          FROM _gw_registration_generations g
@@ -1131,6 +1143,7 @@ export function claimDirtyGatewayRegistration(sql: SyncSql, input: GatewayDirtyR
         shardId: current.shard_id,
         sourceCdbId: current.source_cdb_id,
         schemaEpoch: current.schema_epoch,
+        recoveryGeneration: current.recovery_generation,
         domainSchemaEpoch: current.domain_schema_epoch,
         intentJson: current.intent_json,
         policyDigest: current.policy_digest,
@@ -1144,6 +1157,7 @@ export function stageGatewaySnapshot(sql: SyncSql, input: GatewaySnapshotStage):
     if (input.cookie.length === 0) throw new TypeError("cookie must be nonempty");
     assertNonnegativeSafeInteger(input.runVersion, "runVersion");
     assertNonnegativeSafeInteger(input.targetVersion, "targetVersion");
+    assertNonnegativeSafeInteger(input.recoveryGeneration, "recoveryGeneration");
     assertNonnegativeSafeInteger(input.nowMs, "nowMs");
     for (const [name, value] of [
         ["authEpochs.global", input.authEpochs.global],
@@ -1162,7 +1176,7 @@ export function stageGatewaySnapshot(sql: SyncSql, input: GatewaySnapshotStage):
         `UPDATE _gw_registration_generations
          SET run_token = NULL, run_target_version = NULL, run_lease_expires_at = NULL,
              run_version = run_version + 1,
-             auth_global_epoch = ?, auth_tenant_epoch = ?, auth_principal_epoch = ?,
+             recovery_generation = ?, auth_global_epoch = ?, auth_tenant_epoch = ?, auth_principal_epoch = ?,
              retry_count = 0, retry_at = NULL, retry_error = NULL, updated_at = ?
          WHERE registration_id = ? AND principal_id = ? AND client_id = ? AND sub_id = ?
            AND connection_id = ? AND lifecycle = 'active' AND cdb_state = 'active'
@@ -1178,6 +1192,7 @@ export function stageGatewaySnapshot(sql: SyncSql, input: GatewaySnapshotStage):
                AND h.client_id = _gw_registration_generations.client_id
                AND h.sub_id = _gw_registration_generations.sub_id
            )`,
+        input.recoveryGeneration,
         input.authEpochs.global,
         input.authEpochs.tenant,
         input.authEpochs.principal,
@@ -1255,6 +1270,7 @@ export function claimDueGatewaySnapshot(
         shard_id: string;
         source_cdb_id: string;
         schema_epoch: number;
+        recovery_generation: number;
         domain_schema_epoch: number;
         auth_global_epoch: number;
         auth_tenant_epoch: number;
@@ -1264,7 +1280,7 @@ export function claimDueGatewaySnapshot(
                 o.cookie, o.target_version, o.rows_json, o.byte_size, o.send_attempts, o.next_attempt_at,
                 o.claim_token, o.claim_version, g.organization_id, g.ref, g.args_json,
                 g.intent_json, g.policy_digest, g.query_hash, g.shard_id, g.source_cdb_id,
-                g.schema_epoch, g.domain_schema_epoch,
+                g.schema_epoch, g.recovery_generation, g.domain_schema_epoch,
                 g.auth_global_epoch, g.auth_tenant_epoch, g.auth_principal_epoch
          FROM _gw_snapshot_outbox o
          INNER JOIN _gw_registration_generations g ON g.registration_id = o.registration_id
@@ -1346,6 +1362,7 @@ export function claimDueGatewaySnapshot(
         shardId: due.shard_id,
         sourceCdbId: due.source_cdb_id,
         schemaEpoch: due.schema_epoch,
+        recoveryGeneration: due.recovery_generation,
         domainSchemaEpoch: due.domain_schema_epoch,
         authEpochs: {
             global: due.auth_global_epoch,
@@ -1756,11 +1773,11 @@ export function retainCurrentGatewaySnapshotReplay(
     sql.exec(
         `INSERT INTO _gw_snapshot_replay
          (principal_id, client_id, sub_id, cookie, organization_id, ref, args_json,
-          policy_digest, query_hash, shard_id, source_cdb_id, schema_epoch, domain_schema_epoch,
+          policy_digest, query_hash, shard_id, source_cdb_id, schema_epoch, recovery_generation, domain_schema_epoch,
           auth_global_epoch, auth_tenant_epoch, auth_principal_epoch,
           rows_json, byte_size, created_at, expires_at)
          SELECT g.principal_id, g.client_id, g.sub_id, o.cookie, g.organization_id, g.ref, g.args_json,
-                g.policy_digest, g.query_hash, g.shard_id, g.source_cdb_id, g.schema_epoch,
+                g.policy_digest, g.query_hash, g.shard_id, g.source_cdb_id, g.schema_epoch, g.recovery_generation,
                 g.domain_schema_epoch, g.auth_global_epoch, g.auth_tenant_epoch, g.auth_principal_epoch,
                 o.rows_json, o.byte_size, o.last_sent_at, o.last_sent_at + ?
          FROM _gw_registration_generations g
@@ -1784,6 +1801,7 @@ export function retainCurrentGatewaySnapshotReplay(
            shard_id = excluded.shard_id,
            source_cdb_id = excluded.source_cdb_id,
            schema_epoch = excluded.schema_epoch,
+           recovery_generation = excluded.recovery_generation,
            domain_schema_epoch = excluded.domain_schema_epoch,
            auth_global_epoch = excluded.auth_global_epoch,
            auth_tenant_epoch = excluded.auth_tenant_epoch,
@@ -1813,6 +1831,7 @@ export function resolveGatewaySnapshotReplay(
     assertGatewayRegistrationKey(input);
     if (input.cookie.length === 0) throw new TypeError("cookie must be nonempty");
     assertNonnegativeSafeInteger(input.schemaEpoch, "schemaEpoch");
+    assertNonnegativeSafeInteger(input.recoveryGeneration, "recoveryGeneration");
     assertNonnegativeSafeInteger(input.domainSchemaEpoch, "domainSchemaEpoch");
     assertNonnegativeSafeInteger(input.nowMs, "nowMs");
     pruneGatewaySnapshotReplays(sql, input.nowMs);
@@ -1821,7 +1840,7 @@ export function resolveGatewaySnapshotReplay(
          WHERE principal_id = ? AND client_id = ? AND sub_id = ? AND cookie = ?
            AND organization_id = ? AND ref = ? AND args_json = ?
            AND policy_digest = ? AND query_hash = ? AND shard_id = ? AND source_cdb_id = ?
-           AND schema_epoch = ? AND domain_schema_epoch = ?
+           AND schema_epoch = ? AND recovery_generation = ? AND domain_schema_epoch = ?
            AND auth_global_epoch = ? AND auth_tenant_epoch = ? AND auth_principal_epoch = ?
            AND expires_at > ?`,
         input.principalId,
@@ -1836,6 +1855,7 @@ export function resolveGatewaySnapshotReplay(
         input.shardId,
         input.sourceCdbId,
         input.schemaEpoch,
+        input.recoveryGeneration,
         input.domainSchemaEpoch,
         input.authEpochs.global,
         input.authEpochs.tenant,
@@ -2196,6 +2216,7 @@ function assertGatewayRegistrationInstall(input: GatewayRegistrationInstall): vo
     for (const [name, value] of [
         ["subId", input.subId],
         ["schemaEpoch", input.schemaEpoch],
+        ["recoveryGeneration", input.recoveryGeneration],
         ["domainSchemaEpoch", input.domainSchemaEpoch],
         ["authEpochs.global", input.authEpochs.global],
         ["authEpochs.tenant", input.authEpochs.tenant],
@@ -2273,6 +2294,19 @@ export function ensureGatewayRegistrationColumns(sql: SyncSql): void {
             "ALTER TABLE _gw_registration_generations ADD COLUMN domain_schema_epoch INTEGER CHECK (domain_schema_epoch IS NULL OR domain_schema_epoch > 0)"
         );
     }
+    if (!columns.has("recovery_generation")) {
+        sql.exec(
+            "ALTER TABLE _gw_registration_generations ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0)"
+        );
+    }
+    const replayColumns = new Set(
+        sql.all<{ name: string }>("PRAGMA table_info('_gw_snapshot_replay')").map(column => column.name)
+    );
+    if (replayColumns.size > 0 && !replayColumns.has("recovery_generation")) {
+        sql.exec(
+            "ALTER TABLE _gw_snapshot_replay ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0)"
+        );
+    }
     if (!columns.has("policy_digest")) {
         sql.exec("ALTER TABLE _gw_registration_generations ADD COLUMN policy_digest TEXT");
     }
@@ -2304,7 +2338,6 @@ export function ensureGatewayRegistrationColumns(sql: SyncSql): void {
         sql.all<{ name: string }>("PRAGMA table_info('_gw_registration_generations')").map(column => column.name)
     );
     const legacyRetiredPayloadAssignments = [
-        ["organization_id", "organization_id = ''"],
         ["ref", "ref = ''"],
         ["args_json", "args_json = 'null'"],
         ["intent_json", "intent_json = 'null'"],
@@ -2340,8 +2373,8 @@ export function ensureGatewayRegistrationColumns(sql: SyncSql): void {
              retry_at = updated_at, retry_error = NULL
          WHERE (policy_digest IS NULL OR domain_schema_epoch IS NULL) AND lifecycle != 'retiring'`
     );
-    // Legacy retired generations can predate payload compaction. Keep only
-    // the exact identity needed for idempotent Cdb unsubscribe and deletion.
+    // Legacy retired generations can predate payload compaction. Keep the
+    // recovery owner with the exact identity needed for fenced Cdb cleanup.
     sql.exec(
         `DELETE FROM _gw_snapshot_outbox
          WHERE registration_id IN (

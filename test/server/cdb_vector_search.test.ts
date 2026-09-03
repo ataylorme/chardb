@@ -16,6 +16,7 @@ import { renderVectorMutationTriggerSet } from "../../src/server/vector-triggers
 import { ShardId } from "../../src/types.ts";
 import { searchVector, vector } from "../../src/vector.ts";
 import { forOrg } from "../helpers/cdb-table.ts";
+import { withRecoveryEnv } from "../helpers/recovery.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -76,7 +77,7 @@ function construct(CdbClass: typeof Cdb, db: Database, onQuery?: (query: string)
             ready = callback();
         },
     } as unknown as DurableObjectState;
-    return { cdb: new CdbClass(state, {}), storage, ready };
+    return { cdb: new CdbClass(state, withRecoveryEnv({})), storage, ready };
 }
 
 describe("Cdb vector search policy validation", () => {
@@ -191,7 +192,12 @@ describe("Cdb vector search policy validation", () => {
             })
         ).resolves.toEqual([]);
 
-        await cdb.deleteOrganizationFiles({ organizationId: "org-1", nowMs: 200, domainSchemaEpoch: 1 });
+        await cdb.deleteOrganizationFiles({
+            recoveryGeneration: 0,
+            organizationId: "org-1",
+            nowMs: 200,
+            domainSchemaEpoch: 1,
+        });
         await expect(
             cdb.resolveOrganizationVectorSearch({
                 auth: { userId: "user-1", tenantId: "org-1", role: "member", roles: ["member"], claims: {} },
@@ -200,7 +206,12 @@ describe("Cdb vector search policy validation", () => {
                 resourceId,
                 matches: [{ id: physicalId, score: 0.9 }],
                 limit: 1,
-                route: { shardId: ShardId("ShardDO_00"), schemaEpoch: 1, domainSchemaEpoch: 1 },
+                route: {
+                    shardId: ShardId("ShardDO_00"),
+                    schemaEpoch: 1,
+                    recoveryGeneration: 0,
+                    domainSchemaEpoch: 1,
+                },
             })
         ).rejects.toThrow("CDB_FORBIDDEN: organization was permanently deleted");
         await expect(

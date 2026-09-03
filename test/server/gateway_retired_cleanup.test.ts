@@ -60,6 +60,7 @@ function registration(
     overrides: Partial<GatewayRegistrationInstall> = {}
 ): GatewayRegistrationInstall {
     return {
+        recoveryGeneration: 0,
         registrationId,
         principalId: PrincipalId("principal-1"),
         clientId: ClientId("client-1"),
@@ -130,11 +131,21 @@ describe("Gateway retired-generation cleanup", () => {
         sockets = [];
         waitUntilTasks = [];
         const cdb = {
-            async unsubscribe(subscription: LiveSubscriptionId): Promise<unknown> {
+            async unsubscribe(
+                request:
+                    | LiveSubscriptionId
+                    | { readonly subscription: LiveSubscriptionId; readonly recoveryGeneration: number }
+            ): Promise<unknown> {
+                const subscription = "subscription" in request ? request.subscription : request;
                 unsubscribeCalls.push(subscription);
                 return await unsubscribeBehavior(subscription);
             },
-            async finalizeUnsubscribe(subscription: LiveSubscriptionId): Promise<unknown> {
+            async finalizeUnsubscribe(
+                request:
+                    | LiveSubscriptionId
+                    | { readonly subscription: LiveSubscriptionId; readonly recoveryGeneration: number }
+            ): Promise<unknown> {
+                const subscription = "subscription" in request ? request.subscription : request;
                 finalizeCalls.push(subscription);
                 return await finalizeBehavior(subscription);
             },

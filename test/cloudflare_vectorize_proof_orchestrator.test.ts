@@ -48,6 +48,10 @@ const LIVE_CREATE_ID = `p1_${WIRE_DIGEST}_3`;
 const LIVE_REPLACEMENT_ID = `p1_${WIRE_DIGEST}_4`;
 const REMOTE_WIRE_DIGEST = Buffer.from("b".repeat(64), "hex").toString("base64url");
 const REMOTE_PHYSICAL_ID = `p1_${REMOTE_WIRE_DIGEST}_1`;
+const RECOVERY_VECTOR_ID = `vec1_${"c".repeat(64)}`;
+const RECOVERY_WIRE_DIGEST = Buffer.from("c".repeat(64), "hex").toString("base64url");
+const RECOVERY_PHYSICAL_ID = `p1_${RECOVERY_WIRE_DIGEST}_1`;
+const RECOVERY_PHYSICAL_ID_2 = `p1_${RECOVERY_WIRE_DIGEST}_2`;
 const ACCOUNT_VERIFICATION = Object.freeze({
     method: "profile-oauth-token-whoami" as const,
     profile: "default",
@@ -104,6 +108,24 @@ function terminalDeleteState() {
         ],
         acceptances: [],
         fault: null,
+    };
+}
+
+function recoveryEvidence() {
+    return {
+        recoveryPointDigest: "d".repeat(64),
+        vectorId: RECOVERY_VECTOR_ID,
+        physicalIds: [RECOVERY_PHYSICAL_ID, RECOVERY_PHYSICAL_ID_2],
+        authoritativeVersion: 1,
+        providerReset: { files: 0, vectors: 1 },
+        reconciliation: { filesRehydrated: 0, vectorsRequeued: 1 },
+        providerPresence: {
+            atPoint: [true, false],
+            postPoint: [false, true],
+            afterScrub: [false, false],
+            afterRequeue: [true, false],
+        },
+        restoredRow: { id: "recovery-document", body: "Cloudflare Vectorize recovery point document" },
     };
 }
 
@@ -1189,6 +1211,11 @@ describe("Cloudflare Vectorize proof preparation", () => {
                     return { deployment: second, accountVerification: ACCOUNT_VERIFICATION };
                 },
                 lifecycle: {
+                    proveRecovery: async (input: { recordPhysicalIds: (ids: readonly string[]) => Promise<void> }) => {
+                        events.push("recovery");
+                        await input.recordPhysicalIds([RECOVERY_PHYSICAL_ID, RECOVERY_PHYSICAL_ID_2]);
+                        return recoveryEvidence();
+                    },
                     requestJson: async (input: { path: string; headers?: HeadersInit; body?: unknown }) => {
                         events.push("release");
                         expect(input.path).toBe("/proof/vector-fault/release");
@@ -1316,6 +1343,8 @@ describe("Cloudflare Vectorize proof preparation", () => {
                             DEPLOYED_REPLACEMENT_ID,
                             LIVE_CREATE_ID,
                             LIVE_REPLACEMENT_ID,
+                            RECOVERY_PHYSICAL_ID,
+                            RECOVERY_PHYSICAL_ID_2,
                         ],
                         finalVectorCount: 0,
                         workerAbsent: true,
@@ -1337,6 +1366,8 @@ describe("Cloudflare Vectorize proof preparation", () => {
             "redeploy",
             "release",
             "deployed-lifecycle",
+            "recovery",
+            `append:${RECOVERY_PHYSICAL_ID},${RECOVERY_PHYSICAL_ID_2}`,
             "local-remote",
             `append:${REMOTE_PHYSICAL_ID}`,
             "cleanup",
@@ -1360,8 +1391,9 @@ describe("Cloudflare Vectorize proof preparation", () => {
                 attempted: true,
                 workerAbsent: true,
                 indexAbsent: true,
-                knownPhysicalIdCount: 5,
+                knownPhysicalIdCount: 7,
             },
+            recovery: recoveryEvidence(),
         });
         expect((result.evidence.lifecycle as { settlement: Record<string, unknown> }).settlement).toEqual({
             configuredMs: 120_000,
@@ -1815,7 +1847,7 @@ describe("Cloudflare Vectorize proof preparation", () => {
                         }
                     );
                 },
-                lifecycle: {} as never,
+                lifecycle: { proveRecovery: async () => recoveryEvidence() } as never,
                 createController: dependencies => ({
                     run: async () => {
                         await dependencies.recordDeployedLifecycle?.({

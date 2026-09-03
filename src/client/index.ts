@@ -293,7 +293,7 @@ export function createDeferredChardbClientController(
             }
             const validForMs = current.expiresAtMs - Date.now();
             if (validForMs <= 0) {
-                failSession("CDB_FORBIDDEN", "failed to refresh Chardb authentication", "auth-refresh-read");
+                failSession("CDB_FORBIDDEN", "failed to refresh CharDB authentication", "auth-refresh-read");
                 return;
             }
             const delayMs = Math.min(authRefreshReadBackoffMs, validForMs);
@@ -345,7 +345,7 @@ export function createDeferredChardbClientController(
             socket.send(encodeWire(update));
         } catch {
             pendingAuthRefresh = null;
-            failSession("CDB_STREAM_ABORTED", "failed to send refreshed Chardb authentication", "auth-refresh-send");
+            failSession("CDB_STREAM_ABORTED", "failed to send refreshed CharDB authentication", "auth-refresh-send");
         }
     }
 
@@ -439,7 +439,7 @@ export function createDeferredChardbClientController(
                 failSession(error.code, error.message, "connect");
                 return;
             }
-            failSession("CDB_INVARIANT", "failed to establish Chardb client session", "connect");
+            failSession("CDB_INVARIANT", "failed to establish CharDB client session", "connect");
         });
     }
 
@@ -601,8 +601,8 @@ export function createDeferredChardbClientController(
         } catch {
             const message =
                 state === "connecting"
-                    ? "server sent an invalid Chardb handshake message"
-                    : "server sent an invalid Chardb session message";
+                    ? "server sent an invalid CharDB handshake message"
+                    : "server sent an invalid CharDB session message";
             failSession(
                 "CDB_INVARIANT",
                 message,
@@ -618,7 +618,7 @@ export function createDeferredChardbClientController(
                 if (checkProtocolV(msg.protocolV)) {
                     failSession(
                         "CDB_UNSUPPORTED_FEATURE",
-                        "server selected an unsupported Chardb protocol version",
+                        "server selected an unsupported CharDB protocol version",
                         "protocol-selection"
                     );
                     return;
@@ -677,7 +677,7 @@ export function createDeferredChardbClientController(
                 if (state === "connecting" && msg.reason === "protocolMismatch") {
                     failSession(
                         "CDB_UNSUPPORTED_FEATURE",
-                        "server rejected the Chardb protocol version",
+                        "server rejected the CharDB protocol version",
                         "protocol-rejection"
                     );
                     return;
@@ -722,7 +722,7 @@ export function createDeferredChardbClientController(
                     disconnectSocket(attempt, socket);
                     return;
                 }
-                failSession(msg.code, `Chardb session failed: ${msg.code}`, "session-rejection");
+                failSession(msg.code, `CharDB session failed: ${msg.code}`, "session-rejection");
                 return;
         }
         msg satisfies never;
@@ -948,7 +948,7 @@ export function createDeferredChardbClientController(
         if (terminated) {
             throw new CdbError({
                 code: "CDB_STREAM_ABORTED",
-                message: "cannot open a subscription after the Chardb client has closed",
+                message: "cannot open a subscription after the CharDB client has closed",
             });
         }
         const queryRef = ChardbRef(ref);
@@ -1020,7 +1020,7 @@ export function createDeferredChardbClientController(
             return Promise.reject(
                 new CdbError({
                     code: "CDB_STREAM_ABORTED",
-                    message: "cannot issue a mutation after the Chardb client has closed",
+                    message: "cannot issue a mutation after the CharDB client has closed",
                 })
             );
         }
@@ -1084,7 +1084,7 @@ export function createDeferredChardbClientController(
     }
 
     function close(): void {
-        failSession("CDB_STREAM_ABORTED", "Chardb client closed before pending work settled", "client-close", "closed");
+        failSession("CDB_STREAM_ABORTED", "CharDB client closed before pending work settled", "client-close", "closed");
     }
 
     void isCdbError;

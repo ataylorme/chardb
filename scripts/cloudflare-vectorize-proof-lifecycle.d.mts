@@ -321,6 +321,41 @@ export interface CloudflareVectorizeProofLifecycle {
         readonly deleteMutationIdSha256: null;
         readonly matches: readonly { readonly physicalId: string; readonly score: number }[];
     }>;
+    readonly vectorPresence: (
+        input: ProofInput & { readonly organizationId: string; readonly vectorId: string }
+    ) => Promise<{
+        readonly vectorId: string;
+        readonly records: readonly { readonly physicalId: string; readonly present: boolean }[];
+    }>;
+    readonly proveRecovery: (
+        input: ProofInput & {
+            readonly organizationName: string;
+            readonly organizationSlug: string;
+            readonly mutationRunId: string;
+            readonly documentId: string;
+            readonly initialText: string;
+            readonly initialValues: readonly number[];
+            readonly replacementText: string;
+            readonly replacementValues: readonly number[];
+            readonly timeoutMs: number;
+            readonly intervalMs?: number;
+            readonly recordPhysicalIds: (ids: readonly string[]) => Promise<void> | void;
+        }
+    ) => Promise<{
+        readonly recoveryPointDigest: string;
+        readonly vectorId: string;
+        readonly physicalIds: readonly [string, string];
+        readonly authoritativeVersion: 1;
+        readonly providerReset: { readonly files: number; readonly vectors: number };
+        readonly reconciliation: { readonly filesRehydrated: number; readonly vectorsRequeued: number };
+        readonly providerPresence: {
+            readonly atPoint: readonly [true, false];
+            readonly postPoint: readonly [false, true];
+            readonly afterScrub: readonly [false, false];
+            readonly afterRequeue: readonly [true, false];
+        };
+        readonly restoredRow: { readonly id: string; readonly body: string };
+    }>;
     readonly vectorSearchAudit: (
         input: ProofInput & {
             readonly action: "cursor" | "observe";

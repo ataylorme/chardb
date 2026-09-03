@@ -2,7 +2,7 @@
  * Coverage for `mountChardb`'s auth-handler routing.
  *
  * The framework already short-circuits chardb-reserved prefixes
- * (`/ws`, `/_chardb/*`) to the Chardb
+ * (`/ws`, `/_chardb/*`) to the CharDB
  * WorkerEntrypoint, then falls through to the user's `app.fetch` for
  * anything else. The new `options.authHandler` argument lets a
  * better-auth `auth.handler` claim `/api/auth/*` without the user

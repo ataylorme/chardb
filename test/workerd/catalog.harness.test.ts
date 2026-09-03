@@ -31,7 +31,10 @@ beforeAll(async () => {
         name: WORKER_NAME,
         modules: true,
         script: workerSource,
-        durableObjects: { CATALOG: { className: "Catalog", useSQLite: true } },
+        durableObjects: {
+            CATALOG: { className: "Catalog", useSQLite: true },
+            CDB_RESHARD: { className: "Resharder", useSQLite: true },
+        },
         compatibilityDate: "2024-09-23",
         compatibilityFlags: ["nodejs_compat"],
     });

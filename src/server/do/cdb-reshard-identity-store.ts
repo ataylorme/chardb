@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS _chardb_split_identity (
   schema_version  INTEGER NOT NULL CHECK (schema_version >= 0),
   schema_epoch    INTEGER NOT NULL CHECK (schema_epoch > 0),
   schema_digest   TEXT NOT NULL,
+  recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0),
   tables_json     TEXT NOT NULL,
   created_at      INTEGER NOT NULL CHECK (created_at >= 0)
 );
@@ -27,6 +28,7 @@ export interface CdbReshardSchemaIdentity {
     readonly schemaVersion: number;
     readonly schemaEpoch: number;
     readonly schemaDigest: string;
+    readonly recoveryGeneration: number;
 }
 
 export interface CdbReshardSplitIdentity extends CdbReshardSchemaIdentity {
@@ -45,6 +47,7 @@ interface StoredSplitIdentity {
     readonly schema_version: number;
     readonly schema_epoch: number;
     readonly schema_digest: string;
+    readonly recovery_generation: number;
     readonly tables_json: string;
 }
 
@@ -90,6 +93,11 @@ export function initializeCdbReshardIdentityStore(sql: SyncSql): void {
     const columns = sql.all<{ name: string }>("PRAGMA table_info(_chardb_split_identity)");
     if (!columns.some(column => column.name === "schema_epoch")) {
         sql.exec("ALTER TABLE _chardb_split_identity ADD COLUMN schema_epoch INTEGER CHECK (schema_epoch > 0)");
+    }
+    if (!columns.some(column => column.name === "recovery_generation")) {
+        sql.exec(
+            "ALTER TABLE _chardb_split_identity ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0 CHECK (recovery_generation >= 0)"
+        );
     }
 }
 
@@ -249,8 +257,9 @@ export class CdbReshardIdentityStore {
         }
         this.sql.exec(
             `INSERT INTO _chardb_split_identity
-             (mig_id, range_lo, range_hi, role, schema_version, schema_epoch, schema_digest, tables_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (mig_id, range_lo, range_hi, role, schema_version, schema_epoch, schema_digest,
+              recovery_generation, tables_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             requested.migId,
             requested.rangeLo,
             requested.rangeHi,
@@ -258,6 +267,7 @@ export class CdbReshardIdentityStore {
             requested.schemaVersion,
             requested.schemaEpoch,
             requested.schemaDigest,
+            requested.recoveryGeneration,
             canonical.json,
             nowMs
         );
@@ -317,6 +327,7 @@ export class CdbReshardIdentityStore {
             schemaVersion: stored.schema_version,
             schemaEpoch: stored.schema_epoch,
             schemaDigest: stored.schema_digest,
+            recoveryGeneration: stored.recovery_generation,
             tables: parsed,
         };
         assertActiveSchema(identity, args.state, args.journal);
@@ -345,7 +356,8 @@ export class CdbReshardIdentityStore {
 
     private read(migId: string): StoredSplitIdentity | null {
         return this.sql.one<StoredSplitIdentity>(
-            `SELECT mig_id, range_lo, range_hi, role, schema_version, schema_epoch, schema_digest, tables_json
+            `SELECT mig_id, range_lo, range_hi, role, schema_version, schema_epoch, schema_digest,
+                    recovery_generation, tables_json
              FROM _chardb_split_identity WHERE mig_id = ?`,
             migId
         );
@@ -359,6 +371,7 @@ export class CdbReshardIdentityStore {
             stored.schema_version !== requested.schemaVersion ||
             stored.schema_epoch !== requested.schemaEpoch ||
             stored.schema_digest !== requested.schemaDigest ||
+            stored.recovery_generation !== requested.recoveryGeneration ||
             stored.tables_json !== tablesJson
         ) {
             mismatch(`migration ${requested.migId} belongs to a different immutable Cdb split`);

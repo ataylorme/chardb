@@ -7,6 +7,7 @@ import { file } from "../../src/files/index.ts";
 import { CatalogOrganizationDeletionBarrierStore } from "../../src/server/do/catalog-organization-deletion-barrier-store.ts";
 import { CatalogOrganizationDeletionStore } from "../../src/server/do/catalog-organization-deletion-store.ts";
 import { configureCatalogRuntime } from "../../src/server/do/catalog.ts";
+import { Resharder as ProductionResharder } from "../../src/server/do/resharder.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import { defineMigrations, defineSchemaBaseline } from "../../src/server/schema-migrations.ts";
 import { vector } from "../../src/vector.ts";
@@ -220,6 +221,8 @@ export class Catalog extends ConfiguredCatalog {
     }
 }
 
+export class Resharder extends ProductionResharder {}
+
 export class VectorCatalog extends ConfiguredVectorCatalog {
     async fixtureActivate(): Promise<unknown> {
         const migrationId = "organization-deletion-vector-v1";
@@ -291,7 +294,14 @@ export default {
         >;
         if (typeof stub[operation] !== "function") return new Response("not found", { status: 404 });
         try {
-            return Response.json((await stub[operation](body)) ?? { ok: true });
+            const result =
+                operation === "mutateAuth"
+                    ? await (stub[operation] as (input: unknown, recoveryGeneration: number) => Promise<unknown>)(
+                          body,
+                          0
+                      )
+                    : await stub[operation](body);
+            return Response.json(result ?? { ok: true });
         } catch (error) {
             return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
         }

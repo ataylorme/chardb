@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
   organization_id TEXT,
   authority TEXT CHECK (authority IS NULL OR authority IN ('organization', 'user', 'global')),
   schema_epoch INTEGER CHECK (schema_epoch IS NULL OR schema_epoch > 0),
+  recovery_generation INTEGER CHECK (recovery_generation IS NULL OR recovery_generation >= 0),
   vshard INTEGER CHECK (vshard IS NULL OR (vshard >= 0 AND vshard < 16384)),
   domain_schema_epoch INTEGER CHECK (domain_schema_epoch IS NULL OR domain_schema_epoch > 0),
   ref TEXT,
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
       AND principal_id IS NULL
       AND organization_id IS NULL
       AND schema_epoch IS NULL
+      AND recovery_generation IS NULL
       AND vshard IS NULL
       AND domain_schema_epoch IS NULL
       AND ref IS NULL
@@ -54,6 +56,7 @@ CREATE TABLE IF NOT EXISTS _chardb_live_subscriptions (
       AND principal_id IS NOT NULL
       AND organization_id IS NOT NULL
       AND schema_epoch IS NOT NULL
+      AND recovery_generation IS NOT NULL
       AND vshard IS NOT NULL
       AND domain_schema_epoch IS NOT NULL
       AND ref IS NOT NULL
@@ -122,6 +125,7 @@ export interface StoredSubscriptionRow {
     readonly organization_id: string | null;
     readonly authority: string | null;
     readonly schema_epoch: number | null;
+    readonly recovery_generation: number | null;
     readonly vshard: number | null;
     readonly domain_schema_epoch: number | null;
     readonly ref: string | null;
@@ -218,6 +222,7 @@ function subscriptionPayloadHash(args: CdbSubscriptionRequest, policyDigest: str
         organizationId: args.organizationId,
         ...(args.placement === undefined ? {} : { placement: args.placement }),
         schemaEpoch: args.schemaEpoch,
+        recoveryGeneration: args.recoveryGeneration,
         vshard: args.vshard,
         domainSchemaEpoch: args.domainSchemaEpoch,
         ref: args.ref,
@@ -257,6 +262,7 @@ export function initializeLiveStore(sql: SyncSql): void {
     const subscriptionColumns = new Set(
         sql.all<{ name: string }>("PRAGMA table_info(_chardb_live_subscriptions)").map(column => column.name)
     );
+    const needsRecoveryGenerationBackfill = !subscriptionColumns.has("recovery_generation");
     if (!subscriptionColumns.has("organization_id")) {
         sql.exec("ALTER TABLE _chardb_live_subscriptions ADD COLUMN organization_id TEXT");
     }
@@ -281,11 +287,17 @@ export function initializeLiveStore(sql: SyncSql): void {
             "ALTER TABLE _chardb_live_subscriptions ADD COLUMN schema_epoch INTEGER CHECK (schema_epoch IS NULL OR schema_epoch > 0)"
         );
     }
+    if (!subscriptionColumns.has("recovery_generation")) {
+        sql.exec(
+            "ALTER TABLE _chardb_live_subscriptions ADD COLUMN recovery_generation INTEGER CHECK (recovery_generation IS NULL OR recovery_generation >= 0)"
+        );
+    }
     if (!subscriptionColumns.has("vshard")) {
         sql.exec(
             "ALTER TABLE _chardb_live_subscriptions ADD COLUMN vshard INTEGER CHECK (vshard IS NULL OR (vshard >= 0 AND vshard < 16384))"
         );
     }
+    if (needsRecoveryGenerationBackfill) backfillLegacyRecoveryGeneration(sql);
 
     const outboxColumns = new Set(
         sql.all<{ name: string }>("PRAGMA table_info(_chardb_invalidation_outbox)").map(column => column.name)
@@ -310,6 +322,7 @@ export function retireLegacyLiveSubscriptions(sql: SyncSql): void {
              organization_id = NULL,
              authority = NULL,
              schema_epoch = NULL,
+             recovery_generation = NULL,
              vshard = NULL,
              domain_schema_epoch = NULL,
              ref = NULL,
@@ -320,7 +333,8 @@ export function retireLegacyLiveSubscriptions(sql: SyncSql): void {
              intervals_json = NULL
          WHERE state = 'active'
            AND (organization_id IS NULL OR query_hash IS NULL OR policy_digest IS NULL
-                OR schema_epoch IS NULL OR vshard IS NULL OR domain_schema_epoch IS NULL)`
+                OR schema_epoch IS NULL OR recovery_generation IS NULL
+                OR vshard IS NULL OR domain_schema_epoch IS NULL)`
     );
     sql.exec(
         `DELETE FROM _chardb_live_subscription_tables
@@ -386,13 +400,14 @@ export function assertSubscriptionTables(
     }
 }
 
-export function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionRequest {
+function projectStoredSubscription(row: StoredSubscriptionRow, verifyPayloadHash: boolean): CdbSubscriptionRequest {
     if (
         row.state !== "active" ||
         row.payload_hash === null ||
         row.principal_id === null ||
         row.organization_id === null ||
         row.schema_epoch === null ||
+        row.recovery_generation === null ||
         row.vshard === null ||
         row.domain_schema_epoch === null ||
         row.ref === null ||
@@ -424,6 +439,9 @@ export function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscrip
     if (!Number.isSafeInteger(row.schema_epoch) || row.schema_epoch < 1) {
         throw subscriptionInvariant("active live subscription routing generation is invalid");
     }
+    if (!Number.isSafeInteger(row.recovery_generation) || row.recovery_generation < 0) {
+        throw subscriptionInvariant("active live subscription recovery generation is invalid");
+    }
     if (!Number.isSafeInteger(row.vshard) || row.vshard < 0 || row.vshard >= 16_384) {
         throw subscriptionInvariant("active live subscription vshard is invalid");
     }
@@ -448,6 +466,7 @@ export function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscrip
             ? { placement: { authority: row.authority, partitionKey: row.organization_id } }
             : {}),
         schemaEpoch: row.schema_epoch,
+        recoveryGeneration: row.recovery_generation,
         vshard: row.vshard,
         domainSchemaEpoch: row.domain_schema_epoch,
         ref: ChardbRef(row.ref),
@@ -456,10 +475,41 @@ export function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscrip
         tables,
         intervals: intervals as CdbSubscriptionRequest["intervals"],
     };
-    if (row.payload_hash !== subscriptionPayloadHash(request, row.policy_digest)) {
+    if (verifyPayloadHash && row.payload_hash !== subscriptionPayloadHash(request, row.policy_digest)) {
         throw subscriptionInvariant("active live subscription payload hash does not match its persisted payload");
     }
     return request;
+}
+
+export function parseStoredSubscription(row: StoredSubscriptionRow): CdbSubscriptionRequest {
+    return projectStoredSubscription(row, true);
+}
+
+function backfillLegacyRecoveryGeneration(sql: SyncSql): void {
+    const rows = sql.all<StoredSubscriptionRow>(
+        `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
+                principal_id, organization_id, authority, schema_epoch, recovery_generation, vshard,
+                domain_schema_epoch, ref, args_json, policy_digest, query_hash, tables_json, intervals_json
+         FROM _chardb_live_subscriptions
+         WHERE state = 'active' AND recovery_generation IS NULL`
+    );
+    for (const row of rows) {
+        if (row.policy_digest === null) continue;
+        try {
+            const request = projectStoredSubscription({ ...row, recovery_generation: 0 }, false);
+            sql.exec(
+                `UPDATE _chardb_live_subscriptions
+                 SET recovery_generation = 0, payload_hash = ?
+                 WHERE gateway_id = ? AND registration_id = ?
+                   AND state = 'active' AND recovery_generation IS NULL`,
+                subscriptionPayloadHash(request, row.policy_digest),
+                row.gateway_id,
+                row.registration_id
+            );
+        } catch {
+            // The general legacy retirement pass below removes malformed prior rows.
+        }
+    }
 }
 
 export function parseStoredSubscriptionRouting(row: StoredSubscriptionRow): {
@@ -505,7 +555,7 @@ export function persistLiveSubscription(
     const tableNames = [...new Set(args.tables)].sort();
     const existing = sql.one<StoredSubscriptionRow>(
         `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                principal_id, organization_id, authority, schema_epoch, vshard, domain_schema_epoch,
+                principal_id, organization_id, authority, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
                 ref, args_json, policy_digest, query_hash,
                 tables_json, intervals_json
          FROM _chardb_live_subscriptions
@@ -557,10 +607,10 @@ export function persistLiveSubscription(
         sql.exec(
             `INSERT INTO _chardb_live_subscriptions
              (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-              principal_id, organization_id, authority, schema_epoch, vshard, domain_schema_epoch,
+              principal_id, organization_id, authority, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
               ref, args_json, policy_digest, query_hash,
               tables_json, intervals_json)
-             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             args.subscription.gatewayId,
             args.subscription.registrationId,
             args.subscription.connectionId,
@@ -571,6 +621,7 @@ export function persistLiveSubscription(
             args.organizationId,
             args.placement?.authority ?? null,
             args.schemaEpoch,
+            args.recoveryGeneration,
             args.vshard,
             args.domainSchemaEpoch,
             args.ref,
@@ -693,7 +744,7 @@ export function assertLiveVectorDependencies(sql: SyncSql, resourceIds: readonly
 export function retireLiveSubscription(sql: SyncSql, subscription: LiveSubscriptionId): void {
     const existing = sql.one<StoredSubscriptionRow>(
         `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                principal_id, organization_id, schema_epoch, vshard, domain_schema_epoch,
+                principal_id, organization_id, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
                 ref, args_json, policy_digest, query_hash,
                 tables_json, intervals_json
          FROM _chardb_live_subscriptions
@@ -732,6 +783,7 @@ export function retireLiveSubscription(sql: SyncSql, subscription: LiveSubscript
            organization_id = NULL,
            authority = NULL,
            schema_epoch = NULL,
+           recovery_generation = NULL,
            vshard = NULL,
            domain_schema_epoch = NULL,
            ref = NULL,
@@ -769,7 +821,7 @@ export function retireLiveSubscription(sql: SyncSql, subscription: LiveSubscript
 export function finalizeRetiredLiveSubscription(sql: SyncSql, subscription: LiveSubscriptionId): void {
     const existing = sql.one<StoredSubscriptionRow>(
         `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                principal_id, organization_id, schema_epoch, vshard, domain_schema_epoch,
+                principal_id, organization_id, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
                 ref, args_json, policy_digest, query_hash,
                 tables_json, intervals_json
          FROM _chardb_live_subscriptions
@@ -821,6 +873,58 @@ export function enqueueInvalidations(sql: SyncSql, touchedTables: readonly strin
         throw subscriptionCapacityExceeded("mutation invalidation fanout", CDB_MAX_INVALIDATIONS_PER_MUTATION);
     }
     return enqueueRegistrationInvalidations(sql, registrations, true);
+}
+
+/** Dirty every quiet registration restored from an older recovery generation. */
+export function enqueueRecoveryGenerationInvalidations(sql: SyncSql, recoveryGeneration: number): number {
+    if (!Number.isSafeInteger(recoveryGeneration) || recoveryGeneration < 1) {
+        throw subscriptionInvariant("recovery invalidation generation is invalid");
+    }
+    const registrations = sql
+        .all<{ gateway_id: string; registration_id: string }>(
+            `SELECT gateway_id, registration_id
+             FROM _chardb_live_subscriptions
+             WHERE state = 'active' AND recovery_generation < ?
+             ORDER BY gateway_id, registration_id
+             LIMIT ?`,
+            recoveryGeneration,
+            CDB_MAX_ACTIVE_LIVE_REGISTRATIONS + 1
+        )
+        .map(row => ({ gatewayId: row.gateway_id, registrationId: row.registration_id }));
+    if (registrations.length > CDB_MAX_ACTIVE_LIVE_REGISTRATIONS) {
+        throw subscriptionInvariant("active live registration count exceeds its fixed cap");
+    }
+    return enqueueRegistrationInvalidations(sql, registrations);
+}
+
+/** Promote one freshly reauthorized registration after its post-recovery refetch succeeds. */
+export function promoteLiveSubscriptionRecoveryGeneration(
+    sql: SyncSql,
+    row: StoredSubscriptionRow,
+    recoveryGeneration: number
+): void {
+    if (row.recovery_generation === null || row.policy_digest === null) {
+        throw subscriptionInvariant("active live subscription recovery identity is missing");
+    }
+    if (row.recovery_generation > recoveryGeneration) {
+        throw new CdbError({ code: "CDB_STALE_EPOCH", message: "registered query recovery generation regressed" });
+    }
+    if (row.recovery_generation === recoveryGeneration) return;
+    const request = parseStoredSubscription(row);
+    const promoted = { ...request, recoveryGeneration };
+    sql.exec(
+        `UPDATE _chardb_live_subscriptions
+         SET recovery_generation = ?, payload_hash = ?
+         WHERE gateway_id = ? AND registration_id = ? AND state = 'active'
+           AND recovery_generation = ? AND payload_hash = ?`,
+        recoveryGeneration,
+        subscriptionPayloadHash(promoted, row.policy_digest),
+        row.gateway_id,
+        row.registration_id,
+        row.recovery_generation,
+        row.payload_hash
+    );
+    if (sql.changes() !== 1) throw subscriptionInvariant("registered query changed before recovery promotion");
 }
 
 /** Dirty only active registrations bound to one canonical vector resource. */

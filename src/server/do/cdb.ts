@@ -29,6 +29,7 @@ import { collectCdbTables } from "../cdb-table-registry.ts";
 import { resolveCdbMeta } from "../cdb-table.ts";
 import { initializeExternalReshardCapture, withExternalReshardCapture } from "../external-reshard-capture.ts";
 import { renderFileReshardTriggers } from "../file-reshard-triggers.ts";
+import { refreshRecoverableFile, rehydrateRecoverableFile } from "../file-retention.ts";
 import { renderFileAttachmentTriggerSet } from "../file-triggers.ts";
 import { sourceChardbEnv, withChardbLoopbacks } from "../loopback.ts";
 import { type ChardbManifest, type QueryRouteResponse, emptyManifest, routeValidatedQuery } from "../manifest.ts";
@@ -103,6 +104,7 @@ import {
     assertLiveVectorDependencies,
     assertLiveVectorSubscriptionDependency,
     assertSubscriptionTables,
+    enqueueRecoveryGenerationInvalidations,
     enqueueSchemaMigrationInvalidations,
     enqueueVectorResourceInvalidations,
     finalizeRetiredLiveSubscription,
@@ -111,6 +113,7 @@ import {
     parseStoredSubscriptionRouting,
     persistLiveSubscription,
     persistLiveSubscriptionWithVectorDependency,
+    promoteLiveSubscriptionRecoveryGeneration,
     dueInvalidations as readDueInvalidations,
     nextInvalidationAlarmAt as readNextInvalidationAlarmAt,
     recordInvalidationFailures,
@@ -133,6 +136,7 @@ import {
     uninstallCdbVectorOrganizationDeletionGuards,
 } from "./cdb-vector-organization-deletion-store.ts";
 import { CdbVectorOutboxStore, initializeCdbVectorOutboxStore } from "./cdb-vector-outbox-store.ts";
+import { scrubCdbVectorRecoveryPage } from "./cdb-vector-recovery-scrub.ts";
 import {
     type CdbVectorReshardDestRequest,
     CdbVectorReshardDestStore,
@@ -176,6 +180,7 @@ import {
     CDB_ROUTING_FENCE_STORE_DDL,
     type CdbRoutingFence,
     type CdbRoutingFenceIdentity,
+    initializeCdbRoutingFenceStore,
 } from "./cdb-routing-fence-store.ts";
 import {
     CDB_SCHEMA_MIGRATION_STORE_DDL,
@@ -194,16 +199,21 @@ import {
     type SplitOpLogBatch,
     initializeSplitOpLogAccounting,
 } from "./cdb-split-oplog-store.ts";
+import { RecoveryAdmissionStore } from "./recovery-admission.ts";
+import type { RecoveryAdmissionClock } from "./recovery-coordinator.ts";
 import {
     DurableObjectRecovery,
     abortForArmedRecoveryRestore,
     assertRecoveryAvailable,
+    assertRecoveryAvailableFor,
     initializeRecoveryStorage,
+    readArmedRecoveryRestore,
 } from "./recovery.ts";
 import { adaptSqlStorage } from "./sql_adapter.ts";
 
 export interface CdbEnv {
     readonly CDB_GATEWAY?: DurableObjectNamespace;
+    readonly CDB_RESHARD?: DurableObjectNamespace;
     readonly CDB_FILES?: R2Bucket;
 }
 
@@ -377,7 +387,8 @@ export class Cdb extends DurableObject<CdbEnv> {
             storage: this.ctx.storage,
             resources: () => this.vectorResources(),
             resolveIndex: binding => this.resolveVectorIndex(binding),
-            assertDeliveryAdmission: (claim, sql) => {
+            assertDeliveryAdmission: (claim, sql, recoveryBookmark) => {
+                assertRecoveryAvailableFor(sql, recoveryBookmark);
                 const schema = this.schemaMigrations.state(sql);
                 if (schema.status !== "active") {
                     throw new CdbError({
@@ -992,7 +1003,9 @@ export class Cdb extends DurableObject<CdbEnv> {
         initializeLiveStore(sql);
         initializeCdbAuthInvalidationStore(sql);
         initializeRecoveryStorage(sql);
+        await this.reconcileRecoveryAdmission();
         initializeCdbReshardIdentityStore(sql);
+        initializeCdbRoutingFenceStore(sql);
         const hasFileResources = this.hasFileResources();
         const hasVectorResources = this.vectorResources().length > 0;
         if (hasFileResources || hasVectorResources) {
@@ -1074,7 +1087,7 @@ export class Cdb extends DurableObject<CdbEnv> {
         assertLiveVectorDependencies(sql, activeVectorResources.map(cdbVectorResourceId));
         const cursor = this.ctx.storage.sql.exec<StoredSubscriptionRow>(
             `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                    principal_id, organization_id, authority, schema_epoch, vshard, domain_schema_epoch,
+                    principal_id, organization_id, authority, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
                     ref, args_json, policy_digest, query_hash,
                     tables_json, intervals_json
              FROM _chardb_live_subscriptions
@@ -1244,7 +1257,25 @@ export class Cdb extends DurableObject<CdbEnv> {
         expectedEpoch: number,
         sql = adaptSqlStorage(this.ctx.storage.sql)
     ): CdbSchemaState {
+        assertRecoveryAvailable(sql);
         return this.schemaMigrations.assertActiveEpoch(expectedEpoch, () => this.migrationJournal(), sql);
+    }
+
+    private assertRecoveryGeneration(expectedGeneration: number, sql = adaptSqlStorage(this.ctx.storage.sql)): void {
+        new RecoveryAdmissionStore(sql).assertRequest(expectedGeneration);
+    }
+
+    private async reconcileRecoveryAdmission(): Promise<void> {
+        if (!this.env.CDB_RESHARD) {
+            throw new CdbError({ code: "CDB_SHARD_UNAVAILABLE", message: "CDB_RESHARD binding is unavailable" });
+        }
+        const coordinator = this.env.CDB_RESHARD.get(this.env.CDB_RESHARD.idFromName("global")) as unknown as {
+            adminRecoveryAdmissionClock(): Promise<RecoveryAdmissionClock>;
+        };
+        const clock = await coordinator.adminRecoveryAdmissionClock();
+        this.ctx.storage.transactionSync(() => {
+            new RecoveryAdmissionStore(adaptSqlStorage(this.ctx.storage.sql)).reconcile(clock);
+        });
     }
 
     private assertRoutingEpoch(schemaEpoch: number, placement: CdbPlacement): void {
@@ -1256,6 +1287,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     baselineSchemaMigration(args: CdbSchemaBaselineRequest): CdbSchemaState {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         this.resharding.assertNoActiveReshard();
         const journal = this.migrationJournal();
         const resources = this.vectorResourcesAt(journal, args.targetVersion);
@@ -1272,6 +1304,14 @@ export class Cdb extends DurableObject<CdbEnv> {
 
     /** Provision a never-used destination at the exact schema held by a topology lease. */
     provisionFreshReshardDestination(args: CdbFreshSchemaProvisionRequest): CdbSchemaState {
+        this.ctx.storage.transactionSync(() => {
+            new RecoveryAdmissionStore(adaptSqlStorage(this.ctx.storage.sql)).reconcile({
+                generation: args.recoveryGeneration,
+                activeOperationId: null,
+                activeDigest: null,
+            });
+        });
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         const splitMigId = args.migrationId.startsWith("reshard-dest:")
             ? args.migrationId.slice("reshard-dest:".length)
             : null;
@@ -1307,12 +1347,14 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     prepareSchemaMigration(args: CdbSchemaMigrationPrepareRequest): CdbSchemaState {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         this.resharding.assertNoActiveReshard();
         const journal = this.migrationJournal();
         return this.schemaMigrations.prepare(args, journal);
     }
 
     applySchemaMigration(args: CdbSchemaMigrationApplyRequest): CdbSchemaState {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         this.resharding.assertNoActiveReshard();
         const journal = this.migrationJournal();
         const previousResources = this.vectorResourcesAt(journal, args.version - 1);
@@ -1328,6 +1370,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     async activateSchemaMigration(args: CdbSchemaMigrationActivateRequest): Promise<CdbSchemaState> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         this.resharding.assertNoActiveReshard();
         const state = this.schemaMigrations.activate(
             args,
@@ -1346,19 +1389,23 @@ export class Cdb extends DurableObject<CdbEnv> {
 
     /** Prepare one immutable source-side routing range fence. */
     prepareRoutingFence(args: CdbRoutingFenceIdentity): CdbRoutingFence {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.prepareRoutingFence(args);
     }
 
     /** Stop this source and wake every live registration stranded in the moved range. */
     async activateRoutingFence(args: CdbRoutingFenceIdentity): Promise<CdbRoutingFence> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.activateRoutingFence(args);
     }
 
     /** Project one Catalog auth epoch into the existing live-query invalidation outbox. */
     async invalidateAuthScope(args: CdbAuthInvalidationRequest): Promise<CdbAuthInvalidationResult> {
-        const result = this.ctx.storage.transactionSync(() =>
-            new CdbAuthInvalidationStore(adaptSqlStorage(this.ctx.storage.sql)).apply(args, this.invalidationNowMs())
-        );
+        const result = this.ctx.storage.transactionSync(() => {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertRecoveryGeneration(args.recoveryGeneration, sql);
+            return new CdbAuthInvalidationStore(sql).apply(args, this.invalidationNowMs());
+        });
         const nextAttemptAt = readNextInvalidationAlarmAt(adaptSqlStorage(this.ctx.storage.sql));
         if (nextAttemptAt !== null) {
             await this.scheduleAlarmNoLaterThan(Math.max(this.invalidationNowMs() + 1, nextAttemptAt));
@@ -1368,10 +1415,12 @@ export class Cdb extends DurableObject<CdbEnv> {
 
     /** Mark source data cleanup complete without reopening the fenced range. */
     completeRoutingFenceCleanup(args: CdbRoutingFenceIdentity): CdbRoutingFence {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.completeRoutingFenceCleanup(args);
     }
 
     cancelRoutingFenceBeforeCutover(args: CdbRoutingFenceIdentity): CdbRoutingFence | null {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.cancelRoutingFenceBeforeCutover(args);
     }
 
@@ -1551,6 +1600,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     /** Private same-Worker RPC used by the organization file upload dispatcher. */
     async reserveFile(input: CdbFileReserveRequest & { readonly schemaEpoch: number }): Promise<StoredFile> {
         try {
+            this.assertRecoveryGeneration(input.recoveryGeneration);
             this.resharding.assertRoutingAdmission(input.schemaEpoch, Number(vshardOf([input.organizationId])));
             const reserved = this.files.reserve(input);
             await this.scheduleAlarmNoLaterThan(input.nowMs + CDB_FILE_PENDING_TTL_MS);
@@ -1566,6 +1616,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     ): Promise<readonly CdbValidatedVectorMatch[]> {
         try {
             const vshard = Number(vshardOf([input.organizationId]));
+            this.assertRecoveryGeneration(input.route.recoveryGeneration);
             this.assertActiveSchemaEpoch(input.route.domainSchemaEpoch);
             this.resharding.assertRoutingAdmission(input.route.schemaEpoch, vshard);
             this.assertOrganizationActive(input.organizationId, adaptSqlStorage(this.ctx.storage.sql));
@@ -1578,6 +1629,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 matches: input.matches,
                 limit: input.limit,
             });
+            this.assertRecoveryGeneration(input.route.recoveryGeneration);
             this.assertActiveSchemaEpoch(input.route.domainSchemaEpoch);
             this.resharding.assertRoutingAdmission(input.route.schemaEpoch, vshard);
             this.assertOrganizationActive(input.organizationId, adaptSqlStorage(this.ctx.storage.sql));
@@ -1596,6 +1648,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     /** Private same-Worker RPC after R2 has accepted and hashed the immutable object. */
     markFileReady(input: CdbFileReadyRequest & { readonly schemaEpoch: number }): StoredFile {
         try {
+            this.assertRecoveryGeneration(input.recoveryGeneration);
             this.resharding.assertRoutingAdmission(input.schemaEpoch, Number(vshardOf([input.organizationId])));
             return this.files.markReady(input);
         } catch (error) {
@@ -1608,13 +1661,16 @@ export class Cdb extends DurableObject<CdbEnv> {
         input: CdbFileDownloadRequest & { readonly schemaEpoch: number }
     ): Promise<StoredFile | null> {
         try {
+            this.assertRecoveryGeneration(input.recoveryGeneration);
             this.resharding.assertRoutingAdmission(input.schemaEpoch, Number(vshardOf([input.organizationId])));
-            return await resolveCdbFileDownload({
+            const file = await resolveCdbFileDownload({
                 storage: this.ctx.storage,
                 schema: this.mutationSchema(),
                 files: this.files,
                 request: input,
             });
+            assertRecoveryAvailable(adaptSqlStorage(this.ctx.storage.sql));
+            return file;
         } catch (error) {
             throwCdbRpcError(error);
         }
@@ -1626,6 +1682,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     ): Promise<CdbOrganizationFileDeletionResult> {
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertRecoveryGeneration(input.recoveryGeneration, sql);
             this.assertActiveSchemaEpoch(input.domainSchemaEpoch, sql);
             this.assertFileOwnership(input.organizationId, sql);
             withExternalReshardCapture(sql, Number(vshardOf([input.organizationId])), () => {
@@ -1643,11 +1700,14 @@ export class Cdb extends DurableObject<CdbEnv> {
     vectorOrganizationPurgeStatus(input: {
         readonly organizationId: string;
         readonly schemaEpoch: number;
+        readonly recoveryGeneration: number;
         readonly domainSchemaEpoch: number;
     }) {
         try {
             const vshard = Number(vshardOf([input.organizationId]));
             const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertRecoveryGeneration(input.recoveryGeneration, sql);
+            assertRecoveryAvailable(sql);
             this.assertActiveSchemaEpoch(input.domainSchemaEpoch, sql);
             this.resharding.assertRoutingAdmission(input.schemaEpoch, vshard, sql);
             this.assertFileOwnership(input.organizationId, sql);
@@ -1736,6 +1796,7 @@ export class Cdb extends DurableObject<CdbEnv> {
         let response: CdbSubscriptionResponse | undefined;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertRecoveryGeneration(args.recoveryGeneration, sql);
             this.assertActiveSchemaEpoch(args.domainSchemaEpoch, sql);
             const existing = sql.one<{ present: number }>(
                 `SELECT 1 AS present FROM _chardb_live_subscriptions
@@ -1766,18 +1827,30 @@ export class Cdb extends DurableObject<CdbEnv> {
         return response;
     }
 
-    async unsubscribe(subscription: LiveSubscriptionId): Promise<void> {
+    async unsubscribe(request: {
+        readonly subscription: LiveSubscriptionId;
+        readonly recoveryGeneration: number;
+    }): Promise<void> {
+        const { subscription, recoveryGeneration } = request;
         assertLiveSubscriptionIdentity(subscription);
         this.ctx.storage.transactionSync(() => {
-            retireLiveSubscription(adaptSqlStorage(this.ctx.storage.sql), subscription);
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertRecoveryGeneration(recoveryGeneration, sql);
+            retireLiveSubscription(sql, subscription);
         });
     }
 
     /** Delete one exact tombstone after Gateway has finished every pending install and cleanup retry for it. */
-    async finalizeUnsubscribe(subscription: LiveSubscriptionId): Promise<void> {
+    async finalizeUnsubscribe(request: {
+        readonly subscription: LiveSubscriptionId;
+        readonly recoveryGeneration: number;
+    }): Promise<void> {
+        const { subscription, recoveryGeneration } = request;
         assertLiveSubscriptionIdentity(subscription);
         this.ctx.storage.transactionSync(() => {
-            finalizeRetiredLiveSubscription(adaptSqlStorage(this.ctx.storage.sql), subscription);
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertRecoveryGeneration(recoveryGeneration, sql);
+            finalizeRetiredLiveSubscription(sql, subscription);
         });
     }
 
@@ -1795,6 +1868,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 invalidationNowMs: () => this.invalidationNowMs(),
                 assertActiveSchemaEpoch: (expectedEpoch, sql) => {
                     this.assertActiveSchemaEpoch(expectedEpoch, sql);
+                    this.assertRecoveryGeneration(input.recoveryGeneration, sql);
                 },
                 assertRoutingFence: (schemaEpoch, placement, sql) => {
                     if (!placement) {
@@ -1849,7 +1923,8 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     override async alarm(): Promise<void> {
-        abortForArmedRecoveryRestore(this.ctx, adaptSqlStorage(this.ctx.storage.sql));
+        if (abortForArmedRecoveryRestore(this.ctx, adaptSqlStorage(this.ctx.storage.sql))) return;
+        if (new RecoveryAdmissionStore(adaptSqlStorage(this.ctx.storage.sql)).blocksBackgroundWork()) return;
         await this.maintainAlarmWork({ deliverVectors: true });
     }
 
@@ -1864,9 +1939,32 @@ export class Cdb extends DurableObject<CdbEnv> {
         }
     }
 
-    async adminArmRecoveryRestore(args: { readonly bookmark: string; readonly armedAt: number }) {
+    async adminArmRecoveryRestore(args: {
+        readonly bookmark: string;
+        readonly armedAt: number;
+        readonly operationId: string;
+        readonly generation: number;
+    }) {
         try {
-            return await this.recovery.arm(args.bookmark, args.armedAt);
+            return await this.recovery.arm(args.bookmark, args.armedAt, {
+                operationId: args.operationId,
+                generation: args.generation,
+            });
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    async adminReleaseRecovery(args: { readonly operationId: string; readonly generation: number }) {
+        try {
+            const released = this.recovery.release(args.operationId, args.generation, sql => {
+                enqueueRecoveryGenerationInvalidations(sql, args.generation);
+            });
+            const nextAttemptAt = readNextInvalidationAlarmAt(adaptSqlStorage(this.ctx.storage.sql));
+            if (nextAttemptAt !== null) {
+                await this.scheduleAlarmNoLaterThan(Math.max(this.invalidationNowMs() + 1, nextAttemptAt));
+            }
+            return released;
         } catch (error) {
             throwCdbRpcError(error);
         }
@@ -1888,16 +1986,62 @@ export class Cdb extends DurableObject<CdbEnv> {
         }
     }
 
+    async adminRecoveryRestoreStatus(args: { readonly bookmark: string }) {
+        try {
+            return this.recovery.status(args.bookmark);
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    async adminScrubRecoveryVectors(args: {
+        readonly bookmark: string;
+        readonly afterVectorId: string;
+        readonly afterPhysicalVersion: number;
+        readonly limit: number;
+    }) {
+        try {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const armed = readArmedRecoveryRestore(sql);
+            if (!armed || armed.targetBookmark !== args.bookmark) {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "vector recovery scrub does not match the armed restore",
+                });
+            }
+            const schema = this.schemaMigrations.state(sql);
+            if (schema.status !== "active") {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "vector recovery scrub requires an active schema",
+                });
+            }
+            return await scrubCdbVectorRecoveryPage({
+                sql,
+                resources: this.vectorResources(),
+                resolveIndex: binding => this.resolveVectorIndex(binding),
+                cursor: {
+                    afterVectorId: args.afterVectorId,
+                    afterPhysicalVersion: args.afterPhysicalVersion,
+                },
+                limit: args.limit,
+            });
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
     async adminRequeueRecoveryVectors(args: {
         readonly afterCreatedSeq: number;
         readonly limit: number;
         readonly nowMs: number;
+        readonly bookmark?: string;
     }) {
         try {
             let result: ReturnType<CdbVectorOutboxStore["requeueRecoveryPage"]> | undefined;
             this.ctx.storage.transactionSync(() => {
                 const sql = adaptSqlStorage(this.ctx.storage.sql);
-                assertRecoveryAvailable(sql);
+                assertRecoveryAvailableFor(sql, args.bookmark);
                 const schema = this.schemaMigrations.state(sql);
                 if (schema.status !== "active") {
                     throw new CdbError({
@@ -1924,10 +2068,142 @@ export class Cdb extends DurableObject<CdbEnv> {
         }
     }
 
+    async adminSettleRecoveryVectors(args: { readonly bookmark: string }) {
+        try {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            assertRecoveryAvailableFor(sql, args.bookmark);
+            if (this.vectorResources().length === 0) return { pending: 0, terminal: 0 };
+            await this.vectors.maintain({ recoveryBookmark: args.bookmark });
+            return this.recoveryVectorDeliveryState(sql, "settlement");
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    /** Drain only the vector work that existed before this exact restore fence. */
+    async adminQuiesceRecoveryVectors(args: { readonly bookmark: string }) {
+        try {
+            const before = adaptSqlStorage(this.ctx.storage.sql);
+            assertRecoveryAvailableFor(before, args.bookmark);
+            if (this.vectorResources().length === 0) return { pending: 0, terminal: 0 };
+            await this.vectors.maintain({ recoveryBookmark: args.bookmark });
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            assertRecoveryAvailableFor(sql, args.bookmark);
+            return this.recoveryVectorDeliveryState(sql, "quiescence");
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    private recoveryVectorDeliveryState(sql: SyncSql, phase: "quiescence" | "settlement") {
+        const row = sql.one<{ readonly pending: number | bigint; readonly terminal: number | bigint }>(
+            `SELECT COUNT(*) AS pending,
+                    COALESCE(SUM(CASE WHEN terminal_failure = 1 THEN 1 ELSE 0 END), 0) AS terminal
+             FROM _chardb_vector_outbox`
+        );
+        const pending = Number(row?.pending ?? 0);
+        const terminal = Number(row?.terminal ?? 0);
+        if (
+            !Number.isSafeInteger(pending) ||
+            pending < 0 ||
+            pending > 65_536 ||
+            !Number.isSafeInteger(terminal) ||
+            terminal < 0 ||
+            terminal > pending
+        ) {
+            throw new CdbError({ code: "CDB_INVARIANT", message: `vector recovery ${phase} is invalid` });
+        }
+        return { pending, terminal };
+    }
+
+    async adminRetainRecoveryFiles(args: {
+        readonly bookmark: string;
+        readonly afterFileId: string;
+        readonly limit: number;
+    }) {
+        try {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            const armed = readArmedRecoveryRestore(sql);
+            if (!armed || armed.targetBookmark !== args.bookmark) {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "file recovery retention does not match the armed restore",
+                });
+            }
+            const schema = this.schemaMigrations.state(sql);
+            if (schema.status !== "active") {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "file recovery retention requires an active schema",
+                });
+            }
+            if (!this.hasFileResources()) {
+                return Object.freeze({ processed: 0, afterFileId: args.afterFileId, done: true });
+            }
+            if (!this.env.CDB_FILES) {
+                throw new CdbError({
+                    code: "CDB_SHARD_UNAVAILABLE",
+                    message: "file recovery retention requires CDB_FILES",
+                });
+            }
+            const bucket = this.env.CDB_FILES;
+            const page = new CdbFileStore(sql).retentionPage(args.afterFileId, args.limit);
+            for (let index = 0; index < page.files.length; index += 4) {
+                await Promise.all(page.files.slice(index, index + 4).map(file => refreshRecoverableFile(bucket, file)));
+            }
+            return Object.freeze({
+                processed: page.files.length,
+                afterFileId: page.afterFileId,
+                done: page.done,
+            });
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
+    async adminRehydrateRecoveryFiles(args: {
+        readonly afterFileId: string;
+        readonly limit: number;
+        readonly bookmark?: string;
+    }) {
+        try {
+            const sql = adaptSqlStorage(this.ctx.storage.sql);
+            assertRecoveryAvailableFor(sql, args.bookmark);
+            const schema = this.schemaMigrations.state(sql);
+            if (schema.status !== "active") {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "file recovery requires an active schema",
+                });
+            }
+            if (!this.hasFileResources()) {
+                return Object.freeze({ processed: 0, afterFileId: args.afterFileId, done: true });
+            }
+            if (!this.env.CDB_FILES) {
+                throw new CdbError({ code: "CDB_SHARD_UNAVAILABLE", message: "file recovery requires CDB_FILES" });
+            }
+            const bucket = this.env.CDB_FILES;
+            const page = new CdbFileStore(sql).recoveryPage(args.afterFileId, args.limit);
+            for (let index = 0; index < page.files.length; index += 4) {
+                await Promise.all(
+                    page.files.slice(index, index + 4).map(file => rehydrateRecoverableFile(bucket, file))
+                );
+            }
+            return Object.freeze({
+                processed: page.files.length,
+                afterFileId: page.afterFileId,
+                done: page.done,
+            });
+        } catch (error) {
+            throwCdbRpcError(error);
+        }
+    }
+
     /** Execute a registered shard-local query without exposing it through Gateway yet. */
     async query(input: CdbQueryRequest): Promise<CdbQueryResponse> {
         try {
             const request = { ...input, args: snapshotCdbQueryArgs(input.args) };
+            this.assertRecoveryGeneration(request.recoveryGeneration);
             this.assertActiveSchemaEpoch(request.domainSchemaEpoch);
             if (request.placement) this.assertRoutingEpoch(request.schemaEpoch, request.placement);
             else this.resharding.assertUnplacedRoutingAdmission();
@@ -1957,6 +2233,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 subject: "query result",
                 ref: request.ref,
             });
+            this.assertRecoveryGeneration(request.recoveryGeneration);
             if (request.placement) this.assertRoutingEpoch(request.schemaEpoch, request.placement);
             else this.resharding.assertUnplacedRoutingAdmission();
             if (request.placement?.authority === "organization") {
@@ -1972,6 +2249,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     /** Execute one native binding plan after revalidation against this shard's packaged schema. */
     async executePlan(input: CdbBindingPlanRequest): Promise<CdbQueryResponse> {
         try {
+            this.assertRecoveryGeneration(input.recoveryGeneration);
             this.assertActiveSchemaEpoch(input.domainSchemaEpoch);
             this.assertRoutingEpoch(input.schemaEpoch, input.placement);
             if (input.placement.authority === "organization") {
@@ -1985,6 +2263,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 auth: input.auth,
                 subject: "DB select plan result",
             });
+            this.assertRecoveryGeneration(input.recoveryGeneration);
             this.assertRoutingEpoch(input.schemaEpoch, input.placement);
             if (input.placement.authority === "organization") {
                 this.assertOrganizationActive(input.placement.partitionKey, adaptSqlStorage(this.ctx.storage.sql));
@@ -2000,10 +2279,11 @@ export class Cdb extends DurableObject<CdbEnv> {
     async queryRegistered(request: CdbRegisteredQueryRequest): Promise<CdbQueryResponse> {
         try {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
+            this.assertRecoveryGeneration(request.recoveryGeneration, sql);
             this.assertActiveSchemaEpoch(request.domainSchemaEpoch, sql);
             const row = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, authority, schema_epoch, vshard, domain_schema_epoch,
+                        principal_id, organization_id, authority, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
                         ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
@@ -2020,6 +2300,13 @@ export class Cdb extends DurableObject<CdbEnv> {
                 throw subscriptionInvariant("registered query principal does not match fresh authorization");
             }
             const subscription = parseStoredSubscription(row);
+            const requestedRecoveryGeneration = request.recoveryGeneration;
+            if (subscription.recoveryGeneration > requestedRecoveryGeneration) {
+                throw new CdbError({
+                    code: "CDB_STALE_EPOCH",
+                    message: "registered query belongs to a newer recovery generation",
+                });
+            }
             if (Number(vshardOf([subscription.organizationId])) !== request.vshard) {
                 throw subscriptionInvariant("registered query vshard does not match its persisted partition");
             }
@@ -2094,7 +2381,7 @@ export class Cdb extends DurableObject<CdbEnv> {
 
             const current = sql.one<StoredSubscriptionRow>(
                 `SELECT gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                        principal_id, organization_id, authority, schema_epoch, vshard, domain_schema_epoch,
+                        principal_id, organization_id, authority, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
                         ref, args_json, policy_digest, query_hash,
                         tables_json, intervals_json
                  FROM _chardb_live_subscriptions
@@ -2113,6 +2400,7 @@ export class Cdb extends DurableObject<CdbEnv> {
                 current.policy_digest !== row.policy_digest ||
                 current.query_hash !== row.query_hash ||
                 current.schema_epoch !== row.schema_epoch ||
+                current.recovery_generation !== row.recovery_generation ||
                 current.vshard !== row.vshard ||
                 current.domain_schema_epoch !== row.domain_schema_epoch
             ) {
@@ -2121,9 +2409,11 @@ export class Cdb extends DurableObject<CdbEnv> {
             parseStoredSubscription(current);
             assertSubscriptionTables(sql, request.subscription, [...new Set(subscription.tables)].sort());
             assertLiveVectorSubscriptionDependency(sql, request.subscription, vectorResourceId);
+            this.assertRecoveryGeneration(request.recoveryGeneration, sql);
             this.assertActiveSchemaEpoch(request.domainSchemaEpoch, sql);
             this.resharding.assertRoutingAdmission(request.schemaEpoch, request.vshard, sql);
             if (routed.authority === "organization") this.assertOrganizationActive(reroutedPartition, sql);
+            promoteLiveSubscriptionRecoveryGeneration(sql, current, requestedRecoveryGeneration);
             return { ok: true, result };
         } catch (error) {
             return { ok: false, error: cdbRuntimeError(error).toJSON() };
@@ -2150,6 +2440,7 @@ export class Cdb extends DurableObject<CdbEnv> {
         backfill: { files: number; tombstones: number; done: boolean };
         cursor: { kind: "file" | "organization_tombstone"; afterId: string; done: boolean };
     } {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (!this.hasOrganizationTombstoneResources()) {
             return {
                 enabled: false,
@@ -2188,6 +2479,7 @@ export class Cdb extends DurableObject<CdbEnv> {
         enabled: boolean;
         triggersInstalled: number;
     } {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (!this.hasOrganizationTombstoneResources()) return { enabled: false, triggersInstalled: 0 };
         let triggersInstalled = 0;
         this.ctx.storage.transactionSync(() => {
@@ -2225,6 +2517,7 @@ export class Cdb extends DurableObject<CdbEnv> {
         enabled: boolean;
         triggersUninstalled: number;
     } {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (!this.hasOrganizationTombstoneResources()) return { enabled: false, triggersUninstalled: 0 };
         let triggersUninstalled = 0;
         this.ctx.storage.transactionSync(() => {
@@ -2244,6 +2537,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             readonly limit: number;
         }
     ) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             this.resharding.assertReshardMovement({ migId: args.migId, role: "source", sql });
@@ -2263,6 +2557,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             readonly throughLsn: number;
         }
     ): { applied: number; inserted: number } {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         let result: { applied: number; inserted: number } | undefined;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2284,6 +2579,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             readonly limit: number;
         }
     ) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         const page = this.readReshardFileTombstonesV2(args);
         if (page.rows.some(row => row.vectorUnprovenTurns !== 0)) {
             throw new CdbError({
@@ -2304,6 +2600,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             readonly limit: number;
         }
     ) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             this.resharding.assertReshardMovement({ migId: args.migId, role: "source", sql });
@@ -2323,6 +2620,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             readonly throughLsn: number;
         }
     ): { applied: number; inserted: number } {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         const rows = args.rows.map(row => {
             const vectorUnprovenTurns = (row as Partial<CdbReshardOrganizationTombstone>).vectorUnprovenTurns;
             if (vectorUnprovenTurns !== undefined && vectorUnprovenTurns !== 0) {
@@ -2342,6 +2640,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             readonly throughLsn: number;
         }
     ): { applied: number; inserted: number } {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         let result: { applied: number; inserted: number } | undefined;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2357,6 +2656,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     fenceReshardFileSource(args: Omit<CdbReshardSplitIdentity, "role">): { fenced: boolean } {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
             this.resharding.assertReshardMovement({ migId: args.migId, role: "source", sql });
@@ -2371,6 +2671,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             readonly limit: number;
         }
     ) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         this.resharding.assertReshardMovement({ migId: args.migId, role: "dest" });
         return new CdbFileReshardStore(adaptSqlStorage(this.ctx.storage.sql)).validate(
             this.fileReshardIdentity(args),
@@ -2380,6 +2681,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     reshardFileAppliedProvenance(args: Omit<CdbReshardSplitIdentity, "role">): { rows: number; legacyRows: number } {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         this.resharding.assertReshardMovement({ migId: args.migId, role: "dest" });
         return new CdbFileReshardStore(adaptSqlStorage(this.ctx.storage.sql)).appliedProvenance(
             this.fileReshardIdentity(args)
@@ -2393,6 +2695,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             readonly limit: number;
         }
     ): CdbFileReshardParityPage {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         this.resharding.assertReshardMovement({ migId: args.migId, role: args.role });
         return new CdbFileReshardStore(adaptSqlStorage(this.ctx.storage.sql)).readParityPage(
             this.fileReshardIdentity(args),
@@ -2406,6 +2709,7 @@ export class Cdb extends DurableObject<CdbEnv> {
         prepared: boolean;
         triggersInstalled: number;
     } {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         let prepared = false;
         let triggersInstalled = 0;
         this.ctx.storage.transactionSync(() => {
@@ -2421,6 +2725,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     activateReshardFileDest(args: Omit<CdbReshardSplitIdentity, "role">): { activated: boolean } {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         let activated = false;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2434,6 +2739,7 @@ export class Cdb extends DurableObject<CdbEnv> {
         stopped: boolean;
         triggersUninstalled: number;
     } {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         let stopped = false;
         let triggersUninstalled = 0;
         this.ctx.storage.transactionSync(() => {
@@ -2460,6 +2766,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             readonly limit: number;
         }
     ) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         let result: ReturnType<CdbFileReshardStore["drain"]> | undefined;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2478,6 +2785,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             readonly limit?: number;
         }
     ) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         let result: {
             afterKind: "" | "file" | "organization_tombstone";
             afterId: string;
@@ -2513,6 +2821,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     finishReshardFiles(
         args: Omit<CdbReshardSplitIdentity, "role"> & { readonly role: "source" | "dest"; readonly limit?: number }
     ) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         let result: { cleaned: number; done: boolean } | undefined;
         this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2528,6 +2837,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     beginReshardVectorSource(args: Omit<CdbReshardSplitIdentity, "role">) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) {
             return { enabled: false as const, triggersInstalled: 0, snapshot: null };
         }
@@ -2553,6 +2863,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     inspectReshardVectorSnapshot(args: Omit<CdbReshardSplitIdentity, "role">) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) return { enabled: false as const, snapshot: null };
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2565,6 +2876,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     readReshardVectorSnapshot(args: Omit<CdbReshardSplitIdentity, "role"> & CdbVectorReshardSnapshotRequest) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) return { enabled: false as const, page: null };
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2578,6 +2890,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     stopReshardVectorSource(args: Omit<CdbReshardSplitIdentity, "role">) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) {
             return { enabled: false as const, stopped: false, triggersUninstalled: 0 };
         }
@@ -2614,6 +2927,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     beginReshardVectorDest(args: Omit<CdbReshardSplitIdentity, "role"> & { readonly throughHeadSeq: number }) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) return { enabled: false as const, cursor: null };
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2629,6 +2943,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     applyReshardVectorSnapshot(args: Omit<CdbReshardSplitIdentity, "role"> & CdbVectorReshardDestRequest) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) return { enabled: false as const, result: null };
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2640,6 +2955,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     readReshardVectorParityPage(
         args: Omit<CdbReshardSplitIdentity, "role"> & { readonly cursor: CdbVectorReshardCursor }
     ) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) return { enabled: false as const, encodedPage: null, throughLsn: 0 };
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2654,6 +2970,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     verifyReshardVectorParity(args: Omit<CdbReshardSplitIdentity, "role"> & CdbVectorReshardParityRequest) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) return { enabled: false as const, result: null };
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2676,6 +2993,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     finalizeReshardVectorDest(args: Omit<CdbReshardSplitIdentity, "role"> & { readonly throughLsn: number }) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) {
             return { enabled: false as const, finalized: false, triggersInstalled: 0 };
         }
@@ -2714,6 +3032,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     prepareReshardVectorSourceDrain(
         args: Omit<CdbReshardSplitIdentity, "role"> & { readonly cursor: CdbVectorReshardSourcePrepareCursor }
     ) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) return { enabled: false as const, result: null };
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2728,6 +3047,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     drainReshardVectorSource(
         args: Omit<CdbReshardSplitIdentity, "role"> & { readonly cursor: CdbVectorReshardSourceDeleteCursor }
     ) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) return { enabled: false as const, result: null };
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2748,6 +3068,7 @@ export class Cdb extends DurableObject<CdbEnv> {
             readonly limit?: number;
         }
     ) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) return { enabled: false as const, result: null };
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2875,10 +3196,12 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     abortReshardVectors(args: Omit<CdbReshardSplitIdentity, "role">) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.cleanupReshardVectorSource(args, { allowAbsent: true });
     }
 
     finishReshardVectorDest(args: Omit<CdbReshardSplitIdentity, "role">) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (this.vectorResources().length === 0) return { enabled: false as const, cleaned: false, done: true };
         return this.ctx.storage.transactionSync(() => {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2894,6 +3217,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     finishReshardVectors(args: Omit<CdbReshardSplitIdentity, "role">) {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.cleanupReshardVectorSource(args);
     }
 
@@ -2905,7 +3229,9 @@ export class Cdb extends DurableObject<CdbEnv> {
         schemaEpoch: number;
         schemaDigest: string;
         tables: readonly TableSpec[];
+        recoveryGeneration: number;
     }): Promise<{ enabled: boolean; triggersInstalled: number }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         if (!this.hasOrganizationTombstoneResources()) {
             this.ctx.storage.transactionSync(() =>
                 this.resharding.assertNoUnmovableFileState(adaptSqlStorage(this.ctx.storage.sql))
@@ -2915,12 +3241,15 @@ export class Cdb extends DurableObject<CdbEnv> {
     }
 
     /** Persist fail-closed destination ownership before any provisioning can expose the shard. */
-    prepareReshardDestOwnership(args: {
+    async prepareReshardDestOwnership(args: {
         migId: string;
         rangeLo: number;
         rangeHi: number;
         destinationGeneration: number;
-    }): { prepared: boolean; serving: boolean } {
+        recoveryGeneration: number;
+    }): Promise<{ prepared: boolean; serving: boolean }> {
+        await this.reconcileRecoveryAdmission();
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.prepareReshardDestOwnership(args);
     }
 
@@ -2934,7 +3263,9 @@ export class Cdb extends DurableObject<CdbEnv> {
         schemaDigest: string;
         tables: readonly TableSpec[];
         destinationGeneration: number;
+        recoveryGeneration: number;
     }): Promise<{ ready: boolean }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.beginReshardDest(args);
     }
 
@@ -2942,6 +3273,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     async activateReshardDestServing(
         args: Omit<CdbReshardSplitIdentity, "role"> & { destinationGeneration: number }
     ): Promise<{ activated: boolean }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         const result = this.resharding.activateReshardDestServing(args);
         if (this.vectorResources().length > 0) {
             const sql = adaptSqlStorage(this.ctx.storage.sql);
@@ -2962,39 +3294,51 @@ export class Cdb extends DurableObject<CdbEnv> {
     /** Read bounded captured mutation outcomes in source LSN order. */
     async readSplitOpLogBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         afterLsn: number;
         limit: number;
     }): Promise<SplitOpLogBatch> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.readSplitOpLogBatch(args);
     }
 
     /** Prune source mutation outcomes only after the Resharder durably records destination acceptance. */
-    async ackSplitOpLog(args: { migId: string; throughLsn: number }): Promise<SplitOpLogAckResult> {
+    async ackSplitOpLog(args: {
+        migId: string;
+        recoveryGeneration: number;
+        throughLsn: number;
+    }): Promise<SplitOpLogAckResult> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.ackSplitOpLog(args);
     }
 
     /** Reconstruct source mutation outcomes and its durable cursor atomically on the destination. */
     async applySplitOpLogBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         rangeLo: number;
         rangeHi: number;
         entries: SplitOpLogBatch["entries"];
     }): Promise<SplitOpLogApplyResult> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.applySplitOpLogBatch(args);
     }
 
     /** Returns the tail-capture watermark — the latest `_chardb_split_log.lsn` Source has produced. */
-    async tailWatermark(migId: string): Promise<{ lsn: number }> {
-        return this.resharding.tailWatermark(migId);
+    async tailWatermark(args: { migId: string; recoveryGeneration: number }): Promise<{ lsn: number }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
+        return this.resharding.tailWatermark(args.migId);
     }
 
     /** Resolve the deterministic parent-before-child order for bulk copy. */
     async reshardTableOrder(args: {
         migId: string;
+        recoveryGeneration: number;
         role: "source" | "dest";
         range: RangeFilter;
         tables: readonly TableSpec[];
     }): Promise<{ tableNames: readonly string[] }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.reshardTableOrder(args);
     }
 
@@ -3006,11 +3350,13 @@ export class Cdb extends DurableObject<CdbEnv> {
      */
     async bulkCopyBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         table: TableSpec;
         range: RangeFilter;
         afterRowid: number;
         limit: number;
     }): Promise<{ rows: readonly Record<string, RawJson>[]; lastRowid: number; done: boolean }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.bulkCopyBatch(args);
     }
 
@@ -3024,15 +3370,18 @@ export class Cdb extends DurableObject<CdbEnv> {
      */
     async applyBulkBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         table: TableSpec;
         range: RangeFilter;
         rows: readonly Record<string, RawJson>[];
     }): Promise<{ applied: number; skipped: number }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.applyBulkBatch(args);
     }
 
     /** Permanently reject delayed bulk batches once all source snapshots are copied. */
     async closeReshardBulkDest(args: Omit<CdbReshardSplitIdentity, "role">): Promise<{ closed: boolean }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.closeReshardBulkDest(args);
     }
 
@@ -3044,6 +3393,7 @@ export class Cdb extends DurableObject<CdbEnv> {
      */
     async readTailBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         afterLsn: number;
         limit: number;
     }): Promise<{
@@ -3051,33 +3401,52 @@ export class Cdb extends DurableObject<CdbEnv> {
         lastLsn: number;
         done: boolean;
     }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.readTailBatch(args);
     }
 
     /** Prune only tail transactions the Resharder has durably acknowledged. */
-    async ackTail(args: { migId: string; throughLsn: number }): Promise<{ pruned: number; ackedLsn: number }> {
+    async ackTail(args: {
+        migId: string;
+        recoveryGeneration: number;
+        throughLsn: number;
+    }): Promise<{ pruned: number; ackedLsn: number }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.ackTail(args);
     }
 
     /** Durably stage complete source transactions while stale bulk pages may still arrive. */
     async stageTailBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         tables: readonly TableSpec[];
         range: RangeFilter;
         transactions: readonly TailTransaction[];
     }): Promise<{ staged: number; lastLsn: number }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.stageTailBatch(args);
     }
 
-    async readStagedTailBatch(args: { migId: string; limit: number }): Promise<{ transactions: TailTransaction[] }> {
+    async readStagedTailBatch(args: {
+        migId: string;
+        recoveryGeneration: number;
+        limit: number;
+    }): Promise<{ transactions: TailTransaction[] }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.readStagedTailBatch(args);
     }
 
-    async ackStagedTail(args: { migId: string; throughLsn: number }): Promise<{ removed: number }> {
+    async ackStagedTail(args: {
+        migId: string;
+        recoveryGeneration: number;
+        throughLsn: number;
+    }): Promise<{ removed: number }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.ackStagedTail(args);
     }
 
     async closeTailStaging(args: Omit<CdbReshardSplitIdentity, "role">): Promise<{ closed: boolean }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.closeTailStaging(args);
     }
 
@@ -3089,15 +3458,18 @@ export class Cdb extends DurableObject<CdbEnv> {
      */
     async applyTailBatch(args: {
         migId: string;
+        recoveryGeneration: number;
         tables: readonly TableSpec[];
         range: RangeFilter;
         transactions: readonly TailTransaction[];
     }): Promise<{ applied: number; lastLsn: number }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.applyTailBatch(args);
     }
 
     /** Freeze source capture after fenced convergence and before destructive drain. */
     async stopReshardCapture(args: Omit<CdbReshardSplitIdentity, "role">): Promise<{ stopped: boolean }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.stopReshardCapture(args);
     }
 
@@ -3109,10 +3481,12 @@ export class Cdb extends DurableObject<CdbEnv> {
      */
     async dropMigratedRange(args: {
         migId: string;
+        recoveryGeneration: number;
         table: TableSpec;
         range: RangeFilter;
         batchSize: number;
     }): Promise<{ deleted: number; done: boolean }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.dropMigratedRange(args);
     }
 
@@ -3121,11 +3495,13 @@ export class Cdb extends DurableObject<CdbEnv> {
      * drained. After this call the source is clean of all migration artifacts.
      */
     async finishReshardSource(args: Omit<CdbReshardSplitIdentity, "role">): Promise<void> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.finishReshardSource(args);
     }
 
     /** Stop source capture and remove all transient artifacts before a pre-fence abort. */
     async abortReshardSource(args: Omit<CdbReshardSplitIdentity, "role">): Promise<void> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.abortReshardSource(args);
     }
 
@@ -3133,6 +3509,7 @@ export class Cdb extends DurableObject<CdbEnv> {
     async beginReshardDestAbort(
         args: Omit<CdbReshardSplitIdentity, "role"> & { destinationGeneration: number }
     ): Promise<{ started: boolean }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         const result = await this.resharding.beginReshardDestAbort(args);
         if (this.vectorResources().length > 0) {
             this.ctx.storage.transactionSync(() => {
@@ -3153,11 +3530,13 @@ export class Cdb extends DurableObject<CdbEnv> {
     async abortReshardDestBatch(
         args: Omit<CdbReshardSplitIdentity, "role"> & { batchSize: number }
     ): Promise<{ deleted: number; done: boolean }> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.abortReshardDestBatch(args);
     }
 
     /** Mark a successful destination split drained and release transfer-only state. */
     async finishReshardDest(args: Omit<CdbReshardSplitIdentity, "role">): Promise<void> {
+        this.assertRecoveryGeneration(args.recoveryGeneration);
         return this.resharding.finishReshardDest(args);
     }
 }

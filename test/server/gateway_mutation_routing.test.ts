@@ -38,6 +38,7 @@ const request: TrustedMutationDispatchRequest = {
 };
 
 const authority = {
+    recoveryGeneration: 0,
     principalId: PrincipalId("user-1"),
     organizationId: TenantId("org-1"),
     role: "admin,member",
@@ -65,7 +66,12 @@ function workingDeps(): TrustedMutationDispatchDeps {
             },
             async route(vshard) {
                 expect(vshard).toBe(73);
-                return { shardId: ShardId("shard-a"), schemaEpoch: 9, domainSchemaEpoch: 1 };
+                return {
+                    shardId: ShardId("shard-a"),
+                    schemaEpoch: 9,
+                    domainSchemaEpoch: 1,
+                    recoveryGeneration: 0,
+                };
             },
         },
         cdb(shardId) {
@@ -87,6 +93,7 @@ function workingDeps(): TrustedMutationDispatchDeps {
                             claims: { userRole: "admin,user" },
                         },
                         schemaEpoch: 9,
+                        recoveryGeneration: 0,
                         domainSchemaEpoch: 1,
                     });
                     return { ok: true, cookie: "cookie-1", ran: true, result: { id: "post-1" }, rowsAffected: 1 };
@@ -128,6 +135,7 @@ describe("trusted Gateway mutation dispatch", () => {
                                 shardId: ShardId(catalogCalls === 1 ? "source" : "destination"),
                                 schemaEpoch: catalogCalls,
                                 domainSchemaEpoch: 1,
+                                recoveryGeneration: 0,
                             },
                         };
                     },
@@ -225,7 +233,12 @@ describe("trusted Gateway mutation dispatch", () => {
                         });
                         return {
                             authority,
-                            route: { shardId: ShardId("shard-a"), schemaEpoch: 9, domainSchemaEpoch: 1 },
+                            route: {
+                                shardId: ShardId("shard-a"),
+                                schemaEpoch: 9,
+                                domainSchemaEpoch: 1,
+                                recoveryGeneration: 0,
+                            },
                         };
                     },
                 },
@@ -287,6 +300,7 @@ describe("trusted Gateway mutation dispatch", () => {
                 principalId: PrincipalId("user-1"),
                 organizationId: TenantId("org-1"),
                 schemaEpoch: 7,
+                recoveryGeneration: 0,
                 vshard: 19,
                 domainSchemaEpoch: 1,
                 ref: ChardbRef("queries.ts#listMessages"),
@@ -309,6 +323,7 @@ describe("trusted Gateway mutation dispatch", () => {
             principalId: PrincipalId("user-1"),
             organizationId: TenantId("org-1"),
             schemaEpoch: 7,
+            recoveryGeneration: 0,
             vshard: 19,
             domainSchemaEpoch: 1,
             ref: ChardbRef("queries.ts#listMessages"),
@@ -361,8 +376,14 @@ describe("trusted Gateway mutation dispatch", () => {
                     role: "admin,user",
                     roles: ["admin", "user"],
                     authEpochs: { global: 5, tenant: 0, principal: 8 },
+                    recoveryGeneration: 0,
                 }),
-                route: async () => ({ shardId: ShardId("user-shard"), schemaEpoch: 2, domainSchemaEpoch: 3 }),
+                route: async () => ({
+                    shardId: ShardId("user-shard"),
+                    schemaEpoch: 2,
+                    domainSchemaEpoch: 3,
+                    recoveryGeneration: 0,
+                }),
             },
             cdb: () => ({
                 mutate: async input => {
@@ -411,8 +432,14 @@ describe("trusted Gateway mutation dispatch", () => {
                     role: "admin",
                     roles: ["admin"],
                     authEpochs: { global: 9, tenant: 0, principal: 4 },
+                    recoveryGeneration: 0,
                 }),
-                route: async () => ({ shardId: ShardId("global-shard"), schemaEpoch: 3, domainSchemaEpoch: 2 }),
+                route: async () => ({
+                    shardId: ShardId("global-shard"),
+                    schemaEpoch: 3,
+                    domainSchemaEpoch: 2,
+                    recoveryGeneration: 0,
+                }),
             },
             cdb: () => ({
                 mutate: async input => {
@@ -443,6 +470,7 @@ describe("trusted Gateway mutation dispatch", () => {
         expect(
             projectUserMutationAuth(
                 {
+                    recoveryGeneration: 0,
                     principalId: PrincipalId("user-1"),
                     role: "user",
                     roles: ["user"],
@@ -454,6 +482,7 @@ describe("trusted Gateway mutation dispatch", () => {
         expect(
             projectUserMutationAuth(
                 {
+                    recoveryGeneration: 0,
                     principalId: PrincipalId("user-2"),
                     role: "user",
                     roles: ["user"],
@@ -492,7 +521,12 @@ describe("trusted Gateway mutation dispatch", () => {
                 },
                 async route() {
                     routeCalls++;
-                    return { shardId: ShardId("shard-a"), schemaEpoch: 1, domainSchemaEpoch: 1 };
+                    return {
+                        shardId: ShardId("shard-a"),
+                        schemaEpoch: 1,
+                        domainSchemaEpoch: 1,
+                        recoveryGeneration: 0,
+                    };
                 },
             },
             cdb: () => ({
@@ -540,7 +574,12 @@ describe("trusted Gateway mutation dispatch", () => {
                 },
                 async route() {
                     catalogCalls += 1;
-                    return { shardId: ShardId("unused"), schemaEpoch: 1, domainSchemaEpoch: 1 };
+                    return {
+                        shardId: ShardId("unused"),
+                        schemaEpoch: 1,
+                        domainSchemaEpoch: 1,
+                        recoveryGeneration: 0,
+                    };
                 },
             },
             cdb: () => {
@@ -579,7 +618,12 @@ describe("trusted Gateway mutation dispatch", () => {
                 },
                 async route() {
                     catalogCalls += 1;
-                    return { shardId: ShardId("unused"), schemaEpoch: 1, domainSchemaEpoch: 1 };
+                    return {
+                        shardId: ShardId("unused"),
+                        schemaEpoch: 1,
+                        domainSchemaEpoch: 1,
+                        recoveryGeneration: 0,
+                    };
                 },
             },
             cdb: () => {
@@ -613,7 +657,12 @@ describe("trusted Gateway mutation dispatch", () => {
                     },
                     async route() {
                         catalogCalls += 1;
-                        return { shardId: ShardId("unused"), schemaEpoch: 1, domainSchemaEpoch: 1 };
+                        return {
+                            shardId: ShardId("unused"),
+                            schemaEpoch: 1,
+                            domainSchemaEpoch: 1,
+                            recoveryGeneration: 0,
+                        };
                     },
                 },
                 cdb: () => {
@@ -674,7 +723,12 @@ describe("trusted Gateway mutation dispatch", () => {
                     expect(vshard).toBe(73);
                     routeStarted();
                     await held;
-                    return { shardId: ShardId("shard-a"), schemaEpoch: 9, domainSchemaEpoch: 1 };
+                    return {
+                        shardId: ShardId("shard-a"),
+                        schemaEpoch: 9,
+                        domainSchemaEpoch: 1,
+                        recoveryGeneration: 0,
+                    };
                 },
             },
             cdb: () => ({
@@ -765,8 +819,21 @@ describe("trusted Gateway mutation dispatch", () => {
 
     test("rejects malformed Catalog authority without throwing", () => {
         const expected = { principalId: PrincipalId("user-1"), organizationId: TenantId("org-1") };
+        const { recoveryGeneration: _generation, ...missingGeneration } = authority;
+        let getterCalls = 0;
+        const accessorGeneration = Object.defineProperty({ ...missingGeneration }, "recoveryGeneration", {
+            enumerable: true,
+            get() {
+                getterCalls++;
+                return 0;
+            },
+        });
         for (const malformed of [
             [],
+            missingGeneration,
+            { ...authority, recoveryGeneration: -1 },
+            { ...authority, recoveryGeneration: 0.5 },
+            accessorGeneration,
             { ...authority, roles: "member" },
             { ...authority, userRole: "" },
             { ...authority, userRole: ["admin"] },
@@ -777,6 +844,7 @@ describe("trusted Gateway mutation dispatch", () => {
                 code: "CDB_CATALOG_UNAVAILABLE",
             });
         }
+        expect(getterCalls).toBe(0);
     });
 
     test("keeps membership and user roles in separate policy namespaces", () => {
@@ -833,7 +901,12 @@ describe("trusted Gateway mutation dispatch", () => {
                 },
                 async route(vshard) {
                     expect(vshard).toBe(74);
-                    return { shardId: ShardId("shard-a"), schemaEpoch: 9, domainSchemaEpoch: 1 };
+                    return {
+                        shardId: ShardId("shard-a"),
+                        schemaEpoch: 9,
+                        domainSchemaEpoch: 1,
+                        recoveryGeneration: 0,
+                    };
                 },
             },
             cdb: () => ({

@@ -95,7 +95,7 @@ export interface SessionData {
     readonly [k: string]: unknown;
 }
 
-/** The one ownership axis selected by a Chardb application. */
+/** The one ownership axis selected by a CharDB application. */
 export type ChardbOwnership = "organization" | "user";
 
 type SessionUser = NonNullable<SessionData["user"]>;
@@ -322,7 +322,7 @@ function sessionSnapshotKey(atom: AuthSessionAtom | null): string {
     return JSON.stringify([snapshot.isPending, snapshot.data ?? null]);
 }
 
-/** Read the Better Auth identity that owns the current Chardb scope. */
+/** Read the Better Auth identity that owns the current CharDB scope. */
 export function useChardbIdentity(): ChardbIdentity<ChardbOwnership> {
     const context = useContext(ChardbCtx);
     if (!context) throw new Error("useChardbIdentity must be used inside <ChardbProvider>");
@@ -486,12 +486,12 @@ export interface CreateChardbReactClientOptions<M extends ChardbOwnership, A ext
     extends Pick<ChardbClientOptions, "clientId" | "mutationTimeoutMs" | "onSessionError"> {
     readonly ownership: M;
     /**
-     * Creates the Better Auth client from the same public Worker URL Chardb
+     * Creates the Better Auth client from the same public Worker URL CharDB
      * uses for sockets and files.
      */
     readonly auth: ChardbAuthFactory<A>;
     /**
-     * Public HTTP origin of the Chardb Worker. Browser apps that use files
+     * Public HTTP origin of the CharDB Worker. Browser apps that use files
      * must expose the Worker routes at the app's origin.
      */
     readonly url: string;
@@ -513,7 +513,7 @@ export interface ChardbOrganizationFileClient {
 interface ChardbReactClientBase<M extends ChardbOwnership, A extends AuthClientLike> {
     /** Canonical public Worker origin used for auth, sockets, and file requests. */
     readonly url: string;
-    /** The Better Auth client used by Chardb, kept intact with its inferred plugins. */
+    /** The Better Auth client used by CharDB, kept intact with its inferred plugins. */
     readonly auth: A;
     readonly Provider: (props: PropsWithChildren) => ReactElement;
     readonly useIdentity: () => ChardbIdentity<M>;

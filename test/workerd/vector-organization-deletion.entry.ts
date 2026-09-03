@@ -126,13 +126,18 @@ interface CatalogRpc {
     fixtureActivate(): Promise<unknown>;
     fixtureRunRealAlarm(): Promise<void>;
     fixtureState(input: { organizationId: string }): Promise<Record<string, unknown>>;
-    mutateAuth(input: Record<string, unknown>): Promise<unknown>;
+    mutateAuth(input: Record<string, unknown>, _recoveryGeneration: number): Promise<unknown>;
     resolveOrganizationAuthorityRoute(input: {
         principalId: string;
         organizationId: string;
         vshard: number;
     }): Promise<Record<string, unknown>>;
-    route(vshard: number): Promise<{ shardId: string; schemaEpoch: number; domainSchemaEpoch: number }>;
+    route(vshard: number): Promise<{
+        shardId: string;
+        schemaEpoch: number;
+        recoveryGeneration: number;
+        domainSchemaEpoch: number;
+    }>;
     fixtureBeginTopology(input: { organizationId: string; migrationId: string }): Promise<Record<string, unknown>>;
     fixtureBeginDeletionBarrier(input: {
         organizationId: string;
@@ -150,6 +155,7 @@ interface CdbRpc {
         organizationId: string;
         schemaEpoch: number;
         domainSchemaEpoch: number;
+        recoveryGeneration: number;
     }): Promise<Record<string, unknown> | null>;
     mutate(input: Record<string, unknown>): Promise<Record<string, unknown>>;
     fixturePrepareFile(input: {
@@ -353,13 +359,14 @@ export class Catalog extends app.Catalog {
         const route = await this.route(vshard);
         const request = {
             migId: input.migrationId,
+            recoveryGeneration: 0,
             sourceShard: route.shardId,
             destinationShard: OTHER_SHARD,
             rangeLo: vshard,
             rangeHi: vshard,
             startEpoch: route.schemaEpoch,
         };
-        return { request, operation: this.beginTopologyOperation(request) };
+        return { recoveryGeneration: 0, request, operation: this.beginTopologyOperation(request) };
     }
 
     async fixtureBeginDeletionBarrier(input: {
@@ -367,9 +374,9 @@ export class Catalog extends app.Catalog {
         migrationId: string;
     }): Promise<Record<string, unknown>> {
         const vshard = placement(input.organizationId);
-        const request = { migId: input.migrationId, rangeLo: vshard, rangeHi: vshard };
+        const request = { recoveryGeneration: 0, migId: input.migrationId, rangeLo: vshard, rangeHi: vshard };
         await this.beginOrganizationDeletionBarrier(request);
-        return { ...this.organizationDeletionBarrierStatus(request) };
+        return { recoveryGeneration: 0, ...this.organizationDeletionBarrierStatus(request) };
     }
 
     async fixtureCutover(input: {
@@ -380,6 +387,7 @@ export class Catalog extends app.Catalog {
         const route = await this.route(vshard);
         const topology = {
             migId: input.migrationId,
+            recoveryGeneration: 0,
             sourceShard: OWNER_SHARD,
             destinationShard: OTHER_SHARD,
             rangeLo: vshard,
@@ -387,6 +395,7 @@ export class Catalog extends app.Catalog {
             startEpoch: route.schemaEpoch,
         };
         const cutover = await this.cutover({
+            recoveryGeneration: 0,
             migId: input.migrationId,
             lo: vshard,
             hi: vshard,
@@ -395,7 +404,7 @@ export class Catalog extends app.Catalog {
             startEpoch: route.schemaEpoch,
         });
         const operation = this.completeTopologyOperation(topology);
-        return { cutover, operation, route: await this.route(vshard) };
+        return { recoveryGeneration: 0, cutover, operation, route: await this.route(vshard) };
     }
 
     async fixtureAbortTopology(input: {
@@ -406,6 +415,7 @@ export class Catalog extends app.Catalog {
         const route = await this.route(vshard);
         return {
             ...this.abortTopologyOperation({
+                recoveryGeneration: 0,
                 migId: input.migrationId,
                 sourceShard: OWNER_SHARD,
                 destinationShard: OTHER_SHARD,
@@ -460,6 +470,8 @@ export class Catalog extends app.Catalog {
         };
     }
 }
+
+export class Resharder extends app.Resharder {}
 
 export class Cdb extends app.Cdb {
     private readonly fixtureInstanceId = crypto.randomUUID();
@@ -538,6 +550,7 @@ export class Cdb extends app.Cdb {
             rangeHi: vshard,
             sourceGeneration: input.sourceGeneration,
             destinationGeneration: input.sourceGeneration + 1,
+            recoveryGeneration: 0,
         };
         this.prepareRoutingFence(identity);
         return this.activateRoutingFence(identity);
@@ -569,6 +582,7 @@ export class Cdb extends app.Cdb {
             contentType: "text/plain",
             size: FILE_BODY.length,
             nowMs: Date.now(),
+            recoveryGeneration: 0,
             domainSchemaEpoch: input.domainSchemaEpoch,
             schemaEpoch: input.schemaEpoch,
             auth: authContext,
@@ -589,6 +603,7 @@ export class Cdb extends app.Cdb {
             sha256: FILE_SHA256,
             size: FILE_BODY.length,
             nowMs: Date.now(),
+            recoveryGeneration: 0,
             domainSchemaEpoch: input.domainSchemaEpoch,
             schemaEpoch: input.schemaEpoch,
             auth: authContext,
@@ -607,6 +622,7 @@ export class Cdb extends app.Cdb {
             await this.deleteOrganizationFiles({
                 organizationId: input.organizationId,
                 nowMs: Date.now(),
+                recoveryGeneration: 0,
                 domainSchemaEpoch: input.domainSchemaEpoch,
             });
         } catch (error) {
@@ -637,6 +653,7 @@ export class Cdb extends app.Cdb {
             table: "vector_delete_documents",
             column: "attachment",
             rowId: input.rowId,
+            recoveryGeneration: 0,
             schemaEpoch: input.schemaEpoch,
             domainSchemaEpoch: input.domainSchemaEpoch,
             auth: mutationAuth(input.auth, input.organizationId),
@@ -730,40 +747,50 @@ async function setup(env: Env, organizationId: string): Promise<Record<string, u
     const placementState = await cat.fixtureConfigureOwner({ organizationId });
     await cat.fixtureActivate();
     const now = Date.now();
-    await cat.mutateAuth({
-        model: "user",
-        op: "create",
-        payload: {
-            id: USER_ID,
-            name: "Vector Delete User",
-            email: "vector-delete@example.com",
-            emailVerified: true,
-            createdAt: now,
-            updatedAt: now,
+    await cat.mutateAuth(
+        {
+            model: "user",
+            op: "create",
+            payload: {
+                id: USER_ID,
+                name: "Vector Delete User",
+                email: "vector-delete@example.com",
+                emailVerified: true,
+                createdAt: now,
+                updatedAt: now,
+            },
         },
-    });
-    await cat.mutateAuth({
-        model: "organization",
-        op: "create",
-        payload: { id: organizationId, name: organizationId, slug: organizationId, createdAt: now },
-    });
-    await cat.mutateAuth({
-        model: "member",
-        op: "create",
-        payload: {
-            id: "vector-delete-member",
-            organizationId,
-            userId: USER_ID,
-            role: "member",
-            createdAt: now,
+        0
+    );
+    await cat.mutateAuth(
+        {
+            model: "organization",
+            op: "create",
+            payload: { id: organizationId, name: organizationId, slug: organizationId, createdAt: now },
         },
-    });
+        0
+    );
+    await cat.mutateAuth(
+        {
+            model: "member",
+            op: "create",
+            payload: {
+                id: "vector-delete-member",
+                organizationId,
+                userId: USER_ID,
+                role: "member",
+                createdAt: now,
+            },
+        },
+        0
+    );
     const resolved = await resolve(env, organizationId);
     const route = await cat.route(placement(organizationId));
     return {
         ...placementState,
         authority: resolved.authority,
         shardId: route.shardId,
+        recoveryGeneration: 0,
         schemaEpoch: route.schemaEpoch,
         domainSchemaEpoch: route.domainSchemaEpoch,
         mutationRef: putDocument.__chardbRef,
@@ -791,6 +818,7 @@ async function mutateVector(
         },
         placement: { authority: "organization", partitionKey: input.organizationId },
         auth: mutationAuth(authority, input.organizationId),
+        recoveryGeneration: 0,
         schemaEpoch: route.schemaEpoch,
         domainSchemaEpoch: route.domainSchemaEpoch,
     });
@@ -822,6 +850,7 @@ async function mutateVectorWithStaleAuthority(
         },
         placement: { authority: "organization", partitionKey: input.organizationId },
         auth: mutationAuth(input.authority, input.organizationId),
+        recoveryGeneration: 0,
         schemaEpoch: route.schemaEpoch,
         domainSchemaEpoch: route.domainSchemaEpoch,
     });
@@ -907,37 +936,49 @@ export default {
                 }
             }
             if (operation === "delete-auth-organization") {
-                await catalog(env).mutateAuth({
-                    model: "member",
-                    op: "delete",
-                    where: { organizationId: String(input.organizationId) },
-                });
-                return json(
-                    await catalog(env).mutateAuth({
-                        model: "organization",
+                await catalog(env).mutateAuth(
+                    {
+                        model: "member",
                         op: "delete",
-                        where: { id: String(input.organizationId) },
-                        limitOne: true,
-                    })
+                        where: { organizationId: String(input.organizationId) },
+                    },
+                    0
+                );
+                return json(
+                    await catalog(env).mutateAuth(
+                        {
+                            model: "organization",
+                            op: "delete",
+                            where: { id: String(input.organizationId) },
+                            limitOne: true,
+                        },
+                        0
+                    )
                 );
             }
             if (operation === "delete-auth-members") {
                 return json(
-                    await catalog(env).mutateAuth({
-                        model: "member",
-                        op: "delete",
-                        where: { organizationId: String(input.organizationId) },
-                    })
+                    await catalog(env).mutateAuth(
+                        {
+                            model: "member",
+                            op: "delete",
+                            where: { organizationId: String(input.organizationId) },
+                        },
+                        0
+                    )
                 );
             }
             if (operation === "delete-auth-organization-only") {
                 return json(
-                    await catalog(env).mutateAuth({
-                        model: "organization",
-                        op: "delete",
-                        where: { id: String(input.organizationId) },
-                        limitOne: true,
-                    })
+                    await catalog(env).mutateAuth(
+                        {
+                            model: "organization",
+                            op: "delete",
+                            where: { id: String(input.organizationId) },
+                            limitOne: true,
+                        },
+                        0
+                    )
                 );
             }
             if (operation === "begin-topology") {
@@ -1020,6 +1061,7 @@ export default {
                         organizationId: String(input.organizationId),
                         schemaEpoch: route.schemaEpoch,
                         domainSchemaEpoch: route.domainSchemaEpoch,
+                        recoveryGeneration: route.recoveryGeneration,
                     })
                 );
             }

@@ -56,6 +56,7 @@ describe("Gateway snapshot delivery orchestration", () => {
         };
         db.transaction(() =>
             installGatewayRegistration(sql, {
+                recoveryGeneration: 0,
                 ...identity,
                 organizationId: TenantId("org-delivery"),
                 ref: ChardbRef("queries.ts#delivery"),
@@ -155,6 +156,7 @@ describe("Gateway snapshot delivery orchestration", () => {
         const cookie = Cookie("snapshot-delivery-cookie");
         expect(
             await delivery.stage({
+                recoveryGeneration: 0,
                 ...identity,
                 runToken: run.runToken,
                 runVersion: run.runVersion,
@@ -199,6 +201,7 @@ describe("Gateway snapshot delivery orchestration", () => {
         const { identity, run, delivery, work, setNowMs } = fixture({ throwOnSend: true });
         const cookie = Cookie("snapshot-retry-cookie");
         await delivery.stage({
+            recoveryGeneration: 0,
             ...identity,
             runToken: run.runToken,
             runVersion: run.runVersion,
@@ -235,6 +238,7 @@ describe("Gateway snapshot delivery orchestration", () => {
     test("discards a claimed snapshot when authority changed after staging", async () => {
         const { identity, run, delivery, work, sent } = fixture({ authority: "changed" });
         await delivery.stage({
+            recoveryGeneration: 0,
             ...identity,
             runToken: run.runToken,
             runVersion: run.runVersion,
@@ -264,6 +268,7 @@ describe("Gateway snapshot delivery orchestration", () => {
     test("retires a claimed snapshot when fresh authority is revoked", async () => {
         const { identity, run, delivery, sent, retired } = fixture({ authority: "forbidden" });
         await delivery.stage({
+            recoveryGeneration: 0,
             ...identity,
             runToken: run.runToken,
             runVersion: run.runVersion,
@@ -289,6 +294,7 @@ describe("Gateway snapshot delivery orchestration", () => {
             policyDigest: "policy-migrated",
         });
         await delivery.stage({
+            recoveryGeneration: 0,
             ...identity,
             runToken: run.runToken,
             runVersion: run.runVersion,
@@ -312,6 +318,7 @@ describe("Gateway snapshot delivery orchestration", () => {
         const { identity, run, delivery, work, sent } = fixture({ authority: "retry" });
         const cookie = Cookie("snapshot-authority-retry");
         await delivery.stage({
+            recoveryGeneration: 0,
             ...identity,
             runToken: run.runToken,
             runVersion: run.runVersion,

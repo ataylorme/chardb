@@ -60,6 +60,7 @@ interface StoredCdbSchemaState {
 }
 
 export interface CdbSchemaBaselineRequest {
+    readonly recoveryGeneration: number;
     readonly migrationId: string;
     readonly targetVersion: number;
     readonly targetEpoch: number;
@@ -67,6 +68,7 @@ export interface CdbSchemaBaselineRequest {
 }
 
 export interface CdbFreshSchemaProvisionRequest {
+    readonly recoveryGeneration: number;
     readonly migrationId: string;
     readonly targetVersion: number;
     readonly targetEpoch: number;
@@ -74,6 +76,7 @@ export interface CdbFreshSchemaProvisionRequest {
 }
 
 export interface CdbSchemaMigrationPrepareRequest {
+    readonly recoveryGeneration: number;
     readonly migrationId: string;
     readonly activeVersion: number;
     readonly activeDigest: string;
@@ -83,11 +86,13 @@ export interface CdbSchemaMigrationPrepareRequest {
 }
 
 export interface CdbSchemaMigrationApplyRequest {
+    readonly recoveryGeneration: number;
     readonly migrationId: string;
     readonly version: number;
 }
 
 export interface CdbSchemaMigrationActivateRequest {
+    readonly recoveryGeneration: number;
     readonly migrationId: string;
 }
 

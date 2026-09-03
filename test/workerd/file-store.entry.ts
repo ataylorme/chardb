@@ -3,12 +3,17 @@ import { CdbFileRuntime } from "../../src/server/do/cdb-file-runtime.ts";
 import { CdbFileStore, initializeFileStore } from "../../src/server/do/cdb-file-store.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 import type { ChardbEnv } from "../../src/server/entrypoint.ts";
+import { refreshRecoverableFile } from "../../src/server/file-retention.ts";
 import { renderFileAttachmentTriggers } from "../../src/server/file-triggers.ts";
 import { handleOrganizationFileRequest } from "../../src/server/organization-file-http.ts";
 
 const HASH_A = "f28d6cfd0ebc466e6358e1f4f90edc071d0ba3d413255cdc0ec7917189033ad8";
 const HASH_B = "804f51f71254c4081e37e7c887073560f4a6fa6cdad202e9ac67e032c43ed1e1";
 const HASH_SURVIVOR = "7a01ac37408614bcf58069bb6b6a543f6c473cdded552c491de4eb36aacce235";
+
+function retainedObjectKey(sha256: string): string {
+    return `_chardb/retained/sha256/${sha256}`;
+}
 
 async function sha256(value: string): Promise<string> {
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -110,6 +115,12 @@ export class FileStoreProof extends DurableObject<FileStoreEnv> {
             });
             store.expirePending(106, 107);
         });
+        const seededStore = new CdbFileStore(adaptSqlStorage(this.ctx.storage.sql));
+        for (const fileId of ["file_old", "file_new"] as const) {
+            const file = seededStore.read(fileId);
+            if (!file) throw new Error(`missing seeded file ${fileId}`);
+            await refreshRecoverableFile(this.env.CDB_FILES, file);
+        }
 
         let rolledBack = false;
         try {
@@ -170,7 +181,7 @@ export class FileStoreProof extends DurableObject<FileStoreEnv> {
 
     async object(fileId: string): Promise<Record<string, unknown>> {
         const stored = new CdbFileStore(adaptSqlStorage(this.ctx.storage.sql)).read(fileId);
-        const object = stored ? await this.env.CDB_FILES.head(stored.objectKey) : null;
+        const object = stored?.sha256 ? await this.env.CDB_FILES.head(retainedObjectKey(stored.sha256)) : null;
         return {
             stored,
             object: object
@@ -195,7 +206,7 @@ export class FileStoreProof extends DurableObject<FileStoreEnv> {
             this.env.CDB_FILES.head("v1/org-1/file_old"),
             this.env.CDB_FILES.head("v1/org-1/file_new"),
             this.env.CDB_FILES.head("v1/org-1/file_abandoned"),
-            uploadFile ? this.env.CDB_FILES.head(uploadFile.objectKey) : null,
+            uploadFile?.sha256 ? this.env.CDB_FILES.head(retainedObjectKey(uploadFile.sha256)) : null,
         ]);
         return {
             ...this.inspect(),
@@ -250,12 +261,16 @@ export class FileStoreProof extends DurableObject<FileStoreEnv> {
             });
             store.markReady("survivor", HASH_SURVIVOR, 8, 4_001);
         });
+        const survivorFile = new CdbFileStore(adaptSqlStorage(this.ctx.storage.sql)).read("survivor");
+        if (!survivorFile) throw new Error("missing survivor file");
+        await refreshRecoverableFile(this.env.CDB_FILES, survivorFile);
 
         const runtime = this.runtime();
         const accepted = runtime.deleteOrganization({
             organizationId: "org-bulk",
             nowMs: 5_000,
             domainSchemaEpoch: 1,
+            recoveryGeneration: 0,
         });
         const schedules: number[] = [];
         await runtime.maintain(5_001, async deadline => {
@@ -318,13 +333,14 @@ export class FileCatalogProof extends DurableObject {
             role: "member",
             roles: ["member"],
             authEpochs: { global: 1, tenant: 1, principal: 1 },
+            recoveryGeneration: 0,
         };
     }
 
     async resolveOrganizationAuthorityRoute() {
         return {
             authority: await this.resolveOrganizationAuthority(),
-            route: { shardId: "proof", schemaEpoch: 1, domainSchemaEpoch: 1 },
+            route: { shardId: "proof", recoveryGeneration: 0, schemaEpoch: 1, domainSchemaEpoch: 1 },
         };
     }
 }

@@ -471,7 +471,7 @@ describe("@chardb/react — hook lifecycle", () => {
         });
         expect("useFile" in sdk).toBe(false);
         const userFileHookDoesNotCompile = () => {
-            // @ts-expect-error User-owned Chardb apps do not have organization file routes.
+            // @ts-expect-error User-owned CharDB apps do not have organization file routes.
             sdk.useFile(fileRef("messages", "attachment"));
         };
         expect(typeof userFileHookDoesNotCompile).toBe("function");

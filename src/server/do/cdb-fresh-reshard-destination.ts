@@ -51,6 +51,34 @@ function assertFreshInternalRows(sql: SyncSql, allowDomainRegistry: boolean): vo
             }
             continue;
         }
+        if (name === "_chardb_recovery_admission") {
+            // Every Cdb reconciles the provider recovery clock during boot, so
+            // this singleton exists before resharding can inspect a new
+            // destination. An open clock is coordination metadata, not proof
+            // that the shard has ever served application state.
+            assertExactColumns(sql, name, ["singleton", "generation", "operation_id", "state"]);
+            const rows = sql.all<{
+                singleton: number;
+                generation: number | bigint;
+                operation_id: string | null;
+                state: string;
+            }>(`SELECT * FROM ${quoteIdentifier(name)} LIMIT 2`);
+            const storedGeneration = rows[0]?.generation;
+            const numericGeneration =
+                typeof storedGeneration === "bigint" ? Number(storedGeneration) : storedGeneration;
+            if (
+                rows.length !== 1 ||
+                rows[0]?.singleton !== 1 ||
+                typeof numericGeneration !== "number" ||
+                !Number.isSafeInteger(numericGeneration) ||
+                numericGeneration < 0 ||
+                rows[0].operation_id !== null ||
+                rows[0].state !== "open"
+            ) {
+                notFresh(name);
+            }
+            continue;
+        }
         if (name === "_chardb_auth_invalidation_epochs") {
             // Catalog may project auth epochs into an active split destination
             // before its schema is provisioned. A zero-impact watermark has no

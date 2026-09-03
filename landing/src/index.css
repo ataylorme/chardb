@@ -81,14 +81,6 @@ body {
     -webkit-backdrop-filter: saturate(140%) blur(8px);
 }
 
-.pullquote {
-    font-size: clamp(1.25rem, 2.2vw, 1.75rem);
-    line-height: 1.45;
-    color: #ededed;
-    border-left: 1px solid #ec5713;
-    padding-left: 1rem;
-}
-
 @media (prefers-reduced-motion: no-preference) {
     .shard-pulse {
         animation: shardPulse 4s ease-in-out infinite;
@@ -140,25 +132,23 @@ body {
 }
 
 .sdk-chip {
-    position: relative;
     display: grid;
     grid-template-columns: 36px 1fr;
     grid-template-rows: auto auto;
     column-gap: 0.65rem;
     min-width: 0;
     padding: 0.75rem;
+    overflow: hidden;
     border: 1px solid rgba(255, 255, 255, 0.07);
     border-radius: 12px;
     background: linear-gradient(145deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0.005));
     color: #8d8d8d;
-    overflow: hidden;
 }
 
 .sdk-chip.is-available {
     border-color: rgba(236, 87, 19, 0.24);
     background: linear-gradient(145deg, rgba(236, 87, 19, 0.12), rgba(236, 87, 19, 0.025));
     color: #ededed;
-    box-shadow: inset 0 1px 0 rgba(255, 163, 110, 0.08), 0 12px 36px -28px rgba(236, 87, 19, 0.9);
 }
 
 .sdk-icon-shell {

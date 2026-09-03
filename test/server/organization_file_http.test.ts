@@ -28,12 +28,15 @@ const session = {
 };
 
 const authority = {
+    recoveryGeneration: 0,
     principalId: "user-1",
     organizationId: "org-1",
     role: "member",
     roles: ["member"],
     authEpochs: { global: 1, tenant: 2, principal: 3 },
 };
+
+type DownloadProviderFailure = "retained-get";
 
 function fixture(
     options: {
@@ -45,6 +48,8 @@ function fixture(
         readonly downloadRpcStaleOnce?: boolean;
         readonly downloadMissing?: boolean;
         readonly downloadObjectMissing?: boolean;
+        readonly changeRoleAfterProviderRead?: boolean;
+        readonly uploadProviderFailure?: "retain";
     } = {}
 ) {
     const calls: string[] = [];
@@ -67,13 +72,17 @@ function fixture(
           }
         | undefined;
     let status: "pending" | "ready" = "pending";
+    let readyFile: { readonly fileId: string; readonly size: number; readonly sha256: string } | undefined;
     let downloadCalls = 0;
+    let providerRead = false;
+    let downloadProviderFailure: DownloadProviderFailure | undefined;
     const cdb: OrganizationFileUploadCdb & {
         resolveFileDownload(request: {
             readonly organizationId: string;
             readonly table: string;
             readonly column: string;
             readonly rowId: string;
+            readonly auth: { readonly role: string };
         }): Promise<unknown>;
     } = {
         async reserveFile(request) {
@@ -100,6 +109,7 @@ function fixture(
         markFileReady(request) {
             calls.push("cdb.ready");
             status = "ready";
+            readyFile = { fileId: request.fileId, size: request.size, sha256: request.sha256 };
             return {
                 fileId: request.fileId as never,
                 organizationId: request.organizationId,
@@ -118,22 +128,25 @@ function fixture(
         async resolveFileDownload(request) {
             calls.push("cdb.download");
             downloadCalls++;
+            if (request.auth.role === "viewer") {
+                throw new CdbError({ code: "CDB_FORBIDDEN", message: "file row policy denied access" });
+            }
             if ((options.downloadStaleOnce || options.downloadRpcStaleOnce) && downloadCalls === 1) {
                 if (options.downloadRpcStaleOnce) {
                     throw new Error("CDB_STALE_EPOCH: download route moved");
                 }
                 throw new CdbError({ code: "CDB_STALE_EPOCH", message: "download route moved" });
             }
-            if (options.downloadMissing || !object) return null;
+            if (options.downloadMissing || !readyFile) return null;
             return {
-                fileId: object.customMetadata.chardbFileId,
+                fileId: readyFile.fileId,
                 organizationId: request.organizationId,
                 table: request.table,
                 column: request.column,
-                objectKey: object.key,
+                objectKey: `v1/${request.organizationId}/${readyFile.fileId}`,
                 contentType: "image/png",
-                size: object.size,
-                sha256: object.customMetadata.chardbSha256,
+                size: readyFile.size,
+                sha256: readyFile.sha256,
                 status: "attached",
                 rowId: request.rowId,
                 createdAt: 100,
@@ -150,7 +163,10 @@ function fixture(
             routeCalls++;
             const movingEveryTime = options.moveOnEveryRefresh === true;
             return {
-                authority,
+                authority:
+                    options.changeRoleAfterProviderRead && providerRead
+                        ? { ...authority, role: "viewer", roles: ["viewer"] }
+                        : authority,
                 route: {
                     shardId: (movingEveryTime
                         ? `shard-${routeCalls}`
@@ -158,6 +174,7 @@ function fixture(
                           ? "shard-b"
                           : "shard-a") as never,
                     schemaEpoch: movingEveryTime ? routeCalls : options.moveOnRefresh && routeCalls > 1 ? 2 : 1,
+                    recoveryGeneration: 0,
                     domainSchemaEpoch: 2,
                 },
             };
@@ -166,7 +183,11 @@ function fixture(
     const bucket = {
         async put(key: string, value: Uint8Array, putOptions: R2PutOptions) {
             calls.push("r2.put");
-            const target = key.startsWith("_chardb/retained/") ? retained : object;
+            const retainedKey = key.startsWith("_chardb/retained/");
+            if (options.uploadProviderFailure && retainedKey) {
+                throw new Error("transient R2 put failure");
+            }
+            const target = retainedKey ? retained : object;
             if (target) return null;
             const stored = {
                 key,
@@ -186,8 +207,13 @@ function fixture(
         async get(key: string) {
             calls.push("r2.get");
             if (options.downloadObjectMissing) return null;
+            const retainedKey = key.startsWith("_chardb/retained/");
+            if (retainedKey && downloadProviderFailure === "retained-get") {
+                throw new Error("transient retained R2 get failure");
+            }
             const stored = object?.key === key ? object : retained?.key === key ? retained : undefined;
             if (!stored) return null;
+            providerRead = true;
             return {
                 ...stored,
                 body: new Response(Uint8Array.from(stored.bytes)).body,
@@ -235,7 +261,19 @@ function fixture(
             `https://app.example${ORGANIZATION_FILE_DOWNLOAD_PATH}?organizationId=${overrides.organizationId ?? "org-1"}&table=messages&column=attachment&rowId=row-1`,
             { headers: overrides.origin ? { origin: overrides.origin } : {} }
         );
-    return { auth, calls, downloadRequest, env, object: () => object, request, reservedFileIds };
+    return {
+        auth,
+        calls,
+        downloadRequest,
+        env,
+        failDownloadProviderAt(value: DownloadProviderFailure) {
+            downloadProviderFailure = value;
+        },
+        object: () => object,
+        retained: () => retained,
+        request,
+        reservedFileIds,
+    };
 }
 
 describe("private organization file HTTP upload", () => {
@@ -266,15 +304,15 @@ describe("private organization file HTTP upload", () => {
             "catalog.route",
             "cdb.reserve",
             "r2.put",
-            "r2.put",
             "catalog.route",
             "cdb.ready",
         ]);
-        expect(f.object()).toMatchObject({
-            key: `v1/org-1/${firstBody.file.fileId}`,
+        expect(f.retained()).toMatchObject({
+            key: `_chardb/retained/sha256/${firstBody.file.sha256}`,
             size: 11,
-            customMetadata: { chardbFileId: firstBody.file.fileId, chardbSha256: firstBody.file.sha256 },
+            customMetadata: { chardbRetainedSha256: firstBody.file.sha256, chardbRetainedSize: "11" },
         });
+        expect(f.object()).toBeUndefined();
 
         f.calls.splice(0);
         const retry = await handleOrganizationFileUploadRequest({
@@ -290,8 +328,6 @@ describe("private organization file HTTP upload", () => {
             "auth.session",
             "catalog.route",
             "cdb.reserve",
-            "r2.put",
-            "r2.head",
             "r2.put",
             "catalog.route",
             "cdb.ready",
@@ -334,18 +370,16 @@ describe("private organization file HTTP upload", () => {
             "catalog.route",
             "cdb.reserve",
             "r2.put",
-            "r2.put",
             "catalog.route",
             "catalog.route",
             "cdb.reserve",
-            "r2.put",
-            "r2.head",
             "r2.put",
             "catalog.route",
             "cdb.ready",
         ]);
         expect(new Set(f.reservedFileIds).size).toBe(1);
-        expect(f.object()).toBeDefined();
+        expect(f.retained()).toBeDefined();
+        expect(f.object()).toBeUndefined();
     });
 
     test("fails closed instead of looping when placement changes during the retry", async () => {
@@ -358,11 +392,12 @@ describe("private organization file HTTP upload", () => {
         });
         expect(response.status).toBe(409);
         expect(f.calls.filter(call => call === "cdb.reserve")).toHaveLength(2);
-        expect(f.calls.filter(call => call === "r2.put")).toHaveLength(4);
+        expect(f.calls.filter(call => call === "r2.put")).toHaveLength(2);
         expect(f.calls.filter(call => call === "cdb.ready")).toHaveLength(0);
         expect(f.calls.filter(call => call === "catalog.route")).toHaveLength(4);
         expect(new Set(f.reservedFileIds).size).toBe(1);
-        expect(f.object()).toBeDefined();
+        expect(f.retained()).toBeDefined();
+        expect(f.object()).toBeUndefined();
     });
 
     test("rejects a missing retry identity and an oversized body before Cdb or R2", async () => {
@@ -400,6 +435,26 @@ describe("private organization file HTTP upload", () => {
         expect(f.calls).toEqual(["auth.session", "catalog.route", "cdb.reserve"]);
     });
 
+    test("returns a typed retryable 503 when R2 fails during upload", async () => {
+        const f = fixture({ uploadProviderFailure: "retain" });
+        const response = await handleOrganizationFileUploadRequest({
+            request: f.request(),
+            env: f.env,
+            auth: f.auth,
+            resources: [resource],
+        });
+        expect(response.status).toBe(503);
+        expect(await response.json()).toMatchObject({
+            error: {
+                code: "CDB_SHARD_UNAVAILABLE",
+                retryable: true,
+                docs: "https://chardb.dev/errors/cdb_shard_unavailable",
+            },
+        });
+        expect(f.calls.filter(call => call === "r2.put")).toHaveLength(1);
+        expect(f.calls).not.toContain("cdb.ready");
+    });
+
     test("downloads exact bytes only after a second authority refresh and the Cdb policy read", async () => {
         const f = fixture();
         const uploaded = await handleOrganizationFileUploadRequest({
@@ -425,7 +480,48 @@ describe("private organization file HTTP upload", () => {
         expect(downloaded.headers.get("x-content-type-options")).toBe("nosniff");
         expect(downloaded.headers.get("cross-origin-resource-policy")).toBe("same-origin");
         expect(downloaded.headers.get("content-security-policy")).toBe("sandbox");
-        expect(f.calls).toEqual(["auth.session", "catalog.route", "catalog.route", "cdb.download", "r2.get"]);
+        expect(f.calls).toEqual([
+            "auth.session",
+            "catalog.route",
+            "catalog.route",
+            "cdb.download",
+            "r2.get",
+            "catalog.route",
+            "cdb.download",
+        ]);
+    });
+
+    test("reruns Cdb row policy after R2 and denies a same-route role change", async () => {
+        const f = fixture({ changeRoleAfterProviderRead: true });
+        expect(
+            (
+                await handleOrganizationFileUploadRequest({
+                    request: f.request(),
+                    env: f.env,
+                    auth: f.auth,
+                    resources: [resource],
+                    nowMs: 100,
+                })
+            ).status
+        ).toBe(200);
+        f.calls.splice(0);
+
+        const denied = await handleOrganizationFileDownloadRequest({
+            request: f.downloadRequest(),
+            env: f.env,
+            auth: f.auth,
+            resources: [resource],
+        });
+        expect(denied.status).toBe(403);
+        expect(f.calls).toEqual([
+            "auth.session",
+            "catalog.route",
+            "catalog.route",
+            "cdb.download",
+            "r2.get",
+            "catalog.route",
+            "cdb.download",
+        ]);
     });
 
     test("retries a stale download once against fresh Catalog placement", async () => {
@@ -456,6 +552,8 @@ describe("private organization file HTTP upload", () => {
             "catalog.route",
             "cdb.download",
             "r2.get",
+            "catalog.route",
+            "cdb.download",
         ]);
     });
 
@@ -476,7 +574,7 @@ describe("private organization file HTTP upload", () => {
             resources: [resource],
         });
         expect(response.status).toBe(200);
-        expect(f.calls.filter(call => call === "cdb.download")).toHaveLength(2);
+        expect(f.calls.filter(call => call === "cdb.download")).toHaveLength(3);
     });
 
     test("makes missing, denied, and cross-organization downloads indistinguishable before R2", async () => {
@@ -513,6 +611,36 @@ describe("private organization file HTTP upload", () => {
         expect(crossOrigin.calls).toEqual([]);
     });
 
+    test("returns a typed retryable 503 when the retained download is unavailable", async () => {
+        for (const failure of ["retained-get"] as const) {
+            const f = fixture();
+            const uploaded = await handleOrganizationFileUploadRequest({
+                request: f.request(),
+                env: f.env,
+                auth: f.auth,
+                resources: [resource],
+            });
+            expect(uploaded.status).toBe(200);
+            f.calls.splice(0);
+            f.failDownloadProviderAt(failure);
+
+            const response = await handleOrganizationFileDownloadRequest({
+                request: f.downloadRequest(),
+                env: f.env,
+                auth: f.auth,
+                resources: [resource],
+            });
+            expect(response.status).toBe(503);
+            expect(await response.json()).toMatchObject({
+                error: {
+                    code: "CDB_SHARD_UNAVAILABLE",
+                    retryable: true,
+                    docs: "https://chardb.dev/errors/cdb_shard_unavailable",
+                },
+            });
+        }
+    });
+
     test("reports attached-object corruption and rejects range reads", async () => {
         const corrupt = fixture({ downloadObjectMissing: true });
         await handleOrganizationFileUploadRequest({
@@ -529,14 +657,10 @@ describe("private organization file HTTP upload", () => {
             resources: [resource],
         });
         expect(corruptResponse.status).toBe(500);
-        expect(corrupt.calls).toEqual([
-            "auth.session",
-            "catalog.route",
-            "catalog.route",
-            "cdb.download",
-            "r2.get",
-            "r2.get",
-        ]);
+        expect(await corruptResponse.json()).toMatchObject({
+            error: { code: "CDB_INVARIANT", retryable: false },
+        });
+        expect(corrupt.calls).toEqual(["auth.session", "catalog.route", "catalog.route", "cdb.download", "r2.get"]);
 
         const ranged = fixture();
         const rangeRequest = ranged.downloadRequest();

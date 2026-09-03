@@ -167,6 +167,7 @@ beforeAll(async () => {
             CDB_CATALOG: { className: "Catalog", useSQLite: true },
             CDB_GATEWAY: { className: "Gateway", useSQLite: true },
             CDB_SHARD: { className: "Cdb", useSQLite: true },
+            CDB_RESHARD: { className: "Resharder", useSQLite: true },
         },
         compatibilityDate: "2026-05-10",
         compatibilityFlags: ["nodejs_compat"],

@@ -300,7 +300,11 @@ describe("packaged Wrangler file reshard proof", () => {
                 search: { rowPk: "row-0-0" },
             },
         });
-        expect(sample.alarm).toMatchObject({ deletedObjects: 1, remainingObjects: 15 });
+        expect(sample.alarm).toMatchObject({
+            deletedMetadataRows: 1,
+            remainingMetadataRows: 15,
+            retainedObjects: 16,
+        });
 
         await stop();
         await start();
@@ -326,10 +330,10 @@ describe("packaged Wrangler file reshard proof", () => {
         });
         expect(cleanup.status).toBe(200);
         expect((await cleanup.json()) as unknown).toEqual({
-            schema: "chardb.file-reshard-proof-cleanup.v1",
+            schema: "chardb.file-reshard-proof-cleanup.v2",
             runId: RUN_ID,
             runKey: RUN_KEY,
-            deleted: 15,
+            deleted: 16,
             remaining: 0,
             done: true,
         });
@@ -340,7 +344,7 @@ describe("packaged Wrangler file reshard proof", () => {
         });
         expect(repeatedCleanup.status).toBe(200);
         expect((await repeatedCleanup.json()) as unknown).toEqual({
-            schema: "chardb.file-reshard-proof-cleanup.v1",
+            schema: "chardb.file-reshard-proof-cleanup.v2",
             runId: RUN_ID,
             runKey: RUN_KEY,
             deleted: 0,

@@ -1,8 +1,8 @@
 import { FILE_RESHARD_BENCHMARK_PHASES, fileReshardBenchmarkProfile } from "./file-reshard-benchmark-report.mjs";
 
-export const FILE_RESHARD_DEPLOYMENT_SAMPLE_SCHEMA = "chardb.file-vector-reshard-deployment-sample.v2";
-export const FILE_RESHARD_DEPLOYMENT_PAIR_SCHEMA = "chardb.file-vector-reshard-deployment-pair.v2";
-export const FILE_RESHARD_DEPLOYMENT_CAPABILITIES_SCHEMA = "chardb.file-vector-reshard-proof-capabilities.v2";
+export const FILE_RESHARD_DEPLOYMENT_SAMPLE_SCHEMA = "chardb.file-vector-reshard-deployment-sample.v3";
+export const FILE_RESHARD_DEPLOYMENT_PAIR_SCHEMA = "chardb.file-vector-reshard-deployment-pair.v3";
+export const FILE_RESHARD_DEPLOYMENT_CAPABILITIES_SCHEMA = "chardb.file-vector-reshard-proof-capabilities.v3";
 export const FILE_RESHARD_DEPLOYMENT_TEARDOWN_SCHEMA = "chardb.file-vector-reshard-proof-teardown.v2";
 export const FILE_RESHARD_DEPLOYMENT_FAULT_SCHEMA = "chardb.file-reshard-proof-fault.v1";
 export const FILE_RESHARD_DEPLOYMENT_BINDINGS = Object.freeze([
@@ -25,6 +25,7 @@ export const FILE_RESHARD_DEPLOYMENT_CORRECTNESS = Object.freeze([
     "destinationServing",
     "fileParity",
     "r2Stable",
+    "retainedContentStable",
     "responseLossRecovered",
     "sourceDrained",
     "sourceFenced",
@@ -145,6 +146,7 @@ export function assertFileReshardDeploymentCapabilities(input, expected) {
         "freshDisposableData",
         "providerVectorMutationTrace",
         "publicVectorSearch",
+        "retainedFileRecovery",
         "vectorAwareReshard",
     ]);
     for (const [name, value] of Object.entries(capabilities.features)) {
@@ -252,7 +254,7 @@ export function assertFileReshardDeploymentSample(input, expected = {}) {
         throw new Error("sample candidate drifted");
     }
     exact(sample.workload, "sample.workload", ["id", "version", "profile"]);
-    if (sample.workload.id !== "file-vector-aware-range-move" || sample.workload.version !== 2) {
+    if (sample.workload.id !== "file-vector-aware-range-move" || sample.workload.version !== 3) {
         throw new Error("sample workload identity drifted");
     }
     const profile = fileReshardBenchmarkProfile(sample.workload.profile.name);
@@ -459,16 +461,27 @@ export function assertFileReshardDeploymentSample(input, expected = {}) {
     ) {
         throw new Error("sample did not prove network response-loss recovery");
     }
-    exact(sample.alarm, "sample.alarm", ["invoked", "durable", "ownerShard", "deletedObjects", "remainingObjects"]);
+    exact(sample.alarm, "sample.alarm", [
+        "invoked",
+        "durable",
+        "ownerShard",
+        "deletedMetadataRows",
+        "remainingMetadataRows",
+        "retainedObjects",
+    ]);
     if (sample.alarm.invoked !== true || sample.alarm.durable !== true) throw new Error("sample alarm proof failed");
     string(sample.alarm.ownerShard, "sample.alarm.ownerShard");
-    integer(sample.alarm.deletedObjects, "sample.alarm.deletedObjects", 1);
-    integer(sample.alarm.remainingObjects, "sample.alarm.remainingObjects");
+    integer(sample.alarm.deletedMetadataRows, "sample.alarm.deletedMetadataRows", 1);
+    integer(sample.alarm.remainingMetadataRows, "sample.alarm.remainingMetadataRows");
+    integer(sample.alarm.retainedObjects, "sample.alarm.retainedObjects", profile.files);
     if (
         sample.alarm.ownerShard !== sample.target.destinationShard ||
-        sample.alarm.deletedObjects + sample.alarm.remainingObjects !== profile.files
+        sample.alarm.deletedMetadataRows + sample.alarm.remainingMetadataRows !== profile.files ||
+        sample.alarm.retainedObjects !== profile.files
     ) {
-        throw new Error("sample alarm did not run on the destination owner over the exact dataset");
+        throw new Error(
+            "sample alarm did not run on the destination owner, clean metadata, and retain the exact recovery dataset"
+        );
     }
     exact(sample.correctness, "sample.correctness", FILE_RESHARD_DEPLOYMENT_CORRECTNESS);
     for (const name of FILE_RESHARD_DEPLOYMENT_CORRECTNESS) {

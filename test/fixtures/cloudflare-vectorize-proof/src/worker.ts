@@ -623,6 +623,43 @@ app.post("/proof/vector-adversary/query", async c => {
     return c.json({ ...inspected, matches: projected });
 });
 
+app.post("/proof/vector-presence", async c => {
+    const env = c.env as unknown as ProofEnv;
+    if (!(await proofAuthorized(c.req, env))) return c.json({ error: "not found" }, 404);
+    const body = await c.req.json<{
+        readonly organizationId: string;
+        readonly vectorId: string;
+        readonly versions: readonly number[];
+    }>();
+    exactOrganizationId(body.organizationId);
+    const vectorId = exactVectorId(body.vectorId);
+    if (
+        !Array.isArray(body.versions) ||
+        body.versions.length !== 2 ||
+        body.versions[0] !== 1 ||
+        body.versions[1] !== 2
+    ) {
+        throw new TypeError("proof vector presence requires physical versions 1 and 2");
+    }
+    const physicalIds = body.versions.map(version => cdbVectorizePhysicalId(vectorId, version));
+    const records = await env.CDB_PROOF_VECTORS.getByIds([...physicalIds]);
+    if (!Array.isArray(records) || records.length > physicalIds.length) {
+        throw new TypeError("proof Vectorize presence returned an invalid result");
+    }
+    const present = new Set<string>();
+    for (const record of records) {
+        if (typeof record !== "object" || record === null || !physicalIds.includes(record.id)) {
+            throw new TypeError("proof Vectorize presence returned an unexpected record");
+        }
+        if (present.has(record.id)) throw new TypeError("proof Vectorize presence returned a duplicate record");
+        present.add(record.id);
+    }
+    return c.json({
+        vectorId,
+        records: physicalIds.map(physicalId => ({ physicalId, present: present.has(physicalId) })),
+    });
+});
+
 app.post("/proof/vector-search-audit", async c => {
     const env = c.env as unknown as ProofEnv;
     if (!(await proofAuthorized(c.req, env))) return c.json({ error: "not found" }, 404);

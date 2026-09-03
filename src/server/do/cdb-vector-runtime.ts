@@ -49,7 +49,7 @@ export class CdbVectorRuntime {
             readonly storage: DurableObjectStorage;
             readonly resources: () => readonly VectorResourceV1[];
             readonly resolveIndex: (binding: string) => CdbVectorizeMutationIndex;
-            readonly assertDeliveryAdmission: (claim: CdbVectorClaim, sql: SyncSql) => void;
+            readonly assertDeliveryAdmission: (claim: CdbVectorClaim, sql: SyncSql, recoveryBookmark?: string) => void;
             readonly organizationDeleted?: (organizationId: string, sql: SyncSql) => boolean;
             readonly recordOrganizationUnprovenDeleteTurn?: (
                 organizationId: string,
@@ -64,7 +64,7 @@ export class CdbVectorRuntime {
         }
     ) {}
 
-    async maintain(): Promise<void> {
+    async maintain(options: { readonly recoveryBookmark?: string } = {}): Promise<void> {
         const nowMs = this.input.nowMs();
         let claim: CdbVectorClaim | null = null;
         let resource: VectorResourceV1 | undefined;
@@ -84,7 +84,7 @@ export class CdbVectorRuntime {
                     });
                     if (!claim) return;
                     resource = this.resolveResource(claim);
-                    this.input.assertDeliveryAdmission(claim, sql);
+                    this.input.assertDeliveryAdmission(claim, sql, options.recoveryBookmark);
                     this.assertDomainHead(sql, claim, resource);
                 });
             });
@@ -103,6 +103,13 @@ export class CdbVectorRuntime {
         let settlementClaim: CdbVectorClaim = claimed;
         try {
             await this.input.scheduleAlarmNoLaterThan(claimed.leasedUntil);
+            this.input.storage.transactionSync(() => {
+                this.input.assertDeliveryAdmission(
+                    claimed,
+                    adaptSqlStorage(this.input.storage.sql),
+                    options.recoveryBookmark
+                );
+            });
             const deleteProofRecorded = claimed.operation === "delete" && claimed.deleteProofRecorded;
             const index = deleteProofRecorded ? null : this.input.resolveIndex(claimedResource.binding);
             const receipt =
@@ -141,7 +148,7 @@ export class CdbVectorRuntime {
                     const sql = adaptSqlStorage(this.input.storage.sql);
                     this.input.captureDeliveryTransaction(sql, claimed.placementVshard, () => {
                         const currentResource = this.resolveResource(claimed);
-                        this.input.assertDeliveryAdmission(claimed, sql);
+                        this.input.assertDeliveryAdmission(claimed, sql, options.recoveryBookmark);
                         this.assertDomainHead(sql, claimed, currentResource);
                         new CdbVectorOutboxStore(sql).recordDeleteProof(claimed, acknowledgedAt);
                     });
@@ -157,7 +164,7 @@ export class CdbVectorRuntime {
                 const sql = adaptSqlStorage(this.input.storage.sql);
                 this.input.captureDeliveryTransaction(sql, settlementClaim.placementVshard, () => {
                     const currentResource = this.resolveResource(settlementClaim);
-                    this.input.assertDeliveryAdmission(settlementClaim, sql);
+                    this.input.assertDeliveryAdmission(settlementClaim, sql, options.recoveryBookmark);
                     this.assertDomainHead(sql, settlementClaim, currentResource);
                     const store = new CdbVectorOutboxStore(sql);
                     const unsettledUntil =
@@ -228,7 +235,7 @@ export class CdbVectorRuntime {
                     const sql = adaptSqlStorage(this.input.storage.sql);
                     this.input.captureDeliveryTransaction(sql, claimed.placementVshard, () => {
                         const currentResource = this.resolveResource(claimed);
-                        this.input.assertDeliveryAdmission(claimed, sql);
+                        this.input.assertDeliveryAdmission(claimed, sql, options.recoveryBookmark);
                         this.assertDomainHead(sql, claimed, currentResource);
                         const store = new CdbVectorOutboxStore(sql);
                         const unsettledUntil =

@@ -1,4 +1,4 @@
-//! Chardb protocol v3 wire types.
+//! `CharDB` protocol v3 wire types.
 //!
 //! The tag set and fields are closed at version 3. Unknown error codes and
 //! refetch reasons are the two additive exceptions described by the server
@@ -708,7 +708,7 @@ pub(crate) fn validate_reference(reference: &str) -> Result<()> {
     if !is_valid_reference(reference) {
         return Err(Error::local(
             ErrorKind::Configuration,
-            "Chardb reference must be nonempty and contain '#'",
+            "CharDB reference must be nonempty and contain '#'",
         ));
     }
     Ok(())

@@ -47,12 +47,25 @@ function construct(CdbClass: typeof Cdb, db: Database, index: object) {
                 alarm = deadline;
             },
             getAlarm: async (): Promise<number | null> => alarm,
+            getCurrentBookmark: async () => "00000001-current",
+            onNextSessionRestoreBookmark: async () => "00000002-undo",
         },
         blockConcurrencyWhile: (callback: () => Promise<unknown>): void => {
             ready = callback();
         },
     } as unknown as DurableObjectState;
-    const env = "CDB_MESSAGES" in index ? index : { CDB_MESSAGES: index };
+    const recoveryNamespace = {
+        idFromName: () => "global",
+        get: () => ({
+            adminRecoveryAdmissionClock: async () => ({
+                generation: 0,
+                activeOperationId: null,
+                activeDigest: null,
+            }),
+        }),
+    } as unknown as DurableObjectNamespace;
+    const bindings = "CDB_MESSAGES" in index ? index : { CDB_MESSAGES: index };
+    const env = { ...bindings, CDB_RESHARD: recoveryNamespace };
     return {
         cdb: new CdbClass(state, env as never),
         ready,
@@ -339,6 +352,7 @@ describe("private organization vector mutation delivery", () => {
         await initial.ready;
         expect(
             await initial.cdb.mutate({
+                recoveryGeneration: 0,
                 principalId: "user-1",
                 mutId: "vector-finalized-bootstrap-1",
                 ref: f.put.__chardbRef,
@@ -458,12 +472,16 @@ describe("private organization vector mutation delivery", () => {
             .get() as { active_version: number; active_epoch: number; active_digest: string };
         const args = {
             migId: "unbound-vector-dest-abort",
+            recoveryGeneration: 0,
             rangeLo: range,
             rangeHi: range,
             destinationGeneration: 2,
         };
 
-        expect(configured.cdb.prepareReshardDestOwnership(args)).toEqual({ prepared: true, serving: false });
+        await expect(configured.cdb.prepareReshardDestOwnership(args)).resolves.toEqual({
+            prepared: true,
+            serving: false,
+        });
         await expect(
             configured.cdb.beginReshardDestAbort({
                 ...args,
@@ -514,6 +532,7 @@ describe("private organization vector mutation delivery", () => {
             placement: { authority: "organization" as const, partitionKey: "org-1" },
         };
         const inserted = await configured.cdb.mutate({
+            recoveryGeneration: 0,
             ...request,
             mutId: "vector-put-1",
             ref: f.put.__chardbRef,
@@ -544,10 +563,10 @@ describe("private organization vector mutation delivery", () => {
         db.run(
             `INSERT INTO _chardb_live_subscriptions
                (gateway_id, registration_id, connection_id, client_id, sub_id, state, payload_hash,
-                principal_id, organization_id, authority, schema_epoch, vshard, domain_schema_epoch,
+                principal_id, organization_id, authority, schema_epoch, recovery_generation, vshard, domain_schema_epoch,
                 ref, args_json, policy_digest, query_hash, tables_json, intervals_json)
              VALUES ('gateway-vector', 'registration-vector', 'connection-vector', 'client-vector', 1, 'active',
-                     'payload', 'user-1', 'org-1', 'organization', 1, ?, 1, 'vector-query', '{}',
+                     'payload', 'user-1', 'org-1', 'organization', 1, 0, ?, 1, 'vector-query', '{}',
                      'policy', 'query', '[]', '[]')`,
             [Number(vshardOf(["org-1"]))]
         );
@@ -559,6 +578,7 @@ describe("private organization vector mutation delivery", () => {
 
         expect(
             await configured.cdb.mutate({
+                recoveryGeneration: 0,
                 ...request,
                 mutId: "vector-update-1",
                 ref: f.update.__chardbRef,
@@ -589,6 +609,7 @@ describe("private organization vector mutation delivery", () => {
         ).toEqual({ registration_id: "registration-vector", change_seq: changeSeq });
         expect(
             await configured.cdb.mutate({
+                recoveryGeneration: 0,
                 ...request,
                 mutId: "vector-move-1",
                 ref: f.move.__chardbRef,
@@ -600,6 +621,7 @@ describe("private organization vector mutation delivery", () => {
 
         expect(
             await configured.cdb.mutate({
+                recoveryGeneration: 0,
                 ...request,
                 mutId: "vector-delete-1",
                 ref: f.remove.__chardbRef,
@@ -647,6 +669,7 @@ describe("private organization vector mutation delivery", () => {
         };
         expect(
             await configured.cdb.mutate({
+                recoveryGeneration: 0,
                 ...request,
                 mutId: "organization-delete-put",
                 ref: f.put.__chardbRef,
@@ -659,6 +682,7 @@ describe("private organization vector mutation delivery", () => {
         db.run("UPDATE _chardb_vector_capacity SET outbox_rows = ?", [CDB_VECTOR_MAX_OUTBOX_ROWS]);
         await expect(
             configured.cdb.deleteOrganizationFiles({
+                recoveryGeneration: 0,
                 organizationId: "org-delete",
                 nowMs: 99,
                 domainSchemaEpoch: 1,
@@ -673,6 +697,7 @@ describe("private organization vector mutation delivery", () => {
 
         await expect(
             configured.cdb.deleteOrganizationFiles({
+                recoveryGeneration: 0,
                 organizationId: "org-delete",
                 nowMs: 100,
                 domainSchemaEpoch: 1,
@@ -687,6 +712,7 @@ describe("private organization vector mutation delivery", () => {
         });
         expect(
             await configured.cdb.mutate({
+                recoveryGeneration: 0,
                 ...request,
                 mutId: "organization-delete-late-put",
                 ref: f.put.__chardbRef,
@@ -740,6 +766,7 @@ describe("private organization vector mutation delivery", () => {
         }
 
         await configured.cdb.deleteOrganizationFiles({
+            recoveryGeneration: 0,
             organizationId: "org-page",
             nowMs: 1_000,
             domainSchemaEpoch: 1,
@@ -765,6 +792,7 @@ describe("private organization vector mutation delivery", () => {
         const versionsBeforeRetry = db.query("SELECT vector_id, version FROM _chardb_vectors ORDER BY vector_id").all();
         await expect(
             configured.cdb.deleteOrganizationFiles({
+                recoveryGeneration: 0,
                 organizationId: "org-page",
                 nowMs: 2_000,
                 domainSchemaEpoch: 1,
@@ -804,6 +832,7 @@ describe("private organization vector mutation delivery", () => {
 
         await expect(
             configured.cdb.mutate({
+                recoveryGeneration: 0,
                 principalId: "user-1",
                 mutId: "vector-held-delivery-1",
                 ref: f.put.__chardbRef,
@@ -859,6 +888,7 @@ describe("private organization vector mutation delivery", () => {
 
         await expect(
             configured.cdb.mutate({
+                recoveryGeneration: 0,
                 principalId: "user-1",
                 mutId: "vector-rearm-1",
                 ref: f.put.__chardbRef,
@@ -881,6 +911,72 @@ describe("private organization vector mutation delivery", () => {
         expect(configured.alarm()).toBe(2_000);
     });
 
+    test("quiesces a pre-arm provider mutation before recovery scrub can start", async () => {
+        const db = new Database(":memory:");
+        databases.push(db);
+        const f = fixture();
+        let releaseFirst: (() => void) | undefined;
+        let markFirstStarted: (() => void) | undefined;
+        const firstGate = new Promise<void>(resolve => {
+            releaseFirst = resolve;
+        });
+        const firstStarted = new Promise<void>(resolve => {
+            markFirstStarted = resolve;
+        });
+        let providerCalls = 0;
+        const configured = construct(
+            configureCdbRuntime({ schema: () => f.schema, manifest: () => manifestFromExports({ put: f.put }) }),
+            db,
+            {
+                async upsert(records: readonly { id: string }[]) {
+                    providerCalls++;
+                    if (providerCalls === 1) {
+                        markFirstStarted?.();
+                        await firstGate;
+                    }
+                    return { count: records.length, ids: records.map(record => record.id) };
+                },
+                deleteByIds: () => ({ count: 0, ids: [] }),
+                getByIds: () => [],
+            }
+        );
+        await configured.ready;
+        await expect(
+            configured.cdb.mutate({
+                recoveryGeneration: 0,
+                principalId: "user-1",
+                mutId: "vector-recovery-quiescence-1",
+                ref: f.put.__chardbRef,
+                args: { organizationId: "org-1", id: "message-quiescence", body: "held", values: [1, 0, 0] },
+                auth: { userId: "user-1", tenantId: "org-1", role: "member", roles: ["member"], claims: {} },
+                placement: { authority: "organization", partitionKey: "org-1" },
+                schemaEpoch: 1,
+                domainSchemaEpoch: 1,
+            })
+        ).resolves.toMatchObject({ ok: true, ran: true });
+
+        const ordinaryDelivery = configured.cdb.alarm();
+        await firstStarted;
+        await configured.cdb.adminArmRecoveryRestore({
+            bookmark: "00000000-history",
+            armedAt: 42,
+            operationId: "00000000-0000-4000-8000-000000000001",
+            generation: 1,
+        });
+        releaseFirst?.();
+        await ordinaryDelivery;
+        expect(providerCalls).toBe(1);
+        expect(db.query("SELECT COUNT(*) AS count FROM _chardb_vector_outbox").get()).toEqual({ count: 1 });
+
+        db.run("UPDATE _chardb_vector_outbox SET next_attempt_at = 0, leased_until = NULL, lease_token = NULL");
+        await expect(configured.cdb.adminQuiesceRecoveryVectors({ bookmark: "00000000-history" })).resolves.toEqual({
+            pending: 0,
+            terminal: 0,
+        });
+        expect(providerCalls).toBe(2);
+        expect(db.query("SELECT COUNT(*) AS count FROM _chardb_vector_outbox").get()).toEqual({ count: 0 });
+    });
+
     test("rolls back unstaged domain pointers and staged orphan heads", async () => {
         const db = new Database(":memory:");
         databases.push(db);
@@ -899,6 +995,7 @@ describe("private organization vector mutation delivery", () => {
         );
         await configured.ready;
         const result = await configured.cdb.mutate({
+            recoveryGeneration: 0,
             principalId: "user-1",
             mutId: "vector-bypass-1",
             ref: f.bypass.__chardbRef,
@@ -925,6 +1022,7 @@ describe("private organization vector mutation delivery", () => {
         await configured.ready;
         expect(
             await configured.cdb.mutate({
+                recoveryGeneration: 0,
                 principalId: "user-1",
                 mutId: "vector-fenced-1",
                 ref: f.put.__chardbRef,
@@ -938,12 +1036,13 @@ describe("private organization vector mutation delivery", () => {
         const vshard = Number(vshardOf(["org-1"]));
         const fence = {
             migrationId: "vector-source-fence",
+            recoveryGeneration: 0,
             rangeLo: vshard,
             rangeHi: vshard,
             sourceGeneration: 1,
             destinationGeneration: 2,
         };
-        configured.cdb.prepareRoutingFence(fence);
+        await configured.cdb.prepareRoutingFence(fence);
         await configured.cdb.activateRoutingFence(fence);
         db.run("UPDATE _chardb_vector_outbox SET next_attempt_at = 0, leased_until = NULL, lease_token = NULL");
         await expect(configured.cdb.alarm()).resolves.toBeUndefined();
@@ -1014,6 +1113,7 @@ describe("private organization vector mutation delivery", () => {
         await configured.ready;
         expect(
             await configured.cdb.mutate({
+                recoveryGeneration: 0,
                 principalId: "user-1",
                 mutId: "vector-forged-env-1",
                 ref: f.put.__chardbRef,

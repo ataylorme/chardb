@@ -411,7 +411,7 @@ function mergeAuthIntoSchema<TSchema>(schema: TSchema, synthesizedAuth: Synthesi
  * `mountChardb` routes any request whose path starts with the
  * better-auth basePath (default `/api/auth`) straight to it, so the
  * user never wires the better-auth router into their app manually.
- * Chardb's reserved prefixes (`/ws`, `/_chardb/*`) win over the auth
+ * CharDB's reserved prefixes (`/ws`, `/_chardb/*`) win over the auth
  * handler; everything else falls through to `app.fetch`.
  */
 export interface MountChardbOptions {

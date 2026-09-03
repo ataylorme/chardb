@@ -13,10 +13,10 @@ import {
     cdbVectorizePhysicalId,
 } from "./vector-proof.ts";
 
-const CAPABILITIES_SCHEMA = "chardb.file-vector-reshard-proof-capabilities.v2";
-const CLEANUP_SCHEMA = "chardb.file-reshard-proof-cleanup.v1";
+const CAPABILITIES_SCHEMA = "chardb.file-vector-reshard-proof-capabilities.v3";
+const CLEANUP_SCHEMA = "chardb.file-reshard-proof-cleanup.v2";
 const FAULT_SCHEMA = "chardb.file-reshard-proof-fault.v1";
-const SAMPLE_SCHEMA = "chardb.file-vector-reshard-deployment-sample.v2";
+const SAMPLE_SCHEMA = "chardb.file-vector-reshard-deployment-sample.v3";
 const PHASES = [
     "setup",
     "init",
@@ -294,7 +294,7 @@ export class Catalog extends app.Catalog {
                 throw new Error("proof cleanup manifest is malformed");
             }
             if (keys.includes(input.key)) return;
-            if (keys.length >= 512 || !/^v1\/[A-Za-z0-9_-]{1,128}\/[A-Za-z0-9_-]{1,128}$/.test(input.key)) {
+            if (keys.length >= 512 || !/^_chardb\/retained\/sha256\/[a-f0-9]{64}$/.test(input.key)) {
                 throw new TypeError("proof cleanup key is invalid");
             }
             const next = [...keys, input.key];
@@ -322,9 +322,9 @@ export class Catalog extends app.Catalog {
             if (existing.stage !== input.from) throw new Error(`proof receipt cannot advance from ${existing.stage}`);
             if (input.from === "faulted" && input.to === "completed") {
                 const files = existing.payload.files as FileRecord[] | undefined;
-                const alarm = input.payload.alarm as { remainingObjects?: unknown } | undefined;
-                const remainingObjects = alarm?.remainingObjects;
-                if (!Array.isArray(files) || !Number.isSafeInteger(remainingObjects)) {
+                const alarm = input.payload.alarm as { retainedObjects?: unknown } | undefined;
+                const retainedObjects = alarm?.retainedObjects;
+                if (!Array.isArray(files) || !Number.isSafeInteger(retainedObjects)) {
                     throw new Error("completed proof receipt has no cleanup manifest");
                 }
                 const manifest = this.ctx.storage.sql
@@ -333,13 +333,13 @@ export class Catalog extends app.Catalog {
                         input.runKey
                     )
                     .toArray()[0];
-                const expectedKeys = files.map(file => `v1/${file.organizationId}/${file.fileId}`);
+                const expectedKeys = files.map(file => `_chardb/retained/sha256/${file.contentSha256}`);
                 if (!manifest || JSON.stringify(JSON.parse(manifest.keys_json)) !== JSON.stringify(expectedKeys)) {
                     throw new Error("completed proof cleanup manifest drifted from seeded files");
                 }
                 this.ctx.storage.sql.exec(
                     "UPDATE proof_cleanup_manifest SET initial_remaining = ?, created_at = ? WHERE run_key = ?",
-                    remainingObjects as number,
+                    retainedObjects as number,
                     Date.now(),
                     input.runKey
                 );
@@ -491,6 +491,7 @@ interface CatalogProofRpc {
         remaining: number;
         done: boolean;
     }>;
+    organizationDeletionPurgeStatus(input: { organizationId: string }): Promise<Record<string, unknown>>;
     route(vshard: number): Promise<{ shardId: string; schemaEpoch: number; domainSchemaEpoch: number }>;
 }
 
@@ -738,6 +739,7 @@ export class Cdb extends app.Cdb {
                 sha256: input.file.contentSha256,
                 size: input.file.bytes,
                 nowMs: Date.now(),
+                recoveryGeneration: 0,
                 schemaEpoch: input.schemaEpoch,
                 domainSchemaEpoch: input.domainSchemaEpoch,
                 auth: {
@@ -849,6 +851,53 @@ export class Cdb extends app.Cdb {
             providerMutationCalls,
         };
     }
+
+    async proofFileAlarmState(input: { organizationId: string }): Promise<Record<string, unknown>> {
+        const files = this.ctx.storage.sql
+            .exec<{ status: string; count: number }>(
+                `SELECT status, COUNT(*) AS count FROM _chardb_files
+                 WHERE organization_id = ? GROUP BY status ORDER BY status`,
+                input.organizationId
+            )
+            .toArray();
+        const metadataRows = Number(
+            this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM _chardb_files").one()?.count ??
+                0
+        );
+        const organizationMetadataRows = files.reduce((total, row) => total + Number(row.count), 0);
+        const tombstone = this.ctx.storage.sql
+            .exec<{
+                organization_id: string;
+                deleted_at: number;
+                placement_vshard: number;
+                vector_unproven_turns: number;
+            }>("SELECT * FROM _chardb_deleted_organizations WHERE organization_id = ?", input.organizationId)
+            .toArray();
+        const ownership = this.ctx.storage.sql
+            .exec<{
+                mig_id: string;
+                role: string;
+                outcome: string;
+                source_fenced: number;
+                maintenance_enabled: number;
+                range_lo: number;
+                range_hi: number;
+                updated_at: number;
+            }>(
+                `SELECT mig_id, role, outcome, source_fenced, maintenance_enabled, range_lo, range_hi, updated_at
+                 FROM _chardb_split_file_cursor
+                 ORDER BY updated_at DESC, mig_id`
+            )
+            .toArray();
+        return {
+            alarm: await this.ctx.storage.getAlarm(),
+            metadataRows,
+            organizationMetadataRows,
+            files,
+            tombstone,
+            ownership,
+        };
+    }
 }
 
 interface CdbProofRpc {
@@ -861,6 +910,7 @@ interface CdbProofRpc {
     }): Promise<boolean>;
     proofSettleLocalVectors(): Promise<void>;
     proofVectorEvidence(input: { vectorIds: readonly string[] }): Promise<VectorEvidence>;
+    proofFileAlarmState(input: { organizationId: string }): Promise<Record<string, unknown>>;
 }
 
 function cdb(env: ProofEnv, shardId: string): CdbProofRpc {
@@ -1093,9 +1143,10 @@ async function seedFiles(
         const uploadBody = bodyObject(uploaded.body, "upload");
         const file = bodyObject(uploadBody.file, "uploaded file");
         if (!uploaded.response.ok || typeof file.fileId !== "string") throw new Error(`upload ${index} failed`);
+        const contentSha256 = await hexDigest(bytes);
         await catalog(env).proofAppendCleanupKey({
             runKey: request.runKey,
-            key: `v1/${organizationId}/${file.fileId}`,
+            key: `_chardb/retained/sha256/${contentSha256}`,
         });
         const rowId = `row-${request.sequence < 0 ? "warmup" : request.sequence}-${index}`;
         const values = proofVectorValues(index);
@@ -1119,27 +1170,16 @@ async function seedFiles(
             vectorId: attached.vectorId,
             values,
             bytes: bytes.byteLength,
-            contentSha256: await hexDigest(bytes),
+            contentSha256,
         });
     }
     return records;
 }
 
-async function objectsForOrganizations(bucket: R2Bucket, organizationIds: readonly string[]): Promise<R2Object[]> {
-    const objects: R2Object[] = [];
-    for (const organizationId of organizationIds) {
-        let cursor: string | undefined;
-        do {
-            const page = await bucket.list({ prefix: `v1/${organizationId}/`, ...(cursor ? { cursor } : {}) });
-            objects.push(...page.objects);
-            cursor = page.truncated ? page.cursor : undefined;
-        } while (cursor);
-    }
-    return objects.sort((left, right) => left.key.localeCompare(right.key));
-}
-
-async function inventory(bucket: R2Bucket, organizationIds: readonly string[]): Promise<R2Inventory> {
-    const objects = await objectsForOrganizations(bucket, organizationIds);
+async function inventory(bucket: R2Bucket, files: readonly FileRecord[]): Promise<R2Inventory> {
+    const objects = (await Promise.all(files.map(file => bucket.head(`_chardb/retained/sha256/${file.contentSha256}`))))
+        .filter((object): object is R2Object => object !== null)
+        .sort((left, right) => left.key.localeCompare(right.key));
     return {
         objects: objects.length,
         bytes: objects.reduce((total, object) => total + object.size, 0),
@@ -1278,6 +1318,7 @@ app.get("/proof/file-reshard/capabilities", async c => {
             freshDisposableData: true,
             providerVectorMutationTrace: env.CDB_PROOF_TARGET_KIND === "local",
             publicVectorSearch: true,
+            retainedFileRecovery: true,
             vectorAwareReshard: true,
         },
     });
@@ -1374,7 +1415,7 @@ app.post("/proof/file-reshard/run", async c => {
             checkpoint = "file-seed";
             const files = await seedFiles(origin, env, c.executionCtx, owner, organizationIds, request);
             checkpoint = "pre-move-inventory";
-            const before = await inventory(env.CDB_FILES, organizationIds);
+            const before = await inventory(env.CDB_FILES, files);
             timings.setup = performance.now() - setupStarted;
             const routeBefore = await ledger.route(0);
             const migrationId = `proof-${(await hexDigest(request.runKey)).slice(0, 32)}`;
@@ -1451,7 +1492,7 @@ app.post("/proof/file-reshard/run", async c => {
         const routeAfter = await ledger.route(0);
         const verifyStarted = performance.now();
         checkpoint = "post-move-inventory";
-        const after = await inventory(env.CDB_FILES, organizationIds);
+        const after = await inventory(env.CDB_FILES, files);
         checkpoint = "download-verify";
         await verifyDownloads(origin, env, c.executionCtx, owner, files);
         const vectorIds = files.map(file => file.vectorId);
@@ -1475,13 +1516,25 @@ app.post("/proof/file-reshard/run", async c => {
         });
         checkpoint = "file-alarm";
         const alarmDeadline = Date.now() + 30_000;
-        let alarmInventory = await inventory(env.CDB_FILES, organizationIds);
-        while (alarmInventory.objects !== request.profile.files - 1 && Date.now() < alarmDeadline) {
+        const deletedOrganizationId = organizationIds[0] as string;
+        let alarmState = await cdb(env, destinationShard).proofFileAlarmState({
+            organizationId: deletedOrganizationId,
+        });
+        while (alarmState.organizationMetadataRows !== 0 && Date.now() < alarmDeadline) {
             await scheduler.wait(25);
-            alarmInventory = await inventory(env.CDB_FILES, organizationIds);
+            alarmState = await cdb(env, destinationShard).proofFileAlarmState({
+                organizationId: deletedOrganizationId,
+            });
         }
-        if (alarmInventory.objects !== request.profile.files - 1)
-            throw new Error("durable file alarm did not converge");
+        const alarmInventory = await inventory(env.CDB_FILES, files);
+        if (alarmState.organizationMetadataRows !== 0) {
+            const catalogDeletion = await ledger.organizationDeletionPurgeStatus({
+                organizationId: deletedOrganizationId,
+            });
+            throw new Error(
+                `durable file alarm did not converge: ${JSON.stringify({ catalogDeletion, destinationAlarm: alarmState })}`
+            );
+        }
         timings.verify = performance.now() - verifyStarted;
         const localTrace = env.CDB_PROOF_TARGET_KIND === "local";
         const totalMs = Object.values(timings).reduce((sum, value) => sum + value, 0);
@@ -1491,7 +1544,7 @@ app.post("/proof/file-reshard/run", async c => {
             excluded: request.excluded,
             candidateSha256: request.candidateSha256,
             runKey: request.runKey,
-            workload: { id: "file-vector-aware-range-move", version: 2, profile: request.profile },
+            workload: { id: "file-vector-aware-range-move", version: 3, profile: request.profile },
             target: target(env, sourceShard, destinationShard),
             execution: { startedAt: payload.startedAt, completedAt: new Date().toISOString(), requestAttempts: 2 },
             dataset: {
@@ -1569,8 +1622,9 @@ app.post("/proof/file-reshard/run", async c => {
                 invoked: true,
                 durable: true,
                 ownerShard: routeAfter.shardId,
-                deletedObjects: after.objects - alarmInventory.objects,
-                remainingObjects: alarmInventory.objects,
+                deletedMetadataRows: request.profile.files - Number(alarmState.metadataRows),
+                remainingMetadataRows: Number(alarmState.metadataRows),
+                retainedObjects: alarmInventory.objects,
             },
             correctness: {
                 alarmConverged: true,
@@ -1578,6 +1632,7 @@ app.post("/proof/file-reshard/run", async c => {
                 destinationServing: routeAfter.shardId === destinationShard,
                 fileParity: before.digest === after.digest,
                 r2Stable: before.digest === after.digest,
+                retainedContentStable: alarmInventory.digest === after.digest,
                 responseLossRecovered: true,
                 sourceDrained: driven.state.phase === TERMINAL_PHASE,
                 sourceFenced,
@@ -1610,10 +1665,12 @@ app.post("/proof/file-reshard/run", async c => {
         });
         return c.json(sample);
     } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         return c.json(
             {
                 code: error instanceof TypeError ? "PROOF_REQUEST_INVALID" : "PROOF_RUN_FAILED",
                 checkpoint,
+                message,
             },
             error instanceof TypeError ? 400 : 500
         );

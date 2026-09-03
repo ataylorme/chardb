@@ -116,6 +116,7 @@ function fileOperationSamples(
     return Array.from({ length: count }, (_, sequence) => ({
         sequence,
         objectSequence: sequence % uploadCount,
+        attempts: 1,
         latencyMs: latency,
         bytes: operation === "attach" ? 0 : payloadBytes,
         correctness: {
@@ -335,12 +336,17 @@ export function buildCloudflareFileProof(candidate: ExactCandidate, pairSha256: 
             schemaVersion: 1,
             routingEpoch: 2,
             acceptedStatus: 202,
+            filesReset: 2,
+            filesRetained: 2,
+            vectorsReset: 0,
+            filesRehydrated: 1,
             vectorsRequeued: 0,
             postPointRowReadableBeforeRestore: true,
             pointRowReadableAfterRestore: true,
             postPointRowHiddenAfterRestore: true,
-            postPointR2ObjectRetained: true,
+            postPointLiveKeyAbsent: true,
             pointFileRecoveredFromRetention: true,
+            pointFileRetentionRefreshedBeforeScrub: true,
         },
         lifecycle: {
             uploadIdempotent: true,
@@ -491,7 +497,7 @@ function reshardSample(
         excluded: sequence === -1,
         candidateSha256,
         runKey: `${preparation.runId}_${sequence < 0 ? "warmup" : sequence}`,
-        workload: { id: "file-vector-aware-range-move", version: 2, profile },
+        workload: { id: "file-vector-aware-range-move", version: 3, profile },
         target: reshardTarget(kind, preparation),
         execution: {
             startedAt: "2026-08-29T00:00:00.000Z",
@@ -568,8 +574,9 @@ function reshardSample(
             invoked: true,
             durable: true,
             ownerShard: "cdb-destination",
-            deletedObjects: 1,
-            remainingObjects: profile.files - 1,
+            deletedMetadataRows: 1,
+            remainingMetadataRows: profile.files - 1,
+            retainedObjects: profile.files,
         },
         correctness: Object.fromEntries(FILE_RESHARD_DEPLOYMENT_CORRECTNESS.map(name => [name, true])),
     };

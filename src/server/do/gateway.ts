@@ -10,7 +10,7 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { CdbError, docsUrlFor, isCdbErrorCode, isRetryable } from "../../errors.ts";
+import { CdbError, docsUrlFor, isCdbErrorCode, isRetryable, rehydrateCdbRpcError } from "../../errors.ts";
 import {
     type ChardbRef,
     ClientId,
@@ -249,6 +249,7 @@ export function cdbSubscriptionRequest(input: {
     readonly organizationId: TenantId;
     readonly authority?: MutationAuthority;
     readonly schemaEpoch: number;
+    readonly recoveryGeneration: number;
     readonly vshard: number;
     readonly domainSchemaEpoch: number;
     readonly ref: ChardbRef;
@@ -270,6 +271,7 @@ export function cdbSubscriptionRequest(input: {
             ? {}
             : { placement: { authority: input.authority, partitionKey: input.organizationId } }),
         schemaEpoch: input.schemaEpoch,
+        recoveryGeneration: input.recoveryGeneration,
         vshard: input.vshard,
         domainSchemaEpoch: input.domainSchemaEpoch,
         ref: input.ref,
@@ -618,11 +620,14 @@ export class Gateway extends DurableObject<GatewayEnv> {
         // the same identity. Protected work remains paused throughout grace.
         const nowSeconds = Math.floor(nowMs / 1_000);
         const refreshDeadline = gatewayAuthRefreshDeadlineMs(attachment);
-        if (refreshDeadline === null) return { status: "terminal" };
+        if (refreshDeadline === null) {
+            this.rejectExpiredGatewaySocket(ws);
+            return { status: "terminal" };
+        }
         if (attachment.jwtExp <= nowSeconds) {
-            return nowMs < refreshDeadline
-                ? { status: "refreshing", retryAt: refreshDeadline }
-                : { status: "terminal" };
+            if (nowMs < refreshDeadline) return { status: "refreshing", retryAt: refreshDeadline };
+            this.rejectExpiredGatewaySocket(ws);
+            return { status: "terminal" };
         }
         if (
             this.authRefreshBarriers.has(identity.connectionId) &&
@@ -637,6 +642,15 @@ export class Gateway extends DurableObject<GatewayEnv> {
             return { status: "refreshing", retryAt: Math.ceil(attachment.jwtNbf * 1_000) };
         }
         return { status: "ready", ws, attachment };
+    }
+
+    private rejectExpiredGatewaySocket(ws: WebSocket): void {
+        try {
+            this.rejectAuth(ws, "CDB_FORBIDDEN");
+        } catch {
+            // The alarm caller still owns durable retirement when the socket
+            // cannot receive or complete the terminal close.
+        }
     }
 
     private trackGatewayTask(connectionId: string, task: Promise<void>): Promise<void> {
@@ -684,7 +698,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
     private dueGatewayCleanupRows(nowMs: number): readonly StoredGatewayCleanupRow[] {
         return adaptSqlStorage(this.ctx.storage.sql).all<StoredGatewayCleanupRow>(
             `SELECT g.principal_id, g.client_id, g.sub_id, g.registration_id,
-                    g.connection_id, g.source_cdb_id, g.retry_count
+                    g.connection_id, g.source_cdb_id, g.organization_id, g.recovery_generation, g.retry_count
              FROM _gw_registration_generations g
              WHERE g.lifecycle = 'retiring' AND g.cdb_state = 'retiring'
                AND g.retry_at IS NOT NULL AND g.retry_at <= ?
@@ -810,9 +824,25 @@ export class Gateway extends DurableObject<GatewayEnv> {
                 clientId: ClientId(row.client_id),
                 subId: SubId(row.sub_id),
             };
-            const outcome: unknown = await cdb.unsubscribe(subscription);
+            let recoveryGeneration = row.recovery_generation;
+            let outcome: unknown;
+            try {
+                outcome = await cdb.unsubscribe({ subscription, recoveryGeneration });
+            } catch (error) {
+                const normalized = rehydrateCdbRpcError(error);
+                if (!(normalized instanceof CdbError) || normalized.code !== "CDB_STALE_EPOCH") throw normalized;
+                if (!row.organization_id) {
+                    throw gatewayInvalidationInvariant("retired Gateway generation omitted its recovery owner");
+                }
+                const route = await this.catalog().route(Number(vshardOf([row.organization_id])));
+                recoveryGeneration = route.recoveryGeneration;
+                outcome = await cdb.unsubscribe({ subscription, recoveryGeneration });
+            }
             if (outcome !== undefined) throw new Error("Cdb returned a malformed unsubscribe outcome");
-            const finalized: unknown = await cdb.finalizeUnsubscribe(subscription);
+            const finalized: unknown = await cdb.finalizeUnsubscribe({
+                subscription,
+                recoveryGeneration,
+            });
             if (finalized !== undefined) throw new Error("Cdb returned a malformed unsubscribe finalization outcome");
             this.completeGatewayCleanup(row);
         } catch (error) {
@@ -1539,7 +1569,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const resumeRefetchPendingSubIds = attachment.resumeRefetchPendingSubIds;
         let resumeReplayAttempt = false;
         if (resumeRefetchPendingSubIds !== undefined) {
-            if (!resumeRefetchPendingSubIds.includes(msg.subId)) {
+            if (!resumeRefetchPendingSubIds.includes(msg.subId) && !attachment.snapshotSubIds?.includes(msg.subId)) {
                 if (resumeRefetchPendingSubIds.length >= MAX_INITIAL_SNAPSHOTS_PER_CONNECTION) {
                     this.sendError(ws, "CDB_RATE_LIMITED", msg.subId);
                     return;
@@ -1771,6 +1801,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
         }
 
         const { shardId, schemaEpoch, domainSchemaEpoch } = projected.route;
+        const recoveryGeneration = projected.route.recoveryGeneration;
         if (pending.cancelled) return;
         const currentBeforeInstall = ws.deserializeAttachment() as GwAttachment | null;
         const operationKey = `${att.connectionId}:${msg.subId}`;
@@ -1783,27 +1814,6 @@ export class Gateway extends DurableObject<GatewayEnv> {
             currentBeforeInstall.principalId !== att.principalId
         ) {
             return;
-        }
-
-        // Consume the one-shot resume decision only after routing, authority,
-        // and placement admission succeed. A rejected request must not turn a
-        // later corrected request into the fallback attempt.
-        const resumePending = currentBeforeInstall.resumeRefetchPendingSubIds;
-        if (resumePending !== undefined) {
-            const nextResumePending = pending.resumeReplayAttempt
-                ? resumePending.includes(msg.subId)
-                    ? resumePending
-                    : [...resumePending, msg.subId].sort((left, right) => left - right).map(SubId)
-                : resumePending.filter(subId => subId !== msg.subId);
-            if (
-                nextResumePending.length !== resumePending.length ||
-                nextResumePending.some((subId, index) => subId !== resumePending[index])
-            ) {
-                ws.serializeAttachment({
-                    ...currentBeforeInstall,
-                    resumeRefetchPendingSubIds: nextResumePending,
-                } satisfies VerifiedGwAttachment);
-            }
         }
 
         const cdbId = this.env.CDB_SHARD.idFromName(shardId);
@@ -1837,31 +1847,37 @@ export class Gateway extends DurableObject<GatewayEnv> {
                           shardId,
                           sourceCdbId,
                           schemaEpoch,
+                          recoveryGeneration,
                           domainSchemaEpoch,
                           authEpochs,
                           nowMs: replayAt,
                       });
             });
-            if (!replaySnapshot) {
-                this.send(ws, { t: "mustRefetch", subIds: [msg.subId], reason: "lagged" });
-                return;
-            }
             const currentAfterReplayLookup = ws.deserializeAttachment() as GwAttachment | null;
             if (
+                pending.cancelled ||
+                this.pendingSubscriptions.get(operationKey) !== pending ||
                 !isVerifiedAttachment(currentAfterReplayLookup) ||
+                !isCurrentVerifiedAttachment(currentAfterReplayLookup) ||
                 currentAfterReplayLookup.connectionId !== att.connectionId ||
                 currentAfterReplayLookup.clientId !== att.clientId ||
                 currentAfterReplayLookup.principalId !== att.principalId
             ) {
                 return;
             }
-            const remainingResumeSubIds = currentAfterReplayLookup.resumeRefetchPendingSubIds?.filter(
-                subId => subId !== msg.subId
-            );
-            ws.serializeAttachment({
-                ...currentAfterReplayLookup,
-                ...(remainingResumeSubIds !== undefined ? { resumeRefetchPendingSubIds: remainingResumeSubIds } : {}),
-            } satisfies VerifiedGwAttachment);
+            if (!replaySnapshot) {
+                this.send(ws, { t: "mustRefetch", subIds: [msg.subId], reason: "lagged" });
+                const resumePending = currentAfterReplayLookup.resumeRefetchPendingSubIds;
+                if (resumePending !== undefined && !resumePending.includes(msg.subId)) {
+                    ws.serializeAttachment({
+                        ...currentAfterReplayLookup,
+                        resumeRefetchPendingSubIds: [...resumePending, msg.subId]
+                            .sort((left, right) => left - right)
+                            .map(SubId),
+                    } satisfies VerifiedGwAttachment);
+                }
+                return;
+            }
         }
         const registrationId = crypto.randomUUID();
         const installedAt = this.gatewayNowMs();
@@ -1905,6 +1921,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
                     shardId,
                     sourceCdbId,
                     schemaEpoch,
+                    recoveryGeneration,
                     domainSchemaEpoch,
                     authEpochs,
                     ...(att.lastCookie === undefined ? {} : { lastCookie: att.lastCookie }),
@@ -1963,6 +1980,7 @@ export class Gateway extends DurableObject<GatewayEnv> {
             organizationId: TenantId(organizationId),
             authority: routed.authority,
             schemaEpoch,
+            recoveryGeneration,
             vshard,
             domainSchemaEpoch,
             ref: msg.ref,
@@ -2010,7 +2028,14 @@ export class Gateway extends DurableObject<GatewayEnv> {
         const snapshotSubIds = [...new Set([...(current.snapshotSubIds ?? []), msg.subId])]
             .sort((left, right) => left - right)
             .map(SubId);
-        ws.serializeAttachment({ ...current, snapshotSubIds } satisfies VerifiedGwAttachment);
+        const resumeRefetchPendingSubIds = pending.resumeReplayAttempt
+            ? current.resumeRefetchPendingSubIds
+            : current.resumeRefetchPendingSubIds?.filter(subId => subId !== msg.subId);
+        ws.serializeAttachment({
+            ...current,
+            snapshotSubIds,
+            ...(resumeRefetchPendingSubIds !== undefined ? { resumeRefetchPendingSubIds } : {}),
+        } satisfies VerifiedGwAttachment);
         if (replaySnapshot) {
             try {
                 this.send(ws, {

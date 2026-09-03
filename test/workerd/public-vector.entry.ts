@@ -20,6 +20,7 @@ import baseWorker, {
     Catalog as ProductionCatalog,
     Cdb as ProductionCdb,
     Gateway as ProductionGateway,
+    Resharder as ProductionResharder,
 } from "./gateway-jwt.entry.ts";
 
 const VECTOR_BINDING = "CDB_PROOF_VECTORS";
@@ -110,6 +111,7 @@ function withVectorApi(base: ChardbManifest): ChardbManifest {
 }
 
 export { ProductionCatalog as Catalog };
+export class Resharder extends ProductionResharder {}
 
 export class Gateway extends ProductionGateway {
     protected override runtimeManifest(): ChardbManifest {
@@ -423,11 +425,14 @@ interface Env {
 }
 
 interface CatalogFixture {
-    mutateAuth(args: {
-        readonly model: string;
-        readonly op: "delete";
-        readonly where: Record<string, string>;
-    }): Promise<unknown>;
+    mutateAuth(
+        args: {
+            readonly model: string;
+            readonly op: "delete";
+            readonly where: Record<string, string>;
+        },
+        _recoveryGeneration: number
+    ): Promise<unknown>;
 }
 
 interface CdbFixture {
@@ -464,11 +469,14 @@ export default {
             const body = (await request.json()) as { readonly organizationId: string; readonly userId: string };
             const catalog = env.CDB_CATALOG.get(env.CDB_CATALOG.idFromName("global")) as unknown as CatalogFixture;
             return Response.json(
-                await catalog.mutateAuth({
-                    model: "member",
-                    op: "delete",
-                    where: { organizationId: body.organizationId, userId: body.userId },
-                })
+                await catalog.mutateAuth(
+                    {
+                        model: "member",
+                        op: "delete",
+                        where: { organizationId: body.organizationId, userId: body.userId },
+                    },
+                    0
+                )
             );
         }
         if (url.pathname === "/cdb-drain" || url.pathname === "/cdb-force-due" || url.pathname === "/cdb-state") {

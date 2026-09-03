@@ -10,6 +10,7 @@ import {
 } from "../../src/server/do/cdb-fresh-reshard-destination.ts";
 import { CDB_LIVE_STORE_DDL } from "../../src/server/do/cdb-live-store.ts";
 import { initializeCdbVectorOutboxStore } from "../../src/server/do/cdb-vector-outbox-store.ts";
+import { initializeRecoveryAdmissionStore } from "../../src/server/do/recovery-admission.ts";
 import { adaptSqlStorage } from "../../src/server/do/sql_adapter.ts";
 
 interface Cursor<T> extends Iterable<T> {
@@ -130,6 +131,52 @@ describe("fresh reshard destination proof", () => {
         );
     });
 
+    test("accepts only an open recovery admission clock", () => {
+        const create = () => {
+            const db = new Database(":memory:");
+            databases.push(db);
+            const sql = adaptSqlStorage(sqlStorage(db));
+            initializeRecoveryAdmissionStore(sql);
+            return { db, sql };
+        };
+
+        const initial = create();
+        expect(() => assertFreshReshardDestination(initial.sql)).not.toThrow();
+
+        const advanced = create();
+        advanced.db.run("UPDATE _chardb_recovery_admission SET generation = 7");
+        expect(() => assertFreshReshardDestination(advanced.sql)).not.toThrow();
+
+        for (const statement of [
+            "UPDATE _chardb_recovery_admission SET state = 'blocked', operation_id = '00000000-0000-4000-8000-000000000000'",
+            "UPDATE _chardb_recovery_admission SET state = 'released', operation_id = '00000000-0000-4000-8000-000000000000'",
+            "INSERT INTO _chardb_recovery_admission VALUES (2, 0, NULL, 'open')",
+        ]) {
+            const unsafe = create();
+            if (statement.startsWith("INSERT")) {
+                unsafe.db.exec(`
+                    DROP TABLE _chardb_recovery_admission;
+                    CREATE TABLE _chardb_recovery_admission (
+                      singleton INTEGER, generation INTEGER, operation_id TEXT, state TEXT
+                    );
+                    INSERT INTO _chardb_recovery_admission VALUES (1, 0, NULL, 'open');
+                `);
+            }
+            unsafe.db.run(statement);
+            expect(() => assertFreshReshardDestination(unsafe.sql)).toThrow("_chardb_recovery_admission");
+        }
+
+        const drifted = create();
+        drifted.db.exec(`
+            DROP TABLE _chardb_recovery_admission;
+            CREATE TABLE _chardb_recovery_admission (
+              singleton INTEGER, generation INTEGER, operation_id TEXT, state TEXT, unexpected INTEGER
+            );
+            INSERT INTO _chardb_recovery_admission VALUES (1, 0, NULL, 'open', 0);
+        `);
+        expect(() => assertFreshReshardDestination(drifted.sql)).toThrow("_chardb_recovery_admission");
+    });
+
     test("accepts only the exact pristine external file-capture singleton", () => {
         const create = (ddl: string) => {
             const db = new Database(":memory:");
@@ -231,8 +278,9 @@ describe("fresh reshard destination proof", () => {
         executeDdl(db, CDB_LIVE_STORE_DDL);
         const sql = adaptSqlStorage(sqlStorage(db));
         initializeCdbAuthInvalidationStore(sql);
-        const request = { scope: "tenant" as const, scopeId: "org-moving", epoch: 5 };
+        const request = { recoveryGeneration: 0, scope: "tenant" as const, scopeId: "org-moving", epoch: 5 };
         expect(new CdbAuthInvalidationStore(sql).apply(request, 100)).toMatchObject({
+            recoveryGeneration: 0,
             epoch: 5,
             registrations: 0,
             changeSeq: 0,
@@ -247,10 +295,10 @@ describe("fresh reshard destination proof", () => {
         db.prepare(
             `INSERT INTO _chardb_live_subscriptions
               (gateway_id, registration_id, connection_id, client_id, sub_id, state,
-               payload_hash, principal_id, organization_id, authority, schema_epoch, vshard,
+               payload_hash, principal_id, organization_id, authority, schema_epoch, recovery_generation, vshard,
                domain_schema_epoch, ref, args_json, policy_digest, query_hash, tables_json, intervals_json)
              VALUES ('gateway-dest', 'registration-dest', 'connection-dest', 'client-dest', 1, 'active',
-                     'payload', 'user-dest', 'org-moving', 'organization', 2, 0, 1,
+                     'payload', 'user-dest', 'org-moving', 'organization', 2, 0, 0, 1,
                      'messages.list', '{}', 'policy', 'query', '[]', '[]')`
         ).run();
         expect(new CdbAuthInvalidationStore(sql).apply({ ...request, epoch: 6 }, 102)).toMatchObject({

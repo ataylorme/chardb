@@ -18,6 +18,7 @@ import type {
 import { ClientId, PrincipalId, SubId, TenantId } from "../../src/types.ts";
 import { vshardOf } from "../../src/vshard.ts";
 import { globalScope } from "../helpers/cdb-table.ts";
+import { withRecoveryEnv } from "../helpers/recovery.ts";
 
 interface Cursor<T> extends Iterable<T> {
     readonly columnNames: string[];
@@ -61,7 +62,7 @@ function construct(
             ready = callback();
         },
     } as unknown as DurableObjectState;
-    return { cdb: new CdbClass(state, env), ready };
+    return { cdb: new CdbClass(state, withRecoveryEnv(env)), ready };
 }
 
 const databases: Database[] = [];
@@ -120,6 +121,7 @@ describe("Cdb routing fence", () => {
         const vshard = vshardOf([partitionKey]);
         const fence = {
             migrationId: "native-source-fence",
+            recoveryGeneration: 0,
             rangeLo: vshard,
             rangeHi: vshard,
             sourceGeneration: 1,
@@ -128,6 +130,7 @@ describe("Cdb routing fence", () => {
         runtime.cdb.prepareRoutingFence(fence);
 
         const request = (mutId: string, id: string, schemaEpoch: number): CdbMutationRequest => ({
+            recoveryGeneration: 0,
             principalId: partitionKey,
             mutId,
             ref: putRecord.__chardbRef,
@@ -153,6 +156,7 @@ describe("Cdb routing fence", () => {
 
         await expect(
             runtime.cdb.query({
+                recoveryGeneration: 0,
                 ref: listRecords.__chardbRef,
                 args: { ownerId: partitionKey },
                 placement: { authority: "global", partitionKey },
@@ -163,6 +167,7 @@ describe("Cdb routing fence", () => {
         ).resolves.toMatchObject({ ok: false, error: { code: "CDB_STALE_EPOCH", retryable: true } });
         await expect(
             runtime.cdb.executePlan({
+                recoveryGeneration: 0,
                 plan: {
                     version: 1,
                     kind: "select",
@@ -256,6 +261,7 @@ describe("Cdb routing fence", () => {
             subId: SubId(1),
         };
         const subscribeRequest: CdbSubscriptionRequest = {
+            recoveryGeneration: 0,
             subscription,
             principalId: PrincipalId(partitionKey),
             organizationId: TenantId(partitionKey),
@@ -273,6 +279,7 @@ describe("Cdb routing fence", () => {
 
         const fence = {
             migrationId: "idle-source-fence",
+            recoveryGeneration: 0,
             rangeLo: vshard,
             rangeHi: vshard,
             sourceGeneration: 1,
@@ -280,6 +287,7 @@ describe("Cdb routing fence", () => {
         } as const;
         runtime.cdb.prepareRoutingFence(fence);
         const rerun: CdbRegisteredQueryRequest = {
+            recoveryGeneration: 0,
             subscription,
             placement: { authority: "global", partitionKey },
             auth: { userId: partitionKey, role: "member", roles: ["member"], claims: {} },

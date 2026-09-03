@@ -48,19 +48,24 @@ function ownEnumerableData(value: object, key: string): unknown {
 
 function projectCatalogRoute(value: unknown): RouteResult | undefined {
     if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-    if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(["domainSchemaEpoch", "schemaEpoch", "shardId"])) {
+    const keys = Object.keys(value).sort();
+    const currentKeys = ["domainSchemaEpoch", "recoveryGeneration", "schemaEpoch", "shardId"].sort();
+    if (JSON.stringify(keys) !== JSON.stringify(currentKeys)) {
         return undefined;
     }
     const shardId = ownEnumerableData(value, "shardId");
     const schemaEpoch = ownEnumerableData(value, "schemaEpoch");
     const domainSchemaEpoch = ownEnumerableData(value, "domainSchemaEpoch");
+    const recoveryGeneration = ownEnumerableData(value, "recoveryGeneration");
     if (
         typeof shardId !== "string" ||
         !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(shardId) ||
         !Number.isSafeInteger(schemaEpoch) ||
         (schemaEpoch as number) < 0 ||
         !Number.isSafeInteger(domainSchemaEpoch) ||
-        (domainSchemaEpoch as number) < 1
+        (domainSchemaEpoch as number) < 1 ||
+        !Number.isSafeInteger(recoveryGeneration) ||
+        (recoveryGeneration as number) < 0
     ) {
         return undefined;
     }
@@ -68,7 +73,17 @@ function projectCatalogRoute(value: unknown): RouteResult | undefined {
         shardId: shardId as RouteResult["shardId"],
         schemaEpoch: schemaEpoch as number,
         domainSchemaEpoch: domainSchemaEpoch as number,
+        recoveryGeneration: recoveryGeneration as number,
     };
+}
+
+function sameCatalogRoute(left: RouteResult, right: RouteResult): boolean {
+    return (
+        left.shardId === right.shardId &&
+        left.schemaEpoch === right.schemaEpoch &&
+        left.recoveryGeneration === right.recoveryGeneration &&
+        left.domainSchemaEpoch === right.domainSchemaEpoch
+    );
 }
 
 function projectSession(value: unknown): OrganizationVectorSearchSession | undefined {
@@ -155,47 +170,60 @@ export async function dispatchOrganizationVectorSearch(input: {
             if (!projected.ok) return { ok: false, forbidden: projected.code === "CDB_FORBIDDEN" };
             const route = projectCatalogRoute(ownEnumerableData(resolved, "route"));
             if (!route) return { ok: false, forbidden: false };
+            if (projected.recoveryGeneration !== route.recoveryGeneration) {
+                return { ok: false, forbidden: false };
+            }
             return { ok: true, auth: projected.auth, route };
         } catch {
             return { ok: false, forbidden: false };
         }
     };
 
-    const admitted = await refresh();
+    let admitted = await refresh();
     if (!admitted.ok) {
         return admitted.forbidden ? notFound() : { ok: false, status: 503, code: "CATALOG_UNAVAILABLE" };
     }
-    const matches = await queryCdbVectorizeCandidates({
-        index,
-        resource,
-        organizationId: input.locator.organizationId,
-        values: input.values,
-        limit: input.limit,
-    });
-    const current = await refresh();
-    if (!current.ok) {
-        return current.forbidden ? notFound() : { ok: false, status: 503, code: "CATALOG_UNAVAILABLE" };
-    }
-    try {
-        return {
-            ok: true,
-            value: await input.validate({
-                auth: current.auth,
-                route: current.route,
-                resource,
-                resourceId: cdbVectorResourceId(resource),
-                organizationId: input.locator.organizationId,
-                matches,
-                limit: input.limit,
-            }),
-        };
-    } catch (error) {
-        const normalized = rehydrateCdbRpcError(error);
-        if (isCdbError(normalized)) throw normalized;
-        throw new CdbError({
-            code: "CDB_SHARD_UNAVAILABLE",
-            message: "vector search candidate validation failed",
-            cause: normalized,
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        const matches = await queryCdbVectorizeCandidates({
+            index,
+            resource,
+            organizationId: input.locator.organizationId,
+            values: input.values,
+            limit: input.limit,
         });
+        const current = await refresh();
+        if (!current.ok) {
+            return current.forbidden ? notFound() : { ok: false, status: 503, code: "CATALOG_UNAVAILABLE" };
+        }
+        if (!sameCatalogRoute(admitted.route, current.route)) {
+            if (attempt === 0) {
+                admitted = current;
+                continue;
+            }
+            throw new CdbError({ code: "CDB_STALE_EPOCH", message: "vector route changed during search" });
+        }
+        try {
+            return {
+                ok: true,
+                value: await input.validate({
+                    auth: current.auth,
+                    route: current.route,
+                    resource,
+                    resourceId: cdbVectorResourceId(resource),
+                    organizationId: input.locator.organizationId,
+                    matches,
+                    limit: input.limit,
+                }),
+            };
+        } catch (error) {
+            const normalized = rehydrateCdbRpcError(error);
+            if (isCdbError(normalized)) throw normalized;
+            throw new CdbError({
+                code: "CDB_SHARD_UNAVAILABLE",
+                message: "vector search candidate validation failed",
+                cause: normalized,
+            });
+        }
     }
+    throw new CdbError({ code: "CDB_STALE_EPOCH", message: "vector route did not stabilize" });
 }
