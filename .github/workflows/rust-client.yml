@@ -21,6 +21,7 @@ jobs:
   quality:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    if: github.repository == 'zpg6/chardb'
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
@@ -56,6 +57,7 @@ jobs:
 
   native:
     name: Native ${{ matrix.os }}
+    if: github.repository == 'zpg6/chardb'
     strategy:
       fail-fast: false
       matrix:
@@ -77,6 +79,7 @@ jobs:
 
   msrv:
     runs-on: ubuntu-24.04
+    if: github.repository == 'zpg6/chardb'
     timeout-minutes: 20
     steps:
       - name: Check out repository
@@ -97,6 +100,7 @@ jobs:
 
   targets:
     name: Target ${{ matrix.target }}
+    if: github.repository == 'zpg6/chardb'
     strategy:
       fail-fast: false
       matrix:
@@ -140,6 +144,7 @@ jobs:
 
   workerd-contract:
     runs-on: ubuntu-24.04
+    if: github.repository == 'zpg6/chardb'
     timeout-minutes: 20
     steps:
       - name: Check out repository
