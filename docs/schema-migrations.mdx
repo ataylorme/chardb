@@ -31,7 +31,7 @@ When a project has only its initial `v1` migration, and **all local database sta
 bunx @chardb/core migrations rebaseline --name initial_schema --confirm-local-reset
 ```
 
-This command requires the acknowledgement, refuses a history containing `v2` or later, and atomically replaces `v1.json`, `v1.ts`, and `src/migrations.ts`. It does not inspect deployed databases, so it must never be used after a migration has run in a shared or deployed environment.
+This command requires acknowledgement, refuses a history containing `v2` or later, and atomically replaces `v1.json`, `v1.ts`, and `src/migrations.ts`. It does not inspect deployed databases, so it must never be used after a migration has run in a shared or deployed environment.
 
 ## Prove the upgrade
 
