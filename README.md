@@ -255,6 +255,16 @@ Migration generation is deterministic. It writes immutable, digest-chained JSON 
 
 The public migration path accepts additive SQLite changes that do not require a table rewrite or data cleanup. Destructive and ambiguous changes fail generation.
 
+### Replace an undeployed initial baseline
+
+If a project has only `v1` and has **never been deployed or used in a shared environment**, discard every local database state first, then regenerate the initial baseline:
+
+```sh
+bunx @chardb/core migrations rebaseline --name initial_schema --confirm-local-reset
+```
+
+The acknowledgement is required. The command refuses histories with `v2` or later and atomically replaces only the v1 JSON snapshot, TypeScript snapshot, and journal. It cannot prove that a database was never deployed; do not use it to rewrite a history that has run anywhere outside discarded local state.
+
 ## Recovery
 
 Capture and restore a coordinated Durable Object recovery point with the CLI:

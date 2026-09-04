@@ -595,4 +595,49 @@ describe("migration rebaseline", () => {
         ]);
         expect(project.files.get("/project/src/migrations/v1.json")).toContain('"name":"initial_schema"');
     });
+
+    test("refuses deployed-style history and leaves the version-one artifacts unchanged", async () => {
+        const versionTwo = addMessageColumn(SCAFFOLD_INITIAL_SNAPSHOT, 2, "add_message", "extra");
+        const project = fakeProject([
+            `${stableJson(SCAFFOLD_INITIAL_SNAPSHOT)}\n`,
+            `${stableJson(SCAFFOLD_INITIAL_SNAPSHOT)}\n`,
+            `${stableJson(versionTwo)}\n`,
+            `${stableJson(versionTwo)}\n`,
+        ]);
+        await runMigrationsGenerate(project.ctx, { name: "initial_schema" });
+        await runMigrationsGenerate(project.ctx, { name: "add_message" });
+        const original = new Map(project.files);
+        const inspectionsBefore = project.invocations.length;
+
+        await expect(
+            runMigrationsRebaseline(project.ctx, { name: "replacement", confirmLocalReset: true })
+        ).rejects.toThrow("rebaseline only supports a version 1 migration history");
+
+        expect(project.invocations).toHaveLength(inspectionsBefore);
+        expect(project.files).toEqual(original);
+    });
+
+    test("requires the complete local v1 history and preserves it when its atomic write fails", async () => {
+        const missingAuth = fakeProject();
+        missingAuth.files.delete("/project/src/auth.ts");
+        await expect(
+            runMigrationsRebaseline(missingAuth.ctx, { name: "replacement", confirmLocalReset: true })
+        ).rejects.toThrow("src/auth.ts does not exist");
+        expect(missingAuth.invocations).toEqual([]);
+
+        const project = fakeProject();
+        await runMigrationsGenerate(project.ctx, { name: "initial_schema" });
+        const original = new Map(project.files);
+        const failingContext: CliContext = {
+            ...project.ctx,
+            async writeFilesAtomic() {
+                throw new Error("simulated atomic writer failure");
+            },
+        };
+
+        await expect(
+            runMigrationsRebaseline(failingContext, { name: "initial_schema", confirmLocalReset: true })
+        ).rejects.toThrow("simulated atomic writer failure");
+        expect(project.files).toEqual(original);
+    });
 });

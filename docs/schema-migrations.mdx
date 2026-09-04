@@ -23,6 +23,16 @@ The generator inspects the schema twice in separate Bun processes and rejects di
 
 Never edit a migration after it has run in any shared environment. Generate a new version instead.
 
+## Replace an undeployed initial baseline
+
+When a project has only its initial `v1` migration, and **all local database state has been discarded**, the initial baseline can be regenerated after changing the schema or auth profile:
+
+```bash
+bunx @chardb/core migrations rebaseline --name initial_schema --confirm-local-reset
+```
+
+This command requires the acknowledgement, refuses a history containing `v2` or later, and atomically replaces `v1.json`, `v1.ts`, and `src/migrations.ts`. It does not inspect deployed databases, so it must never be used after a migration has run in a shared or deployed environment.
+
 ## Prove the upgrade
 
 Run the migration test against both an empty database and the previous schema version.

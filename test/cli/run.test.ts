@@ -43,6 +43,8 @@ describe("chardb command availability", () => {
     });
 
     test("parses initial migration generation strictly", async () => {
+        const usage =
+            "usage: chardb migrations generate --name <name>\n       chardb migrations rebaseline --name <name> --confirm-local-reset\n";
         for (const argv of [
             ["migrations"],
             ["migrations", "generate"],
@@ -53,8 +55,35 @@ describe("chardb command availability", () => {
         ]) {
             const { ctx, err } = fakeCtx();
             expect(await runCli(ctx, argv)).toBe(2);
-            expect(err).toEqual(["usage: chardb migrations generate --name <name>\n"]);
+            expect(err).toEqual([usage]);
         }
+    });
+
+    test("requires an explicit acknowledgement before dispatching a migration rebaseline", async () => {
+        const usage =
+            "usage: chardb migrations generate --name <name>\n       chardb migrations rebaseline --name <name> --confirm-local-reset\n";
+        for (const argv of [
+            ["migrations", "rebaseline"],
+            ["migrations", "rebaseline", "--name", "initial_schema"],
+            ["migrations", "rebaseline", "--confirm-local-reset", "--name", "initial_schema"],
+            ["migrations", "rebaseline", "--name", "initial_schema", "--confirm-local-reset", "extra"],
+        ]) {
+            const { ctx, err } = fakeCtx();
+            expect(await runCli(ctx, argv)).toBe(2);
+            expect(err).toEqual([usage]);
+        }
+
+        const accepted = fakeCtx();
+        expect(
+            await runCli(accepted.ctx, [
+                "migrations",
+                "rebaseline",
+                "--name",
+                "initial_schema",
+                "--confirm-local-reset",
+            ])
+        ).toBe(1);
+        expect(accepted.err).toEqual(["chardb migrations: src/schema.ts does not exist\n"]);
     });
 
     test("reports an init preflight failure without an uncaught exception", async () => {
