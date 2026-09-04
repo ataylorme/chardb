@@ -20,6 +20,7 @@ jobs:
   candidate:
     name: Build exact candidate
     runs-on: ubuntu-latest
+    if: github.repository == 'zpg6/chardb'
     timeout-minutes: 10
     steps:
       - name: Check out repository
